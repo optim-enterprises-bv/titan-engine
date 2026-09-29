@@ -33,6 +33,19 @@ three times.
 
   The service runs `static`. Scope (b) replaces these policies rather than tuning them.
 
+## Status
+
+| scope | code | gate |
+|---|---|---|
+| (a) admission | done: `mistralrs-core/src/titan_admit.rs`, called from `engine/add_request.rs`; `TITAN_ADMIT=1` refuses, `TITAN_ADMIT=log` only logs | not run: needs the GPU (`BENCH_ADMIT=1 bench/run.sh ...` adds the probe) |
+| (b) per-request partition | not started: the arena spike needs the GPU | - |
+| (c) fault accounting | done: `mistralrs-core/src/titan_faults.rs`, `TITAN_FAULT_LOG=1` | not run |
+| (c) `mlock` / lookahead budget | not started | - |
+
+The working-set terms of (a) are the PFS ring's measured ones, not a fit. Run the service once with
+`TITAN_ADMIT=log TITAN_PREFILL_MEMLOG=1` over the bench's prompts and compare each logged estimate with the pool
+peak before turning refusal on.
+
 ## Scopes
 
 Each scope sits behind its own env flag, off by default, and has its own gate. To revert a scope, unset its

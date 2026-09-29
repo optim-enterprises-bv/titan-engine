@@ -980,8 +980,8 @@ pub(crate) fn prefill_chunk_size() -> usize {
 /// the 1 GiB tiered reserve; 1024 was ~3% faster to prefill but failed 13k-token prompts at 16k context
 /// and 30k-token prompts at 32k context once decode steps had fragmented the pool.
 const DEFAULT_PREFILL_CHUNK: usize = 512;
-/// Granularity (tokens) of the KV room a chunked prompt reserves up front.
-const KV_RESERVE_STEP: usize = 8192;
+/// Granularity (tokens) of the KV room a chunked prompt reserves up front (also `titan_admit`'s).
+pub(crate) const KV_RESERVE_STEP: usize = 8192;
 /// The GDN prefill switches recurrence kernels below 64 rows (gdn::backend
 /// RECURRENCE_CHUNK_THRESHOLD); every chunk stays at or above it so a chunk runs the same
 /// sequential per-token warp kernel as the whole prompt.
@@ -1934,6 +1934,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 impl ModelWeights {
     pub fn forward(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         let rows = input_ids.dim(1)?;
+        crate::titan_faults::forward_start(rows);
         let t = prof_wall_enter(rows);
         let r = self.forward_inner(input_ids, ctx);
         prof_wall_exit(rows, t);
