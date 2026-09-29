@@ -1,0 +1,47 @@
+From a0e5b6f6d6cecf254d4dc79fa322a5be04e84cf6 Mon Sep 17 00:00:00 2001
+From: titan-engine contributors
+Date: Sun, 27 Sep 2026 06:15:46 +0700
+Subject: [PATCH] detect.rs: bound the escaped-whitespace search to the token
+ (was quadratic in LLVM text size)
+
+---
+ crates/cuda-oxide-codegen/src/target/detect.rs | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/crates/cuda-oxide-codegen/src/target/detect.rs b/crates/cuda-oxide-codegen/src/target/detect.rs
+index 0ca16252..172ae13a 100644
+--- a/crates/cuda-oxide-codegen/src/target/detect.rs
++++ b/crates/cuda-oxide-codegen/src/target/detect.rs
+@@ -352,19 +352,21 @@ fn contains_instruction_family_modifier(
+                 return false;
+             }
+ 
+-            let token_end = following
++            // The token ends at the first whitespace/quote/semicolon or escaped whitespace. An
++            // escape past the first plain delimiter can never be the minimum, so search for escapes
++            // only up to it: the original searched the whole remaining text per match (quadratic).
++            let plain_end = following
+                 .char_indices()
+                 .find_map(|(offset, ch)| {
+                     (ch.is_whitespace() || matches!(ch, '"' | ';')).then_some(offset)
+                 })
+-                .into_iter()
+-                .chain(
+-                    ESCAPED_WHITESPACE
+-                        .iter()
+-                        .filter_map(|escape| following.find(escape)),
+-                )
+-                .min()
+                 .unwrap_or(following.len());
++            let head = &following[..plain_end];
++            let token_end = ESCAPED_WHITESPACE
++                .iter()
++                .filter_map(|escape| head.find(escape))
++                .min()
++                .unwrap_or(plain_end);
+             following[..token_end]
+                 .split('.')
+                 .any(|modifier| modifier == required_modifier)
+-- 
+2.55.0
+

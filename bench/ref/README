@@ -1,0 +1,1 @@
+2026-09-29: refs re-baselined to bin/mistralrs-titan-idle2 (doorbell + one-pass CPU experts; CPU path no longer bit-identical to GPU by user-approved policy). Old exact refs: *.pre-idle-exact.json

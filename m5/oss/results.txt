@@ -1,0 +1,20 @@
+M5 gpt-oss GGUF gates (window 1, 2026-09-28 06:25-06:56, titan-mistral down 31m27s)
+mistral.rs: branch gpt-oss-gguf fafce74 (worktree mr-oss), --dtype f16, --paged-attn off, 4096 ctx
+llama.cpp: acecd56 llama-server, greedy
+
+(1) 20b gpt-oss-20b-F16.gguf (MXFP4 experts, F16 attention), all on GPU in both engines
+  prompt tokens identical 8/8
+  llama-20b vs oss20-stock: 4/8 identical after lstrip, first-token argmax 8/8, top-4 set 8/8
+  oss20-stock vs oss20-t50 (TITAN_TIERED=1 fraction 0.5, 16/32 experts per projection on the CPU twin,
+    decode hit rate 51.3%): 8/8 byte-identical, top-4 8/8, practice replies 20/20 byte-identical
+  tok/s (8x64 incl. prefill): llama 133.8, stock 82.4, t50 32.5
+(2) 120b gpt-oss-120b-MXFP4.gguf (63387346208 bytes, matches header), MemoryMax=20G
+  llama.cpp --n-cpu-moe 28 (27 fails: 16.2 GB CUDA0 alloc): 2.8 tok/s, practice 0.9 tok/s
+  mistral.rs TITAN_TIERED=1 fraction auto (0.21, 27/128 experts per projection on GPU) TITAN_TIERED_MMAP=1:
+    4.4 tok/s, practice 3.4 tok/s; peak cgroup 18.6 GB, RssAnon 1.4 GB
+  prompt tokens identical 8/8; 3/8 identical after lstrip; first-token argmax 8/8; top-4 set 7/8
+    (prompt 3: 4th-place ' top' -2.10 vs ' multiple' -1.86)
+(3) practice: 20 short-answer questions (questions.json), raw harmony prompt, final channel parsed
+  20b: llama 20/20, stock 20/20, t50 20/20      120b: llama 20/20, mistral.rs 20/20
+(4) 35B baseline: q35-oss identical to q35-prof 40/40 (80.8 tok/s)
+(5) nvcc-free build (--features oxide, target-oss-oxide): links, 184 s

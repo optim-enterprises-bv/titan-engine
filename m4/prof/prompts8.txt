@@ -1,0 +1,8 @@
+Write a Rust function that reverses a linked list.
+Explain what a mixture-of-experts layer does.
+Write a C function that counts set bits in an integer.
+What is the difference between HTTP/1.1 and HTTP/2?
+Write a docker-compose file for Postgres and Redis.
+Explain Kubernetes Services and Ingress.
+Implement quicksort in Python.
+How does TLS 1.3 reduce handshake latency?

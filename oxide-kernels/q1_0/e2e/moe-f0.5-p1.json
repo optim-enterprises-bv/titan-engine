@@ -1,0 +1,140 @@
+[
+ {
+  "prompt": "The capital of France is",
+  "text": "ModelErrorModelErrorModelError_Description mer mer_Description mer_DescriptionERRU../../../define_CFREAK_CF_CF_CF_CFREAK_CF_CF_CF_CF_CFruisearilyisms \u0427\u0438SectionsInhipsERRUgetColumnERRUgetColumnERRU\u4e43\u81f3ERRUDialogTitle_ELEMENTriday",
+  "top4": {
+   "151660": 1.1173011,
+   "658": 0.99188995,
+   "63420": 0.98823464,
+   "24082": 0.9757399
+  },
+  "secs": 2.3013193607330322,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 5,
+   "total_tokens": 69,
+   "avg_tok_per_sec": 30.530973,
+   "avg_prompt_tok_per_sec": 59.52381,
+   "avg_compl_tok_per_sec": 29.411764,
+   "total_time_sec": 2.26,
+   "total_prompt_time_sec": 0.084,
+   "total_completion_time_sec": 2.176
+  },
+  "timings": null
+ },
+ {
+  "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+  "text": "ButtonTitlesDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitle_BREAK_CONTINUE)did_PROGRESSDialogTitle_UNSIGNEDerrMsgascarrawidPELLowedigrateduns\u6832ActionButtonousatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureatureature",
+  "top4": {
+   "151660": 1.0700424,
+   "139485": 1.0326085,
+   "96453": 1.021043,
+   "132282": 0.98682064
+  },
+  "secs": 2.3704946041107178,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "avg_tok_per_sec": 32.96233,
+   "avg_prompt_tok_per_sec": 72.625694,
+   "avg_compl_tok_per_sec": 29.670837,
+   "total_time_sec": 2.336,
+   "total_prompt_time_sec": 0.179,
+   "total_completion_time_sec": 2.157
+  },
+  "timings": null
+ },
+ {
+  "prompt": "Once upon a time, in a small village by the sea,",
+  "text": "oganoganthon\"ictionaryictionary Italian Italian Italian Italian ItalianateachingmrJsonValue_FINEplacesplaces_FINEgetError suppression fine suppression fine mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer mer",
+  "top4": {
+   "29536": 1.009722,
+   "48734": 1.0010102,
+   "52259": 0.98373324,
+   "95753": 0.98293936
+  },
+  "secs": 2.5141961574554443,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "avg_tok_per_sec": 31.048388,
+   "avg_prompt_tok_per_sec": 81.76101,
+   "avg_compl_tok_per_sec": 27.574322,
+   "total_time_sec": 2.48,
+   "total_prompt_time_sec": 0.159,
+   "total_completion_time_sec": 2.321
+  },
+  "timings": null
+ },
+ {
+  "prompt": "The three laws of thermodynamics are",
+  "text": "antsModelErrorModelError_AnimModelError mer mer mer mer merLError merLError merLError merLErrorLError_CBLError_CBERRModelErrorModelError_CF_CFerraractersallyonsooursoursoursModelErrorModelErrorModelErrorModelErrorModelError_DIFFnalitytmoreleaseoreleaseDialogTitle_SKIPModelError\u4e43\u81f3",
+  "top4": {
+   "151660": 1.1020885,
+   "42813": 1.0163894,
+   "134494": 1.0061964,
+   "50032": 1.00135
+  },
+  "secs": 2.2352294921875,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 7,
+   "total_tokens": 71,
+   "avg_tok_per_sec": 32.18495,
+   "avg_prompt_tok_per_sec": 72.916664,
+   "avg_compl_tok_per_sec": 30.331753,
+   "total_time_sec": 2.206,
+   "total_prompt_time_sec": 0.096,
+   "total_completion_time_sec": 2.11
+  },
+  "timings": null
+ },
+ {
+  "prompt": "1, 1, 2, 3, 5, 8, 13,",
+  "text": "_TDDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitleDialogTitle=@\"AttributeName_DeleteAttributeName_Delete>Delete",
+  "top4": {
+   "95862": 1.0848203,
+   "86987": 1.042472,
+   "95105": 1.0362076,
+   "95011": 1.0348725
+  },
+  "secs": 2.426603317260742,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 21,
+   "total_tokens": 85,
+   "avg_tok_per_sec": 35.535114,
+   "avg_prompt_tok_per_sec": 73.68421,
+   "avg_compl_tok_per_sec": 30.37494,
+   "total_time_sec": 2.392,
+   "total_prompt_time_sec": 0.285,
+   "total_completion_time_sec": 2.107
+  },
+  "timings": null
+ },
+ {
+  "prompt": "Translate to German: The weather is nice today.\nGerman:",
+  "text": "_na stops stopstopstopstopstopstopstopstopstopstopstopstopstopstopstops\u4e0b\u4f86ly=@\"\u30ab\u30c6antine\u00e5nstroyedictionnalizationizationizationDialogTitle_QUunnDialogTitle latter\u4e43\u81f3GenericType\u4e43\u81f3\u965b\u4e43\u81f3orsche\u4e43\u81f3\u965b\u4e43\u81f3orsche\u4e43\u81f3\u965b\u4e43\u81f3orsche\u4e43\u81f3ONTALizeoningredientsoutu\u00e5n|=\ndefine\u4e86\u4e00sModelAttribute\u4e43\u81f3",
+  "top4": {
+   "716": 0.9813875,
+   "17933": 0.9777038,
+   "72058": 0.9670074,
+   "2936": 0.955799
+  },
+  "secs": 2.231395959854126,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 12,
+   "total_tokens": 76,
+   "avg_tok_per_sec": 34.703194,
+   "avg_prompt_tok_per_sec": 81.63265,
+   "avg_compl_tok_per_sec": 31.32648,
+   "total_time_sec": 2.19,
+   "total_prompt_time_sec": 0.147,
+   "total_completion_time_sec": 2.043
+  },
+  "timings": null
+ }
+]

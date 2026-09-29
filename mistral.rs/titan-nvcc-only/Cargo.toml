@@ -1,0 +1,9 @@
+[package]
+name = "titan-nvcc-only"
+version = "0.1.0"
+edition = "2021"
+description = "titan oxide build: aborting stubs for the CUDA launchers mistral.rs v0.9.4 declares that have no cuda-oxide twin (nvcc-only)"
+publish = false
+license = "MIT"
+
+[dependencies]

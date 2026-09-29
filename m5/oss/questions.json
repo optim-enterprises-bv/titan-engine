@@ -1,0 +1,22 @@
+[
+ ["What is 17 * 23?", "\\b391\\b"],
+ ["What is the capital of Australia?", "canberra"],
+ ["How many sides does a hexagon have?", "\\b(6|six)\\b"],
+ ["What is the chemical symbol for gold?", "\\bau\\b"],
+ ["What is 2 to the power of 10?", "\\b1,?024\\b"],
+ ["Who wrote the novel Pride and Prejudice?", "austen"],
+ ["What is the square root of 144?", "\\b(12|twelve)\\b"],
+ ["Which planet is known as the Red Planet?", "\\bmars\\b"],
+ ["At sea level, what is the boiling point of water in degrees Celsius?", "\\b100\\b"],
+ ["How many minutes are there in 3.5 hours?", "\\b210\\b"],
+ ["What is the largest ocean on Earth?", "pacific"],
+ ["A train travels 60 km in 45 minutes. What is its average speed in km/h?", "\\b80\\b"],
+ ["What is the decimal number 13 written in binary?", "\\b1101\\b"],
+ ["What is the smallest prime number greater than 31?", "\\b37\\b"],
+ ["In which year did World War II end?", "\\b1945\\b"],
+ ["What is the sum of the interior angles of a triangle, in degrees?", "\\b180\\b"],
+ ["Which gas do plants absorb from the air for photosynthesis?", "carbon dioxide|co2|co₂"],
+ ["What is 1000 minus 387?", "\\b613\\b"],
+ ["How many bytes are in a kibibyte?", "\\b1,?024\\b"],
+ ["What is 15% of 240?", "\\b36\\b"]
+]

@@ -1,0 +1,40 @@
+Write a Rust function that parses a CSV line with quoted fields.
+Explain how a B-tree index speeds up database lookups.
+Write a Python script that watches a directory and prints new files.
+What is the difference between TCP and UDP?
+Write a Dockerfile for a small Go web service.
+Explain Kubernetes liveness vs readiness probes.
+Implement binary search in C.
+How does WireGuard perform key exchange?
+Write a SQL query for the top 5 customers by revenue per month.
+Explain the CAP theorem with an example.
+Write a bash script that rotates log files older than 7 days.
+What is a closure in JavaScript? Give an example.
+Write a Rust async function that fetches three URLs concurrently.
+Explain how nftables differs from iptables.
+Write a unit test in pytest for a function that adds two numbers.
+Describe how HTTPS certificate validation works.
+Write a systemd service unit for a Node.js app.
+Explain gradient descent to a high school student.
+Write a regex that matches IPv4 addresses.
+What does the Linux OOM killer do?
+Write a Go function that merges two sorted slices.
+Explain the difference between a process and a thread.
+Write a React component that shows a counter.
+How do you debug a memory leak in a C++ program?
+Write a Makefile for a C project with src/ and include/ directories.
+Explain what a CUDA warp is.
+Write a Terraform resource for an S3 bucket with versioning.
+What is eventual consistency?
+Write a Python class implementing an LRU cache.
+Explain how git merge differs from git rebase.
+Write a shell one-liner to find the 10 largest files under /var.
+Describe the attention mechanism in transformers.
+Write a Rust trait for a shape with area and perimeter.
+Explain how DNS resolution works step by step.
+Write a function in Haskell that computes factorial.
+What is the purpose of a mutex?
+Write an nginx config that reverse proxies to port 3000.
+Explain what quantization does to a neural network.
+Write a Python generator that yields prime numbers.
+How do OpenWrt packages get built?

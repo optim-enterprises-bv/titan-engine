@@ -1,0 +1,402 @@
+[
+ [
+  "What is 48 * 27?",
+  "(?<![\\d.])(1296|1,296)(?![\\d])"
+ ],
+ [
+  "What is 1234 + 5678?",
+  "(?<![\\d.])(6912|6,912)(?![\\d])"
+ ],
+ [
+  "What is 9000 - 4567?",
+  "(?<![\\d.])(4433|4,433)(?![\\d])"
+ ],
+ [
+  "What is 3 cubed plus 4 cubed?",
+  "(?<![\\d.])(91|91)(?![\\d])"
+ ],
+ [
+  "What is 144 divided by 12, multiplied by 7?",
+  "(?<![\\d.])(84|84)(?![\\d])"
+ ],
+ [
+  "What is 25% of 360?",
+  "(?<![\\d.])(90|90)(?![\\d])"
+ ],
+ [
+  "What is the sum of the integers from 1 to 50?",
+  "(?<![\\d.])(1275|1,275)(?![\\d])"
+ ],
+ [
+  "What is 17 squared?",
+  "(?<![\\d.])(289|289)(?![\\d])"
+ ],
+ [
+  "What is 2 to the power of 16?",
+  "(?<![\\d.])(65536|65,536)(?![\\d])"
+ ],
+ [
+  "What is the greatest common divisor of 84 and 126?",
+  "(?<![\\d.])(42|42)(?![\\d])"
+ ],
+ [
+  "What is the least common multiple of 12 and 18?",
+  "(?<![\\d.])(36|36)(?![\\d])"
+ ],
+ [
+  "How many seconds are in 2 hours and 15 minutes?",
+  "(?<![\\d.])(8100|8,100)(?![\\d])"
+ ],
+ [
+  "What is 7! (7 factorial)?",
+  "(?<![\\d.])(5040|5,040)(?![\\d])"
+ ],
+ [
+  "What is 999 * 3?",
+  "(?<![\\d.])(2997|2,997)(?![\\d])"
+ ],
+ [
+  "What is 56 * 56 - 55 * 55?",
+  "(?<![\\d.])(111|111)(?![\\d])"
+ ],
+ [
+  "Tom has 3 boxes with 24 apples each. He gives away 19 apples. How many apples does he have left?",
+  "(?<![\\d.])(53|53)(?![\\d])"
+ ],
+ [
+  "A shirt costs $40 and is discounted by 15%. What is the sale price in dollars?",
+  "(?<![\\d.])(34|34)(?![\\d])"
+ ],
+ [
+  "A car travels at 65 km/h for 4 hours. How many kilometres does it travel?",
+  "(?<![\\d.])(260|260)(?![\\d])"
+ ],
+ [
+  "Sara reads 12 pages a day. How many days does she need to read a 228-page book?",
+  "(?<![\\d.])(19|19)(?![\\d])"
+ ],
+ [
+  "A recipe needs 3 eggs per cake. How many eggs are needed for 14 cakes?",
+  "(?<![\\d.])(42|42)(?![\\d])"
+ ],
+ [
+  "There are 5 classes of 28 students and 4 classes of 31 students. How many students are there in total?",
+  "(?<![\\d.])(264|264)(?![\\d])"
+ ],
+ [
+  "A worker earns $18 per hour and works 37 hours. How many dollars does she earn?",
+  "(?<![\\d.])(666|666)(?![\\d])"
+ ],
+ [
+  "A rectangle is 23 cm long and 17 cm wide. What is its area in square centimetres?",
+  "(?<![\\d.])(391|391)(?![\\d])"
+ ],
+ [
+  "A rectangle is 23 cm long and 17 cm wide. What is its perimeter in centimetres?",
+  "(?<![\\d.])(80|80)(?![\\d])"
+ ],
+ [
+  "John buys 4 notebooks at $2.50 each and a pen for $1.75. He pays with a $20 bill. How much change does he get, in dollars?",
+  "(?<![\\d.])8\\.25(?![\\d])"
+ ],
+ [
+  "A tank holds 450 litres and is filled at 18 litres per minute. How many minutes does it take to fill from empty?",
+  "(?<![\\d.])(25|25)(?![\\d])"
+ ],
+ [
+  "If 8 workers build a wall in 15 days, how many days would 12 workers take at the same rate?",
+  "(?<![\\d.])(10|10)(?![\\d])"
+ ],
+ [
+  "A bag has 6 red, 9 blue and 15 green marbles. What percentage of the marbles are green?",
+  "(?<![\\d.])(50|50)(?![\\d])"
+ ],
+ [
+  "Mia is 3 times as old as her son. The son is 12. How old will Mia be in 5 years?",
+  "(?<![\\d.])(41|41)(?![\\d])"
+ ],
+ [
+  "A train leaves at 09:40 and arrives at 13:05. How many minutes is the journey?",
+  "(?<![\\d.])(205|205)(?![\\d])"
+ ],
+ [
+  "The average of five numbers is 18. Four of them are 12, 20, 15 and 25. What is the fifth?",
+  "(?<![\\d.])(18|18)(?![\\d])"
+ ],
+ [
+  "A farmer has 120 chickens and sells 3/8 of them. How many chickens remain?",
+  "(?<![\\d.])(75|75)(?![\\d])"
+ ],
+ [
+  "A phone costs $600. The price rises by 10% and then falls by 10%. What is the final price in dollars?",
+  "(?<![\\d.])(594|594)(?![\\d])"
+ ],
+ [
+  "A pizza is cut into 12 slices. Ann eats 1/4 of it and Ben eats 1/3 of it. How many slices are left?",
+  "(?<![\\d.])(5|5)(?![\\d])"
+ ],
+ [
+  "What is 15% of 15% of 10000?",
+  "(?<![\\d.])(225|225)(?![\\d])"
+ ],
+ [
+  "How many prime numbers are there between 1 and 30?",
+  "(?<![\\d.])(10|10)(?![\\d])"
+ ],
+ [
+  "What is 1001 divided by 7?",
+  "(?<![\\d.])(143|143)(?![\\d])"
+ ],
+ [
+  "What is 0.125 written as a fraction in lowest terms? Give it as a/b.",
+  "(?<![\\d.])1/8(?![\\d])"
+ ],
+ [
+  "What is the remainder when 1000 is divided by 7?",
+  "(?<![\\d.])(6|6)(?![\\d])"
+ ],
+ [
+  "A store sells pencils in packs of 12. How many packs are needed for 150 pencils?",
+  "(?<![\\d.])(13|13)(?![\\d])"
+ ],
+ [
+  "What is the capital of Canada?",
+  "ottawa"
+ ],
+ [
+  "What is the capital of Japan?",
+  "tokyo"
+ ],
+ [
+  "What is the capital of Kenya?",
+  "nairobi"
+ ],
+ [
+  "What is the chemical symbol for sodium?",
+  "\\bNa\\b"
+ ],
+ [
+  "What is the chemical symbol for iron?",
+  "\\bFe\\b"
+ ],
+ [
+  "How many chromosomes do humans normally have?",
+  "\\b46\\b"
+ ],
+ [
+  "Who painted the Mona Lisa?",
+  "leonardo|da vinci"
+ ],
+ [
+  "Who developed the theory of general relativity?",
+  "einstein"
+ ],
+ [
+  "What is the largest planet in the Solar System?",
+  "jupiter"
+ ],
+ [
+  "What is the hardest natural mineral?",
+  "diamond"
+ ],
+ [
+  "In which year did the first human land on the Moon?",
+  "\\b1969\\b"
+ ],
+ [
+  "What is the longest river in Africa?",
+  "\\bnile\\b"
+ ],
+ [
+  "Which element has atomic number 8?",
+  "oxygen"
+ ],
+ [
+  "What is the speed of light in vacuum, in kilometres per second, rounded to the nearest thousand?",
+  "300[, ]?000"
+ ],
+ [
+  "Who wrote 'Romeo and Juliet'?",
+  "shakespeare"
+ ],
+ [
+  "What is the currency of the United Kingdom?",
+  "pound|sterling"
+ ],
+ [
+  "How many continents are there?",
+  "\\b(7|seven)\\b"
+ ],
+ [
+  "What is the freezing point of water in degrees Fahrenheit?",
+  "\\b32\\b"
+ ],
+ [
+  "Which organ pumps blood through the human body?",
+  "heart"
+ ],
+ [
+  "What is the smallest planet in the Solar System?",
+  "mercury"
+ ],
+ [
+  "Who was the first President of the United States?",
+  "washington"
+ ],
+ [
+  "What language has the most native speakers in the world?",
+  "mandarin|chinese"
+ ],
+ [
+  "What is the tallest mountain on Earth above sea level?",
+  "everest"
+ ],
+ [
+  "Which programming language was created by Guido van Rossum?",
+  "python"
+ ],
+ [
+  "What does CPU stand for?",
+  "central processing unit"
+ ],
+ [
+  "How many bits are in a byte?",
+  "\\b(8|eight)\\b"
+ ],
+ [
+  "What is the main gas in Earth's atmosphere?",
+  "nitrogen"
+ ],
+ [
+  "In which country are the pyramids of Giza?",
+  "egypt"
+ ],
+ [
+  "What is the square root of 225?",
+  "\\b15\\b"
+ ],
+ [
+  "Which company developed the Windows operating system?",
+  "microsoft"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(len('hello world'))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?11['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(sum([3, 5, 7, 9]))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?24['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(10 // 3, 10 % 3)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?3\\ 1['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nx = [1, 2, 3]\ny = x\ny.append(4)\nprint(len(x))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?4['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint('abc' * 3)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?abcabcabc['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(sorted([5, 2, 9, 1])[1])\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?2['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(2 ** 3 ** 2)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?512['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint([i * i for i in range(5)])\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?\\[0,\\ 1,\\ 4,\\ 9,\\ 16\\]['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint('Python'[1:4])\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?yth['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nd = {'a': 1, 'b': 2}\nd['c'] = d['a'] + d['b']\nprint(sum(d.values()))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?6['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(max('banana'))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?n['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\ns = 0\nfor i in range(1, 11):\n    if i % 2 == 0:\n        s += i\nprint(s)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?30['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(int('101', 2))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?5['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(len(set([1, 2, 2, 3, 3, 3])))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?3['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint('-'.join(['a', 'b', 'c']))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?a\\-b\\-c['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(round(7 / 2))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?4['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(list(range(10, 0, -3)))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?\\[10,\\ 7,\\ 4,\\ 1\\]['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\ndef f(n):\n    return 1 if n <= 1 else n * f(n - 1)\nprint(f(5))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?120['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint('Hello'.lower().count('l'))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?2['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\na, b = 3, 5\na, b = b, a + b\nprint(a, b)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?5\\ 8['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(bool([]), bool([0]))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?False\\ True['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(7 / 2)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?3\\.5['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint('racecar'[::-1] == 'racecar')\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?True['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nx = 5\nx *= 3\nx -= 4\nprint(x)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?11['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(abs(-12) + len([None, None]))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?14['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(' '.join(w.capitalize() for w in 'the quick fox'.split()))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?The\\ Quick\\ Fox['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nn = 0\nwhile n * n < 50:\n    n += 1\nprint(n)\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?8['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(min([4, -2, 7], key=abs))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?\\-2['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nprint(hex(255))\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?0xff['\\\"]?`*\\.?\\s*$"
+ ],
+ [
+  "What does this Python code print?\n```python\nfib = [0, 1]\nfor _ in range(6):\n    fib.append(fib[-1] + fib[-2])\nprint(fib[-1])\n```",
+  "(?m)^\\s*(?:output:\\s*)?`*(?:text|python)?\\s*['\\\"]?13['\\\"]?`*\\.?\\s*$"
+ ]
+]

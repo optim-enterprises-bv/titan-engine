@@ -1,0 +1,9 @@
+bin/
+runs/*/*.sqlite
+runs/*/*.nsys-rep
+runs/*/*.qdstrm
+runs/*/*.server.log
+runs/*/*.tsv
+runs/*/*.log
+!runs/*/run.log
+__pycache__/

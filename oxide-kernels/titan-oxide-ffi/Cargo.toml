@@ -1,0 +1,17 @@
+[package]
+name = "titan-oxide-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "cuda-oxide twins of mistral.rs's nvcc host launchers, exported under their C symbol names"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+
+[profile.release]
+debug = false

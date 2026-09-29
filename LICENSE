@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 Optim Enterprises B.V.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---------------------------------------------------------------------------------
+Scope: this licence covers the titan-engine top-level files and directories
+(bench/, deploy/, m0-m6/, sync/, titan-kernels-oxide/, cuda-oxide-fast/, release/)
+and the titan-engine additions in oxide-kernels/. The subdirectories keep their
+own licences:
+
+  mistral.rs/     MIT (mistral.rs/LICENSE, Copyright (c) 2024 Eric Buehler);
+                  titan-engine's changes to it are contributed under the same MIT licence.
+                  Bundled third-party code keeps the licence files in its own directory
+                  (e.g. mistral.rs/mistralrs-quant/third_party/*, mistral.rs/mistralrs-core/third_party/*).
+  candle/         Apache-2.0 OR MIT (candle/LICENSE-APACHE, candle/LICENSE-MIT);
+                  titan-engine's changes to it are offered under the same dual licence.
+  oxide-kernels/  MIT for titan-engine's own code; the kernels translated from other projects
+                  carry those projects' licences as listed in NOTICE.md.
+
+See NOTICE.md for all third-party attributions.

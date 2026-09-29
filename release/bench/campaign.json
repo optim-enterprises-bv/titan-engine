@@ -1,0 +1,489 @@
+{
+ "_doc": "Release benchmark campaign config. See campaign.sh. est_* values are planning assumptions (sources in _src); measured rates replace them in `campaign.sh plan` as soon as tuning/perf items have run. Ours: one documented config per model (main session instruction 2026-09-29): the service unit for the 35B files, each other model's documented best config, same binary. Restructured 2026-09-29 (user): llama.cpp phase first, ours after the prefill fix; 20-min windows, one model each; 2 reps (+1 when the pair's spread > 3%); 4k/13k everywhere, 28k for the 35B files and the 80B; q100 once per engine in the headline config; Qwen3-14B dropped; llama.cpp tuning seeded from known-good settings.",
+ "port": 18560,
+ "window_minutes": 20,
+ "reps": 2,
+ "spread_gate": 0.03,
+ "load_gate": 4.0,
+ "load_wait_s": 600,
+ "foreign_cpu_gate_cores": 1.0,
+ "max_redo": 1,
+ "memory_max": "20G",
+ "cold_page_cache": true,
+ "llama": {
+  "server": "~/ai/llama.cpp/build/bin/llama-server",
+  "ld_library_path": "~/ai/llama.cpp/build/bin:/usr/local/cuda/lib64",
+  "expect_rev": "acecd56",
+  "common": [
+   "-np",
+   "1",
+   "--host",
+   "127.0.0.1",
+   "-cram",
+   "0",
+   "--jinja"
+  ]
+ },
+ "ours": {
+  "unit": "~/titan-engine/deploy/titan-mistral.service",
+  "src": "~/titan-engine/mr-094",
+  "ld_library_path": "~/titan-engine/lib"
+ },
+ "tokens": {
+  "4k": 3900,
+  "13k": 12700,
+  "28k": 27500
+ },
+ "models": [
+  {
+   "id": "q35xl",
+   "name": "Qwen3.6-35B-A3B UD-Q4_K_XL (with MTP head)",
+   "gguf": "~/ai/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "family": "qwen-think",
+   "ctx": 65536,
+   "lengths": [
+    "4k",
+    "13k",
+    "28k"
+   ],
+   "short": [
+    8,
+    256
+   ],
+   "long_decode": 128,
+   "ours": {
+    "base": "service",
+    "variants": {
+     "mtp2": {
+      "TITAN_MTP": "2"
+     },
+     "mtp0": {
+      "TITAN_MTP": "0"
+     }
+    },
+    "_config_src": "deploy/titan-mistral.service (bin/mistralrs-titan-idle2) env and args; -f and variant TITAN_MTP replaced"
+   },
+   "llama": {
+    "moe": true,
+    "ncmoe_hint": 17,
+    "ub": [
+     512,
+     2048
+    ],
+    "fa": [
+     "on",
+     "off"
+    ],
+    "threads": [
+     6,
+     8,
+     12
+    ],
+    "mtp": [
+     3
+    ],
+    "variants": [
+     "mtp",
+     "nomtp"
+    ],
+    "seed": {
+     "ncmoe": 16,
+     "ub": 2048,
+     "fa": "on",
+     "threads": 8
+    },
+    "_seed_src": "this campaign's full sweep, 2026-09-29 10:40 (results/discarded/)"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 25,
+     "llama": 25
+    },
+    "prefill": {
+     "ours": 1300,
+     "llama": 1500
+    },
+    "decode": {
+     "ours": 130,
+     "llama": 72
+    }
+   },
+   "_src": "ours: bench/runs/2026-09-29-0912-deployed-idle-2 (MTP=2 131.5, off 103.6, prompt 1298-1353 tok/s, up 21 s); llama: m6/suite2.out fl-mtp1 72.7, fl-off 65.6 (ncmoe 18, ctx 4096)"
+  },
+  {
+   "id": "q35mx",
+   "name": "Qwen3.6-35B-A3B MXFP4_MOE (with MTP head)",
+   "gguf": "~/ai/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
+   "family": "qwen-think",
+   "ctx": 65536,
+   "lengths": [
+    "4k",
+    "13k",
+    "28k"
+   ],
+   "short": [
+    8,
+    256
+   ],
+   "long_decode": 128,
+   "ours": {
+    "base": "service",
+    "variants": {
+     "mtp2": {
+      "TITAN_MTP": "2"
+     },
+     "mtp0": {
+      "TITAN_MTP": "0"
+     }
+    },
+    "_config_src": "deploy/titan-mistral.service (bin/mistralrs-titan-idle2) env and args; -f and variant TITAN_MTP replaced"
+   },
+   "llama": {
+    "moe": true,
+    "ncmoe_hint": 19,
+    "ub": [
+     512,
+     2048
+    ],
+    "fa": [
+     "on"
+    ],
+    "threads": [
+     6,
+     8,
+     12
+    ],
+    "mtp": [
+     3
+    ],
+    "variants": [
+     "mtp",
+     "nomtp"
+    ],
+    "seed": {
+     "ncmoe": 16,
+     "ub": 2048,
+     "fa": "on",
+     "threads": 8
+    },
+    "_seed_src": "the q35xl sweep (same architecture, near-identical file size)"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 25,
+     "llama": 25
+    },
+    "prefill": {
+     "ours": 1200,
+     "llama": 1400
+    },
+    "decode": {
+     "ours": 110,
+     "llama": 45
+    }
+   },
+   "_src": "m4/mxfp4-real-20260928.md: 40x256 profile 72.9 tok/s MTP off (older build); llama 37.0 tok/s at ncmoe 18 (8x64 incl. prefill)"
+  },
+  {
+   "id": "next80",
+   "name": "Qwen3-Next-80B-A3B-Instruct Q4_K_M",
+   "gguf": "~/ai/models/qwen3-next-80b/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf",
+   "family": "qwen",
+   "ctx": 32768,
+   "lengths": [
+    "4k",
+    "13k",
+    "28k"
+   ],
+   "short": [
+    8,
+    128
+   ],
+   "long_decode": 48,
+   "ours": {
+    "base": "plain",
+    "candidates": {
+     "documented": {
+      "TITAN_TIERED": "1",
+      "TITAN_TIERED_MMAP": "1",
+      "TITAN_TIERED_GPU_FRACTION": "auto",
+      "TITAN_TIERED_PROFILE": "~/titan-engine/m4/next/profile-next.txt",
+      "TITAN_TIERED_LOOKAHEAD": "2",
+      "TITAN_TIERED_LOOKAHEAD_POPULATE": "1",
+      "TITAN_TIERED_PAGEOUT": "1",
+      "TITAN_DOORBELL": "1",
+      "TITAN_CPU_ONEPASS": "1"
+     }
+    },
+    "variants": {
+     "best": {}
+    },
+    "_config_src": "m4/next/p1-20260928.md final config + TITAN_DOORBELL=1 TITAN_CPU_ONEPASS=1 (main session, 2026-09-29)"
+   },
+   "llama": {
+    "moe": true,
+    "ncmoe_hint": 36,
+    "ub": [
+     512,
+     2048,
+     4096
+    ],
+    "fa": [
+     "on"
+    ],
+    "threads": [
+     12
+    ],
+    "variants": [
+     "best"
+    ],
+    "seed": {
+     "ncmoe": 34,
+     "ub": 2048,
+     "fa": "on",
+     "threads": 23
+    },
+    "mtp": [],
+    "_seed_src": "m4/next/p1-20260928.md: --n-cpu-moe 34 -t 23 (33 OOMs at ctx 4096)",
+    "_threads_note": "-t 6/8 dropped: most expert layers run on the CPU; m4/next/p1 measured -t 8 at 2.55 vs -t 23 at 6.50 tok/s on the 80B"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 30,
+     "llama": 25
+    },
+    "prefill": {
+     "ours": 250,
+     "llama": 200
+    },
+    "decode": {
+     "ours": 25,
+     "llama": 10
+    }
+   },
+   "_src": "m4/next/p1-20260928.md: ours 8-prompt 15.2 / 40-prompt 28.5 tok/s, llama ncmoe 34 -t 23 9.8 tok/s (ctx 4096); prefill rates are guesses (NVMe-bound), replaced after tuning",
+   "probe_short": [
+    4,
+    32
+   ]
+  },
+  {
+   "id": "oss120",
+   "name": "gpt-oss-120b MXFP4",
+   "gguf": "~/ai/models/gpt-oss-120b/gpt-oss-120b-MXFP4.gguf",
+   "family": "harmony",
+   "ctx": 32768,
+   "lengths": [
+    "4k",
+    "13k"
+   ],
+   "short": [
+    4,
+    64
+   ],
+   "long_decode": 32,
+   "ours": {
+    "base": "plain",
+    "extra_args": [
+     "--dtype",
+     "f16"
+    ],
+    "candidates": {
+     "documented": {
+      "TITAN_TIERED": "1",
+      "TITAN_TIERED_GPU_FRACTION": "auto",
+      "TITAN_TIERED_MMAP": "1"
+     }
+    },
+    "variants": {
+     "best": {}
+    },
+    "_config_src": "m5/oss/results.txt gate 2 (tiered, fraction auto, host experts in the GGUF mmap)"
+   },
+   "llama": {
+    "moe": true,
+    "ncmoe_hint": 30,
+    "ub": [
+     512,
+     2048
+    ],
+    "fa": [
+     "on"
+    ],
+    "threads": [
+     12
+    ],
+    "variants": [
+     "best"
+    ],
+    "seed": {
+     "ncmoe": 28,
+     "ub": 2048,
+     "fa": "on",
+     "threads": 23
+    },
+    "mtp": [],
+    "_seed_src": "m5/oss/results.txt: --n-cpu-moe 28 (27 OOMs at ctx 4096)",
+    "_threads_note": "-t 6/8 dropped: most expert layers run on the CPU; m4/next/p1 measured -t 8 at 2.55 vs -t 23 at 6.50 tok/s on the 80B"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 90,
+     "llama": 60
+    },
+    "prefill": {
+     "ours": 120,
+     "llama": 100
+    },
+    "decode": {
+     "ours": 4.4,
+     "llama": 2.8
+    },
+    "quality_tokens_per_q": 25
+   },
+   "_src": "m5/oss/results.txt: ours 4.4 tok/s, llama ncmoe 28 2.8 tok/s (ctx 4096, 8x64 incl. prefill); prefill guessed; quality ~20 tokens/question at Reasoning: low (m5 practice: 405 tokens / 20 questions)",
+   "probe_short": [
+    2,
+    32
+   ],
+   "quality_set": "q40"
+  },
+  {
+   "id": "oss20",
+   "name": "gpt-oss-20b (MXFP4 experts, F16 attention)",
+   "gguf": "~/ai/models/gpt-oss-20b-F16.gguf",
+   "family": "harmony",
+   "ctx": 16384,
+   "lengths": [
+    "4k",
+    "13k"
+   ],
+   "short": [
+    8,
+    256
+   ],
+   "long_decode": 128,
+   "ours": {
+    "base": "plain",
+    "extra_args": [
+     "--dtype",
+     "f16"
+    ],
+    "candidates": {
+     "documented": {}
+    },
+    "variants": {
+     "best": {}
+    },
+    "_config_src": "m5/oss/results.txt gate 1: stock (every expert in a GPU slot) was the faster of stock / t50"
+   },
+   "llama": {
+    "moe": true,
+    "ncmoe_hint": 0,
+    "ub": [
+     512,
+     2048
+    ],
+    "fa": [
+     "on"
+    ],
+    "threads": [],
+    "variants": [
+     "best"
+    ],
+    "seed": {
+     "ncmoe": 0,
+     "ub": 2048,
+     "fa": "on",
+     "threads": 8
+    },
+    "mtp": [],
+    "_seed_src": "m5/oss: all layers on the GPU at ctx 4096; threads unused with every layer on the GPU"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 20,
+     "llama": 15
+    },
+    "prefill": {
+     "ours": 2000,
+     "llama": 4000
+    },
+    "decode": {
+     "ours": 82,
+     "llama": 134
+    },
+    "quality_tokens_per_q": 25
+   },
+   "_src": "m5/oss/results.txt: 8x64 incl. prefill llama 133.8, ours stock 82.4 (ctx 4096)"
+  },
+  {
+   "id": "bonsai27",
+   "name": "Bonsai-27B Q1_0 (dense qwen35)",
+   "gguf": "~/ai/models/bonsai/Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf",
+   "family": "qwen-think",
+   "ctx": 16384,
+   "lengths": [
+    "4k",
+    "13k"
+   ],
+   "short": [
+    8,
+    256
+   ],
+   "long_decode": 128,
+   "ours": {
+    "base": "plain",
+    "candidates": {
+     "documented": {}
+    },
+    "variants": {
+     "best": {}
+    },
+    "_config_src": "m4/bonsai-e2e.sh / m4/q1f bench_final: stock (no titan env)"
+   },
+   "llama": {
+    "moe": false,
+    "ub": [
+     512,
+     2048
+    ],
+    "fa": [
+     "on"
+    ],
+    "threads": [],
+    "variants": [
+     "best"
+    ],
+    "seed": {
+     "ub": 2048,
+     "fa": "on",
+     "threads": 8
+    },
+    "mtp": [],
+    "_seed_src": "dense, all on the GPU (m4/bonsai-e2e.sh); threads unused"
+   },
+   "quality_variants": "headline",
+   "est": {
+    "load_s": {
+     "ours": 10,
+     "llama": 8
+    },
+    "prefill": {
+     "ours": 1070,
+     "llama": 1100
+    },
+    "decode": {
+     "ours": 56,
+     "llama": 65
+    }
+   },
+   "_src": "m4/q1f/bench_final.log: v5 56.0 tok/s, prefill 1078 tok/s @1.9k; llama 65.3 tok/s, 1105 tok/s"
+  }
+ ]
+}

@@ -1,0 +1,80 @@
+nsys, Qwen3.6-35B tiered auto, 8 prompts x 128 tokens; wall nvcc 22.9s vs nvcc-free 24.1s; GPU kernel total 8.28s vs 9.18s
+    738.9 ms  nvcc    277.6  oxide   1016.5  void gdn_decode_recurrence_kernel<__nv_bfloat16, (int)128, (int)64>(const T1 *, const T1 *, const T1
+     91.3 ms  nvcc      0.0  oxide     91.3  fused_glu4_f32k
+     58.2 ms  nvcc    120.5  oxide    178.6  void moe_router_topk_kernel<float, (int)256, (bool)0, (bool)0>(const T1 *, float *, unsigned int *, 
+     45.8 ms  nvcc     11.5  oxide     57.3  void gated_delta_rule_recurrence_kernel_tiled<(int)128, (int)64>(const float *, const float *, const
+     17.8 ms  nvcc      0.0  oxide     17.8  mmq_q8_0_x24_nc0
+     11.2 ms  nvcc   1419.4  oxide   1430.6  mmvq_gguf_q8_0_bf16_plain_cuda1
+      5.7 ms  nvcc     94.3  oxide     99.9  badd_f32
+      5.6 ms  nvcc    162.7  oxide    168.3  std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, float, float, float, float, (bool)
+      5.1 ms  nvcc      0.0  oxide      5.1  mmq_fixup_qk32_x24_nc0
+      3.2 ms  nvcc   1184.6  oxide   1187.9  q5k_q8_1_moe_gemv
+      3.2 ms  nvcc      0.0  oxide      3.2  mmq_q8_0_x32_nc0
+      3.1 ms  nvcc      0.0  oxide      3.1  mmq_q8_0_x16_nc0
+      2.9 ms  nvcc    165.2  oxide    168.1  rmsnorm_f32
+      2.3 ms  nvcc    248.9  oxide    251.2  copy2d_bf16
+      2.0 ms  nvcc    163.8  oxide    165.8  bmul_f32
+      1.6 ms  nvcc     82.9  oxide     84.5  quantize_q8_1
+      1.4 ms  nvcc      0.0  oxide      1.4  quantize_mmq_q8_1_f32_d4
+      1.3 ms  nvcc    112.0  oxide    113.4  cast_f32_bf16
+      1.3 ms  nvcc    142.0  oxide    143.3  ucopy_bf16
+      1.2 ms  nvcc    957.2  oxide    958.4  q4k_q8_1_moe_gemv
+      1.2 ms  nvcc    159.7  oxide    160.9  void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const float>
+      1.0 ms  nvcc    273.9  oxide    274.9  is_u32_f32
+      1.0 ms  nvcc     45.4  oxide     46.4  void gdn_rmsnorm_gated_kernel<__nv_bfloat16>(const T1 *, const T1 *, const T1 *, T1 *, int, int, flo
+      0.9 ms  nvcc      0.0  oxide      0.9  mmq_fixup_qk32_x32_nc0
+      0.9 ms  nvcc     97.1  oxide     97.9  q6k_q8_1_moe_gemv
+      0.8 ms  nvcc     26.4  oxide     27.2  void qk_rms_norm_rope_positions_kernel<float, (bool)1>(const T1 *, const T1 *, const T1 *, const T1 
+      0.7 ms  nvcc     84.1  oxide     84.9  cast_bf16_f32
+      0.7 ms  nvcc      0.0  oxide      0.7  mmq_fixup_qk32_x16_nc0
+      0.7 ms  nvcc      0.0  oxide      0.7  quantize_mmq_q8_1_bf16_d4
+      0.7 ms  nvcc    104.4  oxide    105.1  void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemv
+      0.7 ms  nvcc      6.1  oxide      6.7  apply_causal_mask_f32_kernel(float *, int, int, int, int, int)
+      0.5 ms  nvcc     33.8  oxide     34.3  usigmoid_f32
+      0.5 ms  nvcc     55.8  oxide     56.3  is_u32_bf16
+      0.5 ms  nvcc     42.5  oxide     42.9  ucopy_f32
+      0.2 ms  nvcc    120.9  oxide    121.2  mmvq_gguf_quantize_q8_1_f32
+      0.2 ms  nvcc      6.7  oxide      6.9  void gemv2T_kernel_val<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (int)128, (int)
+      0.1 ms  nvcc     20.3  oxide     20.4  std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv
+      0.1 ms  nvcc     14.1  oxide     14.2  softmax_f32
+      0.1 ms  nvcc      0.3  oxide      0.3  void save_conv_state_kernel<__nv_bfloat16>(const T1 *, T1 *, int, int, int, int)
+      0.0 ms  nvcc      9.1  oxide      9.2  bmul_bf16
+      0.0 ms  nvcc      1.2  oxide      1.3  void gdn_prepare_recurrence_kernel<__nv_bfloat16>(const T1 *, const T1 *, const T1 *, const float *,
+      0.0 ms  nvcc      9.3  oxide      9.3  usigmoid_bf16
+      0.0 ms  nvcc      2.2  oxide      2.3  void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_tn_align1>(T1::Params)
+      0.0 ms  nvcc      1.6  oxide      1.6  void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)8, (int)9, (bool)0, cublasGemvT
+      0.0 ms  nvcc      0.0  oxide      0.0  top1_large_stage1_f32(const float *, float *, unsigned int *, int, int)
+      0.0 ms  nvcc      1.2  oxide      1.2  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float
+      0.0 ms  nvcc      0.0  oxide      0.0  void cutlass::Kernel2<cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align1>(T1::Param
+      0.0 ms  nvcc      0.0  oxide      0.1  void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align2>(T1::Param
+      0.0 ms  nvcc      0.0  oxide      0.0  void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(T1::Para
+      0.0 ms  nvcc      0.0  oxide      0.0  void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align2>(T1::Param
+      0.0 ms  nvcc      0.2  oxide      0.2  badd_bf16
+      0.0 ms  nvcc      0.0  oxide      0.0  void gemmk1_kernel<int, float, (int)256, (int)5, (bool)1, (bool)0, (bool)0, (bool)0, cublasGemvTenso
+      0.0 ms  nvcc      0.0  oxide      0.0  where_u8_bf16
+      0.0 ms  nvcc      0.1  oxide      0.1  void cutlass::Kernel2<cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align1>(T1::Param
+      0.0 ms  nvcc      0.0  oxide      0.0  nvjet_sm120_tst_mma_64x24x64_8_16x24x64_tmaAB_alignCD4_bz_NNNN
+     -0.0 ms  nvcc      0.0  oxide      0.0  top1_large_stage2_f32_packed(const float *, const unsigned int *, float *, int)
+     -0.0 ms  nvcc      0.0  oxide      0.0  const_set_f32
+     -0.0 ms  nvcc      0.0  oxide      0.0  nvjet_sm120_tst_mma_16x32x128_8_16x8x128_tmaAB_alignCD4_bz_TNNN
+     -0.0 ms  nvcc      0.1  oxide      0.1  affine_bf16
+     -0.0 ms  nvcc      0.1  oxide      0.1  std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv
+     -0.0 ms  nvcc      0.3  oxide      0.3  void cutlass::Kernel2<cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1>(T1::Params)
+     -0.0 ms  nvcc      2.2  oxide      2.2  void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_tn_align1>(T1::Params)
+     -0.0 ms  nvcc      1.5  oxide      1.5  void causal_conv1d_full_kernel<__nv_bfloat16>(const T1 *, const T1 *, T1 *, int, int, int, int)
+     -0.0 ms  nvcc      8.2  oxide      8.2  void gemv2T_kernel_val<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (int)128, (int)
+     -0.1 ms  nvcc      5.0  oxide      4.9  std::enable_if<T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_
+     -0.7 ms  nvcc      0.7  oxide      0.0  void quantize_mmq_q8_1<__nv_bfloat16, (mmq_q8_1_ds_layout)0>(const T1 *, const int *, void *, long, 
+     -0.7 ms  nvcc      0.7  oxide      0.0  void mul_mat_q_stream_k_fixup<(ggml_type)8, (int)16, (bool)0>(const int *, const int *, void *, ggml
+     -0.8 ms  nvcc    146.5  oxide    145.8  copy2d_f32
+     -0.8 ms  nvcc    236.4  oxide    235.6  fast_sum_f32
+     -0.9 ms  nvcc      0.9  oxide      0.0  void mul_mat_q_stream_k_fixup<(ggml_type)8, (int)32, (bool)0>(const int *, const int *, void *, ggml
+     -1.3 ms  nvcc      1.3  oxide      0.0  void quantize_mmq_q8_1<float, (mmq_q8_1_ds_layout)0>(const T1 *, const int *, void *, long, long, lo
+     -1.3 ms  nvcc     54.4  oxide     53.0  void causal_conv1d_update_kernel<__nv_bfloat16>(const T1 *, const T1 *, T1 *, T1 *, int, int, int)
+     -1.5 ms  nvcc     67.6  oxide     66.1  mmvq_gguf_quantize_q8_1_bf16
+     -2.7 ms  nvcc      2.7  oxide      0.0  void mul_mat_q<(ggml_type)8, (int)16, (bool)0>(const char *, const int *, const int *, const int *, 
+     -3.0 ms  nvcc      3.0  oxide      0.0  void mul_mat_q<(ggml_type)8, (int)32, (bool)0>(const char *, const int *, const int *, const int *, 
+     -4.8 ms  nvcc      4.8  oxide      0.0  void mul_mat_q_stream_k_fixup<(ggml_type)8, (int)24, (bool)0>(const int *, const int *, void *, ggml
+     -5.1 ms  nvcc   1395.1  oxide   1390.0  mmvq_gguf_q8_0_f32_plain_cuda1
+    -16.9 ms  nvcc     16.9  oxide      0.0  void mul_mat_q<(ggml_type)8, (int)24, (bool)0>(const char *, const int *, const int *, const int *, 
+    -76.9 ms  nvcc     76.9  oxide      0.0  void fused_glu_kernel_vec4<float, float4>(const T2 *, const T2 *, T2 *, unsigned int, int)

@@ -1,0 +1,7 @@
+calib 41 requests, eval 41 requests, 24 layers, 128 experts
+slots/layer   8 ( 6.2%)  lru  36.9%  static  43.8%  static+lru  37.0%  prefill+lru  37.0% (1958784 decode expert uses)
+slots/layer  16 (12.5%)  lru  61.1%  static  60.8%  static+lru  61.3%  prefill+lru  61.2% (1958784 decode expert uses)
+slots/layer  32 (25.0%)  lru  78.2%  static  79.2%  static+lru  78.7%  prefill+lru  78.6% (1958784 decode expert uses)
+slots/layer  48 (37.5%)  lru  87.1%  static  88.6%  static+lru  88.1%  prefill+lru  87.9% (1958784 decode expert uses)
+slots/layer  64 (50.0%)  lru  91.8%  static  94.2%  static+lru  93.5%  prefill+lru  93.0% (1958784 decode expert uses)
+slots/layer  96 (75.0%)  lru  95.1%  static  99.0%  static+lru  98.5%  prefill+lru  96.7% (1958784 decode expert uses)

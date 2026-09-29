@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>titan monitor</title>
+<style>
+:root {
+  --bg: #0a0d12;
+  --panel: #10151c;
+  --panel-2: #141b24;
+  --line: #1d2632;
+  --text: #dbe3ec;
+  --muted: #7b8898;
+  --faint: #4a5563;
+  --teal: #2dd4bf;
+  --blue: #5ea8ff;
+  --amber: #f5b942;
+  --red: #f26d6d;
+  --violet: #a58bff;
+  --green: #52d68a;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: inherit; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+header {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 20px; background: rgba(10, 13, 18, 0.92);
+  border-bottom: 1px solid var(--line); backdrop-filter: blur(6px);
+}
+.brand { font-weight: 700; letter-spacing: 0.02em; }
+.brand span { color: var(--teal); }
+.model { font-family: var(--mono); font-size: 12px; color: var(--muted); max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.pill.live .dot { background: var(--green); box-shadow: 0 0 0 3px rgba(82, 214, 138, 0.15); }
+.pill.down .dot { background: var(--red); }
+.nav a { text-decoration: none; color: var(--muted); padding: 4px 10px; border-radius: 6px; }
+.nav a:hover { background: var(--panel-2); color: var(--text); }
+
+main { max-width: 1480px; margin: 0 auto; padding: 18px 20px 40px; display: grid; gap: 14px; }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+.grid.wide { grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
+.card {
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  min-width: 0; display: flex; flex-direction: column; gap: 6px;
+}
+.card h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; display: flex; justify-content: space-between; gap: 8px; }
+.card h3 small { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--faint); }
+.big { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.big .u { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+.sub { color: var(--muted); font-size: 12px; }
+.sub b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+.rows { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; }
+.rows dt { color: var(--muted); }
+.rows dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.na { color: var(--faint); }
+svg.spark { width: 100%; height: 38px; display: block; margin-top: auto; }
+.bar { height: 6px; border-radius: 3px; background: #1b232e; overflow: hidden; display: flex; }
+.bar > i { display: block; height: 100%; }
+
+.state { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 16px; align-items: center; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--faint); }
+.chip.on { color: #081018; font-weight: 600; border-color: transparent; }
+.chip[data-s="idle"].on { background: #8a97a8; }
+.chip[data-s="prefill"].on { background: var(--blue); }
+.chip[data-s="generating"].on { background: var(--teal); }
+.chip[data-s="queued"].on { background: var(--amber); }
+.chip[data-s="error"].on { background: var(--red); }
+.progress { margin-top: 10px; }
+.progress .bar { height: 10px; border-radius: 5px; }
+.progress .meta { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; color: var(--muted); gap: 10px; flex-wrap: wrap; }
+.ring { position: relative; width: 150px; height: 150px; margin: 0 auto; }
+.ring svg { width: 150px; height: 150px; transform: rotate(-90deg); }
+.ring .lbl { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.ring .lbl b { font-family: var(--mono); font-size: 24px; }
+.ring .lbl span { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
+.span2 { grid-column: span 2; }
+.halves { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; flex: 1; }
+.halves > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cur { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-top: 14px; }
+.cur div { background: #0d1219; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.cur span { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.cur b { font-family: var(--mono); font-size: 16px; font-weight: 500; }
+.section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint); margin: 6px 2px -4px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: right; font-weight: 500; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+td { text-align: right; padding: 6px 8px; border-bottom: 1px solid #151c25; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+tr:last-child td { border-bottom: 0; }
+.st { font-family: system-ui, sans-serif; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #1b232e; color: var(--muted); }
+.st.done { color: var(--green); }
+.st.decode, .st.prefill { color: var(--blue); }
+.st.length { color: var(--amber); }
+.st.error, .st.cancelled { color: var(--red); }
+.tablewrap { overflow-x: auto; }
+@media (max-width: 640px) {
+  .span2 { grid-column: auto; }
+  .halves { grid-template-columns: 1fr; }
+  .state { grid-template-columns: 1fr; }
+  header { padding: 10px 14px; }
+  main { padding: 14px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">titan<span>/</span>monitor</div>
+  <div class="model" id="model">-</div>
+  <div class="spacer"></div>
+  <span class="pill" id="conn"><span class="dot"></span><span id="conn-t">connecting</span></span>
+  <nav class="nav"><a href="/ui">Chat</a></nav>
+</header>
+<main>
+  <div class="grid wide" style="grid-template-columns: minmax(0, 3fr) minmax(260px, 1fr);">
+    <section class="card">
+      <h3>Model state <small id="req-count"></small></h3>
+      <div class="chips" id="chips">
+        <span class="chip" data-s="idle">Idle</span>
+        <span class="chip" data-s="prefill">Reading prompt</span>
+        <span class="chip" data-s="generating">Generating</span>
+        <span class="chip" data-s="queued">Queued <span id="qn" class="num">0</span></span>
+        <span class="chip" data-s="error">Error</span>
+      </div>
+      <div class="progress">
+        <div class="bar" id="pf-bar"><i id="pf-reused" style="background:#3b4d66;width:0"></i><i id="pf-new" style="background:var(--blue);width:0"></i></div>
+        <div class="meta"><span id="pf-left">No prompt in flight</span><span id="pf-right" class="num"></span></div>
+      </div>
+      <div class="cur">
+        <div><span>Request</span><b id="cur-id">-</b></div>
+        <div><span>Prompt</span><b id="cur-prompt">-</b></div>
+        <div><span>Reused</span><b id="cur-reused">-</b></div>
+        <div><span>Output</span><b id="cur-out">-</b></div>
+        <div><span>TTFT</span><b id="cur-ttft">-</b></div>
+        <div><span>Elapsed</span><b id="cur-el">-</b></div>
+      </div>
+    </section>
+    <section class="card">
+      <h3>Context fill</h3>
+      <div class="ring">
+        <svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="50" fill="none" stroke="#1b232e" stroke-width="11"/><circle id="ctx-arc" cx="60" cy="60" r="50" fill="none" stroke="var(--teal)" stroke-width="11" stroke-linecap="round" stroke-dasharray="0 314.16"/></svg>
+        <div class="lbl"><b id="ctx-pct">0%</b><span id="ctx-t">0 / 0</span></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section class="card span2">
+      <h3>Speed <small>tok/s</small></h3>
+      <div class="halves">
+        <div>
+          <div class="sub">Decode</div>
+          <div class="big" id="dec">-</div>
+          <div class="sub">last request <b id="dec-last">-</b> &middot; avg <b id="dec-avg">-</b></div>
+          <svg class="spark" id="sp-dec"></svg>
+        </div>
+        <div>
+          <div class="sub">Prompt</div>
+          <div class="big" id="pp">-</div>
+          <div class="sub">last request <b id="pp-last">-</b> &middot; avg <b id="pp-avg">-</b></div>
+          <svg class="spark" id="sp-pp"></svg>
+        </div>
+      </div>
+    </section>
+    <section class="card">
+      <h3>GPU load <small id="gpu-name"></small></h3>
+      <div class="big" id="gpu-util">-</div>
+      <dl class="rows">
+        <dt>SM clock</dt><dd id="gpu-clk">-</dd>
+        <dt>Memory clock</dt><dd id="gpu-mclk">-</dd>
+      </dl>
+      <svg class="spark" id="sp-gpu"></svg>
+    </section>
+    <section class="card">
+      <h3>VRAM</h3>
+      <div class="big" id="vram">-</div>
+      <div class="bar"><i id="vram-bar" style="background:var(--violet);width:0"></i></div>
+      <div class="sub" id="vram-sub">&nbsp;</div>
+      <svg class="spark" id="sp-vram"></svg>
+    </section>
+    <section class="card">
+      <h3>Power</h3>
+      <div class="big" id="pwr">-</div>
+      <div class="sub" id="pwr-sub">&nbsp;</div>
+      <div class="bar"><i id="pwr-bar" style="background:var(--amber);width:0"></i></div>
+      <svg class="spark" id="sp-pwr"></svg>
+    </section>
+    <section class="card">
+      <h3>GPU temperature</h3>
+      <div class="big" id="temp">-</div>
+      <div class="bar"><i id="temp-bar" style="background:var(--amber);width:0"></i></div>
+      <div class="sub" id="temp-sub">&nbsp;</div>
+      <svg class="spark" id="sp-temp"></svg>
+    </section>
+    <section class="card">
+      <h3>PCIe</h3>
+      <div class="big" id="pcie">-</div>
+      <dl class="rows">
+        <dt>To GPU (RX)</dt><dd id="pcie-rx">-</dd>
+        <dt>From GPU (TX)</dt><dd id="pcie-tx">-</dd>
+        <dt>Engine uploads</dt><dd id="pcie-up">-</dd>
+      </dl>
+      <svg class="spark" id="sp-pcie"></svg>
+    </section>
+    <section class="card">
+      <h3>CPU</h3>
+      <div class="big" id="cpu">-</div>
+      <dl class="rows">
+        <dt>Threads</dt><dd id="cpu-cores">-</dd>
+        <dt>Miss pool busy</dt><dd id="cpu-pool">-</dd>
+      </dl>
+      <svg class="spark" id="sp-cpu"></svg>
+    </section>
+    <section class="card">
+      <h3>RAM</h3>
+      <div class="big" id="ram">-</div>
+      <div class="bar"><i id="ram-bar" style="background:var(--red);width:0"></i></div>
+      <dl class="rows">
+        <dt>Process RSS</dt><dd id="rss">-</dd>
+        <dt>anon / file-backed</dt><dd id="rss-split">-</dd>
+      </dl>
+    </section>
+    <section class="card">
+      <h3>Disk read <small id="disk-dev"></small></h3>
+      <div class="big" id="disk">-</div>
+      <div class="sub">this process <b id="disk-proc">-</b> &middot; write <b id="disk-w">-</b></div>
+      <svg class="spark" id="sp-disk"></svg>
+    </section>
+  </div>
+
+  <div class="section-title">Titan engine</div>
+  <div class="grid wide">
+    <section class="card">
+      <h3>Tiered experts</h3>
+      <div class="big" id="exp">-</div>
+      <div class="bar"><i id="exp-gpu" style="background:var(--violet);width:0"></i><i id="exp-host" style="background:#3b4d66;width:0"></i></div>
+      <dl class="rows">
+        <dt>On GPU</dt><dd id="exp-gpu-t">-</dd>
+        <dt>On host</dt><dd id="exp-host-t">-</dd>
+        <dt>Expert uploads</dt><dd id="exp-up">-</dd>
+      </dl>
+    </section>
+    <section class="card">
+      <h3>Decode hit rate <small>5 s rolling</small></h3>
+      <div class="big" id="hit">-</div>
+      <dl class="rows">
+        <dt>Cumulative</dt><dd id="hit-tot">-</dd>
+        <dt>MTP verify rows</dt><dd id="hit-ver">-</dd>
+        <dt>CPU-miss time / token</dt><dd id="miss">-</dd>
+      </dl>
+      <svg class="spark" id="sp-hit"></svg>
+    </section>
+    <section class="card">
+      <h3>MTP <small>tokens per step</small></h3>
+      <div class="big" id="mtp">-</div>
+      <dl class="rows">
+        <dt>Cumulative</dt><dd id="mtp-tot">-</dd>
+        <dt>Draft acceptance</dt><dd id="mtp-acc">-</dd>
+        <dt>Verify steps</dt><dd id="mtp-steps">-</dd>
+      </dl>
+      <svg class="spark" id="sp-mtp"></svg>
+    </section>
+    <section class="card">
+      <h3>Prefix cache</h3>
+      <div class="big" id="pc">-</div>
+      <dl class="rows">
+        <dt>Hits / lookups</dt><dd id="pc-hits">-</dd>
+        <dt>Entries</dt><dd id="pc-ent">-</dd>
+        <dt>Held on host</dt><dd id="pc-mib">-</dd>
+        <dt>Last request reused</dt><dd id="pc-last">-</dd>
+      </dl>
+    </section>
+  </div>
+
+  <section class="card">
+    <h3>Recent requests <small id="rq-n"></small></h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Time</th><th>Status</th><th>Prompt</th><th>Reused</th><th>Output</th><th>Tok/s</th><th>Prompt tok/s</th><th>TTFT</th><th>Duration</th></tr></thead>
+        <tbody id="rq"><tr><td colspan="9" class="na" style="text-align:center">No requests yet</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const STATS_URL = "/v1/titan/stats";
+const PERIOD_MS = 1000;
+const HISTORY = 90;
+const TEMP_SCALE_C = 100;
+const $ = (id) => document.getElementById(id);
+const hist = {};
+
+function push(key, v) {
+  const h = hist[key] || (hist[key] = []);
+  h.push(typeof v === "number" && isFinite(v) ? v : null);
+  if (h.length > HISTORY) h.shift();
+  return h;
+}
+
+function fmt(v, d = 1) {
+  if (v === null || v === undefined || !isFinite(v)) return null;
+  return Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function setText(id, v, unit) {
+  const el = $(id);
+  if (v === null || v === undefined) { el.innerHTML = '<span class="na">n/a</span>'; return; }
+  el.textContent = v + (unit || "");
+}
+
+function setBig(id, v, unit) {
+  const el = $(id);
+  if (v === null || v === undefined) { el.innerHTML = '<span class="na">-</span>'; return; }
+  el.innerHTML = "";
+  el.append(document.createTextNode(v));
+  if (unit) { const u = document.createElement("span"); u.className = "u"; u.textContent = unit; el.append(u); }
+}
+
+function pct(v, d = 0) { return v === null || v === undefined ? null : fmt(100 * v, d) + "%"; }
+function gib(mib) { return mib === null || mib === undefined ? null : fmt(mib / 1024, 1); }
+
+function spark(id, data, color, max) {
+  const svg = $(id);
+  const w = 200, h = 38;
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  const vals = data.filter((v) => v !== null);
+  if (vals.length < 2) { svg.innerHTML = ""; return; }
+  const top = Math.max(max || 0, ...vals) || 1;
+  const step = w / (data.length - 1);
+  const off = 0;
+  let line = "", started = false;
+  data.forEach((v, i) => {
+    if (v === null) { started = false; return; }
+    const x = (off + i) * step, y = h - 2 - (v / top) * (h - 4);
+    line += (started ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+    started = true;
+  });
+  const firstX = (off + data.findIndex((v) => v !== null)) * step;
+  const area = line + `L${w} ${h}L${firstX.toFixed(1)} ${h}Z`;
+  svg.innerHTML = `<path d="${area}" fill="${color}" fill-opacity="0.12" stroke="none"/>` +
+    `<path d="${line}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`;
+}
+
+function width(id, frac) { $(id).style.width = Math.max(0, Math.min(1, frac || 0)) * 100 + "%"; }
+
+function clock(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString("en-GB", { hour12: false });
+}
+
+function secs(s) {
+  if (s === null || s === undefined) return null;
+  return s < 10 ? fmt(s, 2) + " s" : s < 600 ? fmt(s, 1) + " s" : fmt(s / 60, 1) + " min";
+}
+
+function render(s) {
+  const m = s.model, sp = s.speed, g = s.gpu, pc = s.pcie, t = s.titan;
+  $("model").textContent = (m.name || "").split("/").filter(Boolean).pop() || "-";
+  $("model").title = m.name || "";
+  $("req-count").textContent = m.requests_total ? m.requests_total + " requests since start" : "";
+
+  for (const c of document.querySelectorAll(".chip")) {
+    const on = c.dataset.s === m.state || (c.dataset.s === "queued" && m.queued > 0);
+    c.classList.toggle("on", on);
+  }
+  $("qn").textContent = m.queued;
+
+  const pf = m.prefill;
+  if (m.state === "prefill" && pf.total > 0) {
+    width("pf-reused", pf.reused / pf.total);
+    width("pf-new", (pf.done - pf.reused) / pf.total);
+    const rate = sp.prompt_tps_current;
+    $("pf-left").textContent = "Reading prompt" + (pf.reused ? ` (${pf.reused.toLocaleString()} reused from prefix cache)` : "") +
+      (pf.elapsed_s !== null ? ` · ${fmt(pf.elapsed_s, 1)} s` : "") + (rate ? ` · ${fmt(rate, 0)} tok/s` : "");
+    $("pf-right").textContent = `${pf.done.toLocaleString()} / ${pf.total.toLocaleString()} tokens · ${fmt(100 * pf.done / pf.total, 0)}%`;
+  } else {
+    width("pf-reused", 0);
+    width("pf-new", m.state === "generating" ? 1 : 0);
+    $("pf-left").textContent = m.state === "generating" ? "Prompt done, generating" : m.state === "error" ? "Last request failed" : "No prompt in flight";
+    $("pf-right").textContent = "";
+  }
+
+  const ctx = s.context, frac = ctx.max ? ctx.tokens / ctx.max : 0;
+  $("ctx-arc").setAttribute("stroke-dasharray", `${(314.16 * Math.min(1, frac)).toFixed(1)} 314.16`);
+  $("ctx-arc").setAttribute("stroke", frac > 0.9 ? "var(--red)" : frac > 0.7 ? "var(--amber)" : "var(--teal)");
+  $("ctx-pct").textContent = fmt(100 * frac, frac < 0.1 ? 1 : 0) + "%";
+  const k = (n) => n >= 1000 ? fmt(n / 1000, 1) + "k" : String(n);
+  $("ctx-t").textContent = `${k(ctx.tokens)} / ${k(ctx.max)}`;
+
+  const live = m.state === "generating" ? sp.decode_tps_current : null;
+  setBig("dec", fmt(live !== null ? live : sp.decode_tps_last, 1), "tok/s");
+  setText("dec-last", fmt(sp.decode_tps_last, 1));
+  setText("dec-avg", fmt(sp.decode_tps_avg, 1));
+  spark("sp-dec", push("dec", sp.decode_tps_1s), "#2dd4bf");
+  setBig("pp", fmt(m.state === "prefill" ? sp.prompt_tps_current : sp.prompt_tps_last, 0), "tok/s");
+  setText("pp-last", fmt(sp.prompt_tps_last, 0));
+  setText("pp-avg", fmt(sp.prompt_tps_avg, 0));
+  spark("sp-pp", push("pp", sp.prompt_tps_rolling), "#5ea8ff");
+
+  if (g.available) {
+    $("gpu-name").textContent = g.name.replace(/^NVIDIA (GeForce )?/, "");
+    setBig("gpu-util", g.util_pct, "%");
+    setText("gpu-clk", g.clock_sm_mhz !== null ? `${g.clock_sm_mhz} / ${g.clock_sm_max_mhz ?? "?"} MHz` : null);
+    setText("gpu-mclk", g.clock_mem_mhz !== null ? `${g.clock_mem_mhz} MHz · P${g.pstate ?? "?"}` : null);
+    setBig("vram", gib(g.vram_used_mib), `/ ${gib(g.vram_total_mib)} GiB`);
+    width("vram-bar", g.vram_used_mib / g.vram_total_mib);
+    $("vram-sub").textContent = `memory controller ${g.mem_util_pct ?? "?"}% busy`;
+    setBig("pwr", fmt(g.power_w, 0), "W");
+    $("pwr-sub").textContent = `of ${fmt(g.power_limit_w, 0)} W limit`;
+    width("pwr-bar", g.power_w / g.power_limit_w);
+    setBig("temp", g.temp_c, "°C");
+    width("temp-bar", (g.temp_c || 0) / TEMP_SCALE_C);
+    $("temp-bar").style.background = g.temp_c >= 85 ? "var(--red)" : "var(--amber)";
+    $("temp-sub").textContent = g.pstate !== null ? `performance state P${g.pstate}` : "";
+  } else {
+    $("gpu-name").textContent = "";
+    for (const id of ["gpu-util", "vram", "pwr", "temp"]) setBig(id, null);
+    $("temp-sub").textContent = "";
+    width("temp-bar", 0);
+    $("gpu-util").innerHTML = '<span class="na" style="font-size:18px">unavailable</span>';
+    setText("gpu-clk", null); setText("gpu-mclk", null);
+    $("vram-sub").textContent = g.reason ? "NVML: " + g.reason : "";
+    $("pwr-sub").textContent = "";
+    width("vram-bar", 0); width("pwr-bar", 0);
+  }
+  spark("sp-gpu", push("gpu", g.available ? g.util_pct : null), "#a58bff", 100);
+  spark("sp-vram", push("vram", g.available ? g.vram_used_mib : null), "#a58bff", g.vram_total_mib || 0);
+  spark("sp-pwr", push("pwr", g.available ? g.power_w : null), "#f5b942", g.power_limit_w || 0);
+  spark("sp-temp", push("temp", g.available ? g.temp_c : null), "#f5b942", TEMP_SCALE_C);
+
+  if (pc.available && pc.gen) {
+    setBig("pcie", "Gen" + pc.gen, `x${pc.width}` + (pc.max_gen && (pc.max_gen !== pc.gen || pc.max_width !== pc.width) ? ` (max Gen${pc.max_gen} x${pc.max_width})` : ""));
+  } else {
+    $("pcie").innerHTML = '<span class="na" style="font-size:18px">unavailable</span>';
+  }
+  setText("pcie-rx", fmt(pc.rx_mbs, 0), " MB/s");
+  setText("pcie-tx", fmt(pc.tx_mbs, 0), " MB/s");
+  setText("pcie-up", fmt(pc.engine_upload_mbs, 1), " MB/s");
+  spark("sp-pcie", push("pcie", pc.rx_mbs), "#5ea8ff");
+
+  setBig("cpu", fmt(s.cpu.util_pct, 0), "%");
+  setText("cpu-cores", s.cpu.cores);
+  setText("cpu-pool", fmt(s.cpu.miss_pool_busy_pct, 0), "%");
+  spark("sp-cpu", push("cpu", s.cpu.util_pct), "#52d68a", 100);
+
+  setBig("ram", gib(s.ram.used_mib), `/ ${gib(s.ram.total_mib)} GiB`);
+  width("ram-bar", s.ram.used_mib / s.ram.total_mib);
+  setText("rss", gib(s.ram.rss_mib), " GiB");
+  setText("rss-split", `${gib(s.ram.rss_anon_mib)} / ${gib(s.ram.rss_file_mib)} GiB`);
+
+  $("disk-dev").textContent = (s.disk.devices || []).join(", ");
+  setBig("disk", fmt(s.disk.read_mbs, 1), "MB/s");
+  setText("disk-proc", fmt(s.disk.process_read_mbs, 1), " MB/s");
+  setText("disk-w", fmt(s.disk.write_mbs, 1), " MB/s");
+  spark("sp-disk", push("disk", s.disk.read_mbs), "#f26d6d");
+
+  if (t.tiered) {
+    setBig("exp", t.experts_gpu.toLocaleString(), `/ ${t.experts_total.toLocaleString()} experts on GPU`);
+    const tot = t.experts_gpu_mib + t.experts_host_mib;
+    width("exp-gpu", t.experts_gpu_mib / tot);
+    width("exp-host", t.experts_host_mib / tot);
+    setText("exp-gpu-t", `${t.experts_gpu.toLocaleString()} · ${gib(t.experts_gpu_mib)} GiB`);
+    setText("exp-host-t", `${(t.experts_total - t.experts_gpu).toLocaleString()} · ${gib(t.experts_host_mib)} GiB`);
+    setText("exp-up", t.expert_uploads.toLocaleString());
+  } else {
+    $("exp").innerHTML = '<span class="na" style="font-size:18px">not tiered</span>';
+    for (const id of ["exp-gpu-t", "exp-host-t", "exp-up"]) setText(id, null);
+  }
+  setBig("hit", pct(t.hit_rate_rolling, 1));
+  setText("hit-tot", pct(t.hit_rate_total, 2));
+  setText("hit-ver", pct(t.verify_hit_rate_total, 1));
+  setText("miss", fmt(t.cpu_miss_ms_per_token, 2), " ms");
+  spark("sp-hit", push("hit", t.hit_rate_rolling === null ? null : 100 * t.hit_rate_rolling), "#a58bff", 100);
+
+  const mt = t.mtp;
+  if (mt.enabled) {
+    setBig("mtp", fmt(mt.tokens_per_step_rolling, 2));
+    setText("mtp-tot", fmt(mt.tokens_per_step_total, 2));
+    setText("mtp-acc", `${pct(mt.acceptance_rolling, 0) ?? "-"} · ${pct(mt.acceptance_total, 1)} all`);
+    setText("mtp-steps", mt.steps.toLocaleString());
+  } else {
+    $("mtp").innerHTML = '<span class="na" style="font-size:18px">off or idle</span>';
+    for (const id of ["mtp-tot", "mtp-acc", "mtp-steps"]) setText(id, null);
+  }
+  spark("sp-mtp", push("mtp", mt.tokens_per_step_rolling), "#2dd4bf");
+
+  const p = t.prefix_cache;
+  setBig("pc", pct(p.hit_rate, 0), "hit rate");
+  setText("pc-hits", `${p.hits} / ${p.lookups}`);
+  setText("pc-ent", p.entries);
+  setText("pc-mib", fmt(p.mib, 0), " MiB");
+  setText("pc-last", p.last_reused.toLocaleString(), " tokens");
+
+  const cur = s.requests.find((r) => r.status === "prefill" || r.status === "decode") || s.requests[0];
+  setText("cur-id", cur ? "#" + cur.id + " " + cur.status : null);
+  setText("cur-prompt", cur ? cur.prompt.toLocaleString() : null);
+  setText("cur-reused", cur ? cur.reused.toLocaleString() : null);
+  setText("cur-out", cur ? cur.output.toLocaleString() : null);
+  setText("cur-ttft", cur ? secs(cur.ttft_s) : null);
+  setText("cur-el", cur ? secs(cur.duration_s) : null);
+
+  $("rq-n").textContent = s.requests.length ? `last ${s.requests.length}` : "";
+  const rows = s.requests.map((r) => {
+    const cell = (v) => v === null || v === undefined ? '<span class="na">-</span>' : v;
+    return `<tr><td>${clock(r.start_ms)}</td><td><span class="st ${r.status}">${r.status}</span></td>` +
+      `<td>${r.prompt.toLocaleString()}</td><td>${r.reused ? r.reused.toLocaleString() : '<span class="na">0</span>'}</td>` +
+      `<td>${r.output.toLocaleString()}</td><td>${cell(fmt(r.tps, 1))}</td><td>${cell(fmt(r.prompt_tps, 0))}</td>` +
+      `<td>${cell(secs(r.ttft_s))}</td><td>${cell(secs(r.duration_s))}</td></tr>`;
+  });
+  $("rq").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="9" class="na" style="text-align:center">No requests yet</td></tr>';
+}
+
+function conn(ok, text) {
+  $("conn").className = "pill " + (ok ? "live" : "down");
+  $("conn-t").textContent = text;
+}
+
+let timer = null, inflight = false;
+async function poll() {
+  timer = null;
+  inflight = true;
+  try {
+    const r = await fetch(STATS_URL, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    render(s);
+    conn(true, "live · " + clock(s.time_ms));
+  } catch (e) {
+    conn(false, "disconnected");
+  }
+  inflight = false;
+  if (!document.hidden) timer = setTimeout(poll, PERIOD_MS);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && timer === null && !inflight) poll();
+});
+poll();
+</script>
+</body>
+</html>

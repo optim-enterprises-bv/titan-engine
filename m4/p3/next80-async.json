@@ -1,0 +1,32 @@
+{
+ "name": "Qwen3-Next-80B-A3B Q4_K_M, GPU 0.28, tuned for async uploads",
+ "train": "~/titan-engine/m4/next/out/next-calib.trace",
+ "eval": "~/titan-engine/m4/next/out/next-eval-base.trace",
+ "profile": "~/titan-engine/m4/next/profile-next.txt",
+ "experts": 512,
+ "slots": 143,
+ "out": "~/titan-engine/m4/p3/out/next80-143-async",
+ "main_cost": "async",
+ "costs": {
+  "sync": {
+   "measured_static_tok_s": 28.5,
+   "c_miss_us": 111,
+   "c_up_us": 390
+  },
+  "fastup": {
+   "measured_static_tok_s": 28.5,
+   "c_miss_us": 111,
+   "c_up_us": 80
+  },
+  "async": {
+   "measured_static_tok_s": 28.5,
+   "c_miss_us": 111,
+   "c_up_us": 0
+  },
+  "nvme": {
+   "measured_static_tok_s": 28.5,
+   "c_miss_us": 258,
+   "c_up_us": 390
+  }
+ }
+}

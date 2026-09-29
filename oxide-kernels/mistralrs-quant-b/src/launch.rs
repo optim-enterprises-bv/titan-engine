@@ -1,0 +1,1170 @@
+//! Pure-Rust twins of mistralrs-quant's extern "C" host launchers (group B: afq, fp8, gptq, mxfp4,
+//! marlin, cutlass-moe). Same names, parameter lists and C ABI as `mistralrs_quant::*::ffi`, same
+//! grid / block / shared-memory selection and host-side branching; the oxide kernels are launched
+//! through the CUDA driver API on the caller's stream (launchers without a stream parameter use the
+//! legacy default stream, as `<<<>>>` without a stream does).
+//!
+//! The oxide module is loaded once per CUDA context (the stream's context, or the current one for
+//! the null stream; if no context is current, device 0's primary context, as the runtime API would)
+//! and its functions are cached. The module image is the `#[cuda_module]` bundle embedded in the
+//! running executable; if there is none, the PTX file named by `$MISTRALRS_QUANT_B_PTX`, else
+//! `<crate>/mistralrs_quant_b.ptx`.
+//!
+//! Like the C launchers (`<<<>>>` without error checks), launch failures are not reported.
+#![allow(clippy::too_many_arguments, clippy::missing_safety_doc)]
+use cuda_core::sys;
+use std::collections::HashMap;
+use std::ffi::{CString, c_void};
+use std::sync::{Mutex, OnceLock};
+
+struct Module {
+    module: sys::CUmodule,
+    functions: HashMap<&'static str, sys::CUfunction>,
+}
+// CUmodule / CUfunction are driver handles, valid from any thread of the process.
+unsafe impl Send for Module {}
+
+static MODULES: OnceLock<Mutex<HashMap<(usize, usize), Module>>> = OnceLock::new();
+
+/// Module 0: this crate's embedded `#[cuda_module]` bundle (else `$MISTRALRS_QUANT_B_PTX`, else
+/// `<crate>/mistralrs_quant_b.ptx`). Module 1: the Marlin kernels, built by the `marlin-kernels`
+/// sub-crate (`$MISTRALRS_QUANT_B_MARLIN_PTX`, else `<crate>/marlin-kernels/marlin_kernels.ptx`).
+fn module_image(which: usize) -> Vec<u8> {
+    if which == 0 {
+        if let Ok(bundles) = cuda_core::embedded::artifact_bundles_from_current_exe() {
+            for b in &bundles {
+                if b.name == "mistralrs_quant_b" {
+                    if let Some(p) = b.payload(cuda_core::embedded::ArtifactPayloadKind::Cubin)
+                        .or_else(|| b.payload(cuda_core::embedded::ArtifactPayloadKind::Ptx))
+                    {
+                        let mut v = p.to_vec();
+                        v.push(0);
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    let path = if which == 0 {
+        std::env::var("MISTRALRS_QUANT_B_PTX").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/mistralrs_quant_b.ptx").to_string())
+    } else {
+        std::env::var("MISTRALRS_QUANT_B_MARLIN_PTX").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/marlin-kernels/marlin_kernels.ptx").to_string())
+    };
+    let mut v = std::fs::read(&path).unwrap_or_else(|e| panic!("mistralrs-quant-b: cannot read module {which} from {path}: {e}"));
+    v.push(0);
+    v
+}
+
+fn check(r: sys::CUresult, what: &str) {
+    assert!(r == 0, "mistralrs-quant-b: {what} failed: {r:?}");
+}
+
+/// The context `stream` belongs to (the current context for the null stream).
+unsafe fn stream_context(stream: sys::CUstream) -> sys::CUcontext {
+    unsafe {
+        check(sys::cuInit(0), "cuInit");
+        let mut ctx: sys::CUcontext = std::ptr::null_mut();
+        if !stream.is_null() {
+            check(sys::cuStreamGetCtx(stream, &mut ctx), "cuStreamGetCtx");
+            return ctx;
+        }
+        check(sys::cuCtxGetCurrent(&mut ctx), "cuCtxGetCurrent");
+        if ctx.is_null() {
+            let mut dev: sys::CUdevice = 0;
+            check(sys::cuDeviceGet(&mut dev, 0), "cuDeviceGet");
+            check(sys::cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain");
+            check(sys::cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+        }
+        ctx
+    }
+}
+
+/// The oxide kernel `name` in `stream`'s context (loading the module on first use).
+static LAUNCHED: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+/// Every oxide kernel entry a launcher has resolved so far (instance coverage for the gate).
+pub fn launched() -> Vec<&'static str> {
+    LAUNCHED.get_or_init(|| Mutex::new(Default::default())).lock().unwrap().iter().copied().collect()
+}
+
+unsafe fn function(name: &'static str, stream: sys::CUstream) -> sys::CUfunction {
+    LAUNCHED.get_or_init(|| Mutex::new(Default::default())).lock().unwrap().insert(name);
+    unsafe {
+        let ctx = stream_context(stream);
+        let mut map = MODULES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let which = (name.starts_with("marlin_") || name.contains("marlin_repack")) as usize;
+        let m = map.entry((ctx as usize, which)).or_insert_with(|| {
+            let mut cur: sys::CUcontext = std::ptr::null_mut();
+            check(sys::cuCtxGetCurrent(&mut cur), "cuCtxGetCurrent");
+            if cur != ctx {
+                check(sys::cuCtxPushCurrent_v2(ctx), "cuCtxPushCurrent");
+            }
+            let image = module_image(which);
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            check(sys::cuModuleLoadData(&mut module, image.as_ptr() as *const c_void), "cuModuleLoadData");
+            if cur != ctx {
+                let mut popped: sys::CUcontext = std::ptr::null_mut();
+                check(sys::cuCtxPopCurrent_v2(&mut popped), "cuCtxPopCurrent");
+            }
+            Module { module, functions: HashMap::new() }
+        });
+        let module = m.module;
+        *m.functions.entry(name).or_insert_with(|| {
+            let mut f: sys::CUfunction = std::ptr::null_mut();
+            let c = CString::new(name).unwrap();
+            check(sys::cuModuleGetFunction(&mut f, module, c.as_ptr()), name);
+            f
+        })
+    }
+}
+
+unsafe fn launch(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32, stream: *mut c_void, args: &mut [*mut c_void]) {
+    unsafe {
+        let s = stream as sys::CUstream;
+        let f = function(name, s);
+        // Errors are dropped, as the C launcher's `<<<>>>` drops them.
+        let _ = sys::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared, s, args.as_mut_ptr(), std::ptr::null_mut());
+    }
+}
+
+/// Kernel argument slot: the address of a by-value argument.
+macro_rules! args {
+    ($($v:ident),*) => { [$(&raw mut $v as *mut c_void),*] };
+}
+
+fn cdiv(a: u32, b: u32) -> u32 {
+    a.wrapping_add(b - 1) / b
+}
+
+// ============================================================================ AFQ
+// Every AFQ launcher uses the legacy default stream (`<<<grid, block>>>`).
+
+unsafe fn afq_dequant(name: &'static str, w_q: *const c_void, scales: *const c_void, biases: *const c_void, output: *mut c_void, rows: i32, cols: i32) {
+    let total = (rows as u64).wrapping_mul(cols as i64 as u64);
+    let blocks = total.wrapping_add(255) / 256;
+    let (mut a, mut b, mut c, mut d, mut r, mut k) = (w_q, scales, biases, output, rows, cols);
+    unsafe { launch(name, (blocks as u32, 1, 1), (256, 1, 1), 0, std::ptr::null_mut(), &mut args!(a, b, c, d, r, k)) }
+}
+
+unsafe fn afq_quant(name: &'static str, bits: u64, gs: i32, w: *const c_void, w_q: *mut c_void, scales: *mut c_void, biases: *mut c_void, rows: i32, cols: i32) {
+    let groups_per_row = (cols / gs) as i64 as u64;
+    let total_groups = (rows as i64 as u64).wrapping_mul(groups_per_row);
+    let blocks = total_groups.wrapping_add(7) / 8;
+    let packed_cols = (cols as i64 as u64).wrapping_mul(bits) / 32;
+    // cudaMemset(w_q, 0, rows * packed_cols * 4): legacy default stream, errors dropped.
+    let bytes = (rows as i64 as u64).wrapping_mul(packed_cols).wrapping_mul(4);
+    unsafe {
+        let _ = stream_context(std::ptr::null_mut());
+        let _ = sys::cuMemsetD8Async(w_q as sys::CUdeviceptr, 0, bytes as usize, std::ptr::null_mut());
+    }
+    let (mut a, mut b, mut c, mut d, mut r, mut k) = (w, w_q, scales, biases, rows, cols);
+    unsafe { launch(name, (blocks as u32, 1, 1), (256, 1, 1), 0, std::ptr::null_mut(), &mut args!(a, b, c, d, r, k)) }
+}
+
+unsafe fn afq_qmv(name: &'static str, x: *const c_void, w_q: *const c_void, scales: *const c_void, biases: *const c_void, y: *mut c_void, m: i32, n: i32, k: i32) {
+    let threads = m.wrapping_mul(n).wrapping_mul(32);
+    let blocks = cdiv(threads as u32, 256);
+    let (mut a, mut b, mut c, mut d, mut e, mut mm, mut nn, mut kk) = (x, w_q, scales, biases, y, m, n, k);
+    unsafe { launch(name, (blocks, 1, 1), (256, 1, 1), 0, std::ptr::null_mut(), &mut args!(a, b, c, d, e, mm, nn, kk)) }
+}
+
+unsafe fn afq_qmm(name: &'static str, x: *const c_void, w_q: *const c_void, scales: *const c_void, biases: *const c_void, y: *mut c_void, m: i32, n: i32, k: i32) {
+    let grid = (cdiv(n as u32, 32), cdiv(m as u32, 32), 1);
+    let (mut a, mut b, mut c, mut d, mut e, mut mm, mut nn, mut kk) = (x, w_q, scales, biases, y, m, n, k);
+    unsafe { launch(name, grid, (32, 32, 1), 0, std::ptr::null_mut(), &mut args!(a, b, c, d, e, mm, nn, kk)) }
+}
+
+// GENERATED LAUNCHERS BEGIN
+pub unsafe extern "C" fn afq_dequantize_2bit_gs32_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs32_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs64_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs64_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs128_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs128_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs32_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs32_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs32_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs64_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs64_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs64_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs128_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs128_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs128_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs32_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs32_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs64_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs64_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs128_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs128_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs32_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs32_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs32_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs64_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs64_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs64_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs128_f32(w_q: *const u8, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs128_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs128_f32(x: *const f32, w_q: *const u8, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs32_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs32_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs64_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs64_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs128_f32(w_q: *const u32, scales: *const f32, biases: *const f32, output: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs128_f32", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs32_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs32_f32", 2, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs64_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs64_f32", 2, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs128_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs128_f32", 2, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs32_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs32_f32", 4, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs64_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs64_f32", 4, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs128_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs128_f32", 4, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs32_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs32_f32", 8, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs32_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs32_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs64_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs64_f32", 8, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs64_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs64_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs128_f32(w: *const f32, w_q: *mut u32, scales: *mut f32, biases: *mut f32, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs128_f32", 8, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs128_f32(x: *const f32, w_q: *const u32, scales: *const f32, biases: *const f32, y: *mut f32, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs128_f32", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs32_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs32_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs64_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs64_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs128_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs128_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs32_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs32_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs32_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs64_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs64_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs64_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs128_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs128_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs128_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs32_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs32_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs64_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs64_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs128_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs128_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs32_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs32_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs32_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs64_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs64_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs64_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs128_f16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs128_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs128_f16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs32_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs32_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs64_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs64_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs128_f16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs128_f16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs32_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs32_f16", 2, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs64_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs64_f16", 2, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs128_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs128_f16", 2, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs32_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs32_f16", 4, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs64_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs64_f16", 4, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs128_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs128_f16", 4, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs32_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs32_f16", 8, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs32_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs32_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs64_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs64_f16", 8, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs64_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs64_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs128_f16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs128_f16", 8, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs128_f16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs128_f16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs32_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs32_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs64_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs64_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_2bit_gs128_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_2bit_gs128_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_2bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_2bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs32_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs32_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs32_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs64_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs64_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs64_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_3bit_gs128_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_3bit_gs128_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_3bit_gs128_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_3bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs32_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs32_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs64_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs64_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_4bit_gs128_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_4bit_gs128_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_4bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_4bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs32_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs32_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs32_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs64_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs64_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs64_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_6bit_gs128_bf16(w_q: *const u8, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_6bit_gs128_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_6bit_gs128_bf16(x: *const u16, w_q: *const u8, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_6bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs32_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs32_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs64_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs64_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_dequantize_8bit_gs128_bf16(w_q: *const u32, scales: *const u16, biases: *const u16, output: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_dequant("afq_dequantize_8bit_gs128_bf16", w_q as _, scales as _, biases as _, output as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmv_8bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmv("afq_qmv_8bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs32_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs32_bf16", 2, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs64_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs64_bf16", 2, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_2bit_gs128_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_2bit_gs128_bf16", 2, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_2bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_2bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs32_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs32_bf16", 4, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs64_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs64_bf16", 4, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_4bit_gs128_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_4bit_gs128_bf16", 4, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_4bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_4bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs32_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs32_bf16", 8, 32, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs32_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs32_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs64_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs64_bf16", 8, 64, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs64_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs64_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+pub unsafe extern "C" fn afq_quantize_8bit_gs128_bf16(w: *const u16, w_q: *mut u32, scales: *mut u16, biases: *mut u16, rows: i32, cols: i32) {
+    unsafe { afq_quant("afq_quantize_8bit_gs128_bf16", 8, 128, w as _, w_q as _, scales as _, biases as _, rows, cols) }
+}
+pub unsafe extern "C" fn afq_qmm_8bit_gs128_bf16(x: *const u16, w_q: *const u32, scales: *const u16, biases: *const u16, y: *mut u16, m: i32, n: i32, k: i32) {
+    unsafe { afq_qmm("afq_qmm_8bit_gs128_bf16", x as _, w_q as _, scales as _, biases as _, y as _, m, n, k) }
+}
+// GENERATED LAUNCHERS END
+
+// ============================================================================ launch-error reporting
+/// `cudaGetErrorString` of the runtime error a failed `<<<>>>` launch reports.
+fn runtime_error(r: sys::CUresult) -> (i32, &'static str) {
+    match r as i32 {
+        // cuLaunchKernel reports a zero / oversized grid or block as INVALID_VALUE; the runtime
+        // reports it as cudaErrorInvalidConfiguration.
+        1 => (9, "invalid configuration argument"),
+        701 => (701, "too many resources requested for launch"),
+        98 | 500 => (98, "invalid device function"),
+        x => (x, "unspecified launch failure"),
+    }
+}
+
+/// `<<<>>>` followed by `CUDA_CHECK(cudaGetLastError())`: on a failed launch print the same message
+/// and, when the C macro exits, exit the process with the runtime error code.
+unsafe fn launch_checked(
+    name: &'static str, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32, stream: *mut c_void, args: &mut [*mut c_void],
+    site: &str, exit: bool,
+) {
+    unsafe {
+        let s = stream as sys::CUstream;
+        let f = function(name, s);
+        let r = sys::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared, s, args.as_mut_ptr(), std::ptr::null_mut());
+        if r as i32 != 0 {
+            let (code, msg) = runtime_error(r);
+            eprintln!("CUDA error at {site}: {msg}");
+            if exit {
+                std::process::exit(code);
+            }
+        }
+    }
+}
+
+// ============================================================================ scalar FP8
+macro_rules! scalar_fp8 {
+    ($to:ident, $from:ident, $t:ty, $kto:literal, $kfrom:literal, $l1:literal, $l2:literal) => {
+        pub unsafe extern "C" fn $to(d_input: *const u8, d_output: *mut $t, num_elements: usize, stream: *mut c_void) {
+            let nb = (num_elements.wrapping_add(255) / 256) as i32;
+            let (mut a, mut b, mut n) = (d_input, d_output, num_elements);
+            unsafe { launch_checked($kto, (nb as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(a, b, n), concat!("kernels/scalar_fp8/scalar_fp8.cu:", $l1), true) }
+        }
+        pub unsafe extern "C" fn $from(d_input: *const $t, d_output: *mut u8, num_elements: usize, stream: *mut c_void) {
+            let nb = (num_elements.wrapping_add(255) / 256) as i32;
+            let (mut a, mut b, mut n) = (d_input, d_output, num_elements);
+            unsafe { launch_checked($kfrom, (nb as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(a, b, n), concat!("kernels/scalar_fp8/scalar_fp8.cu:", $l2), true) }
+        }
+    };
+}
+scalar_fp8!(launch_fp8_to_f32_kernel, launch_f32_to_fp8_kernel, f32, "fp8_to_f32", "f32_to_fp8", "56", "91");
+scalar_fp8!(launch_fp8_to_f16_kernel, launch_f16_to_fp8_kernel, u16, "fp8_to_f16", "f16_to_fp8", "67", "103");
+scalar_fp8!(launch_fp8_to_bf16_kernel, launch_bf16_to_fp8_kernel, u16, "fp8_to_bf16", "bf16_to_fp8", "79", "115");
+
+// ============================================================================ vector FP8
+macro_rules! vector_fp8 {
+    ($dq:ident, $q:ident, $t:ty, $kdq:literal, $kq:literal, $l1:literal, $l2:literal) => {
+        pub unsafe extern "C" fn $dq(d_weight: *const u8, d_scale: *const f32, d_output: *mut $t, num_elements: usize, stream: *mut c_void) {
+            let nv = num_elements.wrapping_add(127) / 128;
+            let (mut a, mut b, mut c, mut n) = (d_weight, d_scale, d_output, num_elements);
+            unsafe { launch_checked($kdq, (nv as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(a, b, c, n), concat!("kernels/vector_fp8/vector_fp8.cu:", $l1), true) }
+        }
+        pub unsafe extern "C" fn $q(d_input: *const $t, d_weight: *mut u8, d_scale: *mut f32, num_elements: usize, stream: *mut c_void) {
+            let nv = num_elements.wrapping_add(127) / 128;
+            let (mut a, mut b, mut c, mut n) = (d_input, d_weight, d_scale, num_elements);
+            unsafe { launch_checked($kq, (nv as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(a, b, c, n), concat!("kernels/vector_fp8/vector_fp8.cu:", $l2), true) }
+        }
+    };
+}
+vector_fp8!(launch_dequant_fp8_vector_kernel_f32, launch_quant_fp8_vector_kernel_f32, f32, "dequant_fp8_vector_f32", "quant_fp8_vector_f32", "126", "166");
+vector_fp8!(launch_dequant_fp8_vector_kernel_f16, launch_quant_fp8_vector_kernel_f16, u16, "dequant_fp8_vector_f16", "quant_fp8_vector_f16", "139", "180");
+vector_fp8!(launch_dequant_fp8_vector_kernel_bf16, launch_quant_fp8_vector_kernel_bf16, u16, "dequant_fp8_vector_bf16", "quant_fp8_vector_bf16", "151", "193");
+
+// ============================================================================ blockwise FP8
+macro_rules! blockwise_fp8 {
+    ($dq:ident, $q:ident, $t:ty, $kdq:literal, $kq:literal, $l1:literal, $l2:literal) => {
+        pub unsafe extern "C" fn $dq(
+            d_weight: *const u8, d_scale: *const f32, d_output: *mut $t, weight_height: i32, weight_width: i32, weight_row_stride: i32,
+            scale_stride: i32, weight_block_size_y: i32, weight_block_size_x: i32, stream: *mut c_void,
+        ) {
+            let gy = weight_height.wrapping_add(weight_block_size_y).wrapping_sub(1) / weight_block_size_y;
+            let gx = weight_width.wrapping_add(weight_block_size_x).wrapping_sub(1) / weight_block_size_x;
+            let (mut a, mut b, mut c) = (d_weight, d_scale, d_output);
+            let (mut h, mut w, mut rs, mut ss, mut by, mut bx) = (weight_height, weight_width, weight_row_stride, scale_stride, weight_block_size_y, weight_block_size_x);
+            unsafe { launch_checked($kdq, (gx as u32, gy as u32, 1), (32, 32, 1), 0, stream, &mut args!(a, b, c, h, w, rs, ss, by, bx), concat!("kernels/blockwise_fp8/blockwise_fp8.cu:", $l1), true) }
+        }
+        pub unsafe extern "C" fn $q(
+            d_input: *const $t, d_weight: *mut u8, d_scale: *mut f32, weight_height: i32, weight_width: i32, weight_row_stride: i32,
+            scale_stride: i32, weight_block_size_y: i32, weight_block_size_x: i32, stream: *mut c_void,
+        ) {
+            let gy = weight_height.wrapping_add(weight_block_size_y).wrapping_sub(1) / weight_block_size_y;
+            let gx = weight_width.wrapping_add(weight_block_size_x).wrapping_sub(1) / weight_block_size_x;
+            let (mut a, mut b, mut c) = (d_input, d_weight, d_scale);
+            let (mut h, mut w, mut rs, mut ss, mut by, mut bx) = (weight_height, weight_width, weight_row_stride, scale_stride, weight_block_size_y, weight_block_size_x);
+            unsafe { launch_checked($kq, (gx as u32, gy as u32, 1), (32, 32, 1), 0, stream, &mut args!(a, b, c, h, w, rs, ss, by, bx), concat!("kernels/blockwise_fp8/blockwise_fp8.cu:", $l2), true) }
+        }
+    };
+}
+blockwise_fp8!(launch_dequant_fp8_blockwise_kernel_f32, launch_quant_fp8_blockwise_kernel_f32, f32, "dequant_fp8_blockwise_f32", "quant_fp8_blockwise_f32", "155", "206");
+blockwise_fp8!(launch_dequant_fp8_blockwise_kernel_f16, launch_quant_fp8_blockwise_kernel_f16, u16, "dequant_fp8_blockwise_f16", "quant_fp8_blockwise_f16", "172", "223");
+blockwise_fp8!(launch_dequant_fp8_blockwise_kernel_bf16, launch_quant_fp8_blockwise_kernel_bf16, u16, "dequant_fp8_blockwise_bf16", "quant_fp8_blockwise_bf16", "189", "240");
+
+// ============================================================================ blockwise FP8 GEMM
+// (blockwise_fp8_gemm.cu's CUDA_CHECK prints but does not exit.)
+macro_rules! fp8_gemm {
+    ($mm:ident, $moe:ident, $kmm:literal, $kmoe:literal, $l1:literal, $l2:literal) => {
+        pub unsafe extern "C" fn $mm(
+            input: *const u16, weight: *const u8, weight_scale: *const f32, output: *mut u16, m: i32, n: i32, k: i32, scale_row_stride: i32,
+            block_size_y: i32, block_size_x: i32, stream: *mut c_void,
+        ) {
+            let grid = ((n.wrapping_add(31) / 32) as u32, (m.wrapping_add(31) / 32) as u32, 1);
+            let (mut a, mut b, mut c, mut d) = (input, weight, weight_scale, output);
+            let (mut mm, mut nn, mut kk, mut s, mut by, mut bx) = (m, n, k, scale_row_stride, block_size_y, block_size_x);
+            unsafe { launch_checked($kmm, grid, (32, 32, 1), 0, stream, &mut args!(a, b, c, d, mm, nn, kk, s, by, bx), concat!("kernels/blockwise_fp8/blockwise_fp8_gemm.cu:", $l1), false) }
+        }
+        pub unsafe extern "C" fn $moe(
+            input: *const u16, weights: *const u8, weight_scales: *const f32, indices: *const u32, output: *mut u16, num_tokens: i32, topk: i32,
+            num_experts: i32, n: i32, k: i32, scale_row_stride: i32, block_size_y: i32, block_size_x: i32, input_has_topk_dim: bool,
+            stream: *mut c_void,
+        ) {
+            let total = num_tokens.wrapping_mul(topk).wrapping_mul(n);
+            let nb = total.wrapping_add(15) / 16;
+            let (mut a, mut b, mut c, mut d, mut e) = (input, weights, weight_scales, indices, output);
+            let (mut nt, mut tk, mut ne, mut nn, mut kk, mut s, mut by, mut bx) = (num_tokens, topk, num_experts, n, k, scale_row_stride, block_size_y, block_size_x);
+            let mut ht = input_has_topk_dim as u8;
+            unsafe {
+                launch_checked($kmoe, (nb as u32, 1, 1), (512, 1, 1), 0, stream, &mut args!(a, b, c, d, e, nt, tk, ne, nn, kk, s, by, bx, ht), concat!("kernels/blockwise_fp8/blockwise_fp8_gemm.cu:", $l2), false)
+            }
+        }
+    };
+}
+fp8_gemm!(launch_fp8_matmul_f16, launch_fp8_indexed_moe_gemm_f16, "fp8_matmul_f16", "fp8_moe_gemm_f16", "282", "325");
+fp8_gemm!(launch_fp8_matmul_bf16, launch_fp8_indexed_moe_gemm_bf16, "fp8_matmul_bf16", "fp8_moe_gemm_bf16", "300", "350");
+
+// ============================================================================ GPTQ (exllama)
+// All four launchers use the legacy default stream and do not check errors.
+
+/// `gemm_half_q_half_cuda_part`: `pick_gemm_half_q_half_gptq_kernel(true, m_count, bit)`; a NULL
+/// pick (m_count outside 1..=8 or bit not in {2, 3, 4, 8}) launches nothing.
+pub unsafe extern "C" fn gemm_half_q_half_cuda_part(
+    a: *const u16, b_q_weight: *const u32, b_gptq_qzeros: *const u32, b_gptq_scales: *const u16, b_q_perm: *const i32, c: *mut u16,
+    size_m: i32, size_n: i32, size_k: i32, m_count: i32, groups: i32, bit: i32,
+) {
+    const NAMES: [[&str; 8]; 4] = [
+        ["gptq_gemm_2bit_m1", "gptq_gemm_2bit_m2", "gptq_gemm_2bit_m3", "gptq_gemm_2bit_m4", "gptq_gemm_2bit_m5", "gptq_gemm_2bit_m6", "gptq_gemm_2bit_m7", "gptq_gemm_2bit_m8"],
+        ["gptq_gemm_3bit_m1", "gptq_gemm_3bit_m2", "gptq_gemm_3bit_m3", "gptq_gemm_3bit_m4", "gptq_gemm_3bit_m5", "gptq_gemm_3bit_m6", "gptq_gemm_3bit_m7", "gptq_gemm_3bit_m8"],
+        ["gptq_gemm_4bit_m1", "gptq_gemm_4bit_m2", "gptq_gemm_4bit_m3", "gptq_gemm_4bit_m4", "gptq_gemm_4bit_m5", "gptq_gemm_4bit_m6", "gptq_gemm_4bit_m7", "gptq_gemm_4bit_m8"],
+        ["gptq_gemm_8bit_m1", "gptq_gemm_8bit_m2", "gptq_gemm_8bit_m3", "gptq_gemm_8bit_m4", "gptq_gemm_8bit_m5", "gptq_gemm_8bit_m6", "gptq_gemm_8bit_m7", "gptq_gemm_8bit_m8"],
+    ];
+    let bi = match bit { 2 => 0, 3 => 1, 4 => 2, 8 => 3, _ => return };
+    if !(1..=8).contains(&m_count) {
+        return;
+    }
+    let grid = (
+        (size_n.wrapping_add(511) / 512) as u32,
+        (size_m.wrapping_add(m_count - 1) / m_count) as u32,
+        (size_k.wrapping_add(127) / 128) as u32,
+    );
+    let (mut a0, mut a1, mut a2, mut a3, mut a4) = (a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c);
+    let (mut m, mut n, mut k, mut g, mut p) = (size_m, size_n, size_k, groups, b_q_perm);
+    unsafe { launch(NAMES[bi][(m_count - 1) as usize], grid, (128, 1, 1), 0, std::ptr::null_mut(), &mut args!(a0, a1, a2, a3, a4, m, n, k, g, p)) }
+}
+
+/// `reconstruct_exllama`: any `bit` other than 2, 3, 8 uses the 4-bit kernel.
+pub unsafe extern "C" fn reconstruct_exllama(
+    b_q_weight: *const u32, b_gptq_qzeros: *const u32, b_gptq_scales: *const u16, b_q_perm: *const i32, out: *mut u16, height: i32, width: i32,
+    groups: i32, bit: i32,
+) {
+    let name = match bit { 2 => "reconstruct_exllama_2bit", 3 => "reconstruct_exllama_3bit", 8 => "reconstruct_exllama_8bit", _ => "reconstruct_exllama_4bit" };
+    let grid = ((width.wrapping_add(127) / 128) as u32, (height.wrapping_add(127) / 128) as u32, 1);
+    let (mut a0, mut a1, mut a2, mut a3) = (b_q_weight, b_q_perm, b_gptq_qzeros, b_gptq_scales);
+    let (mut h, mut w, mut g, mut o) = (height, width, groups, out);
+    unsafe { launch(name, grid, (128, 1, 1), 0, std::ptr::null_mut(), &mut args!(a0, a1, a2, a3, h, w, g, o)) }
+}
+
+/// `gemm_half_q_half_alt`: the 8-bit kernel for bit == 8, else the 4-bit one; height = k / 32 * bit.
+pub unsafe extern "C" fn gemm_half_q_half_alt(
+    a: *const u16, b_q_weight: *const u32, b_gptq_qzeros: *const u32, b_gptq_scales: *const u16, b_g_idx: *const i32, c: *mut u16, size_m: i32,
+    size_n: i32, size_k: i32, bit: i32,
+) {
+    let name = if bit == 8 { "gemm_half_q_half_alt_8bit" } else { "gemm_half_q_half_alt_4bit" };
+    let grid = ((size_n.wrapping_add(127) / 128) as u32, (size_m.wrapping_add(7) / 8) as u32, (size_k.wrapping_add(127) / 128) as u32);
+    let (mut v, mut mat, mut mo, mut sc, mut z, mut gi) = (a, b_q_weight, c, b_gptq_scales, b_gptq_qzeros, b_g_idx);
+    let (mut batch, mut height, mut width) = (size_m, (size_k / 32).wrapping_mul(bit), size_n);
+    unsafe { launch(name, grid, (128, 1, 1), 0, std::ptr::null_mut(), &mut args!(v, mat, mo, sc, z, gi, batch, height, width)) }
+}
+
+/// `reconstruct_gptq`: 4-bit kernel unless bit is 2, 8 or 3 (3 also switches grid.y to height / 32).
+pub unsafe extern "C" fn reconstruct_gptq(
+    b_q_weight: *const u32, b_gptq_qzeros: *const u32, b_gptq_scales: *const u16, b_g_idx: *const i32, out: *mut u16, height: i32, width: i32,
+    groups: i32, bit: i32,
+) {
+    let per = 32 / bit;
+    let mut gy = height.wrapping_add(per - 1) / per;
+    let name = match bit {
+        2 => "reconstruct_gptq_2bit",
+        8 => "reconstruct_gptq_8bit",
+        3 => {
+            gy = height.wrapping_add(31) / 32;
+            "reconstruct_gptq_3bit"
+        }
+        _ => "reconstruct_gptq_4bit",
+    };
+    let grid = ((width.wrapping_add(127) / 128) as u32, gy as u32, 1);
+    let (mut w, mut s, mut z, mut gi) = (b_q_weight, b_gptq_scales, b_gptq_qzeros, b_g_idx);
+    let (mut h, mut wd, mut g, mut o) = (height, width, groups, out);
+    unsafe { launch(name, grid, (128, 1, 1), 0, std::ptr::null_mut(), &mut args!(w, s, z, gi, h, wd, g, o)) }
+}
+
+// ============================================================================ MXFP4
+// mxfp4_gemm.cu / mxfp4_gemm_wmma.cu: CUDA_CHECK prints and continues.
+
+/// `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem)` + CUDA_CHECK.
+unsafe fn set_max_dyn_smem(name: &'static str, stream: *mut c_void, smem: usize, site: &str) {
+    unsafe {
+        let f = function(name, stream as sys::CUstream);
+        let r = sys::cuFuncSetAttribute(f, sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32);
+        if r as i32 != 0 {
+            eprintln!("CUDA error at {site}: invalid argument");
+        }
+    }
+}
+
+macro_rules! mxfp4_launchers {
+    ($t:literal, $mm:ident, $moe:ident, $grp:ident, $wmma:ident, $gwmma:ident, $l_mm:literal, $l_moe:literal, $l_grp_attr:literal, $l_grp:literal, $l_wmma:literal, $l_gwmma_attr:literal, $l_gwmma:literal) => {
+        pub unsafe extern "C" fn $mm(
+            input: *const u16, weight: *const u8, weight_scale: *const u8, bias: *const u16, output: *mut u16, m: i32, n: i32, k: i32, has_bias: bool,
+            stream: *mut c_void,
+        ) {
+            let (mut a, mut b, mut c, mut d, mut e) = (input, weight, weight_scale, bias, output);
+            let (mut mm, mut nn, mut kk, mut hb) = (m, n, k, has_bias as u8);
+            let (name, grid, block) = if m <= 4 {
+                (concat!("mxfp4_vecmat_", $t), ((n.wrapping_add(3) / 4) as u32, m as u32, 1), (256, 1, 1))
+            } else {
+                (concat!("mxfp4_matmul_tiled_", $t), ((n.wrapping_add(63) / 64) as u32, (m.wrapping_add(63) / 64) as u32, 1), (16, 16, 1))
+            };
+            unsafe { launch_checked(name, grid, block, 0, stream, &mut args!(a, b, c, d, e, mm, nn, kk, hb), concat!("kernels/mxfp4/mxfp4_gemm.cu:", $l_mm), false) }
+        }
+        pub unsafe extern "C" fn $moe(
+            input: *const u16, weights: *const u8, weight_scales: *const u8, biases: *const u16, indices: *const u32, output: *mut u16, num_tokens: i32,
+            topk: i32, num_experts: i32, n: i32, k: i32, has_bias: bool, input_has_topk_dim: bool, stream: *mut c_void,
+        ) {
+            let n_chunks = n.wrapping_add(7) / 8;
+            let total = if input_has_topk_dim { num_tokens.wrapping_mul(topk).wrapping_mul(n_chunks) } else { num_tokens.wrapping_mul(n_chunks) };
+            let smem = (k.wrapping_add(k.wrapping_add(31) / 32) as i64 as u64).wrapping_mul(4);
+            let (mut a, mut b, mut c, mut d, mut e, mut f) = (input, weights, weight_scales, biases, indices, output);
+            let (mut nt, mut tk, mut ne, mut nn, mut kk, mut hb, mut ht) = (num_tokens, topk, num_experts, n, k, has_bias as u8, input_has_topk_dim as u8);
+            unsafe {
+                launch_checked(concat!("mxfp4_moe_gemm_", $t), (total as u32, 1, 1), (256, 1, 1), smem as u32, stream,
+                    &mut args!(a, b, c, d, e, f, nt, tk, ne, nn, kk, hb, ht), concat!("kernels/mxfp4/mxfp4_gemm.cu:", $l_moe), false)
+            }
+        }
+        pub unsafe extern "C" fn $grp(
+            input: *const u16, weights: *const u8, weight_scales: *const u8, biases: *const u16, indices: *const u32, output: *mut u16, num_tokens: i32,
+            topk: i32, num_experts: i32, n: i32, k: i32, has_bias: bool, input_has_topk_dim: bool, stream: *mut c_void,
+        ) {
+            let smem = (num_tokens.wrapping_mul(topk) as i64 as u64).wrapping_mul(4) as usize;
+            const NAME: &str = concat!("mxfp4_moe_grouped_tiled_", $t);
+            unsafe { set_max_dyn_smem(NAME, stream, smem, concat!("kernels/mxfp4/mxfp4_gemm.cu:", $l_grp_attr)) };
+            let (mut a, mut b, mut c, mut d, mut e, mut f) = (input, weights, weight_scales, biases, indices, output);
+            let (mut nt, mut tk, mut ne, mut nn, mut kk, mut hb, mut ht) = (num_tokens, topk, num_experts, n, k, has_bias as u8, input_has_topk_dim as u8);
+            unsafe {
+                launch_checked(NAME, ((n.wrapping_add(63) / 64) as u32, num_experts as u32, 1), (16, 16, 1), smem as u32, stream,
+                    &mut args!(a, b, c, d, e, f, nt, tk, ne, nn, kk, hb, ht), concat!("kernels/mxfp4/mxfp4_gemm.cu:", $l_grp), false)
+            }
+        }
+        pub unsafe extern "C" fn $wmma(
+            input: *const u16, weight: *const u8, weight_scale: *const u8, bias: *const u16, output: *mut u16, m: i32, n: i32, k: i32, has_bias: bool,
+            stream: *mut c_void,
+        ) {
+            if m <= 4 {
+                return unsafe { $mm(input, weight, weight_scale, bias, output, m, n, k, has_bias, stream) };
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (input, weight, weight_scale, bias, output);
+            let (mut mm, mut nn, mut kk, mut hb) = (m, n, k, has_bias as u8);
+            unsafe {
+                launch_checked(concat!("mxfp4_matmul_wmma_", $t), ((n.wrapping_add(63) / 64) as u32, (m.wrapping_add(63) / 64) as u32, 1), (256, 1, 1),
+                    WMMA_SMEM as u32, stream, &mut args!(a, b, c, d, e, mm, nn, kk, hb), concat!("kernels/mxfp4/mxfp4_gemm_wmma.cu:", $l_wmma), false)
+            }
+        }
+        pub unsafe extern "C" fn $gwmma(
+            input: *const u16, weights: *const u8, weight_scales: *const u8, biases: *const u16, indices: *const u32, output: *mut u16, num_tokens: i32,
+            topk: i32, num_experts: i32, n: i32, k: i32, has_bias: bool, input_has_topk_dim: bool, stream: *mut c_void,
+        ) {
+            let tlb = (num_tokens.wrapping_mul(topk).wrapping_mul(4).wrapping_add(15)) & !15;
+            let smem = (tlb as i64 as u64).wrapping_add(WMMA_SMEM as u64) as usize;
+            const NAME: &str = concat!("mxfp4_moe_grouped_wmma_", $t);
+            unsafe { set_max_dyn_smem(NAME, stream, smem, concat!("kernels/mxfp4/mxfp4_gemm_wmma.cu:", $l_gwmma_attr)) };
+            let (mut a, mut b, mut c, mut d, mut e, mut f) = (input, weights, weight_scales, biases, indices, output);
+            let (mut nt, mut tk, mut ne, mut nn, mut kk, mut hb, mut ht) = (num_tokens, topk, num_experts, n, k, has_bias as u8, input_has_topk_dim as u8);
+            unsafe {
+                launch_checked(NAME, ((n.wrapping_add(63) / 64) as u32, num_experts as u32, 1), (256, 1, 1), smem as u32, stream,
+                    &mut args!(a, b, c, d, e, f, nt, tk, ne, nn, kk, hb, ht), concat!("kernels/mxfp4/mxfp4_gemm_wmma.cu:", $l_gwmma), false)
+            }
+        }
+    };
+}
+/// `wmma_smem_bytes()`: A_sh + B_sh (2 x 64 x 32 x 2 bytes) + C_sh (64 x 64 x 4 bytes).
+const WMMA_SMEM: usize = 24576;
+mxfp4_launchers!("f16", launch_mxfp4_matmul_f16, launch_mxfp4_indexed_moe_gemm_f16, launch_mxfp4_moe_grouped_gemm_f16,
+    launch_mxfp4_matmul_wmma_f16, launch_mxfp4_moe_grouped_gemm_wmma_f16, "798", "844", "889", "897", "540", "579", "587");
+mxfp4_launchers!("bf16", launch_mxfp4_matmul_bf16, launch_mxfp4_indexed_moe_gemm_bf16, launch_mxfp4_moe_grouped_gemm_bf16,
+    launch_mxfp4_matmul_wmma_bf16, launch_mxfp4_moe_grouped_gemm_wmma_bf16, "823", "867", "911", "920", "564", "603", "611");
+
+/// `mxfp4_get_max_smem_optin()`: cudaDevAttrMaxSharedMemoryPerBlockOptin of the current device.
+pub unsafe extern "C" fn mxfp4_get_max_smem_optin() -> i32 {
+    unsafe {
+        let _ = stream_context(std::ptr::null_mut());
+        let mut dev: sys::CUdevice = 0;
+        let mut v: i32 = 0;
+        if sys::cuCtxGetDevice(&mut dev) != 0 {
+            return 0;
+        }
+        let _ = sys::cuDeviceGetAttribute(&mut v, sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev);
+        v
+    }
+}
+
+// ============================================================================ Marlin
+fn dev_attr(attr: sys::CUdevice_attribute) -> i32 {
+    unsafe {
+        let _ = stream_context(std::ptr::null_mut());
+        let mut dev: sys::CUdevice = 0;
+        let _ = sys::cuDeviceGet(&mut dev, 0);
+        let mut v = 0i32;
+        let _ = sys::cuDeviceGetAttribute(&mut v, attr, dev);
+        v
+    }
+}
+fn div_ceil_i(a: i32, b: i32) -> i32 {
+    (a + b - 1) / b
+}
+#[derive(Clone, Copy)]
+struct ThCfg {
+    thread_k: i32,
+    thread_n: i32,
+    num_threads: i32,
+}
+const SMALL_CFGS: [ThCfg; 4] = [
+    ThCfg { thread_k: 128, thread_n: 128, num_threads: 256 },
+    ThCfg { thread_k: 128, thread_n: 64, num_threads: 128 },
+    ThCfg { thread_k: 64, thread_n: 256, num_threads: 256 },
+    ThCfg { thread_k: 64, thread_n: 128, num_threads: 128 },
+];
+const LARGE_CFGS: [ThCfg; 4] = [
+    ThCfg { thread_k: 64, thread_n: 256, num_threads: 256 },
+    ThCfg { thread_k: 128, thread_n: 128, num_threads: 256 },
+    ThCfg { thread_k: 64, thread_n: 128, num_threads: 128 },
+    ThCfg { thread_k: 128, thread_n: 64, num_threads: 128 },
+];
+/// `get_scales_cache_size` (no act_order, is_k_full).
+fn scales_cache_size(c: ThCfg, group_size: i32) -> i32 {
+    let tb_groups = if group_size == -1 { 1 } else if group_size == 0 { div_ceil_i(c.thread_k, 32) } else { div_ceil_i(c.thread_k, group_size) };
+    tb_groups * c.thread_n * 2 * 4
+}
+fn is_valid_cache_size(c: ThCfg, mut max_m_blocks: i32, prob_m: i32, num_bits: i32, scales_cache: i32, max_shared_mem: i32) -> bool {
+    let pack_factor = 32 / num_bits;
+    let b_size = (c.thread_k * c.thread_n / pack_factor) * 4;
+    let m_blocks = div_ceil_i(prob_m, 16);
+    let mut tb_max_m = 16;
+    loop {
+        if m_blocks >= max_m_blocks {
+            tb_max_m *= max_m_blocks;
+            break;
+        }
+        max_m_blocks -= 1;
+        // (m_blocks == 0 would loop forever in C++ as well; CHECK is a no-op)
+    }
+    let a_size = (tb_max_m * c.thread_k) * 2;
+    let pipe_size = ((a_size + b_size) * 4) as f32;
+    let reduce_size = std::cmp::max(c.num_threads * 32 * 4, (c.thread_n / 64) * 32 * (tb_max_m / 16) * 4 * 2 * 4 * 2) as f32;
+    pipe_size + reduce_size < 0.95f32 * ((max_shared_mem - scales_cache) as f32)
+}
+fn is_valid_config(c: ThCfg, max_m_blocks: i32, prob_m: i32, prob_n: i32, prob_k: i32, group_size: i32, max_shared_mem: i32) -> bool {
+    if prob_k % c.thread_k != 0 || prob_n % c.thread_n != 0 {
+        return false;
+    }
+    if c.thread_n < 64 || c.thread_k < 64 || c.num_threads < 128 {
+        return false;
+    }
+    let sc = scales_cache_size(c, group_size);
+    is_valid_cache_size(c, max_m_blocks, prob_m, 4, sc, max_shared_mem)
+}
+fn determine_thread_config(prob_m: i32, prob_n: i32, prob_k: i32, group_size: i32, max_shared_mem: i32) -> (i32, ThCfg) {
+    let mut max_m_blocks = 4;
+    while max_m_blocks > 0 {
+        let cfgs = if prob_m <= 16 { &SMALL_CFGS } else { &LARGE_CFGS };
+        for &c in cfgs {
+            if is_valid_config(c, max_m_blocks, prob_m, prob_n, prob_k, group_size, max_shared_mem) {
+                return (max_m_blocks, c);
+            }
+        }
+        max_m_blocks -= 1;
+    }
+    (0, ThCfg { thread_k: -1, thread_n: -1, num_threads: -1 })
+}
+
+/// `marlin_matmul<scalar_t, kU4B8 | kU4, has_zp, 4>`: legacy-free, launches on `stream`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn marlin_matmul(
+    prefix: &str, a: *const c_void, b: *const c_void, scales: *mut c_void, zeros: *mut c_void, c: *mut c_void, prob_m_in: i32, prob_k: i32,
+    prob_n: i32, workspace: *mut c_void, groupsize: i32, stream: i64,
+) {
+    const SHARED_MEM: i32 = 96 * 1024;
+    let stream = stream as usize as *mut c_void;
+    let tot_m = prob_m_in;
+    let tot_m_blocks = div_ceil_i(tot_m, 16);
+    let pad = 16 * tot_m_blocks - tot_m;
+    let sms = dev_attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    let max_shared_mem = dev_attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN);
+    let (max_m_blocks, cfg) = determine_thread_config(prob_m_in, prob_n, prob_k, groupsize, max_shared_mem);
+    let num_threads = cfg.num_threads;
+    let thread_k_blocks = cfg.thread_k / 16;
+    let thread_n_blocks = cfg.thread_n / 16;
+    let group_blocks = if groupsize == -1 { -1 } else { groupsize / 16 };
+    let blocks = sms;
+    let num_groups = prob_k / groupsize;
+    if prob_m_in == 0 || prob_n == 0 || prob_k == 0 {
+        return;
+    }
+    let mut a_ptr = a as *const [u32; 4];
+    let mut c_ptr = c as *mut [u32; 4];
+    let mut i = 0;
+    while i < tot_m_blocks {
+        let mut thread_m_blocks = tot_m_blocks - i;
+        let mut prob_m = tot_m - 16 * i;
+        let mut par = 1;
+        if thread_m_blocks > max_m_blocks {
+            par = (16 * thread_m_blocks - pad) / (16 * max_m_blocks);
+            if par > 16 {
+                par = 16;
+            }
+            prob_m = (16 * max_m_blocks) * par;
+            i += max_m_blocks * (par - 1);
+            thread_m_blocks = max_m_blocks;
+        }
+        let known = matches!((thread_n_blocks, thread_k_blocks, num_threads), (8, 8, 256) | (16, 4, 256) | (8, 4, 128) | (4, 8, 128))
+            && (1..=4).contains(&thread_m_blocks)
+            && matches!(group_blocks, -1 | 4 | 8);
+        if !known {
+            // C++: throw std::runtime_error("Unsupported shapes: MKN") through an extern "C" frame.
+            eprintln!("terminate called after throwing an instance of 'std::runtime_error'\n  what():  Unsupported shapes: MKN");
+            std::process::abort();
+        }
+        let gname = if group_blocks == -1 { "m1".to_string() } else { group_blocks.to_string() };
+        let name = format!("{prefix}_t{num_threads}_m{thread_m_blocks}_n{thread_n_blocks}_k{thread_k_blocks}_g{gname}");
+        let name: &'static str = intern(name);
+        unsafe {
+            let f = function(name, stream as sys::CUstream);
+            let _ = sys::cuFuncSetAttribute(f, sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SHARED_MEM);
+        }
+        let (mut a0, mut b0, mut c0, mut s0, mut z0) = (a_ptr, b as *const [u32; 4], c_ptr, scales as *const [u32; 4], zeros as *const [u32; 4]);
+        let mut g0: *const i32 = std::ptr::null();
+        let (mut pm, mut pn, mut pk, mut ng, mut lk) = (prob_m, prob_n, prob_k, num_groups, workspace as *mut i32);
+        unsafe { launch(name, (blocks as u32, 1, 1), (num_threads as u32, 1, 1), SHARED_MEM as u32, stream, &mut args!(a0, b0, c0, s0, z0, g0, pm, pn, pk, ng, lk)) };
+        a_ptr = a_ptr.wrapping_offset((16 * thread_m_blocks * (prob_k / 8) * par) as isize);
+        c_ptr = c_ptr.wrapping_offset((16 * thread_m_blocks * (prob_n / 8) * par) as isize);
+        i += max_m_blocks;
+    }
+}
+
+/// Leak-once interning of generated kernel names (the function cache keys on `&'static str`).
+fn intern(s: String) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut m = NAMES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some(&v) = m.get(&s) {
+        return v;
+    }
+    let v: &'static str = Box::leak(s.clone().into_boxed_str());
+    m.insert(s, v);
+    v
+}
+
+macro_rules! marlin_launcher {
+    ($name:ident, $prefix:literal) => {
+        pub unsafe extern "C" fn $name(
+            a: *const c_void, b: *const c_void, scales: *mut c_void, zeros: *mut c_void, c: *mut c_void, prob_m: i32, prob_k: i32, prob_n: i32,
+            workspace: *mut c_void, groupsize: i32, stream: i64,
+        ) {
+            unsafe { marlin_matmul($prefix, a, b, scales, zeros, c, prob_m, prob_k, prob_n, workspace, groupsize, stream) }
+        }
+    };
+}
+marlin_launcher!(marlin_gptq_4bit_f16, "marlin_gptq_f16");
+marlin_launcher!(marlin_gptq_4bit_bf16, "marlin_gptq_bf16");
+marlin_launcher!(marlin_awq_4bit_f16, "marlin_awq_f16");
+marlin_launcher!(marlin_awq_4bit_bf16, "marlin_awq_bf16");
+
+/// `gptq_marlin_repack`: `has_perm` is hard-wired to true in the C code, so the perm kernel runs
+/// for every call (a null `perm` faults there as well). Host asserts are active (no NDEBUG).
+pub unsafe extern "C" fn gptq_marlin_repack(weight: *mut c_void, perm: *mut c_void, out: *mut c_void, size_k: i32, size_n: i32, num_bits: i32, stream: i64) {
+    assert!(size_k % 16 == 0, "size_k % tile_k_size == 0");
+    assert!(size_n % 64 == 0, "size_n % tile_n_size == 0");
+    assert!(num_bits == 4 || num_bits == 8, "num_bits == 4 || num_bits == 8");
+    let blocks = dev_attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    let name = if num_bits == 4 { "gptq_marlin_repack_4_perm" } else { "gptq_marlin_repack_8_perm" };
+    let stream = stream as usize as *mut c_void;
+    let (mut w, mut p, mut o, mut k, mut n) = (weight as *const u32, perm as *const u32, out as *mut u32, size_k, size_n);
+    unsafe { launch(name, (blocks as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(w, p, o, k, n)) }
+}
+
+/// `awq_marlin_repack(in, perm, out, k, n, num_bits)`: size_n = n * pack_factor; `perm` unused.
+pub unsafe extern "C" fn awq_marlin_repack(inp: *mut c_void, perm: *mut c_void, out: *mut c_void, k: i32, n: i32, num_bits: i32, stream: i64) {
+    let _ = perm;
+    let pack_factor = 32 / num_bits;
+    let (size_k, size_n) = (k, n * pack_factor);
+    let blocks = dev_attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    let name = match num_bits { 4 => "awq_marlin_repack_4", 8 => "awq_marlin_repack_8", _ => return };
+    let stream = stream as usize as *mut c_void;
+    let (mut w, mut o, mut kk, mut nn) = (inp as *const u32, out as *mut u32, size_k, size_n);
+    unsafe { launch(name, (blocks as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(w, o, kk, nn)) }
+}
+
+// ============================================================================ bitsandbytes
+macro_rules! bnb_launcher {
+    ($name:ident, $t:ty, $k:literal, $four:expr) => {
+        pub unsafe extern "C" fn $name(code: *mut f32, a: *mut u8, absmax: *mut f32, out: *mut $t, blocksize: i32, n: i32, stream: *mut c_void) {
+            let tile = if $four { 1024 } else { 512 };
+            let grid = (n.wrapping_add(tile - 1) / tile) as u32;
+            let (mut c, mut aa, mut am, mut o) = (code as *const f32, a as *const u8, absmax as *const f32, out);
+            let (mut bs, mut nn) = (if $four { blocksize / 2 } else { blocksize }, n);
+            unsafe { launch($k, (grid, 1, 1), (64, 1, 1), 0, stream, &mut args!(c, aa, am, o, bs, nn)) }
+        }
+    };
+}
+bnb_launcher!(dequantize_blockwise_f32_int8, f32, "bnb_dequant_f32_int8", false);
+bnb_launcher!(dequantize_blockwise_f32_fp4, f32, "bnb_dequant_f32_fp4", true);
+bnb_launcher!(dequantize_blockwise_f32_nf4, f32, "bnb_dequant_f32_nf4", true);
+bnb_launcher!(dequantize_blockwise_f16_int8, u16, "bnb_dequant_f16_int8", false);
+bnb_launcher!(dequantize_blockwise_f16_fp4, u16, "bnb_dequant_f16_fp4", true);
+bnb_launcher!(dequantize_blockwise_f16_nf4, u16, "bnb_dequant_f16_nf4", true);
+bnb_launcher!(dequantize_blockwise_bf16_int8, u16, "bnb_dequant_bf16_int8", false);
+bnb_launcher!(dequantize_blockwise_bf16_fp4, u16, "bnb_dequant_bf16_fp4", true);
+bnb_launcher!(dequantize_blockwise_bf16_nf4, u16, "bnb_dequant_bf16_nf4", true);
+
+// ============================================================================ CUTLASS grouped GEMM
+/// `launch_cutlass_moe_grouped_gemm_2x_bf16`: problem sizes / pointers / leading dims live in
+/// device memory (device-only scheduling), so the grid is persistent (4 blocks per SM) and every
+/// block walks the tiles of all problems. Returns 0 (cutlass::Status::kSuccess) when launched.
+pub unsafe extern "C" fn launch_cutlass_moe_grouped_gemm_2x_bf16(
+    a_ptrs: *mut *const c_void, b_ptrs: *mut *const c_void, d_ptrs: *mut *mut c_void, problem_sizes: *const i32, problem_count: i32,
+    lda: *mut i64, ldb: *mut i64, ldd: *mut i64, workspace: *mut c_void, workspace_size: usize, tile_cfg: i32, stream: *mut c_void,
+) -> i32 {
+    let _ = (workspace, workspace_size);
+    let name = match tile_cfg { 0 => "grouped_mm_2x_large", 1 => "grouped_mm_2x_medium", _ => "grouped_mm_2x_small" };
+    let sms = dev_attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    let (mut a, mut b, mut d, mut ps, mut pc) = (a_ptrs as *const *const u16, b_ptrs as *const *const u16, d_ptrs as *const *mut u16, problem_sizes, problem_count);
+    let (mut la, mut lb, mut ld) = (lda as *const i64, ldb as *const i64, ldd as *const i64);
+    unsafe {
+        let s = stream as sys::CUstream;
+        let f = function(name, s);
+        let mut args = args!(a, b, d, ps, pc, la, lb, ld);
+        let r = sys::cuLaunchKernel(f, (sms * 4) as u32, 1, 1, 128, 1, 1, 0, s, args.as_mut_ptr(), std::ptr::null_mut());
+        if r as i32 != 0 { 7 } else { 0 } // kErrorInternal
+    }
+}
+
+/// `cutlass_moe_grouped_gemm_2x_workspace_size`: the device-only problem visitor needs none.
+pub unsafe extern "C" fn cutlass_moe_grouped_gemm_2x_workspace_size(problem_count: i32) -> usize {
+    let _ = problem_count;
+    0
+}

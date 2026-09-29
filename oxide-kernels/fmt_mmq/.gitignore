@@ -1,0 +1,5 @@
+.mut/
+target/
+# rebuilt by ref/nvcc_*.sh (cubins are ignored repo-wide)
+ref/*.ptx
+ref/*.log

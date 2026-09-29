@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mistral.rs</title>
+    <base href="/ui/" />
+    <script type="module" crossorigin src="./assets/index-DBhCojWe.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-D59UDrzn.css">
+  </head>
+  <body class="bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100">
+    <div id="app"></div>
+    <script>
+      // link to the live monitor in the header (the bundle predates it; webui/ModelBar.svelte has it too)
+      new MutationObserver((_, obs) => {
+        const tools = document.querySelector('header button[aria-label="Tools panel"]');
+        if (!tools || document.getElementById("titan-monitor-link")) return;
+        const a = document.createElement("a");
+        a.id = "titan-monitor-link";
+        a.href = "/monitor";
+        a.title = "Live monitor";
+        a.textContent = "Monitor";
+        a.className = "rounded-md px-2 py-1 text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200";
+        tools.before(a);
+      }).observe(document.getElementById("app"), { childList: true, subtree: true });
+    </script>
+  </body>
+</html>

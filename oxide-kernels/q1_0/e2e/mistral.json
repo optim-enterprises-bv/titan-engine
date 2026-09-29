@@ -1,0 +1,140 @@
+[
+ {
+  "prompt": "The capital of France is",
+  "text": "Paris. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of",
+  "top4": {
+   "12095": 1.1454347,
+   "279": 1.0539825,
+   "3070": 1.046433,
+   "537": 1.0221335
+  },
+  "secs": 0.443554162979126,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 5,
+   "total_tokens": 69,
+   "avg_tok_per_sec": 167.88322,
+   "avg_prompt_tok_per_sec": 500.0,
+   "avg_compl_tok_per_sec": 159.601,
+   "total_time_sec": 0.411,
+   "total_prompt_time_sec": 0.01,
+   "total_completion_time_sec": 0.401
+  },
+  "timings": null
+ },
+ {
+  "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+  "text": "if n <= 0:\n        raise ValueError(\"n must be a positive integer\")\n    elif n == 1:\n        return 0\n    elif n == 2:\n        return 1\n    else:\n        return fibonacci(n - 1) + fibonacci(n - 2)\n\ndef fibonacci(n):\n",
+  "top4": {
+   "262": 1.270719,
+   "1066": 1.1043786,
+   "198": 1.0309434,
+   "13874": 0.9666155
+  },
+  "secs": 0.5119326114654541,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "avg_tok_per_sec": 156.82281,
+   "avg_prompt_tok_per_sec": 112.06897,
+   "avg_compl_tok_per_sec": 170.66667,
+   "total_time_sec": 0.491,
+   "total_prompt_time_sec": 0.116,
+   "total_completion_time_sec": 0.375
+  },
+  "timings": null
+ },
+ {
+  "prompt": "Once upon a time, in a small village by the sea,",
+  "text": "there lived a young girl named Lila. She was known for her love of the sea and her ability to speak with the waves. The villagers often said that she was the daughter of the ocean itself. One day, a great storm came and caused the sea to rise. Lila was the only one who could calm",
+  "top4": {
+   "1052": 1.2111356,
+   "12163": 1.1308239,
+   "264": 1.0559449,
+   "279": 1.0173445
+  },
+  "secs": 0.5152418613433838,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "avg_tok_per_sec": 155.24194,
+   "avg_prompt_tok_per_sec": 108.333336,
+   "avg_compl_tok_per_sec": 170.21275,
+   "total_time_sec": 0.496,
+   "total_prompt_time_sec": 0.12,
+   "total_completion_time_sec": 0.376
+  },
+  "timings": null
+ },
+ {
+  "prompt": "The three laws of thermodynamics are",
+  "text": "fundamental principles in physics that describe the behavior of energy and matter. The first law states that energy cannot be created or destroyed, only transformed from one form to another. The second law introduces the concept of entropy, stating that the total entropy of an isolated system can never decrease over time. The third law asserts that as the",
+  "top4": {
+   "15811": 1.1214639,
+   "2989": 1.0742421,
+   "279": 1.0571216,
+   "25": 1.0570841
+  },
+  "secs": 0.3951265811920166,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 7,
+   "total_tokens": 71,
+   "avg_tok_per_sec": 186.3517,
+   "avg_prompt_tok_per_sec": 700.0,
+   "avg_compl_tok_per_sec": 172.50673,
+   "total_time_sec": 0.381,
+   "total_prompt_time_sec": 0.01,
+   "total_completion_time_sec": 0.371
+  },
+  "timings": null
+ },
+ {
+  "prompt": "1, 1, 2, 3, 5, 8, 13,",
+  "text": "21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765",
+  "top4": {
+   "220": 1.2197021,
+   "4992": 1.1146542,
+   "2503": 1.1123141,
+   "12236": 1.0415386
+  },
+  "secs": 0.5408341884613037,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 21,
+   "total_tokens": 85,
+   "avg_tok_per_sec": 163.46153,
+   "avg_prompt_tok_per_sec": 157.89473,
+   "avg_compl_tok_per_sec": 165.37468,
+   "total_time_sec": 0.52,
+   "total_prompt_time_sec": 0.133,
+   "total_completion_time_sec": 0.387
+  },
+  "timings": null
+ },
+ {
+  "prompt": "Translate to German: The weather is nice today.\nGerman:",
+  "text": "Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das",
+  "top4": {
+   "19000": 1.2036425,
+   "8408": 1.1935728,
+   "12741": 1.181584,
+   "9236": 1.121878
+  },
+  "secs": 0.5119779109954834,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 12,
+   "total_tokens": 76,
+   "avg_tok_per_sec": 153.22581,
+   "avg_prompt_tok_per_sec": 100.84034,
+   "avg_compl_tok_per_sec": 169.76128,
+   "total_time_sec": 0.496,
+   "total_prompt_time_sec": 0.119,
+   "total_completion_time_sec": 0.377
+  },
+  "timings": null
+ }
+]

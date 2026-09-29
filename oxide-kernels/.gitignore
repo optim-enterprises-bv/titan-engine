@@ -1,0 +1,11 @@
+target/
+.oxide-artifacts/
+*.ll
+build.log
+tools/
+*.cubin
+reference/candle-ffi/libmoe.a
+reference/*/lib*.a
+.mut/
+refptx/
+mistralrs-paged-attn-b/ref/

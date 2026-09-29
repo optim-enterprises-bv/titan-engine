@@ -1,0 +1,58 @@
+# build output
+target/
+target-*/
+**/target/
+*.so
+*.a
+*.o
+*.cubin
+*.fatbin
+__pycache__/
+*.pyc
+
+# models and model-derived data: never commit
+*.gguf
+*.safetensors
+!candle/candle-examples/**/*.safetensors
+*.bin
+*.npz
+*.trace
+*.trace.xz
+
+# profiler output
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
+*.ncu-rep
+
+# run output, logs, machine state
+*.log
+*.out
+*.nohup
+*.stdout
+*.console
+*.mem
+**/out/
+**/logs/
+**/ctl/
+bench/runs/
+bench/history.jsonl
+bench/history.html
+bench/bin/
+release/bench/results/*.json
+release/bench/state/
+
+# machine-local
+/lib/
+/nocuda-bin/
+/ref/
+.omc/
+**/.omc/
+.gpu.lock
+.nogap
+!mistral.rs/releases/**
+
+# NVIDIA proprietary tools used locally for SASS inspection: never commit
+oxide-kernels/tools/
+*.so.*

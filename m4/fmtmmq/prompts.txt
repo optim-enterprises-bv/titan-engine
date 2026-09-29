@@ -1,0 +1,9 @@
+The capital of France is
+def fibonacci(n):
+    """Return the nth Fibonacci number."""
+In Rust, the borrow checker ensures that
+A mixture-of-experts layer routes each token to
+The three laws of thermodynamics are
+SELECT name, COUNT(*) FROM orders GROUP BY
+WireGuard is a VPN protocol that
+Once upon a time, in a small village by the sea,

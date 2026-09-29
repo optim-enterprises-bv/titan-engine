@@ -1,0 +1,3152 @@
+You are a coding agent working in a Rust repository. The following files are the context for the conversation.
+
+===== mistralrs-core/src/prefix_cacher.rs =====
+use candle_core::{Device, Result};
+use indexmap::IndexMap;
+use itertools::Itertools;
+use tracing::info;
+
+use crate::{
+    kv_cache::RecurrentStateSnapshot, paged_attention::block_hash::BlockHash, pipeline::KvCache,
+    sequence::Sequence,
+};
+
+#[derive(PartialEq, Eq, Debug, Hash)]
+struct Tokens(Vec<u32>);
+
+impl Tokens {
+    /// Returns the length of the common prefix shared with `other`.
+    fn shared_prefix_len(&self, other: &Self) -> usize {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+}
+
+impl From<Vec<u32>> for Tokens {
+    fn from(value: Vec<u32>) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone)]
+struct CacheElement {
+    cache: Vec<Option<KvCache>>,
+    /// Recurrent state snapshots for hybrid models (one per recurrent layer)
+    recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
+    audio_hashes: Option<Vec<u64>>,
+    image_hashes: Option<Vec<u64>>,
+    video_hashes: Option<Vec<u64>>,
+}
+
+impl CacheElement {
+    fn can_rewind_to(&self, len: usize) -> bool {
+        self.cache
+            .iter()
+            .flatten()
+            .all(|layer| layer.try_set_len(len).is_ok())
+    }
+}
+
+pub struct PrefixCacheManagerV2 {
+    caches: IndexMap<Tokens, CacheElement>,
+    paged_recurrent_caches: IndexMap<Vec<BlockHash>, Vec<RecurrentStateSnapshot>>,
+    n_on_device: usize,
+    no_prefix_cache: bool,
+    has_paged_attention: bool,
+}
+
+#[derive(Clone)]
+pub enum MatchingCache {
+    Normal {
+        normal: Vec<Option<KvCache>>,
+        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
+        images_to_keep: usize,
+        audios_to_keep: usize,
+        videos_to_keep: usize,
+        toks: Vec<u32>,
+        offset: usize,
+    },
+}
+
+impl PrefixCacheManagerV2 {
+    pub fn new(n_on_device: usize, no_prefix_cache: bool, has_paged_attention: bool) -> Self {
+        if !no_prefix_cache && !has_paged_attention {
+            info!("Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.");
+        }
+        PrefixCacheManagerV2 {
+            caches: IndexMap::new(),
+            paged_recurrent_caches: IndexMap::new(),
+            n_on_device,
+            no_prefix_cache,
+            has_paged_attention,
+        }
+    }
+
+    fn paged_recurrent_capacity(&self) -> usize {
+        self.n_on_device.max(1).saturating_mul(8)
+    }
+
+    /// This always keeps the cache on the device.
+    pub fn add_sequence(
+        &mut self,
+        seq: &mut Sequence,
+        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
+    ) {
+        // Do not cache if prefix caching disabled
+        if self.no_prefix_cache {
+            return;
+        }
+
+        // For paged attention, prefix caching is handled by the KVCacheManager.
+        // PrefixCacheManagerV2 only handles non-paged attention caching.
+        if !self.has_paged_attention {
+            let cache = seq.normal_cache().to_vec();
+
+            self.caches.insert(
+                seq.get_toks().to_vec().into(),
+                CacheElement {
+                    cache,
+                    recurrent_snapshots,
+                    image_hashes: seq.image_hashes().map(|x| x.to_vec()),
+                    audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
+                    video_hashes: seq.video_hashes().map(|x| x.to_vec()),
+                },
+            );
+        }
+    }
+
+    /// Evict the caches. This will evict the first k seqs such that the number of sequences on device after the copy is
+    /// the maximum allowed. Returns the number of evicted sequences.
+    pub fn evict_caches(&mut self) -> Result<usize> {
+        if self.no_prefix_cache {
+            return Ok(0);
+        }
+        let mut n_on_device = 0;
+        for cache in self.caches.values() {
+            let first_non_none = cache
+                .cache
+                .iter()
+                .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
+            let Some(Some(first_non_none)) = first_non_none else {
+                continue;
+            };
+
+            let cache_device = match first_non_none {
+                KvCache::Normal { k, .. } => {
+                    k.all_data().as_ref().expect("No KV cache data").device()
+                }
+                KvCache::Rotating { k, .. } => {
+                    k.all_data().as_ref().expect("No KV cache data").device()
+                }
+                KvCache::Shared { .. } => continue,
+            };
+
+            if !matches!(cache_device, Device::Cpu) {
+                n_on_device += 1;
+            }
+        }
+        let mut n_evicted = 0;
+        // Intentionally evict the first ones first, as they are the oldest
+        for cache in self.caches.values_mut() {
+            if n_on_device - n_evicted <= self.n_on_device {
+                break;
+            }
+            let first_non_none = cache
+                .cache
+                .iter()
+                .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
+            let Some(Some(first_non_none)) = first_non_none else {
+                continue;
+            };
+
+            let cache_device = match first_non_none {
+                KvCache::Normal { k, .. } => {
+                    k.all_data().as_ref().expect("No KV cache data").device()
+                }
+                KvCache::Rotating { k, .. } => {
+                    k.all_data().as_ref().expect("No KV cache data").device()
+                }
+                KvCache::Shared { .. } => continue,
+            };
+
+            if !matches!(cache_device, Device::Cpu) {
+                cache.cache.clear();
+                n_evicted += 1;
+            }
+        }
+
+        self.caches.retain(|_tokens, cache| !cache.cache.is_empty());
+
+        Ok(n_evicted)
+    }
+
+    /// Evict all the caches.
+    pub fn evict_all_caches(&mut self) -> Result<usize> {
+        let len = self.caches.len();
+        self.caches.clear();
+        self.paged_recurrent_caches.clear();
+        Ok(len)
+    }
+
+    /// Add a recurrent-state snapshot for a paged-attention block-hash prefix key.
+    /// This is used by hybrid models to restore recurrent states alongside paged KV prefix hits.
+    pub fn add_paged_recurrent_prefix(
+        &mut self,
+        key: Vec<BlockHash>,
+        snapshots: Vec<RecurrentStateSnapshot>,
+    ) {
+        if self.no_prefix_cache
+            || !self.has_paged_attention
+            || key.is_empty()
+            || snapshots.is_empty()
+        {
+            return;
+        }
+
+        // Maintain LRU order by reinserting on update.
+        let _ = self.paged_recurrent_caches.shift_remove(&key);
+        self.paged_recurrent_caches.insert(key, snapshots);
+
+        while self.paged_recurrent_caches.len() > self.paged_recurrent_capacity() {
+            let _ = self.paged_recurrent_caches.shift_remove_index(0);
+        }
+    }
+
+    /// Lookup a recurrent-state snapshot for a paged-attention block-hash prefix key.
+    /// Returns a cloned snapshot and updates LRU order.
+    pub fn get_paged_recurrent_prefix(
+        &mut self,
+        key: &[BlockHash],
+    ) -> Option<Vec<RecurrentStateSnapshot>> {
+        if self.no_prefix_cache || !self.has_paged_attention || key.is_empty() {
+            return None;
+        }
+
+        let key = key.to_vec();
+        let snapshots = self.paged_recurrent_caches.shift_remove(&key)?;
+        let out = snapshots.clone();
+        self.paged_recurrent_caches.insert(key, snapshots);
+        Some(out)
+    }
+
+    pub fn get_longest_paged_recurrent_prefix(
+        &mut self,
+        block_hashes: &[BlockHash],
+        max_blocks: usize,
+    ) -> Option<(usize, Vec<RecurrentStateSnapshot>)> {
+        if self.no_prefix_cache || !self.has_paged_attention {
+            return None;
+        }
+
+        let max_blocks = max_blocks.min(block_hashes.len());
+        for n_blocks in (1..=max_blocks).rev() {
+            if let Some(snapshots) = self.get_paged_recurrent_prefix(&block_hashes[..n_blocks]) {
+                return Some((n_blocks, snapshots));
+            }
+        }
+        None
+    }
+
+    /// Search for a matching cache given some tokens. Image-containing sequences are now cached too.
+    pub fn search_for_matching_cache(
+        &mut self,
+        toks: &[u32],
+        image_hashes: Option<&[u64]>,
+        audio_hashes: Option<&[u64]>,
+        video_hashes: Option<&[u64]>,
+    ) -> Result<Option<MatchingCache>> {
+        // Do not search if prefix caching disabled or no tokens
+        if self.no_prefix_cache || toks.is_empty() {
+            return Ok(None);
+        }
+
+        if self.has_paged_attention {
+            // For paged attention, prefix caching is handled by the KVCacheManager.
+            // PrefixCacheManagerV2 only handles non-paged attention caching.
+            return Ok(None);
+        }
+
+        let toks = Tokens(toks.to_vec());
+
+        let mut best_match: Option<(usize, &CacheElement, usize, usize, usize)> = None;
+        for (k, v) in &self.caches {
+            let match_len = toks.shared_prefix_len(k);
+            if match_len == 0 {
+                continue;
+            }
+
+            let images_match_until = match image_hashes {
+                Some(input_hashes) => match &v.image_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
+            let audios_match_until = match audio_hashes {
+                Some(input_hashes) => match &v.audio_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
+            // Vision/audio models can use repeated placeholder tokens (e.g. <image_soft_token>)
+            // that are identical regardless of the actual image/audio content. This means
+            // token-level matching can extend through image/audio regions even when the
+            // underlying content differs, leaving stale vision/audio encoder outputs in the
+            // KV cache. Skip entries where any overlapping images or audios diverge.
+            let cached_image_count = v.image_hashes.as_ref().map_or(0, |h| h.len());
+            let input_image_count = image_hashes.map_or(0, |h| h.len());
+            if images_match_until < input_image_count.min(cached_image_count) {
+                continue;
+            }
+
+            let cached_audio_count = v.audio_hashes.as_ref().map_or(0, |h| h.len());
+            let input_audio_count = audio_hashes.map_or(0, |h| h.len());
+            if audios_match_until < input_audio_count.min(cached_audio_count) {
+                continue;
+            }
+
+            let videos_match_until = match video_hashes {
+                Some(input_hashes) => match &v.video_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
+            let cached_video_count = v.video_hashes.as_ref().map_or(0, |h| h.len());
+            let input_video_count = video_hashes.map_or(0, |h| h.len());
+            if videos_match_until < input_video_count.min(cached_video_count) {
+                continue;
+            }
+
+            // Sliding/rotating caches only retain a fixed tail. If a cache has already
+            // truncated older tokens, it can still safely serve an exact extension of the
+            // cached prefix, but it cannot be rewound to an earlier logical length. Skip such
+            // candidates here so a rolled-over cache does not block a shorter valid prefix hit.
+            if !v.can_rewind_to(match_len) {
+                continue;
+            }
+
+            if best_match
+                .as_ref()
+                .is_none_or(|(len, _, _, _, _)| match_len > *len)
+            {
+                best_match = Some((
+                    match_len,
+                    v,
+                    images_match_until,
+                    audios_match_until,
+                    videos_match_until,
+                ));
+            }
+        }
+
+        if let Some((
+            match_len,
+            cache_element,
+            images_match_until,
+            audios_match_until,
+            videos_match_until,
+        )) = best_match
+        {
+            let new_toks = toks.0[match_len..].to_vec();
+            if new_toks.is_empty() {
+                return Ok(None);
+            }
+
+            let mut cache = cache_element.clone();
+            // Count how many input images are not already cached
+            let images_to_keep = if let Some(input_hashes) = image_hashes {
+                input_hashes.len().saturating_sub(images_match_until)
+            } else {
+                0
+            };
+            let audios_to_keep = if let Some(input_hashes) = audio_hashes {
+                input_hashes.len().saturating_sub(audios_match_until)
+            } else {
+                0
+            };
+            let videos_to_keep = if let Some(input_hashes) = video_hashes {
+                input_hashes.len().saturating_sub(videos_match_until)
+            } else {
+                0
+            };
+            for layer in cache.cache.iter_mut().flatten() {
+                if layer.try_set_len(match_len).is_err() {
+                    return Ok(None);
+                }
+            }
+            for layer in cache.cache.iter_mut().flatten() {
+                layer.set_len(match_len)?;
+            }
+            return Ok(Some(MatchingCache::Normal {
+                normal: cache.cache,
+                recurrent_snapshots: cache.recurrent_snapshots,
+                images_to_keep,
+                audios_to_keep,
+                videos_to_keep,
+                toks: new_toks,
+                offset: match_len,
+            }));
+        }
+
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{DType, Device, Tensor};
+
+    use super::{CacheElement, MatchingCache, PrefixCacheManagerV2};
+    use crate::kv_cache::{KvCache, RotatingCache, SingleCache};
+
+    fn make_cache_tensor(len: usize) -> candle_core::Result<Tensor> {
+        Tensor::zeros((1, 1, len, 1), DType::F32, &Device::Cpu)
+    }
+
+    fn make_rotating_kv_cache(
+        logical_len: usize,
+        sliding_window: usize,
+    ) -> candle_core::Result<KvCache> {
+        let src = make_cache_tensor(logical_len)?;
+        let mut k = RotatingCache::new(2, sliding_window, sliding_window);
+        let mut v = RotatingCache::new(2, sliding_window, sliding_window);
+        let _ = k.append(&src)?;
+        let _ = v.append(&src)?;
+        Ok(KvCache::Rotating { k, v })
+    }
+
+    fn make_normal_kv_cache(logical_len: usize) -> candle_core::Result<KvCache> {
+        let src = make_cache_tensor(logical_len)?;
+        let mut k = SingleCache::new(2, logical_len, logical_len);
+        let mut v = SingleCache::new(2, logical_len, logical_len);
+        k.append(&src)?;
+        v.append(&src)?;
+        Ok(KvCache::Normal { k, v })
+    }
+
+    #[test]
+    fn skips_rolled_over_rotating_candidate_that_cannot_rewind() -> candle_core::Result<()> {
+        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
+
+        prefix_cacher.caches.insert(
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),
+            CacheElement {
+                cache: vec![Some(make_rotating_kv_cache(10, 4)?)],
+                recurrent_snapshots: None,
+                audio_hashes: None,
+                image_hashes: None,
+                video_hashes: None,
+            },
+        );
+        prefix_cacher.caches.insert(
+            vec![1, 2, 3, 4, 5, 9].into(),
+            CacheElement {
+                cache: vec![Some(make_normal_kv_cache(6)?)],
+                recurrent_snapshots: None,
+                audio_hashes: None,
+                image_hashes: None,
+                video_hashes: None,
+            },
+        );
+
+        let hit = prefix_cacher.search_for_matching_cache(
+            &[1, 2, 3, 4, 5, 6, 7, 99],
+            None,
+            None,
+            None,
+        )?;
+
+        match hit {
+            Some(MatchingCache::Normal { toks, offset, .. }) => {
+                assert_eq!(offset, 5);
+                assert_eq!(toks, vec![6, 7, 99]);
+            }
+            None => panic!("expected a shorter valid prefix-cache hit"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn allows_exact_extension_from_rolled_over_rotating_cache() -> candle_core::Result<()> {
+        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
+
+        prefix_cacher.caches.insert(
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),
+            CacheElement {
+                cache: vec![Some(make_rotating_kv_cache(10, 4)?)],
+                recurrent_snapshots: None,
+                audio_hashes: None,
+                image_hashes: None,
+                video_hashes: None,
+            },
+        );
+
+        let hit = prefix_cacher.search_for_matching_cache(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            None,
+            None,
+            None,
+        )?;
+
+        match hit {
+            Some(MatchingCache::Normal { toks, offset, .. }) => {
+                assert_eq!(offset, 10);
+                assert_eq!(toks, vec![11]);
+            }
+            None => panic!("expected exact-extension prefix-cache hit"),
+        }
+
+        Ok(())
+    }
+}
+
+===== mistralrs-core/src/kv_cache/hybrid_cache.rs =====
+//! Hybrid cache for models that mix attention and recurrent layers (e.g., GraniteMoeHybrid, Qwen3 Next)
+//!
+//! This implements vLLM-style continuous batching for hybrid models:
+//! - Attention layers use standard KV cache batching
+//! - Recurrent layers (Mamba SSM or GDN) use a pool-based state with indexed access
+//!
+//! The key insight is that recurrent state is accessed via `state_indices` which map
+//! each sequence in the current batch to its slot in the pool.
+
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
+
+use super::KvCache;
+use crate::layers_masker::PastKvLenCache;
+
+/// Pool-based recurrent state cache for continuous batching.
+///
+/// Works for both Mamba SSM and GDN (Gated Delta Net) recurrent layers.
+/// Instead of dynamically sized state tensors, we maintain a pool of
+/// state slots that grows dynamically. Each sequence is assigned a slot index,
+/// and the forward pass uses `index_select` (gather) and index assignment (scatter)
+/// to access the correct states.
+#[derive(Debug)]
+pub struct RecurrentStatePool {
+    /// Convolution state pool: (capacity, conv_dim, conv_width)
+    pub conv_state: Tensor,
+    /// Recurrent state pool: (capacity, ...state_dims)
+    /// For Mamba: (capacity, n_heads, head_dim, d_state)
+    /// For GDN: (capacity, n_v_heads, key_dim, value_dim)
+    pub recurrent_state: Tensor,
+    /// Stack of free slot indices (for allocation)
+    free_slots: Vec<usize>,
+    /// Current capacity (grows dynamically)
+    capacity: usize,
+    /// Shape parameters for growing
+    conv_dim: usize,
+    conv_width: usize,
+    state_dims: Vec<usize>,
+    conv_dtype: DType,
+    recurrent_dtype: DType,
+    device: Device,
+}
+
+/// Initial pool capacity before dynamic growth.
+const INITIAL_POOL_CAPACITY: usize = 4;
+
+impl RecurrentStatePool {
+    /// Create a new recurrent state pool.
+    ///
+    /// - `conv_dim`: dimension of the convolution state
+    /// - `conv_width`: kernel size / d_conv for causal conv1d
+    /// - `state_dims`: shape of the recurrent state per slot (e.g. `[n_heads, head_dim, d_state]`)
+    pub fn new(
+        conv_dim: usize,
+        conv_width: usize,
+        state_dims: Vec<usize>,
+        conv_dtype: DType,
+        recurrent_dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let capacity = INITIAL_POOL_CAPACITY;
+
+        let conv_state = Tensor::zeros((capacity, conv_dim, conv_width), conv_dtype, device)?;
+
+        let mut recurrent_shape = vec![capacity];
+        recurrent_shape.extend_from_slice(&state_dims);
+        let recurrent_state = Tensor::zeros(recurrent_shape, recurrent_dtype, device)?;
+
+        let free_slots: Vec<usize> = (0..capacity).rev().collect();
+
+        Ok(Self {
+            conv_state,
+            recurrent_state,
+            free_slots,
+            capacity,
+            conv_dim,
+            conv_width,
+            state_dims,
+            conv_dtype,
+            recurrent_dtype,
+            device: device.clone(),
+        })
+    }
+
+    /// Grow the pool by doubling capacity.
+    fn grow(&mut self) -> Result<()> {
+        let new_capacity = self.capacity * 2;
+
+        // Allocate new larger conv_state and copy existing data
+        let new_conv = Tensor::zeros(
+            (new_capacity, self.conv_dim, self.conv_width),
+            self.conv_dtype,
+            &self.device,
+        )?;
+        new_conv.slice_set(&self.conv_state, 0, 0)?;
+
+        // Allocate new larger recurrent_state and copy existing data
+        let mut recurrent_shape = vec![new_capacity];
+        recurrent_shape.extend_from_slice(&self.state_dims);
+        let new_recurrent = Tensor::zeros(recurrent_shape, self.recurrent_dtype, &self.device)?;
+        new_recurrent.slice_set(&self.recurrent_state, 0, 0)?;
+
+        // Add new slots to free list
+        self.free_slots.extend((self.capacity..new_capacity).rev());
+
+        self.conv_state = new_conv;
+        self.recurrent_state = new_recurrent;
+        self.capacity = new_capacity;
+
+        tracing::info!("Recurrent state pool grew to capacity {new_capacity}");
+        Ok(())
+    }
+
+    /// Allocate a state slot for a new sequence. Returns the slot index.
+    /// The pool grows dynamically if no free slots are available.
+    /// The slot's state is reset to zeros to prevent state bleeding.
+    pub fn allocate(&mut self) -> Option<usize> {
+        if self.free_slots.is_empty() {
+            if let Err(e) = self.grow() {
+                tracing::error!("Failed to grow recurrent state pool: {e}");
+                return None;
+            }
+        }
+        let slot_idx = self.free_slots.pop()?;
+        if self.reset_slot(slot_idx).is_err() {
+            tracing::warn!("Failed to reset recurrent state slot {slot_idx}, state may be stale");
+        }
+        Some(slot_idx)
+    }
+
+    /// Free a state slot when a sequence completes.
+    pub fn free(&mut self, slot_idx: usize) {
+        debug_assert!(slot_idx < self.capacity);
+        self.free_slots.push(slot_idx);
+    }
+
+    /// Gather conv states for the given slot indices
+    pub fn gather_conv_state(&self, state_indices: &Tensor) -> Result<Tensor> {
+        self.conv_state.index_select(state_indices, 0)
+    }
+
+    /// Gather recurrent states for the given slot indices
+    pub fn gather_recurrent_state(&self, state_indices: &Tensor) -> Result<Tensor> {
+        self.recurrent_state.index_select(state_indices, 0)
+    }
+
+    /// Scatter conv states back to the pool for the given slot indices
+    pub fn scatter_conv_state(&mut self, state_indices: &Tensor, values: &Tensor) -> Result<()> {
+        let indices: Vec<u32> = state_indices.to_vec1()?;
+        self.scatter_conv_state_for_indices(&indices, values)
+    }
+
+    pub fn scatter_conv_state_for_indices(
+        &mut self,
+        indices: &[u32],
+        values: &Tensor,
+    ) -> Result<()> {
+        for (batch_idx, &slot_idx) in indices.iter().enumerate() {
+            let value = values.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+            self.conv_state.slice_set(&value, 0, slot_idx as usize)?;
+        }
+        Ok(())
+    }
+
+    pub fn scatter_conv_state_with_host_indices(
+        &mut self,
+        state_indices: &Tensor,
+        host_indices: Option<&[u32]>,
+        values: &Tensor,
+    ) -> Result<()> {
+        if let Some(indices) = host_indices {
+            self.scatter_conv_state_for_indices(indices, values)
+        } else {
+            self.scatter_conv_state(state_indices, values)
+        }
+    }
+
+    /// Scatter recurrent states back to the pool for the given slot indices
+    pub fn scatter_recurrent_state(
+        &mut self,
+        state_indices: &Tensor,
+        values: &Tensor,
+    ) -> Result<()> {
+        let indices: Vec<u32> = state_indices.to_vec1()?;
+        self.scatter_recurrent_state_for_indices(&indices, values)
+    }
+
+    pub fn scatter_recurrent_state_for_indices(
+        &mut self,
+        indices: &[u32],
+        values: &Tensor,
+    ) -> Result<()> {
+        for (batch_idx, &slot_idx) in indices.iter().enumerate() {
+            let value = values.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+            self.recurrent_state
+                .slice_set(&value, 0, slot_idx as usize)?;
+        }
+        Ok(())
+    }
+
+    pub fn scatter_recurrent_state_with_host_indices(
+        &mut self,
+        state_indices: &Tensor,
+        host_indices: Option<&[u32]>,
+        values: &Tensor,
+    ) -> Result<()> {
+        if let Some(indices) = host_indices {
+            self.scatter_recurrent_state_for_indices(indices, values)
+        } else {
+            self.scatter_recurrent_state(state_indices, values)
+        }
+    }
+
+    /// Reset a specific slot's state to zeros
+    pub fn reset_slot(&mut self, slot_idx: usize) -> Result<()> {
+        let zero_conv = Tensor::zeros(
+            (1, self.conv_dim, self.conv_width),
+            self.conv_dtype,
+            &self.device,
+        )?;
+
+        let mut recurrent_shape = vec![1usize];
+        recurrent_shape.extend_from_slice(&self.state_dims);
+        let zero_recurrent = Tensor::zeros(recurrent_shape, self.recurrent_dtype, &self.device)?;
+
+        self.conv_state.slice_set(&zero_conv, 0, slot_idx)?;
+        self.recurrent_state
+            .slice_set(&zero_recurrent, 0, slot_idx)?;
+        Ok(())
+    }
+
+    /// Reset all slots
+    pub fn reset(&mut self) -> Result<()> {
+        // zeroed in place: captured CUDA graphs address the pool buffers directly
+        self.conv_state.slice_set(&self.conv_state.zeros_like()?, 0, 0)?;
+        self.recurrent_state.slice_set(&self.recurrent_state.zeros_like()?, 0, 0)?;
+        self.free_slots = (0..self.capacity).rev().collect();
+        Ok(())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn num_free_slots(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn conv_dtype(&self) -> DType {
+        self.conv_dtype
+    }
+
+    pub fn recurrent_dtype(&self) -> DType {
+        self.recurrent_dtype
+    }
+}
+
+impl Clone for RecurrentStatePool {
+    fn clone(&self) -> Self {
+        Self {
+            conv_state: self.conv_state.clone(),
+            recurrent_state: self.recurrent_state.clone(),
+            free_slots: self.free_slots.clone(),
+            capacity: self.capacity,
+            conv_dim: self.conv_dim,
+            conv_width: self.conv_width,
+            state_dims: self.state_dims.clone(),
+            conv_dtype: self.conv_dtype,
+            recurrent_dtype: self.recurrent_dtype,
+            device: self.device.clone(),
+        }
+    }
+}
+
+/// Per-layer cache that can be either attention (KV) or recurrent (state pool)
+#[derive(Clone, Debug)]
+pub enum HybridLayerCache {
+    Attention(KvCache),
+    Recurrent(RecurrentStatePool),
+}
+
+impl HybridLayerCache {
+    pub fn reset(&mut self) {
+        match self {
+            Self::Attention(kv) => kv.reset(),
+            Self::Recurrent(pool) => {
+                let _ = pool.reset();
+            }
+        }
+    }
+
+    pub fn as_kv_cache(&self) -> Option<&KvCache> {
+        match self {
+            Self::Attention(kv) => Some(kv),
+            Self::Recurrent(_) => None,
+        }
+    }
+
+    pub fn as_kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+        match self {
+            Self::Attention(kv) => Some(kv),
+            Self::Recurrent(_) => None,
+        }
+    }
+
+    pub fn as_recurrent_pool(&self) -> Option<&RecurrentStatePool> {
+        match self {
+            Self::Attention(_) => None,
+            Self::Recurrent(pool) => Some(pool),
+        }
+    }
+
+    pub fn as_recurrent_pool_mut(&mut self) -> Option<&mut RecurrentStatePool> {
+        match self {
+            Self::Attention(_) => None,
+            Self::Recurrent(pool) => Some(pool),
+        }
+    }
+}
+
+/// Layer type indicator for hybrid models
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HybridLayerType {
+    Attention,
+    Recurrent,
+}
+
+/// Configuration for the recurrent layer state dimensions
+#[derive(Clone, Debug)]
+pub struct RecurrentLayerConfig {
+    /// Dimension of the convolution state
+    pub conv_dim: usize,
+    /// Kernel size for causal conv1d
+    pub conv_width: usize,
+    /// Shape of the recurrent state per slot.
+    /// For Mamba: [n_heads, head_dim, d_state]
+    /// For GDN: [n_v_heads, key_dim, value_dim]
+    pub state_dims: Vec<usize>,
+    pub recurrent_dtype: Option<DType>,
+}
+
+/// Configuration for creating a hybrid cache
+#[derive(Clone, Debug)]
+pub struct HybridCacheConfig {
+    pub layer_types: Vec<HybridLayerType>,
+    pub max_seq_len: usize,
+    pub recurrent: RecurrentLayerConfig,
+}
+
+/// Hybrid cache that stores per-layer caches for mixed attention/recurrent models
+///
+/// For continuous batching:
+/// - Attention layers use standard KV cache with batching support
+/// - Recurrent layers use RecurrentStatePool with indexed access via state_indices
+#[derive(Clone, Debug)]
+pub struct HybridCache {
+    pub caches: Vec<HybridLayerCache>,
+    config: HybridCacheConfig,
+    /// Current batch's state indices for recurrent pool access.
+    /// Set by clone_in_cache before forward, used by model during forward.
+    /// Shape: (batch_size,) containing pool slot indices.
+    state_indices: Option<Tensor>,
+    state_indices_host: Option<Vec<u32>>,
+}
+
+impl HybridCache {
+    pub const CACHE_GROW_SIZE: usize = 512;
+
+    pub fn new(
+        config: HybridCacheConfig,
+        dtype: candle_core::DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut caches = Vec::with_capacity(config.layer_types.len());
+
+        for layer_type in &config.layer_types {
+            let cache = match layer_type {
+                HybridLayerType::Attention => HybridLayerCache::Attention(KvCache::new_normal(
+                    2,
+                    config.max_seq_len,
+                    Self::CACHE_GROW_SIZE,
+                )),
+                HybridLayerType::Recurrent => HybridLayerCache::Recurrent(RecurrentStatePool::new(
+                    config.recurrent.conv_dim,
+                    config.recurrent.conv_width,
+                    config.recurrent.state_dims.clone(),
+                    dtype,
+                    config.recurrent.recurrent_dtype.unwrap_or(dtype),
+                    device,
+                )?),
+            };
+            caches.push(cache);
+        }
+
+        Ok(Self {
+            caches,
+            config,
+            state_indices: None,
+            state_indices_host: None,
+        })
+    }
+
+    /// Allocate state slots for a new sequence across all recurrent layers.
+    /// Returns the slot index (same for all layers).
+    pub fn allocate_seq(&mut self) -> Option<usize> {
+        // Collect recurrent layer indices once so rollback can target only recurrent pools.
+        let recurrent_layers: Vec<usize> = self
+            .caches
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cache)| match cache {
+                HybridLayerCache::Recurrent(_) => Some(idx),
+                HybridLayerCache::Attention(_) => None,
+            })
+            .collect();
+
+        let mut expected_slot = None;
+        let mut allocated_slots = Vec::new();
+
+        for &layer_idx in &recurrent_layers {
+            let slot_idx = {
+                let HybridLayerCache::Recurrent(pool) = &mut self.caches[layer_idx] else {
+                    unreachable!("recurrent_layers only contains recurrent entries");
+                };
+                match pool.allocate() {
+                    Some(idx) => idx,
+                    None => {
+                        for (&rollback_layer_idx, &rollback_slot_idx) in
+                            recurrent_layers.iter().zip(allocated_slots.iter())
+                        {
+                            if let HybridLayerCache::Recurrent(pool) =
+                                &mut self.caches[rollback_layer_idx]
+                            {
+                                pool.free(rollback_slot_idx);
+                            }
+                        }
+                        return None;
+                    }
+                }
+            };
+
+            if let Some(expected) = expected_slot {
+                if slot_idx != expected {
+                    tracing::warn!(
+                        "Hybrid recurrent pool slot mismatch: expected {expected}, got {slot_idx}. Rolling back allocation."
+                    );
+                    if let HybridLayerCache::Recurrent(pool) = &mut self.caches[layer_idx] {
+                        pool.free(slot_idx);
+                    }
+                    for (&rollback_layer_idx, &rollback_slot_idx) in
+                        recurrent_layers.iter().zip(allocated_slots.iter())
+                    {
+                        if let HybridLayerCache::Recurrent(pool) =
+                            &mut self.caches[rollback_layer_idx]
+                        {
+                            pool.free(rollback_slot_idx);
+                        }
+                    }
+                    return None;
+                }
+            } else {
+                expected_slot = Some(slot_idx);
+            }
+
+            allocated_slots.push(slot_idx);
+        }
+
+        expected_slot
+    }
+
+    /// Free state slots for a sequence across all recurrent layers.
+    pub fn free_seq(&mut self, slot_idx: usize) {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Recurrent(pool) = cache {
+                pool.free(slot_idx);
+            }
+        }
+    }
+
+    /// Reset a specific sequence's state in all recurrent layers.
+    pub fn reset_seq(&mut self, slot_idx: usize) -> Result<()> {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Recurrent(pool) = cache {
+                pool.reset_slot(slot_idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        for cache in &mut self.caches {
+            cache.reset();
+        }
+        self.state_indices = None;
+        self.state_indices_host = None;
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.caches.len()
+    }
+
+    pub fn layer_types(&self) -> &[HybridLayerType] {
+        &self.config.layer_types
+    }
+
+    pub fn config(&self) -> &HybridCacheConfig {
+        &self.config
+    }
+
+    /// Get a mutable reference to a specific layer's cache
+    pub fn get_mut(&mut self, layer: usize) -> Option<&mut HybridLayerCache> {
+        self.caches.get_mut(layer)
+    }
+
+    /// Get a reference to a specific layer's cache
+    pub fn get(&self, layer: usize) -> Option<&HybridLayerCache> {
+        self.caches.get(layer)
+    }
+
+    /// Set the state indices for the current batch.
+    /// Called by HybridCacheManager::clone_in_cache before forward.
+    pub fn set_state_indices(&mut self, indices: Option<Tensor>) {
+        self.state_indices = indices;
+        self.state_indices_host = None;
+    }
+
+    pub fn set_state_indices_with_host(
+        &mut self,
+        indices: Option<Tensor>,
+        host_indices: Option<Vec<u32>>,
+    ) {
+        self.state_indices = indices;
+        self.state_indices_host = host_indices;
+    }
+
+    /// Get the state indices for the current batch.
+    /// Used by the model during forward to access recurrent state pool.
+    pub fn state_indices(&self) -> Option<&Tensor> {
+        self.state_indices.as_ref()
+    }
+
+    pub fn state_indices_host(&self) -> Option<&[u32]> {
+        self.state_indices_host.as_deref()
+    }
+}
+
+impl PastKvLenCache for HybridCache {
+    fn get_past_kv_len(&self) -> Result<usize> {
+        for cache in &self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                return Ok(kv.current_seq_len());
+            }
+        }
+        Ok(0)
+    }
+}
+
+impl HybridCache {
+    /// Room for `len` positions in every attention layer's KV cache (see `KvCache::reserve`).
+    pub fn reserve_attention(&mut self, len: usize) -> Result<()> {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.reserve(len)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Truncate all attention layer KV caches to the given sequence length.
+    /// Recurrent layers are unchanged, use snapshot/restore for recurrent rollback.
+    pub fn truncate_attention_to(&mut self, len: usize) -> Result<()> {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.set_len(len)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot of a single recurrent layer's state for prefix caching.
+#[derive(Clone, Debug)]
+pub struct RecurrentStateSnapshot {
+    pub conv_state: Tensor,
+    pub recurrent_state: Tensor,
+}
+
+impl HybridCache {
+    /// Snapshot the recurrent state for a sequence at the given slot index.
+    /// Returns one snapshot per recurrent layer, in layer order.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn snapshot_recurrent_state(&self, slot_idx: usize) -> Result<Vec<RecurrentStateSnapshot>> {
+        let mut snapshots = Vec::new();
+        for cache in &self.caches {
+            if let HybridLayerCache::Recurrent(pool) = cache {
+                let idx_tensor = Tensor::from_vec(vec![slot_idx as u32], (1,), pool.device())?;
+                let conv = pool.gather_conv_state(&idx_tensor)?;
+                let recurrent = pool.gather_recurrent_state(&idx_tensor)?;
+                snapshots.push(RecurrentStateSnapshot {
+                    conv_state: conv,
+                    recurrent_state: recurrent,
+                });
+            }
+        }
+        Ok(snapshots)
+    }
+
+    /// Restore recurrent state snapshots into the pool at the given slot index.
+    /// Snapshots must be in the same layer order as returned by `snapshot_recurrent_state`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn restore_recurrent_state(
+        &mut self,
+        slot_idx: usize,
+        snapshots: &[RecurrentStateSnapshot],
+    ) -> Result<()> {
+        let mut snap_iter = snapshots.iter();
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Recurrent(pool) = cache {
+                if let Some(snap) = snap_iter.next() {
+                    let conv = snap.conv_state.to_device(pool.device())?;
+                    let recurrent = snap.recurrent_state.to_device(pool.device())?;
+                    let idx_tensor = Tensor::from_vec(vec![slot_idx as u32], (1,), pool.device())?;
+                    pool.scatter_conv_state(&idx_tensor, &conv)?;
+                    pool.scatter_recurrent_state(&idx_tensor, &recurrent)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+===== mistralrs-core/src/kv_cache/single_cache.rs =====
+use candle_core::{Result, Tensor};
+
+use super::NormalCache;
+
+#[derive(Debug, Clone)]
+pub struct SingleCacheSnapshot {
+    pub current_seq_len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SingleCache {
+    // all_data is an option on a Tensor, this makes it possible to only create the actual tensor
+    // on the first call where the batch size is easily known.
+    // Also this makes it safe to clone a KvCache that has been reset (as in it will not share
+    // its internal state with the cloned instance).
+    pub all_data: Option<Tensor>,
+    pub dim: usize,
+    pub current_seq_len: usize,
+    pub capacity_seq_len: usize,
+    pub max_seq_len: usize,
+}
+
+impl SingleCache {
+    pub fn new(dim: usize, max_seq_len: usize, capacity_seq_len: usize) -> Self {
+        Self {
+            all_data: None,
+            dim,
+            current_seq_len: 0,
+            max_seq_len,
+            capacity_seq_len,
+        }
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    pub fn all_data(&self) -> Option<&Tensor> {
+        self.all_data.as_ref()
+    }
+
+    pub fn current_data(&self) -> Result<Option<Tensor>> {
+        let data = match self.all_data.as_ref() {
+            None => None,
+            Some(d) => Some(d.narrow(self.dim, 0, self.current_seq_len)?),
+        };
+        Ok(data)
+    }
+
+    pub fn snapshot(&self) -> SingleCacheSnapshot {
+        SingleCacheSnapshot {
+            current_seq_len: self.current_seq_len,
+        }
+    }
+
+    pub fn can_append_from_snapshot(
+        &self,
+        snapshot: &SingleCacheSnapshot,
+        append_len: usize,
+    ) -> bool {
+        snapshot.current_seq_len == self.current_seq_len
+            && snapshot
+                .current_seq_len
+                .checked_add(append_len)
+                .is_some_and(|len| len <= self.max_seq_len)
+    }
+
+    pub fn rollback_to(&mut self, keep_len: usize) -> candle_core::Result<()> {
+        self.set_len(keep_len)
+    }
+
+    pub fn reset(&mut self) {
+        self.current_seq_len = 0;
+        self.all_data = None;
+        // a reset cache starts small again: a capacity grown (or reserved) for an earlier, longer
+        // sequence would otherwise be allocated in full by the next sequence's first append
+        self.capacity_seq_len = self.capacity_seq_len.min(NormalCache::CACHE_GROW_SIZE);
+    }
+
+    pub fn try_set_len(&self, len: usize) -> candle_core::Result<()> {
+        if len > self.capacity_seq_len {
+            candle_core::bail!(
+                "kv-cache: requested length ({}) exceeds current capacity ({})",
+                len,
+                self.capacity_seq_len
+            );
+        }
+        Ok(())
+    }
+
+    pub fn set_len(&mut self, len: usize) -> candle_core::Result<()> {
+        self.try_set_len(len)?;
+        self.current_seq_len = len;
+        Ok(())
+    }
+
+    /// Room for `len` positions (at most `max_seq_len`) in one allocation now, instead of one
+    /// reallocation per `CACHE_GROW_SIZE` step as appends arrive (a chunked prompt knows its length up
+    /// front; the outgrown buffers fragment the device pool).
+    pub fn reserve(&mut self, len: usize) -> Result<()> {
+        let len = len.min(self.max_seq_len);
+        if len <= self.capacity_seq_len {
+            return Ok(());
+        }
+        if let Some(ad) = &self.all_data {
+            let mut shape = ad.dims().to_vec();
+            shape[self.dim] = len;
+            let grown = Tensor::zeros(shape, ad.dtype(), ad.device())?;
+            grown.slice_set(ad, self.dim, 0)?;
+            self.all_data = Some(grown);
+        }
+        self.capacity_seq_len = len;
+        Ok(())
+    }
+
+    pub fn append(&mut self, src: &Tensor) -> Result<()> {
+        let seq_len = src.dim(self.dim)?;
+        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
+        // self.all_data.get_or_insert_with.
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.capacity_seq_len;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            self.all_data = Some(ad);
+        };
+
+        // Expand kv cache
+        if self.current_seq_len + seq_len > self.capacity_seq_len {
+            let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
+            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
+            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
+            if self.capacity_seq_len > self.max_seq_len {
+                candle_core::bail!(
+                    "kv-cache: requested capacity ({}) above max seq len ({})",
+                    self.capacity_seq_len,
+                    self.max_seq_len
+                )
+            }
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.capacity_seq_len;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            ad.slice_set(self.all_data.as_ref().unwrap(), self.dim, 0)?;
+            self.all_data = Some(ad);
+        }
+
+        let ad = self.all_data.as_mut().unwrap();
+
+        ad.slice_set(src, self.dim, self.current_seq_len)?;
+        self.current_seq_len += seq_len;
+        Ok(())
+    }
+}
+
+===== mistralrs-core/src/gdn/layer.rs =====
+use candle_core::{DType, Result, Tensor};
+use mistralrs_quant::{Comm, QuantMethod, ShardedVarBuilder};
+use std::sync::Arc;
+
+use crate::device_map::DeviceMapper;
+use crate::pipeline::RecurrentBatchKind;
+
+use super::backend;
+use super::cache::GdnLayerCache;
+use super::config::{GdnConfig, GdnDims};
+use super::norm::RmsNormGated;
+use super::projection::{GdnInputProjection, GdnProjection};
+use super::weights::{GdnInputProjectionKind, GdnWeightLoadCtx, GdnWeights};
+
+pub struct GatedDeltaNet {
+    pub input_proj: GdnInputProjection,
+    pub conv1d_weight: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+    pub norm: RmsNormGated,
+    pub out_proj: Arc<dyn QuantMethod>,
+    /// GGUF files whose `ssm_out` quant blocks span several V heads keep the converter's (tiled) head
+    /// order in the weight; the output is gathered into that order before `out_proj` instead.
+    pub out_proj_input_perm: Option<Tensor>,
+    dims: GdnDims,
+}
+
+impl GatedDeltaNet {
+    pub fn load(
+        vb: ShardedVarBuilder,
+        cfg: &dyn GdnConfig,
+        mapper: &dyn DeviceMapper,
+        layer_idx: usize,
+        loading_isq: bool,
+        comm: &Arc<Comm>,
+        input_projection_kind: GdnInputProjectionKind,
+    ) -> Result<Self> {
+        let dims = GdnDims::new(cfg);
+        let weights = GdnWeights::load(
+            vb,
+            GdnWeightLoadCtx {
+                cfg,
+                dims: &dims,
+                mapper,
+                layer_idx,
+                loading_isq,
+                comm,
+                input_projection_kind,
+            },
+        )?;
+        Ok(Self {
+            input_proj: weights.input_proj,
+            conv1d_weight: weights.conv1d_weight,
+            dt_bias: weights.dt_bias,
+            a_log: weights.a_log,
+            norm: weights.norm,
+            out_proj: weights.out_proj,
+            out_proj_input_perm: None,
+            dims,
+        })
+    }
+
+    /// Build a GDN layer from already-loaded weights (GGUF path), in HF layout:
+    /// grouped V-head order, `conv1d_weight` shaped `(conv_dim, 1, kernel)` and
+    /// `a_log` = `A_log` (not the `-exp(A_log)` that GGUF stores as `ssm_a`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        cfg: &dyn GdnConfig,
+        in_proj_qkv: Arc<dyn QuantMethod>,
+        in_proj_z: Arc<dyn QuantMethod>,
+        in_proj_b: Arc<dyn QuantMethod>,
+        in_proj_a: Arc<dyn QuantMethod>,
+        conv1d_weight: Tensor,
+        dt_bias: Tensor,
+        a_log: Tensor,
+        norm_weight: Tensor,
+        out_proj: Arc<dyn QuantMethod>,
+    ) -> Self {
+        Self {
+            input_proj: GdnInputProjection::Split {
+                in_proj_qkv,
+                in_proj_z,
+                in_proj_b,
+                in_proj_a,
+            },
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm: RmsNormGated::from_weight(norm_weight, cfg.rms_norm_eps()),
+            out_proj,
+            out_proj_input_perm: None,
+            dims: GdnDims::new(cfg),
+        }
+    }
+
+    /// See `out_proj_input_perm`.
+    pub fn with_out_proj_input_perm(mut self, index: Tensor) -> Self {
+        self.out_proj_input_perm = Some(index);
+        self
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cache: &mut GdnLayerCache,
+        batch_kind: RecurrentBatchKind,
+    ) -> Result<Tensor> {
+        self.forward_with_conv_carry(x, cache, batch_kind, false)
+    }
+
+    /// `forward`, where `conv_carry` marks a prompt chunk that continues the one before it: the
+    /// full causal conv (which zero-pads its window) then sees the last `kernel - 1` inputs of the
+    /// previous chunk, kept in `cache.conv_state`. They are prepended to the chunk and their outputs
+    /// dropped, so every output is the same window sum, in the same order, as an unchunked prompt's.
+    /// The recurrence already starts from `cache.recurrent_state`.
+    pub fn forward_with_conv_carry(
+        &self,
+        x: &Tensor,
+        cache: &mut GdnLayerCache,
+        batch_kind: RecurrentBatchKind,
+        conv_carry: bool,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, _) = x.dims3()?;
+        let dtype = x.dtype();
+
+        let projected = self.project(x, batch_size, seq_len)?;
+        let mixed_qkv = projected.conv_input();
+        let carry = self.dims.conv_kernel_size.saturating_sub(1);
+        let mixed_qkv = if conv_carry && carry > 0 && matches!(batch_kind, RecurrentBatchKind::Prefill) {
+            let state_len = cache.conv_state.dim(2)?;
+            let prev = cache
+                .conv_state
+                .narrow(2, state_len - carry, carry)?
+                .transpose(1, 2)?
+                .to_dtype(mixed_qkv.dtype())?;
+            let ext = Tensor::cat(&[prev, mixed_qkv], 1)?;
+            backend::causal_conv1d(&ext, &self.conv1d_weight, &self.dims, cache, batch_kind)?
+                .narrow(1, carry, seq_len)?
+        } else {
+            backend::causal_conv1d(
+                &mixed_qkv,
+                &self.conv1d_weight,
+                &self.dims,
+                cache,
+                batch_kind,
+            )?
+        };
+        let y = backend::apply_recurrence_from_convolved(
+            &mixed_qkv,
+            &projected.b,
+            &projected.a,
+            &self.a_log,
+            &self.dt_bias,
+            &self.dims,
+            batch_size,
+            seq_len,
+            cache,
+            dtype,
+        )?;
+
+        self.finish_forward(y, projected.z, batch_size, seq_len, dtype)
+    }
+
+    /// Decode steps for the `seq_len` rows of `x` (batch 1) in one call, each row bit-identical to
+    /// `forward(row, cache, Decode)`: the projections go through `lin` (a row-exact batched matmul),
+    /// the causal conv and the recurrence run row by row with the decode kernels, and `on_row(r, cache)`
+    /// sees the state after row `r` (speculative verification keeps it for rollback).
+    pub fn forward_decode_rows(
+        &self,
+        x: &Tensor,
+        cache: &mut GdnLayerCache,
+        lin: &super::projection::LinearFn<'_>,
+        on_row: &mut dyn FnMut(usize, &GdnLayerCache) -> Result<()>,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, _) = x.dims3()?;
+        if batch_size != 1 {
+            candle_core::bail!("GDN decode rows expects batch 1, got {batch_size}");
+        }
+        let dtype = x.dtype();
+        let d = &self.dims;
+        // (conv input, z, per-row (b, a)): b and a feed the recurrence one row at a time
+        let (mixed_qkv, z, ba) = match &self.input_proj {
+            GdnInputProjection::Split {
+                in_proj_qkv,
+                in_proj_z,
+                in_proj_b,
+                in_proj_a,
+            } => {
+                // F32-activation weights cast each row in and out: cast the rows in once
+                let f32_in = x.dtype() != DType::F32
+                    && [in_proj_b, in_proj_a].iter().all(|w| w.quantized_act_type() == Some(DType::F32));
+                let xs = if f32_in { x.to_dtype(DType::F32)? } else { x.clone() };
+                let row = |w: &Arc<dyn QuantMethod>, r: usize| -> Result<Tensor> {
+                    let y = w.forward(&xs.narrow(1, r, 1)?)?;
+                    let y = if f32_in { y.to_dtype(dtype)? } else { y };
+                    y.reshape((1, 1, d.num_v_heads))
+                };
+                (
+                    lin(in_proj_qkv, x)?.reshape((1, seq_len, d.conv_dim))?,
+                    lin(in_proj_z, x)?.reshape((1, seq_len, d.num_v_heads, d.head_v_dim))?,
+                    (0..seq_len)
+                        .map(|r| Ok((row(in_proj_b, r)?, row(in_proj_a, r)?)))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+            GdnInputProjection::Grouped { .. } => {
+                let p = self.input_proj.forward_with(x, d, batch_size, seq_len, lin)?;
+                let ba = (0..seq_len)
+                    .map(|r| Ok((p.b.narrow(1, r, 1)?, p.a.narrow(1, r, 1)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                (p.conv_input(), p.z, ba)
+            }
+        };
+        let mut ys = Vec::with_capacity(seq_len);
+        for r in 0..seq_len {
+            let mixed = backend::causal_conv1d(
+                &mixed_qkv.narrow(1, r, 1)?,
+                &self.conv1d_weight,
+                &self.dims,
+                cache,
+                RecurrentBatchKind::Decode,
+            )?;
+            ys.push(backend::apply_recurrence_from_convolved(
+                &mixed,
+                &ba[r].0,
+                &ba[r].1,
+                &self.a_log,
+                &self.dt_bias,
+                &self.dims,
+                batch_size,
+                1,
+                cache,
+                dtype,
+            )?);
+            on_row(r, cache)?;
+        }
+        let y = Tensor::cat(&ys, 1)?;
+        self.finish_forward_with(y, z, batch_size, seq_len, lin)
+    }
+
+    fn project(&self, x: &Tensor, batch_size: usize, seq_len: usize) -> Result<GdnProjection> {
+        self.input_proj.forward(x, &self.dims, batch_size, seq_len)
+    }
+
+    fn finish_forward(
+        &self,
+        y: Tensor,
+        z: Tensor,
+        batch_size: usize,
+        seq_len: usize,
+        _dtype: DType,
+    ) -> Result<Tensor> {
+        self.finish_forward_with(y, z, batch_size, seq_len, &|w, x| w.forward(x))
+    }
+
+    fn finish_forward_with(
+        &self,
+        y: Tensor,
+        z: Tensor,
+        batch_size: usize,
+        seq_len: usize,
+        lin: &super::projection::LinearFn<'_>,
+    ) -> Result<Tensor> {
+        let z_shape = z.shape().clone();
+        let y = y.reshape(((), self.dims.head_v_dim))?;
+        let z = z.reshape(((), self.dims.head_v_dim))?;
+        let y = self.norm.forward(&y, &z)?;
+        let y = y.reshape(z_shape)?;
+        let y = y.reshape((batch_size, seq_len, self.dims.value_dim))?;
+        let y = match &self.out_proj_input_perm {
+            Some(index) => y.index_select(index, 2)?,
+            None => y,
+        };
+        lin(&self.out_proj, &y)
+    }
+}
+
+===== mistralrs-core/src/kv_cache/rotating_cache.rs =====
+use candle_core::{Result, Tensor};
+
+use super::NormalCache;
+
+#[derive(Debug, Clone)]
+pub struct RotatingCacheSnapshot {
+    pub dim: usize,
+    pub current_seq_len: usize,
+    pub max_seq_len: usize,
+    pub capacity_seq_len: usize,
+    pub retained: Option<Tensor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RotatingCache {
+    pub all_data: Option<Tensor>,
+    pub dim: usize,
+    // The total size of the sequence seen so far.
+    pub current_seq_len: usize,
+    // max_seq_len is the number of retained tokens in the sliding window.
+    pub max_seq_len: usize,
+    pub capacity_seq_len: usize,
+    // The full K/V tensor returned by the last `append()` call.
+    // During prefill this may be larger than the internal buffer (retained + new),
+    // which is what shared KV layers need for correct attention.
+    pub last_append_result: Option<Tensor>,
+}
+
+impl RotatingCache {
+    pub fn new(dim: usize, max_seq_len: usize, capacity_seq_len: usize) -> Self {
+        Self {
+            all_data: None,
+            dim,
+            current_seq_len: 0,
+            max_seq_len,
+            capacity_seq_len: capacity_seq_len.min(max_seq_len),
+            last_append_result: None,
+        }
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    pub fn all_data(&self) -> Option<&Tensor> {
+        self.all_data.as_ref()
+    }
+
+    pub fn current_data(&self) -> Result<Option<Tensor>> {
+        let data = match self.all_data.as_ref() {
+            None => None,
+            Some(d) => {
+                if self.current_seq_len >= self.max_seq_len {
+                    Some(d.clone())
+                } else {
+                    Some(d.narrow(self.dim, 0, self.current_seq_len)?)
+                }
+            }
+        };
+        Ok(data)
+    }
+
+    pub fn last_append_result(&self) -> Option<&Tensor> {
+        self.last_append_result.as_ref()
+    }
+
+    pub fn snapshot(&self) -> Result<RotatingCacheSnapshot> {
+        Ok(RotatingCacheSnapshot {
+            dim: self.dim,
+            current_seq_len: self.current_seq_len,
+            max_seq_len: self.max_seq_len,
+            capacity_seq_len: self.capacity_seq_len,
+            retained: self.current_data()?,
+        })
+    }
+
+    pub fn can_append_from_snapshot(
+        &self,
+        snapshot: &RotatingCacheSnapshot,
+        append_len: usize,
+    ) -> bool {
+        snapshot.current_seq_len == self.current_seq_len
+            && snapshot.max_seq_len == self.max_seq_len
+            && append_len <= self.max_seq_len
+    }
+
+    pub fn accepted_append_from_batched_append(
+        &self,
+        snapshot: &RotatingCacheSnapshot,
+        keep_len: usize,
+        row_idx: usize,
+        batch_len: usize,
+    ) -> Result<Option<Tensor>> {
+        let accepted_len = keep_len
+            .checked_sub(snapshot.current_seq_len)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("rotating cache rollback keep_len underflow".into())
+            })?;
+        if accepted_len == 0 {
+            return Ok(None);
+        }
+        let appended = self.last_append_result.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("missing rotating cache append result".into())
+        })?;
+        let dim0 = appended.dim(0)?;
+        if batch_len == 0 || dim0 % batch_len != 0 {
+            candle_core::bail!(
+                "rotating cache batch shape mismatch: dim0={dim0}, batch_len={batch_len}"
+            );
+        }
+        let per_row = dim0 / batch_len;
+        let retained_len = snapshot.current_seq_len.min(snapshot.max_seq_len);
+        appended
+            .narrow(0, row_idx * per_row, per_row)?
+            .narrow(snapshot.dim, retained_len, accepted_len)?
+            .contiguous()
+            .map(Some)
+    }
+
+    pub fn restore_from_snapshot(
+        snapshot: &RotatingCacheSnapshot,
+        accepted_append: Option<Tensor>,
+        keep_len: usize,
+    ) -> Result<Self> {
+        let accepted_len = keep_len
+            .checked_sub(snapshot.current_seq_len)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("rotating cache rollback keep_len underflow".into())
+            })?;
+        if let Some(accepted_append) = accepted_append.as_ref() {
+            if accepted_append.dim(snapshot.dim)? != accepted_len {
+                candle_core::bail!(
+                    "rotating cache rollback accepted append length mismatch: got {}, expected {accepted_len}",
+                    accepted_append.dim(snapshot.dim)?
+                );
+            }
+        } else if accepted_len != 0 {
+            candle_core::bail!(
+                "rotating cache rollback missing accepted append for accepted_len={accepted_len}"
+            );
+        }
+
+        let retained = match (snapshot.retained.as_ref(), accepted_append.as_ref()) {
+            (Some(retained), Some(accepted)) => Tensor::cat(&[retained, accepted], snapshot.dim)?,
+            (Some(retained), None) => retained.clone(),
+            (None, Some(accepted)) => accepted.clone(),
+            (None, None) => {
+                return Ok(Self {
+                    all_data: None,
+                    dim: snapshot.dim,
+                    current_seq_len: keep_len,
+                    max_seq_len: snapshot.max_seq_len,
+                    capacity_seq_len: snapshot.capacity_seq_len.min(snapshot.max_seq_len),
+                    last_append_result: None,
+                });
+            }
+        };
+
+        let retained_len = retained.dim(snapshot.dim)?;
+        let keep = retained_len.min(snapshot.max_seq_len);
+        let retained = retained
+            .narrow(snapshot.dim, retained_len - keep, keep)?
+            .contiguous()?;
+        let capacity_seq_len = snapshot
+            .capacity_seq_len
+            .max(keep)
+            .min(snapshot.max_seq_len)
+            .max(keep);
+        let mut shape = retained.dims().to_vec();
+        shape[snapshot.dim] = capacity_seq_len;
+        let all_data = Tensor::zeros(shape, retained.dtype(), retained.device())?;
+        if keep > 0 {
+            all_data.slice_set(&retained, snapshot.dim, 0)?;
+        }
+
+        Ok(Self {
+            all_data: Some(all_data),
+            dim: snapshot.dim,
+            current_seq_len: keep_len,
+            max_seq_len: snapshot.max_seq_len,
+            capacity_seq_len,
+            last_append_result: None,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.current_seq_len = 0;
+        self.all_data = None;
+        self.last_append_result = None;
+    }
+
+    pub fn try_set_len(&self, len: usize) -> candle_core::Result<()> {
+        // Once the retained window has dropped old tokens, rollback would require
+        // data that is no longer present.
+        if self.current_seq_len > self.max_seq_len && len < self.current_seq_len {
+            candle_core::bail!(
+                "Sliding KV cache cannot roll back after truncation \
+                 (current_seq_len {} > max_seq_len {}, requested len {})",
+                self.current_seq_len,
+                self.max_seq_len,
+                len,
+            );
+        }
+        if self.current_seq_len.saturating_sub(len) > self.max_seq_len {
+            candle_core::bail!(
+                "Sliding KV cache tried to reset to len {len} while current is {} and max retained is {}",
+                self.current_seq_len,
+                self.max_seq_len
+            );
+        }
+        Ok(())
+    }
+
+    pub fn set_len(&mut self, len: usize) -> candle_core::Result<()> {
+        self.try_set_len(len)?;
+        self.current_seq_len = len;
+        self.last_append_result = None;
+        Ok(())
+    }
+
+    pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {
+        let seq_len = src.dim(self.dim)?;
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.capacity_seq_len;
+            self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
+        }
+
+        let retained_len = self.current_seq_len.min(self.max_seq_len);
+        if self.current_seq_len + seq_len > self.capacity_seq_len {
+            let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
+            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
+            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
+            self.capacity_seq_len = self.capacity_seq_len.min(self.max_seq_len);
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.capacity_seq_len;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            if retained_len > 0 {
+                let retained = self
+                    .all_data
+                    .as_ref()
+                    .unwrap()
+                    .narrow(self.dim, 0, retained_len)?
+                    .contiguous()?;
+                ad.slice_set(&retained, self.dim, 0)?;
+            }
+            self.all_data = Some(ad);
+        }
+
+        let ad = self.all_data.as_mut().unwrap();
+
+        // During prefill (seq_len > 1), if total tokens exceed the sliding window,
+        // we need the full K/V (retained + new) for correct attention: different
+        // query positions attend to different windows. Read retained BEFORE the
+        // buffer is overwritten below.
+        let prefill_full_kv = if seq_len > 1 && (retained_len + seq_len) > self.max_seq_len {
+            Some(if retained_len > 0 {
+                let retained = ad.narrow(self.dim, 0, retained_len)?.contiguous()?;
+                Tensor::cat(&[&retained, &src.contiguous()?], self.dim)?
+            } else {
+                src.clone()
+            })
+        } else {
+            None
+        };
+
+        self.current_seq_len += seq_len;
+
+        let result = if seq_len >= self.max_seq_len {
+            let to_copy = src
+                .narrow(self.dim, seq_len - self.max_seq_len, self.max_seq_len)?
+                .contiguous()?;
+            ad.slice_set(&to_copy, self.dim, 0)?;
+            if let Some(full_kv) = prefill_full_kv {
+                full_kv
+            } else {
+                ad.clone()
+            }
+        } else {
+            let keep_from_old = retained_len.min(self.max_seq_len - seq_len);
+            // Only rotate when keep_start > 0 (the cache has reached the sliding window and we actually need to shift entries left).
+            if keep_from_old > 0 {
+                let keep_start = retained_len - keep_from_old;
+                if keep_start > 0 {
+                    let kept = ad
+                        .narrow(self.dim, keep_start, keep_from_old)?
+                        .copy()?
+                        .contiguous()?;
+                    ad.slice_set(&kept, self.dim, 0)?;
+                }
+            }
+
+            ad.slice_set(&src.contiguous()?, self.dim, keep_from_old)?;
+
+            if let Some(full_kv) = prefill_full_kv {
+                full_kv
+            } else if self.current_seq_len >= self.max_seq_len {
+                ad.clone()
+            } else {
+                ad.narrow(self.dim, 0, self.current_seq_len)?
+            }
+        };
+
+        self.last_append_result = Some(result.clone());
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{Device, Tensor};
+
+    use super::RotatingCache;
+
+    fn make_src(values: &[f32]) -> candle_core::Result<Tensor> {
+        Tensor::new(values.to_vec(), &Device::Cpu)?.reshape((1, 1, values.len(), 1))
+    }
+
+    fn make_batched_src(rows: &[&[f32]]) -> candle_core::Result<Tensor> {
+        let len = rows.first().map(|row| row.len()).unwrap_or(0);
+        assert!(rows.iter().all(|row| row.len() == len));
+        let values = rows
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>();
+        Tensor::new(values, &Device::Cpu)?.reshape((rows.len(), 1, len, 1))
+    }
+
+    #[test]
+    fn retains_last_window_in_order() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+
+        let first = cache.append(&make_src(&[0., 1., 2.])?)?;
+        assert_eq!(first.flatten_all()?.to_vec1::<f32>()?, vec![0., 1., 2.]);
+        assert_eq!(cache.current_seq_len(), 3);
+
+        let second = cache.append(&make_src(&[3., 4., 5.])?)?;
+        // During multi-token append (prefill), full K/V is returned so all
+        // query positions can attend to their correct sliding windows.
+        assert_eq!(
+            second.flatten_all()?.to_vec1::<f32>()?,
+            vec![0., 1., 2., 3., 4., 5.]
+        );
+        assert_eq!(cache.current_seq_len(), 6);
+
+        let current = cache.current_data()?.unwrap();
+        assert_eq!(
+            current.flatten_all()?.to_vec1::<f32>()?,
+            vec![2., 3., 4., 5.]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_rollback_after_truncation() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+        let _ = cache.append(&make_src(&[0., 1., 2., 3., 4.])?)?;
+
+        assert!(cache.try_set_len(4).is_err());
+        assert!(cache.set_len(4).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn restores_from_snapshot_after_sliding_window_advance() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+        let _ = cache.append(&make_src(&[0., 1., 2., 3., 4.])?)?;
+        let snapshot = cache.snapshot()?;
+
+        let _ = cache.append(&make_src(&[5., 6., 7.])?)?;
+        let accepted = cache.accepted_append_from_batched_append(&snapshot, 7, 0, 1)?;
+        assert_eq!(
+            accepted.as_ref().unwrap().flatten_all()?.to_vec1::<f32>()?,
+            vec![5., 6.]
+        );
+
+        let restored = RotatingCache::restore_from_snapshot(&snapshot, accepted, 7)?;
+        assert_eq!(restored.current_seq_len(), 7);
+        assert_eq!(
+            restored
+                .current_data()?
+                .unwrap()
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            vec![3., 4., 5., 6.]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_accepted_append_from_batched_append_row() -> candle_core::Result<()> {
+        let mut single = RotatingCache::new(2, 4, 4);
+        let _ = single.append(&make_src(&[0., 1., 2.])?)?;
+        let snapshot = single.snapshot()?;
+
+        let mut batched = RotatingCache::new(2, 4, 4);
+        let _ = batched.append(&make_batched_src(&[&[0., 1., 2.], &[10., 11., 12.]])?)?;
+        let _ = batched.append(&make_batched_src(&[&[3., 4., 5.], &[13., 14., 15.]])?)?;
+
+        let accepted = batched.accepted_append_from_batched_append(&snapshot, 5, 1, 2)?;
+        assert_eq!(
+            accepted.unwrap().flatten_all()?.to_vec1::<f32>()?,
+            vec![13., 14.]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn returns_full_kv_on_large_prefill() -> candle_core::Result<()> {
+        // Sliding window = 4, but prefill has 7 tokens
+        let mut cache = RotatingCache::new(2, 4, 4);
+
+        // Prefill with more tokens than the window
+        let result = cache.append(&make_src(&[0., 1., 2., 3., 4., 5., 6.])?)?;
+        // Should return ALL 7 tokens for correct attention during prefill
+        assert_eq!(
+            result.flatten_all()?.to_vec1::<f32>()?,
+            vec![0., 1., 2., 3., 4., 5., 6.]
+        );
+        assert_eq!(cache.current_seq_len(), 7);
+
+        // Internal buffer should only retain the last 4
+        let current = cache.current_data()?.unwrap();
+        assert_eq!(
+            current.flatten_all()?.to_vec1::<f32>()?,
+            vec![3., 4., 5., 6.]
+        );
+
+        // Subsequent decode (single token) should work normally
+        let decode = cache.append(&make_src(&[7.])?)?;
+        assert_eq!(
+            decode.flatten_all()?.to_vec1::<f32>()?,
+            vec![4., 5., 6., 7.]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn returns_full_kv_on_prefill_with_retained() -> candle_core::Result<()> {
+        // Sliding window = 4, initial small append, then large prefill
+        let mut cache = RotatingCache::new(2, 4, 4);
+
+        // First: small append (fits in window)
+        let first = cache.append(&make_src(&[0., 1., 2.])?)?;
+        assert_eq!(first.flatten_all()?.to_vec1::<f32>()?, vec![0., 1., 2.]);
+
+        // Second: prefill that overflows window (retained=3 + new=3 = 6 > 4)
+        let second = cache.append(&make_src(&[3., 4., 5.])?)?;
+        // Should return retained + new = all 6 tokens
+        assert_eq!(
+            second.flatten_all()?.to_vec1::<f32>()?,
+            vec![0., 1., 2., 3., 4., 5.]
+        );
+
+        // Internal buffer should only retain the last 4
+        let current = cache.current_data()?.unwrap();
+        assert_eq!(
+            current.flatten_all()?.to_vec1::<f32>()?,
+            vec![2., 3., 4., 5.]
+        );
+
+        Ok(())
+    }
+}
+
+===== mistralrs-core/src/engine/logger.rs =====
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use tracing::info;
+
+pub struct IntervalLogger {
+    enable_logging: Arc<AtomicBool>,
+    prefix_cache_hits: Arc<AtomicUsize>,
+    tokens_processed: Arc<AtomicUsize>,
+    total_new_seqs: Arc<AtomicUsize>,
+    num_running: Arc<AtomicUsize>,
+    num_waiting: Arc<AtomicUsize>,
+    encoder_cache_hits: Option<Arc<AtomicUsize>>,
+    encoder_cache_misses: Option<Arc<AtomicUsize>>,
+}
+
+impl IntervalLogger {
+    /// Starts an interval logger. Call `begin_logging` to begin the logging process.
+    pub fn new(
+        interval: Duration,
+        encoder_cache_counters: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+    ) -> Self {
+        let prefix_cache_hits = Arc::new(AtomicUsize::new(0));
+        let tokens_processed = Arc::new(AtomicUsize::new(0));
+        let total_new_seqs = Arc::new(AtomicUsize::new(0));
+        let enable_logging = Arc::new(AtomicBool::new(false));
+        let num_running = Arc::new(AtomicUsize::new(0));
+        let num_waiting = Arc::new(AtomicUsize::new(0));
+
+        let t_prefix_cache_hits = prefix_cache_hits.clone();
+        let t_tokens_processed = tokens_processed.clone();
+        let t_total_new_seqs = total_new_seqs.clone();
+        let t_enable_logging = enable_logging.clone();
+        let t_num_running = num_running.clone();
+        let t_num_waiting = num_waiting.clone();
+        let (encoder_cache_hits, encoder_cache_misses) = match encoder_cache_counters {
+            Some((h, m)) => (Some(h), Some(m)),
+            None => (None, None),
+        };
+        let t_enc_hits = encoder_cache_hits.clone();
+        let t_enc_misses = encoder_cache_misses.clone();
+        thread::spawn(move || {
+            // Start the actual logging
+            loop {
+                thread::sleep(interval);
+                if !t_enable_logging.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                let total_new_seqs = t_total_new_seqs.load(Ordering::Relaxed);
+                let prefix_cache_hits = t_prefix_cache_hits.load(Ordering::Relaxed);
+                let tokens_processed = t_tokens_processed.swap(0, Ordering::Relaxed);
+                let num_running = t_num_running.load(Ordering::Relaxed);
+                let num_waiting = t_num_waiting.load(Ordering::Relaxed);
+
+                if total_new_seqs != 0 && tokens_processed != 0 {
+                    let enc_cache_info =
+                        if let (Some(ref hits), Some(ref misses)) = (&t_enc_hits, &t_enc_misses) {
+                            let h = hits.load(Ordering::Relaxed);
+                            let m = misses.load(Ordering::Relaxed);
+                            let total = h + m;
+                            if total > 0 {
+                                format!(
+                                    ", Encoder cache hitrate {:.2}%",
+                                    100. * h as f64 / total as f64
+                                )
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                    // Throughput = tokens processed during this interval / interval duration.
+                    // Combines both prefill and decode tokens. The counter is atomically
+                    // swapped to 0 each interval, so the metric reflects only the current
+                    // window and is not cumulative.
+                    info!(
+                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}, {num_running} running, {num_waiting} waiting",
+                        tokens_processed as f64 / interval.as_secs_f64(),
+                        100. * prefix_cache_hits as f64 / total_new_seqs as f64,
+                    );
+                }
+            }
+        });
+
+        Self {
+            prefix_cache_hits,
+            tokens_processed,
+            total_new_seqs,
+            enable_logging,
+            num_running,
+            num_waiting,
+            encoder_cache_hits,
+            encoder_cache_misses,
+        }
+    }
+
+    pub fn enable_logging(&self) {
+        self.enable_logging.store(true, Ordering::Relaxed);
+    }
+
+    /// Reset all counters to zero. Call after warmup/dummy runs to get clean stats.
+    pub fn reset(&self) {
+        self.prefix_cache_hits.store(0, Ordering::Relaxed);
+        self.tokens_processed.store(0, Ordering::Relaxed);
+        self.total_new_seqs.store(0, Ordering::Relaxed);
+        self.num_running.store(0, Ordering::Relaxed);
+        self.num_waiting.store(0, Ordering::Relaxed);
+        if let Some(ref hits) = self.encoder_cache_hits {
+            hits.store(0, Ordering::Relaxed);
+        }
+        if let Some(ref misses) = self.encoder_cache_misses {
+            misses.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_tokens_processed(&self, num_tokens: usize) {
+        self.tokens_processed
+            .fetch_add(num_tokens, Ordering::Relaxed);
+    }
+
+    pub fn add_new_sequence(&self) {
+        self.total_new_seqs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_prefix_cache_hit(&self) {
+        self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_num_running(&self, running: usize) {
+        self.num_running.store(running, Ordering::Relaxed);
+    }
+
+    pub fn set_num_waiting(&self, waiting: usize) {
+        self.num_waiting.store(waiting, Ordering::Relaxed);
+    }
+
+    /// Return cumulative prefix cache (hits, total_sequences).
+    pub fn prefix_cache_stats(&self) -> (usize, usize) {
+        (
+            self.prefix_cache_hits.load(Ordering::Relaxed),
+            self.total_new_seqs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Return cumulative encoder cache (hits, misses), or `None` if no encoder cache exists.
+    pub fn encoder_cache_stats(&self) -> Option<(usize, usize)> {
+        match (&self.encoder_cache_hits, &self.encoder_cache_misses) {
+            (Some(h), Some(m)) => Some((h.load(Ordering::Relaxed), m.load(Ordering::Relaxed))),
+            _ => None,
+        }
+    }
+}
+
+===== mistralrs-core/src/speculative/verifier.rs =====
+use std::sync::Arc;
+
+use candle_core::{DType, Result, Tensor};
+use rand::Rng;
+use rand_isaac::Isaac64Rng;
+
+use crate::pipeline::sampling::{finish_or_add_toks_to_seq, sample_sequence};
+use crate::pipeline::Pipeline;
+use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::sampler::Logprobs;
+use crate::sequence::{Sequence, SequenceRecognizer, SequenceState};
+
+pub struct VerificationOutcome {
+    pub accepted_drafts: usize,
+    pub proposed_drafts: usize,
+    pub keep_len: usize,
+    pub continuation_token: Option<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_verified_step<P: Pipeline>(
+    pipeline: &P,
+    seq: &mut Sequence,
+    verify_logits: Tensor,
+    proposal: Vec<u32>,
+    proposal_logits: Option<Tensor>,
+    base_len: usize,
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    disable_eos_stop: bool,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    anchor_to_emit: Option<Logprobs>,
+) -> Result<VerificationOutcome> {
+    let general_metadata = pipeline.get_metadata();
+    let eos_tok = if disable_eos_stop {
+        None
+    } else {
+        Some(&general_metadata.eos_tok[..])
+    };
+    let return_logprobs = seq.return_logprobs();
+
+    if let Some(anchor) = anchor_to_emit {
+        finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, anchor, eos_tok, true).await?;
+        if matches!(seq.getstate(), SequenceState::Done(_)) {
+            let keep_len = base_len + 1;
+            seq.clear_staged_speculative_tokens();
+            return Ok(VerificationOutcome {
+                accepted_drafts: 0,
+                proposed_drafts: proposal.len(),
+                keep_len,
+                continuation_token: None,
+            });
+        }
+    }
+
+    if let Some(proposal_logits) = proposal_logits {
+        if !seq.sampler().is_argmax() && matches!(seq.recognizer, SequenceRecognizer::None) {
+            return finish_verified_step_stochastic(
+                pipeline,
+                seq,
+                verify_logits,
+                proposal,
+                proposal_logits,
+                base_len,
+                prefix_cacher,
+                eos_tok,
+                return_logprobs,
+                rng,
+            )
+            .await;
+        }
+    }
+
+    let mut accepted = 0usize;
+    for (idx, draft) in proposal.iter().copied().enumerate() {
+        let row = logit_row(&verify_logits, idx)?;
+        let sampled = sample_sequence(
+            row.clone(),
+            seq,
+            return_logprobs,
+            eos_tok,
+            general_metadata.llg_factory.clone(),
+            general_metadata.max_seq_len,
+            rng.clone(),
+            false,
+            false,
+            false,
+        )
+        .await?;
+        let sampled_token = sampled.token;
+        if sampled_token == draft {
+            accepted += 1;
+            finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, true).await?;
+            if matches!(seq.getstate(), SequenceState::Done(_)) {
+                let keep_len = base_len + 1 + accepted;
+                seq.clear_staged_speculative_tokens();
+                return Ok(VerificationOutcome {
+                    accepted_drafts: accepted,
+                    proposed_drafts: proposal.len(),
+                    keep_len,
+                    continuation_token: None,
+                });
+            }
+        } else {
+            let keep_len = base_len + 1 + accepted;
+            finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, true).await?;
+            if matches!(seq.getstate(), SequenceState::Done(_)) {
+                seq.clear_staged_speculative_tokens();
+                return Ok(VerificationOutcome {
+                    accepted_drafts: accepted,
+                    proposed_drafts: proposal.len(),
+                    keep_len,
+                    continuation_token: None,
+                });
+            }
+            return Ok(VerificationOutcome {
+                accepted_drafts: accepted,
+                proposed_drafts: proposal.len(),
+                keep_len,
+                continuation_token: Some(sampled_token),
+            });
+        }
+    }
+
+    let row = logit_row(&verify_logits, accepted)?;
+    let continuation = sample_sequence(
+        row.clone(),
+        seq,
+        return_logprobs,
+        eos_tok,
+        general_metadata.llg_factory.clone(),
+        general_metadata.max_seq_len,
+        rng.clone(),
+        false,
+        false,
+        false,
+    )
+    .await?;
+    let continuation_token = continuation.token;
+    finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, continuation, eos_tok, true).await?;
+
+    let keep_len = base_len + 1 + accepted;
+    let continuation_token = if matches!(seq.getstate(), SequenceState::Done(_)) {
+        seq.clear_staged_speculative_tokens();
+        None
+    } else {
+        Some(continuation_token)
+    };
+
+    Ok(VerificationOutcome {
+        accepted_drafts: accepted,
+        proposed_drafts: proposal.len(),
+        keep_len,
+        continuation_token,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_verified_step_stochastic<P: Pipeline>(
+    pipeline: &P,
+    seq: &mut Sequence,
+    verify_logits: Tensor,
+    proposal: Vec<u32>,
+    proposal_logits: Tensor,
+    base_len: usize,
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    eos_tok: Option<&[u32]>,
+    return_logprobs: bool,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+) -> Result<VerificationOutcome> {
+    let mut accepted = 0usize;
+    for (idx, draft) in proposal.iter().copied().enumerate() {
+        let target_row = logit_row(&verify_logits, idx)?;
+        let candidate_row = logit_row(&proposal_logits, idx)?;
+        let sampler = seq.sampler();
+        let target_probs =
+            sampler.speculative_target_probs(flat_logits(target_row.clone())?, seq.get_toks())?;
+        let candidate_probs =
+            sampler.speculative_candidate_probs(flat_logits(candidate_row)?, seq.get_toks())?;
+        if target_probs.len() != candidate_probs.len() {
+            candle_core::bail!(
+                "speculative target/candidate vocab mismatch: target={}, candidate={}",
+                target_probs.len(),
+                candidate_probs.len()
+            );
+        }
+        let draft_idx = draft as usize;
+        let p_i = target_probs.get(draft_idx).copied().unwrap_or(0.0);
+        let q_i = candidate_probs.get(draft_idx).copied().unwrap_or(0.0);
+        let accept_prob = if q_i <= 0.0 {
+            if p_i > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            (p_i / q_i).min(1.0)
+        };
+        let draw = {
+            let mut rng = rng.lock().expect("could not lock rng mutex");
+            rng.random::<f32>()
+        };
+
+        if draw <= accept_prob {
+            accepted += 1;
+            let sampled = sampler.logprobs_from_probs(draft, &target_probs, return_logprobs)?;
+            finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, true).await?;
+            if matches!(seq.getstate(), SequenceState::Done(_)) {
+                let keep_len = base_len + 1 + accepted;
+                seq.clear_staged_speculative_tokens();
+                return Ok(VerificationOutcome {
+                    accepted_drafts: accepted,
+                    proposed_drafts: proposal.len(),
+                    keep_len,
+                    continuation_token: None,
+                });
+            }
+            continue;
+        }
+
+        let mut adjusted_probs = target_probs
+            .iter()
+            .zip(candidate_probs.iter())
+            .map(|(p, q)| (p - q).max(0.0))
+            .collect::<Vec<_>>();
+        if normalize_probs(&mut adjusted_probs).is_err() {
+            adjusted_probs = target_probs;
+        }
+        let sampled = sampler.sample_from_probs(&adjusted_probs, return_logprobs, rng.clone())?;
+        let sampled_token = sampled.token;
+        let keep_len = base_len + 1 + accepted;
+        finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, true).await?;
+        if matches!(seq.getstate(), SequenceState::Done(_)) {
+            seq.clear_staged_speculative_tokens();
+            return Ok(VerificationOutcome {
+                accepted_drafts: accepted,
+                proposed_drafts: proposal.len(),
+                keep_len,
+                continuation_token: None,
+            });
+        }
+        return Ok(VerificationOutcome {
+            accepted_drafts: accepted,
+            proposed_drafts: proposal.len(),
+            keep_len,
+            continuation_token: Some(sampled_token),
+        });
+    }
+
+    let row = logit_row(&verify_logits, accepted)?;
+    let sampler = seq.sampler();
+    let target_probs =
+        sampler.speculative_target_probs(flat_logits(row.clone())?, seq.get_toks())?;
+    let continuation = sampler.sample_from_probs(&target_probs, return_logprobs, rng)?;
+    let continuation_token = continuation.token;
+    finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, continuation, eos_tok, true).await?;
+
+    let keep_len = base_len + 1 + accepted;
+    let continuation_token = if matches!(seq.getstate(), SequenceState::Done(_)) {
+        seq.clear_staged_speculative_tokens();
+        None
+    } else {
+        Some(continuation_token)
+    };
+
+    Ok(VerificationOutcome {
+        accepted_drafts: accepted,
+        proposed_drafts: proposal.len(),
+        keep_len,
+        continuation_token,
+    })
+}
+
+fn logit_row(logits: &Tensor, row: usize) -> Result<Tensor> {
+    match logits.dims() {
+        [_, rows, _] => {
+            if row >= *rows {
+                candle_core::bail!("speculative logit row {row} is out of range for {rows} rows");
+            }
+            logits.narrow(1, row, 1)
+        }
+        [rows, _] => {
+            if row >= *rows {
+                candle_core::bail!("speculative logit row {row} is out of range for {rows} rows");
+            }
+            logits.narrow(0, row, 1)
+        }
+        shape => candle_core::bail!("speculative logits have unsupported shape {shape:?}"),
+    }
+}
+
+fn flat_logits(logits: Tensor) -> Result<Tensor> {
+    match logits.dims() {
+        [1, 1, _] => logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32),
+        [1, _] => logits.squeeze(0)?.to_dtype(DType::F32),
+        [_] => logits.to_dtype(DType::F32),
+        dims => candle_core::bail!("speculative logit row must flatten to rank 1, got {dims:?}"),
+    }
+}
+
+fn normalize_probs(probs: &mut [f32]) -> Result<()> {
+    let sum: f32 = probs
+        .iter()
+        .copied()
+        .filter(|prob| prob.is_finite() && *prob > 0.0)
+        .sum();
+    if sum <= 0.0 {
+        candle_core::bail!("all probabilities are zero in speculative adjusted distribution");
+    }
+    for prob in probs.iter_mut() {
+        if prob.is_finite() && *prob > 0.0 {
+            *prob /= sum;
+        } else {
+            *prob = 0.0;
+        }
+    }
+    Ok(())
+}
+
+===== mistralrs-core/src/speculative/driver.rs =====
+use std::any::Any;
+use std::sync::Arc;
+
+use candle_core::{Result, Tensor};
+use rand_isaac::Isaac64Rng;
+
+use crate::pipeline::sampling::{finish_or_add_toks_to_seq, sample_sequence};
+use crate::pipeline::text_models_inputs_processor::InputMetadata;
+use crate::pipeline::Pipeline;
+use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::sequence::{Sequence, SequenceState};
+
+use super::cache::{SpeculativeCacheAccess, SpeculativeCacheGuard, SpeculativeCacheOutcome};
+use super::proposer::{SpeculativeProposalBatch, SpeculativeProposeBatchCtx};
+use super::staging::{staged_batch_state, StagedBatchState};
+use super::verifier::{finish_verified_step, VerificationOutcome};
+
+pub trait SpeculativePipelineExt: Pipeline {
+    fn has_speculative_proposer(&self) -> bool;
+
+    fn speculative_proposal_len(&self) -> Option<usize>;
+
+    fn speculative_target_hiddens(&self, rows: &[(usize, usize)]) -> Result<Option<Tensor>>;
+
+    fn speculative_propose(
+        &mut self,
+        ctx: SpeculativeProposeBatchCtx<'_>,
+    ) -> Result<Option<SpeculativeProposalBatch>>;
+
+    fn build_speculative_verify_inputs(&self, input_meta: InputMetadata) -> Result<Box<dyn Any>>;
+}
+
+/// Drop staged speculative proposals when the next step cannot verify them.
+///
+/// Staged tokens are only valid for the immediately following speculative
+/// verification forward pass. If batching, cache backend choice, or another
+/// constraint makes specdec unavailable for that pass, keeping them would let a
+/// later step verify tokens against the wrong target state.
+pub(crate) fn clear_staged_speculative_tokens(seqs: &mut [&mut Sequence]) {
+    for seq in seqs.iter_mut() {
+        seq.clear_staged_speculative_tokens();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn try_sample_speculative_causal_gen<P, C>(
+    target: &mut P,
+    seqs: &mut [&mut Sequence],
+    logits: &[Tensor],
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    disable_eos_stop: bool,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    cache: &C,
+) -> Result<bool>
+where
+    P: SpeculativePipelineExt,
+    C: SpeculativeCacheAccess,
+{
+    if !target.has_speculative_proposer() || seqs.is_empty() || logits.len() != seqs.len() {
+        clear_staged_speculative_tokens(seqs);
+        return Ok(false);
+    }
+
+    let staged_state = staged_batch_state(seqs);
+    match staged_state {
+        StagedBatchState::Homogeneous(staged_len) => {
+            verify_staged_batch(
+                target,
+                seqs,
+                logits,
+                staged_len,
+                prefix_cacher,
+                disable_eos_stop,
+                rng,
+                cache,
+            )
+            .await?;
+            Ok(true)
+        }
+        StagedBatchState::Mixed => {
+            trim_mixed_staged_allocations(seqs, cache)?;
+            clear_staged_speculative_tokens(seqs);
+            bootstrap_staged_batch(
+                target,
+                seqs,
+                logits,
+                prefix_cacher,
+                disable_eos_stop,
+                rng,
+                cache,
+            )
+            .await?;
+            Ok(true)
+        }
+        StagedBatchState::None => {
+            bootstrap_staged_batch(
+                target,
+                seqs,
+                logits,
+                prefix_cacher,
+                disable_eos_stop,
+                rng,
+                cache,
+            )
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
+fn trim_mixed_staged_allocations<C>(seqs: &mut [&mut Sequence], cache: &C) -> Result<()>
+where
+    C: SpeculativeCacheAccess,
+{
+    for seq in seqs.iter_mut() {
+        let staged_len = seq.active_staged_speculative_len();
+        if staged_len == 0 {
+            continue;
+        }
+        let Some(base_len) = seq.get_toks().len().checked_sub(1) else {
+            continue;
+        };
+        let mut guard = cache.guard_for_reserved(*seq.id(), base_len, staged_len + 1);
+        guard.rollback_to(seq.get_toks().len())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bootstrap_staged_batch<P, C>(
+    target: &mut P,
+    seqs: &mut [&mut Sequence],
+    logits: &[Tensor],
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    disable_eos_stop: bool,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    cache: &C,
+) -> Result<()>
+where
+    P: SpeculativePipelineExt,
+    C: SpeculativeCacheAccess,
+{
+    let general_metadata = target.get_metadata();
+    let eos_tok = if disable_eos_stop {
+        None
+    } else {
+        Some(&general_metadata.eos_tok[..])
+    };
+    let use_async_pool = seqs.len() > 1;
+
+    let mut active_indices = Vec::new();
+    let mut sampled_tokens = Vec::new();
+    let mut base_lens = Vec::new();
+    let mut hidden_rows = Vec::new();
+
+    for (idx, (seq, logits)) in seqs.iter_mut().zip(logits.iter()).enumerate() {
+        let base_len = seq.get_toks().len();
+        let return_logprobs = seq.return_logprobs();
+        let anchor = sample_sequence(
+            logits.clone(),
+            seq,
+            return_logprobs,
+            eos_tok,
+            general_metadata.llg_factory.clone(),
+            general_metadata.max_seq_len,
+            rng.clone(),
+            use_async_pool,
+            false,
+            use_async_pool,
+        )
+        .await?;
+        let sampled_token = anchor.token;
+        finish_or_add_toks_to_seq(target, prefix_cacher, seq, anchor, eos_tok, true).await?;
+        if !matches!(seq.getstate(), SequenceState::Done(_)) {
+            active_indices.push(idx);
+            sampled_tokens.push(sampled_token);
+            base_lens.push(base_len);
+            hidden_rows.push((idx, 0));
+        }
+    }
+
+    propose_and_stage_batch(
+        target,
+        seqs,
+        &active_indices,
+        &sampled_tokens,
+        &base_lens,
+        &hidden_rows,
+        rng,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_staged_batch<P, C>(
+    target: &mut P,
+    seqs: &mut [&mut Sequence],
+    logits: &[Tensor],
+    staged_len: usize,
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    disable_eos_stop: bool,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    cache: &C,
+) -> Result<()>
+where
+    P: SpeculativePipelineExt,
+    C: SpeculativeCacheAccess,
+{
+    let mut outcomes: Vec<Option<VerificationOutcome>> = Vec::with_capacity(seqs.len());
+    let mut cache_guards: Vec<Option<C::Guard>> = Vec::with_capacity(seqs.len());
+    let mut cache_outcomes: Vec<Option<SpeculativeCacheOutcome>> = Vec::with_capacity(seqs.len());
+    for (seq, logits) in seqs.iter_mut().zip(logits.iter()) {
+        let Some(base_len) = seq.get_toks().len().checked_sub(1) else {
+            cache_guards.push(None);
+            cache_outcomes.push(None);
+            outcomes.push(None);
+            continue;
+        };
+        let proposal = seq.take_staged_speculative_tokens();
+        let proposal_logits = seq.take_staged_speculative_logits();
+        if proposal.len() != staged_len {
+            seq.clear_staged_speculative_tokens();
+            cache_guards.push(None);
+            cache_outcomes.push(None);
+            outcomes.push(None);
+            continue;
+        }
+
+        let cache_guard = cache.guard_for_reserved(*seq.id(), base_len, staged_len + 1);
+        let outcome = finish_verified_step(
+            target,
+            seq,
+            logits.clone(),
+            proposal,
+            proposal_logits,
+            base_len,
+            prefix_cacher,
+            disable_eos_stop,
+            rng.clone(),
+            None,
+        )
+        .await?;
+        let accepted_all = outcome.accepted_drafts == outcome.proposed_drafts;
+        cache_outcomes.push(Some(SpeculativeCacheOutcome {
+            keep_len: outcome.keep_len,
+            accepted_all,
+        }));
+        cache_guards.push(Some(cache_guard));
+        outcomes.push(Some(outcome));
+    }
+    cache.finish_verification_batch(&mut cache_guards, seqs, &cache_outcomes)?;
+    for (seq, outcome) in seqs.iter_mut().zip(outcomes.iter()) {
+        if let Some(outcome) = outcome {
+            seq.set_num_computed_tokens(outcome.keep_len);
+        }
+    }
+
+    let mut active_indices = Vec::new();
+    let mut sampled_tokens = Vec::new();
+    let mut base_lens = Vec::new();
+    let mut hidden_rows = Vec::new();
+    for (idx, outcome) in outcomes.iter().enumerate() {
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        let Some(continuation_token) = outcome.continuation_token else {
+            continue;
+        };
+        active_indices.push(idx);
+        sampled_tokens.push(continuation_token);
+        base_lens.push(outcome.keep_len);
+        hidden_rows.push((idx, outcome.accepted_drafts));
+    }
+
+    propose_and_stage_batch(
+        target,
+        seqs,
+        &active_indices,
+        &sampled_tokens,
+        &base_lens,
+        &hidden_rows,
+        rng,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose_and_stage_batch<P, C>(
+    target: &mut P,
+    seqs: &mut [&mut Sequence],
+    active_indices: &[usize],
+    sampled_tokens: &[u32],
+    base_lens: &[usize],
+    hidden_rows: &[(usize, usize)],
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    cache: &C,
+) -> Result<()>
+where
+    P: SpeculativePipelineExt,
+    C: SpeculativeCacheAccess,
+{
+    // Staging in one concrete sequence:
+    //
+    //   1. Target verifies [A B C D E F G].
+    //   2. Drafts B..G are accepted, then the verifier samples continuation H
+    //      from the last verified row. The cache contains A..G, but not H.
+    //   3. We still have the target hidden state for G, and we just sampled H,
+    //      so the proposer can immediately draft [I J K L M N].
+    //   4. Store [I J K L M N] on the sequence. The next target decode
+    //      forward consumes [H I J K L M N], appending H and verifying the
+    //      staged tokens in one pass.
+    //
+    // In a batch, every participating sequence follows the same shape with the
+    // same proposal width. Acceptance can still differ per sequence; only the
+    // target forward shape is fixed.
+    if active_indices.is_empty() {
+        return Ok(());
+    }
+    let Some(proposal_len) = target.speculative_proposal_len() else {
+        clear_active_staged(seqs, active_indices);
+        return Ok(());
+    };
+    if proposal_len == 0 {
+        clear_active_staged(seqs, active_indices);
+        return Ok(());
+    }
+
+    let can_stage = {
+        let sequences = active_indices
+            .iter()
+            .map(|idx| &*seqs[*idx] as &Sequence)
+            .collect::<Vec<_>>();
+        cache.can_stage_proposal(&sequences, base_lens, proposal_len)
+    };
+    if !can_stage {
+        clear_active_staged(seqs, active_indices);
+        return Ok(());
+    }
+
+    let target_hiddens = match target.speculative_target_hiddens(hidden_rows)? {
+        Some(hidden) => Some(hidden),
+        None => {
+            clear_active_staged(seqs, active_indices);
+            return Ok(());
+        }
+    };
+
+    let seq_ids = active_indices
+        .iter()
+        .map(|idx| *seqs[*idx].id())
+        .collect::<Vec<_>>();
+    let proposal_batch = {
+        let sequences = active_indices
+            .iter()
+            .map(|idx| &*seqs[*idx] as &Sequence)
+            .collect::<Vec<_>>();
+        target.speculative_propose(SpeculativeProposeBatchCtx {
+            sampled_tokens,
+            sampled_tokens_emitted: true,
+            seq_ids: &seq_ids,
+            base_lens,
+            sequences: &sequences,
+            cache: cache.proposer_cache(&sequences)?,
+            target_hiddens,
+            rng: rng.clone(),
+        })?
+    };
+
+    let Some(proposal_batch) = proposal_batch else {
+        clear_active_staged(seqs, active_indices);
+        return Ok(());
+    };
+    if proposal_batch.proposals.len() != active_indices.len() {
+        candle_core::bail!(
+            "speculative proposer returned {} proposals for {} active sequences",
+            proposal_batch.proposals.len(),
+            active_indices.len()
+        );
+    }
+
+    for (idx, proposal) in active_indices.iter().zip(proposal_batch.proposals) {
+        if proposal.tokens.len() == proposal_len {
+            seqs[*idx].set_staged_speculative(proposal.tokens, proposal.logits);
+        } else {
+            seqs[*idx].clear_staged_speculative_tokens();
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_active_staged(seqs: &mut [&mut Sequence], active_indices: &[usize]) {
+    for idx in active_indices {
+        seqs[*idx].clear_staged_speculative_tokens();
+    }
+}
+
+===== mistralrs-core/src/engine/add_request.rs =====
+use crate::{
+    pipeline::{KvCache, NormalCache},
+    prefix_cacher::MatchingCache,
+    request::{DetokenizationRequest, NormalRequest, TokenizationRequest},
+    sequence::SeqStepType,
+    tools::{ToolCallFormat, ToolCallState, ToolChoice},
+    ModelCategory, RequestMessage, Response,
+};
+use candle_core::Tensor;
+use either::Either;
+use std::{
+    ops::Deref,
+    sync::{atomic::Ordering, Arc},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tracing::warn;
+
+use crate::{
+    get_mut_arcmutex, handle_seq_error,
+    request::Request,
+    sampler::Sampler,
+    sequence::{Sequence, SequenceGroup},
+    StopTokens,
+};
+
+use super::{agentic_loop, Engine, TERMINATE_ALL_NEXT_STEP};
+
+impl Engine {
+    pub async fn handle_request(self: Arc<Self>, request: Request) {
+        match request {
+            Request::Normal(mut request) => {
+                let is_chat = matches!(
+                    &request.messages,
+                    RequestMessage::Chat { .. } | RequestMessage::MultimodalChat { .. }
+                );
+                let in_agentic_loop =
+                    request.max_tool_rounds == agentic_loop::AGENTIC_LOOP_REENTRY_SENTINEL;
+                let has_tooling = self.tool_callbacks.keys().any(|name| {
+                    agentic_loop::registered_tool_active_for_request(
+                        name,
+                        request.enable_code_execution,
+                        request.enable_shell,
+                    )
+                });
+                let has_search = request.web_search_options.is_some();
+                let has_agentic =
+                    request.max_tool_rounds.is_some() || request.tool_dispatch_url.is_some();
+                let has_input_files =
+                    cfg!(feature = "code-execution") && is_chat && !request.input_files.is_empty();
+
+                if is_chat
+                    && !in_agentic_loop
+                    && (has_search || has_tooling || has_agentic || has_input_files)
+                {
+                    agentic_loop::agentic_loop(self.clone(), *request).await;
+                } else if request.files.as_ref().is_some_and(|f| !f.is_empty()) {
+                    // `request.files` is set but nothing would produce them. Reject rather than silently degrading to a plain chat.
+                    let _ = request
+                        .response
+                        .send(crate::Response::ValidationError(
+                            "request.files is set but no agentic surface is enabled \
+                             (enable_code_execution / tools / web_search / \
+                             enable_shell / max_tool_rounds / tool_dispatch_url). Files cannot be \
+                             produced without one of these."
+                                .into(),
+                        ))
+                        .await;
+                } else {
+                    if is_chat && !request.input_files.is_empty() {
+                        agentic_loop::inject_input_files_message(&mut request);
+                    }
+                    self.add_request(*request).await;
+                }
+            }
+            Request::ReIsq(level) => {
+                if let Err(e) = get_mut_arcmutex!(self.pipeline).re_isq_model(level) {
+                    warn!("ISQ requantization failed: {e:?}");
+                }
+            }
+            Request::Calibration(req) => {
+                let result = {
+                    let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                    match &req.action {
+                        crate::CalibrationAction::Start => pipeline
+                            .begin_calibration()
+                            .and_then(|()| pipeline.calibration_status()),
+                        crate::CalibrationAction::Status => pipeline.calibration_status(),
+                        crate::CalibrationAction::Apply { save_cimatrix } => {
+                            pipeline.apply_calibration(save_cimatrix.clone())
+                        }
+                    }
+                };
+                if let Err(e) = &result {
+                    warn!("Calibration request failed: {e:?}");
+                }
+                let _ = req.response.send(result).await;
+            }
+            Request::Tokenize(req) => self.tokenize_text(req).await,
+            Request::Detokenize(req) => self.detokenize_text(req).await,
+            Request::Terminate => (),
+            Request::TerminateAllSeqsNextStep => {
+                TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst)
+            }
+        }
+    }
+
+    pub(super) async fn add_request(&self, request: NormalRequest) {
+        let is_chat = matches!(
+            request.messages,
+            RequestMessage::Chat { .. } | RequestMessage::MultimodalChat { .. }
+        );
+        let echo_prompt = matches!(
+            request.messages,
+            RequestMessage::Completion {
+                echo_prompt: true,
+                ..
+            }
+        );
+
+        let best_of = match request.messages {
+            RequestMessage::Completion { best_of, .. } => best_of,
+            RequestMessage::Chat { .. }
+            | RequestMessage::CompletionTokens(_)
+            | RequestMessage::MultimodalChat { .. }
+            | RequestMessage::ImageGeneration { .. }
+            | RequestMessage::SpeechGeneration { .. }
+            | RequestMessage::Embedding { .. }
+            | RequestMessage::EmbeddingTokens { .. } => None,
+        };
+        let truncate_sequence = request.truncate_sequence;
+        if is_chat
+            && !get_mut_arcmutex!(self.pipeline)
+                .get_chat_template()
+                .as_ref()
+                .is_some_and(|ch_t| ch_t.has_chat_template())
+        {
+            request
+                    .response
+                    .send(Response::ValidationError(
+                        "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            return;
+        }
+
+        // Verify the model's category matches the messages received.
+        match (
+            get_mut_arcmutex!(self.pipeline).category(),
+            &request.messages,
+        ) {
+            (
+                ModelCategory::Text | ModelCategory::Multimodal { .. },
+                RequestMessage::Chat { .. }
+                | RequestMessage::MultimodalChat { .. }
+                | RequestMessage::Completion { .. }
+                | RequestMessage::CompletionTokens(_),
+            ) => (),
+            (ModelCategory::Diffusion, RequestMessage::ImageGeneration { .. }) => (),
+            (ModelCategory::Speech, RequestMessage::SpeechGeneration { .. }) => (),
+            (
+                ModelCategory::Embedding,
+                RequestMessage::Embedding { .. } | RequestMessage::EmbeddingTokens { .. },
+            ) => (),
+            _ => {
+                request
+                    .response
+                    .send(Response::ValidationError(
+                        "Received a request incompatible for this model's category.".into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
+        }
+
+        let images = match request.messages {
+            RequestMessage::MultimodalChat { ref images, .. } => Some(images.clone()),
+            _ => None,
+        };
+
+        let audios = match request.messages {
+            RequestMessage::MultimodalChat { ref audios, .. } => Some(audios.clone()),
+            _ => None,
+        };
+        let videos = match request.messages {
+            RequestMessage::MultimodalChat { ref videos, .. } => Some(videos.clone()),
+            _ => None,
+        };
+        let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+        let preferred_tool_call_format = {
+            let pipeline = get_mut_arcmutex!(self.pipeline);
+            pipeline
+                .get_chat_template()
+                .and_then(|chat_template| chat_template.tool_call_format())
+        };
+        let uses_harmony_t

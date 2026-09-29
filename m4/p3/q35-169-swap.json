@@ -1,0 +1,8 @@
+{"name": "Qwen3.6-35B-A3B UD-Q4_K_XL, GPU 0.66, 2-fold prompt split (swap)",
+ "train": "~/titan-engine/m4/out/q35-calib.trace", "eval": "~/titan-engine/m4/out/q35-calib.trace",
+ "split": "swap", "experts": 256, "slots": 169, "layer_scale": 1.1111, "out": "~/titan-engine/m4/p3/out/q35-169-swap",
+ "main_cost": "sync",
+ "costs": {
+  "sync":  {"measured_static_tok_s": 78.0, "c_miss_us": 75, "c_up_us": 380},
+  "fastup": {"measured_static_tok_s": 78.0, "c_miss_us": 75, "c_up_us": 80},
+  "async": {"measured_static_tok_s": 78.0, "c_miss_us": 75, "c_up_us": 0}}}

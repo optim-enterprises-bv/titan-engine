@@ -1,0 +1,182 @@
+[
+ {
+  "prompt": "The capital of France is",
+  "text": " Paris. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of France. Paris is located in the north of France. Paris is the capital of",
+  "top4": {
+   " Paris": -0.3468416929244995,
+   " the": -3.0084893703460693,
+   " **": -3.2002761363983154,
+   " not": -3.789936065673828
+  },
+  "secs": 0.3216552734375,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 5,
+   "total_tokens": 69,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 5,
+   "prompt_ms": 13.123,
+   "prompt_per_token_ms": 2.6246,
+   "prompt_per_second": 381.01043968604745,
+   "predicted_n": 64,
+   "predicted_ms": 295.112,
+   "predicted_per_token_ms": 4.684317460317461,
+   "predicted_per_second": 213.47827265580523
+  }
+ },
+ {
+  "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+  "text": "    if n <= 0:\n        raise ValueError(\"n must be a positive integer\")\n    elif n == 1:\n        return 0\n    elif n == 2:\n        return 1\n    else:\n        return fibonacci(n - 1) + fibonacci(n - 2)\n\ndef fibonacci(n):\n",
+  "top4": {
+   "   ": -0.0036519612185657024,
+   "    \n": -5.91853666305542,
+   "\n": -7.9048590660095215,
+   "``": -9.405688285827637
+  },
+  "secs": 0.315183162689209,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 13,
+   "prompt_ms": 18.975,
+   "prompt_per_token_ms": 1.4596153846153848,
+   "prompt_per_second": 685.1119894598155,
+   "predicted_n": 64,
+   "predicted_ms": 287.036,
+   "predicted_per_token_ms": 4.556126984126984,
+   "predicted_per_second": 219.48466394459234
+  }
+ },
+ {
+  "prompt": "Once upon a time, in a small village by the sea,",
+  "text": " there lived a young girl named Lila. She was known for her love of the sea and her ability to speak with the waves. The villagers often said that she was the daughter of the ocean itself. One day, a great storm came and caused the sea to rise. Lila was the only one who could calm",
+  "top4": {
+   " there": -0.08264198899269104,
+   " lived": -2.87290620803833,
+   " a": -4.967142581939697,
+   " the": -5.941239833831787
+  },
+  "secs": 0.3238089084625244,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 13,
+   "total_tokens": 77,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 13,
+   "prompt_ms": 9.471,
+   "prompt_per_token_ms": 0.7285384615384616,
+   "prompt_per_second": 1372.6111287086896,
+   "predicted_n": 64,
+   "predicted_ms": 304.756,
+   "predicted_per_token_ms": 4.837396825396825,
+   "predicted_per_second": 206.72275525338304
+  }
+ },
+ {
+  "prompt": "The three laws of thermodynamics are",
+  "text": " fundamental principles in physics that describe the behavior of energy and matter. The first law states that energy cannot be created or destroyed, only transformed from one form to another. The second law introduces the concept of entropy, stating that the total entropy of an isolated system can never decrease over time. The third law asserts that as the",
+  "top4": {
+   " fundamental": -1.0280462503433228,
+   " important": -2.3402915000915527,
+   " the": -2.760579824447632,
+   ":": -2.8066155910491943
+  },
+  "secs": 0.3252289295196533,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 7,
+   "total_tokens": 71,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 7,
+   "prompt_ms": 10.498,
+   "prompt_per_token_ms": 1.4997142857142856,
+   "prompt_per_second": 666.7936749857116,
+   "predicted_n": 64,
+   "predicted_ms": 304.631,
+   "predicted_per_token_ms": 4.835412698412698,
+   "predicted_per_second": 206.80758031848367
+  }
+ },
+ {
+  "prompt": "1, 1, 2, 3, 5, 8, 13,",
+  "text": " 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765",
+  "top4": {
+   " ": -0.06639806926250458,
+   " etc": -3.6727614402770996,
+   " ...": -3.7002663612365723,
+   " ...\n": -5.626891613006592
+  },
+  "secs": 0.3148016929626465,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 21,
+   "total_tokens": 85,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 21,
+   "prompt_ms": 11.068,
+   "prompt_per_token_ms": 0.527047619047619,
+   "prompt_per_second": 1897.3617636429349,
+   "predicted_n": 64,
+   "predicted_ms": 294.47,
+   "predicted_per_token_ms": 4.674126984126985,
+   "predicted_per_second": 213.94369545284746
+  }
+ },
+ {
+  "prompt": "Translate to German: The weather is nice today.\nGerman:",
+  "text": " Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das Wetter ist heute sch\u00f6n.\nGerman: Das",
+  "top4": {
+   " Das": -0.909026026725769,
+   " Die": -1.297092318534851,
+   " Der": -1.6858853101730347,
+   " Es": -3.5862579345703125
+  },
+  "secs": 0.3180418014526367,
+  "usage": {
+   "completion_tokens": 64,
+   "prompt_tokens": 12,
+   "total_tokens": 76,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 12,
+   "prompt_ms": 9.458,
+   "prompt_per_token_ms": 0.7881666666666667,
+   "prompt_per_second": 1268.7671812222457,
+   "predicted_n": 64,
+   "predicted_ms": 298.073,
+   "predicted_per_token_ms": 4.73131746031746,
+   "predicted_per_second": 211.35762044868204
+  }
+ }
+]
