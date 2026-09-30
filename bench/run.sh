@@ -86,6 +86,7 @@ serve mtpoff  mtpoff  "TITAN_MTP=0"
 serve ident   ident   "TITAN_MTP=0" "s#^$MDIR\$#$OLDDIR#;s#^65536\$#4096#"
 serve nsys2   nsys    ""
 serve nsys0   nsys    "TITAN_MTP=0"
+[ "${BENCH_ADMIT:-}" = 1 ] && serve admit admit "TITAN_ADMIT=1"
 for n in nsys2 nsys0; do
   [ -f $R/$n.nsys-rep ] || continue
   t=$(date +%s)

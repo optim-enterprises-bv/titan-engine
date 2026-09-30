@@ -23,6 +23,7 @@ hb, ha = load("hyg-before.json") or {}, load("hyg-after.json") or {}
 kern = load("kernel.json") or {}
 svc, off, ident = load("e2e-service.json") or {}, load("e2e-mtpoff.json") or {}, load("e2e-ident.json") or {}
 n2, n0 = load("nsys-mtp2.json") or {}, load("nsys-off.json") or {}
+adm = (load("e2e-admit.json") or {}).get("admit")
 
 M = {}  # name -> {v, spread, better, unit, tier}
 
@@ -135,6 +136,8 @@ line = {"id": rid, "date": meta.get("date"), "label": meta.get("label"), "binary
         "e2e_detail": {"prompt_tokens": {k: [r.get("prompt_tokens") for r in svc.get(f"cold_{k}", [])] for k in ("4k", "13k")},
                        "warm13k_cached_tokens": [r.get("cached_tokens") for r in svc.get("warm_13k", [])],
                        "repeat_identical_mtp2": svc.get("repeat_identical"), "repeat_identical_off": off.get("repeat_identical")}}
+if adm:
+    line["admit"] = {k: adm.get(k) for k in ("pass", "refused_all", "refuse_ms_max", "after_ok")}
 json.dump(line, open(f"{rd}/summary.json", "w"), indent=1)
 hist = f"{B}/history.jsonl"
 old = [l for l in open(hist)] if os.path.exists(hist) else []
@@ -159,6 +162,9 @@ for n, m in M.items():
         L.append(f"| {n[4:]} ({m['unit']}) | {f(m['v'], 2)} | {', '.join(f(x, 2) for x in m['reps'])} | {sp(m)} |")
 L += ["", f"Prompt tokens: {line['e2e_detail']['prompt_tokens']}; warm 13k cached tokens {line['e2e_detail']['warm13k_cached_tokens']}; "
       f"8x256 rep2 identical to rep1: MTP=2 {svc.get('repeat_identical')}, off {off.get('repeat_identical')}.", "",
+      *([f"Admission probe (TITAN_ADMIT=1): **{'PASS' if adm.get('pass') else 'FAIL'}**, over-context refused "
+         f"{adm.get('refused_all')} in at most {f(adm.get('refuse_ms_max'), 0)} ms, next request ok {adm.get('after_ok')}, "
+         f"28k prompt {(adm.get('long_28k') or {}).get('prompt_tokens')} tokens.", ""] if adm else []),
       "## Path tier: one layer's MoE forward as the model runs it (nsys, µs, median over layers)", "",
       "| batch@profile | blocks | span | busy | idle in span | routed experts | shared expert | other | rep spans | spread | llama fused FFN | experts / llama FFN |",
       "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|"]
