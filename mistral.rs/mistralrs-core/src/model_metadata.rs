@@ -192,6 +192,11 @@ impl NormalLoaderType {
                     ex!("LiquidAI/LFM2-8B-A1B", "LFM2"),
                 ],
             },
+            Self::Spark2_5 => ArchMetadata {
+                families: &["Spark-X2.5"],
+                modalities: m,
+                examples: &[],
+            },
         }
     }
 }
@@ -409,6 +414,7 @@ impl NormalLoaderType {
             Self::Qwen3_5 => "Qwen3_5ForCausalLM",
             Self::Lfm2 => "Lfm2ForCausalLM",
             Self::Lfm2Moe => "Lfm2MoeForCausalLM",
+            Self::Spark2_5 => "Spark2_5ForCausalLM",
         }
     }
 }

@@ -256,6 +256,10 @@ pub mod kernels {
             1 => gelu_tanh(x),
             2 => fmaxf(0.0, x),
             3 => mul(x, normcdf_ftz(x)),
+            // C++ `1.0f / (1.0f + expf(-x))` under --use_fast_math: [FMUL x*-log2e; MUFU.EX2;
+            // FADD.FTZ +1; MUFU.RCP] -- i.e. `silu` without the final multiply by x (nvcc folds the
+            // `1.0f *` away). act 4 is GLU sigmoid; the C++ `default:` (>=5) stays silu.
+            4 => rcp(add(ex2(mul(x, NEG_LOG2E)), 1.0)),
             _ => silu(x),
         }
     }
@@ -2443,9 +2447,23 @@ pub mod kernels {
         quantize_tail::<LAYOUT>(v, vy, ib, iqs);
     }
 
+    /// `mmq_glu_product<input_t>`: the activation is rounded to `input_t`, then multiplied in
+    /// `input_t` precision, exactly as the C++ does (`(input_t)act(g) * (input_t)u`). IT: 0 f32,
+    /// 1 f16, 2 bf16.
     #[inline(always)]
-    pub unsafe fn quantize_mmq_q8_1_glu<const LAYOUT: u32>(
-        gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32,
+    pub fn glu_product<const IT: u32>(g: f32, u: f32, activation: i32) -> f32 {
+        match IT {
+            0 => mul(glu_act(g, activation), u),
+            1 => H::tmul(H::from_f(glu_act(g, activation)), H::from_f(u)).to_f(),
+            _ => B::tmul(B::from_f(glu_act(g, activation)), B::from_f(u)).to_f(),
+        }
+    }
+
+    /// quantize_mmq_q8_1_glu<input_t, ds_layout>: one activation quantization pass over a fused
+    /// gate/up GLU. IT: 0 f32, 1 f16, 2 bf16.
+    #[inline(always)]
+    pub unsafe fn quantize_mmq_q8_1_glu<const IT: u32, const LAYOUT: u32>(
+        gate: *const u8, up: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32,
     ) {
         let i0 = ((thread::blockDim_x() as i64) * thread::blockIdx_y() as i64 + thread::threadIdx_x() as i64) * 4;
         if i0 >= ne0 {
@@ -2456,19 +2474,14 @@ pub mod kernels {
         let ib = (i0 / 128) * ne1 as i64 + i1;
         let iqs = i0 % 128;
         let base = i01 * s01 + i0;
-        let mut v = [0f32; 4];
-        if i0 < ne00 {
-            v[0] = mul(glu_act(*gate.offset(base as isize), activation), *up.offset(base as isize));
-        }
-        if i0 + 1 < ne00 {
-            v[1] = mul(glu_act(*gate.offset(base as isize + 1), activation), *up.offset(base as isize + 1));
-        }
-        if i0 + 2 < ne00 {
-            v[2] = mul(glu_act(*gate.offset(base as isize + 2), activation), *up.offset(base as isize + 2));
-        }
-        if i0 + 3 < ne00 {
-            v[3] = mul(glu_act(*gate.offset(base as isize + 3), activation), *up.offset(base as isize + 3));
-        }
+        let g4 = load4::<IT>(gate, base, i0, ne00);
+        let u4 = load4::<IT>(up, base, i0, ne00);
+        let v = [
+            glu_product::<IT>(g4[0], u4[0], activation),
+            glu_product::<IT>(g4[1], u4[1], activation),
+            glu_product::<IT>(g4[2], u4[2], activation),
+            glu_product::<IT>(g4[3], u4[3], activation),
+        ];
         quantize_tail::<LAYOUT>(v, vy, ib, iqs);
     }
 
@@ -3196,15 +3209,21 @@ pub mod kernels {
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f32_d4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<0, 0>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f16_d4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<1, 0>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_bf16_d4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<2, 0>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
-    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_d4(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<0>(gate, up, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_d4(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<0, 0>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f16_d4(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<1, 0>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_bf16_d4(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<2, 0>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f32_ds4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<0, 1>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f16_ds4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<1, 1>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_bf16_ds4(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<2, 1>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
-    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_ds4(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<1>(gate, up, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_ds4(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<0, 1>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f16_ds4(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<1, 1>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_bf16_ds4(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<2, 1>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f32_d2s6(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<0, 2>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_f16_d2s6(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<1, 2>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
     #[kernel] pub unsafe fn quantize_mmq_q8_1_bf16_d2s6(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) { quantize_mmq_q8_1::<2, 2>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }
-    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_d2s6(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<2>(gate, up, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_d2s6(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<0, 2>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f16_d2s6(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<1, 2>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
+    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_bf16_d2s6(gate: *const u16, up: *const u16, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) { quantize_mmq_q8_1_glu::<2, 2>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }
     #[kernel] #[launch_bounds(256, 1)] pub unsafe fn mmq_q4_0_x8_nc0(x: *const u8, y: *const i32, ids_dst: *const i32, expert_bounds: *const i32, dst: *mut u8, tmp_fixup: *mut f32, bpn_mp: u32, bpn_l: u32, bpn_d: u32, nrows_x: i32, ncols_dst: i32, stride_row_x: i32, ncols_y: i32, stride_col_dst: i32, cr_mp: u32, cr_l: u32, cr_d: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_channel_x: i32, stride_channel_y: i32, stride_channel_dst: i32, sr_mp: u32, sr_l: u32, sr_d: u32, nsy_mp: u32, nsy_l: u32, nsy_d: u32, stride_sample_x: i32, stride_sample_y: i32, stride_sample_dst: i32, type_dst: i32, ntx_mp: u32, ntx_l: u32, ntx_d: u32) { mul_mat_q::<Q4_0, 8, false>(x, y, ids_dst, expert_bounds, dst, tmp_fixup, Fd { mp: bpn_mp, l: bpn_l, d: bpn_d }, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, Fd { mp: cr_mp, l: cr_l, d: cr_d }, Fd { mp: ncy_mp, l: ncy_l, d: ncy_d }, stride_channel_x, stride_channel_y, stride_channel_dst, Fd { mp: sr_mp, l: sr_l, d: sr_d }, Fd { mp: nsy_mp, l: nsy_l, d: nsy_d }, stride_sample_x, stride_sample_y, stride_sample_dst, type_dst, Fd { mp: ntx_mp, l: ntx_l, d: ntx_d }) }
     #[kernel] #[launch_bounds(256, 1)] pub unsafe fn mmq_q4_0_x8_nc1(x: *const u8, y: *const i32, ids_dst: *const i32, expert_bounds: *const i32, dst: *mut u8, tmp_fixup: *mut f32, bpn_mp: u32, bpn_l: u32, bpn_d: u32, nrows_x: i32, ncols_dst: i32, stride_row_x: i32, ncols_y: i32, stride_col_dst: i32, cr_mp: u32, cr_l: u32, cr_d: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_channel_x: i32, stride_channel_y: i32, stride_channel_dst: i32, sr_mp: u32, sr_l: u32, sr_d: u32, nsy_mp: u32, nsy_l: u32, nsy_d: u32, stride_sample_x: i32, stride_sample_y: i32, stride_sample_dst: i32, type_dst: i32, ntx_mp: u32, ntx_l: u32, ntx_d: u32) { mul_mat_q::<Q4_0, 8, true>(x, y, ids_dst, expert_bounds, dst, tmp_fixup, Fd { mp: bpn_mp, l: bpn_l, d: bpn_d }, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, Fd { mp: cr_mp, l: cr_l, d: cr_d }, Fd { mp: ncy_mp, l: ncy_l, d: ncy_d }, stride_channel_x, stride_channel_y, stride_channel_dst, Fd { mp: sr_mp, l: sr_l, d: sr_d }, Fd { mp: nsy_mp, l: nsy_l, d: nsy_d }, stride_sample_x, stride_sample_y, stride_sample_dst, type_dst, Fd { mp: ntx_mp, l: ntx_l, d: ntx_d }) }
     #[kernel] #[launch_bounds(256, 1)] pub unsafe fn mmq_q4_0_x16_nc0(x: *const u8, y: *const i32, ids_dst: *const i32, expert_bounds: *const i32, dst: *mut u8, tmp_fixup: *mut f32, bpn_mp: u32, bpn_l: u32, bpn_d: u32, nrows_x: i32, ncols_dst: i32, stride_row_x: i32, ncols_y: i32, stride_col_dst: i32, cr_mp: u32, cr_l: u32, cr_d: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_channel_x: i32, stride_channel_y: i32, stride_channel_dst: i32, sr_mp: u32, sr_l: u32, sr_d: u32, nsy_mp: u32, nsy_l: u32, nsy_d: u32, stride_sample_x: i32, stride_sample_y: i32, stride_sample_dst: i32, type_dst: i32, ntx_mp: u32, ntx_l: u32, ntx_d: u32) { mul_mat_q::<Q4_0, 16, false>(x, y, ids_dst, expert_bounds, dst, tmp_fixup, Fd { mp: bpn_mp, l: bpn_l, d: bpn_d }, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, Fd { mp: cr_mp, l: cr_l, d: cr_d }, Fd { mp: ncy_mp, l: ncy_l, d: ncy_d }, stride_channel_x, stride_channel_y, stride_channel_dst, Fd { mp: sr_mp, l: sr_l, d: sr_d }, Fd { mp: nsy_mp, l: nsy_l, d: nsy_d }, stride_sample_x, stride_sample_y, stride_sample_dst, type_dst, Fd { mp: ntx_mp, l: ntx_l, d: ntx_d }) }

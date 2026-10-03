@@ -1,0 +1,6 @@
+# swap-window binaries (334 MB each) and their run logs/out are not source.
+mistralrs-swap-w*
+out/
+*.server.log
+build-oxide.log
+live-test*.toml

@@ -328,3 +328,8 @@ pub(crate) fn top1_f32_packed(input: &Tensor) -> Result<[f32; 2]> {
     let packed = dev.clone_dtoh(&ws.packed)?;
     Ok([packed[0], packed[1]])
 }
+
+/// Model unload: free the top-1 buffers.
+pub(crate) fn release_workspaces() {
+    *TOP1_WS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}

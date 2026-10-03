@@ -152,3 +152,88 @@ impl MlaWeights {
         candle_core::bail!("MLA weights require CUDA support")
     }
 }
+
+/// m4/deq: `GgufMatMul::dequantize_w` is the exact f32 dequantize (QTensor::dequantize: llama.cpp's to_float /
+/// convert.cu f32 values) through the `dyn QuantMethod` every caller holds, on CPU and CUDA, and the MLA caller
+/// (`compute_weights`) gets those exact values. The old path (dequantize_f16 -> f32) rounds these weights, so the
+/// test fails on it. (Lives in mistralrs-core: the nvcc-free mistralrs-quant test binary cannot link the
+/// nvcc-only stubs, which only mistralrs-core's oxide feature pulls in.)
+#[cfg(all(test, feature = "cuda", target_family = "unix"))]
+mod deq_tests {
+    use super::MlaWeights;
+    use candle_core::quantized::{GgmlDType, QStorage, QTensor};
+    use candle_core::{DType, Device, Result, Tensor};
+    use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+    use std::sync::Arc;
+
+    fn bits(t: &Tensor) -> Result<Vec<u32>> {
+        Ok(t.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect())
+    }
+
+    fn check(device: &Device) -> Result<()> {
+        // 4 heads x (nope 64 + v 64) rows, kv_lora_rank 512 columns
+        let (heads, nope, vd, rank) = (4usize, 64usize, 64usize, 512usize);
+        let (rows, cols) = (heads * (nope + vd), rank);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7919 % 1013) as f32 - 506.0) / 506.0 * (1.0 + (i / cols) as f32 * 0.037))
+            .collect();
+        let dense = Tensor::from_vec(values, (rows, cols), &Device::Cpu)?;
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::MXFP4,
+            GgmlDType::IQ4XS,
+            GgmlDType::Q8_1,
+        ] {
+            // IQ4_XS (dequantized on the host; its CUDA dequantize_f16 used to fail) cannot be quantized by
+            // candle: random blocks with a finite scale d = 0.1.
+            let bytes = if dtype == GgmlDType::IQ4XS {
+                let mut b: Vec<u8> =
+                    (0..rows * cols / 256 * 136).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+                for blk in b.chunks_exact_mut(136) {
+                    blk[..2].copy_from_slice(&half::f16::from_f32(0.1).to_bits().to_le_bytes());
+                }
+                b
+            } else {
+                QTensor::quantize(&dense, dtype)?.data()?.to_vec()
+            };
+            let q = QTensor::new(QStorage::from_data(std::borrow::Cow::Owned(bytes), device, dtype)?, (rows, cols))?;
+            let want = q.dequantize(device)?;
+            let old = q.dequantize_f16(device)?.to_dtype(DType::F32)?;
+            let layer: Arc<dyn QuantMethod> =
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf { q_weight: Arc::new(q), b: None })?);
+            let got = layer.dequantize_w()?;
+            assert_eq!(got.dtype(), DType::F32, "{dtype:?}");
+            let (g, w, o) = (bits(&got)?, bits(&want)?, bits(&old)?);
+            let differ = g.iter().zip(&w).filter(|(a, b)| a != b).count();
+            let old_differ = o.iter().zip(&w).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{dtype:?} on {device:?}: dequantize_w differs from dequantize");
+            if !matches!(dtype, GgmlDType::MXFP4 | GgmlDType::IQ4XS) {
+                assert!(old_differ > 0, "{dtype:?}: the old f16 path should round some values");
+            }
+            // the MLA caller: w_uk = rows [h*(nope+v), h*(nope+v)+nope) of the exact weight
+            let (w_uk, _w_uv_t) = MlaWeights::compute_weights(layer.as_ref(), device, heads, rank, nope, vd)?;
+            let exact_uk = want.reshape((heads, nope + vd, rank))?.narrow(1, 0, nope)?.contiguous()?;
+            let uk_differ = bits(&w_uk)?.iter().zip(&bits(&exact_uk)?).filter(|(a, b)| a != b).count();
+            assert_eq!(uk_differ, 0, "{dtype:?}: MLA w_uk differs from the exact dequantize");
+            println!(
+                "dequantize_w {dtype:?} on {}: exact ({} values), MLA w_uk exact; the old f16 path differed on {old_differ}",
+                if device.is_cpu() { "cpu" } else { "cuda" },
+                w.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dequantize_w_is_exact_f32_cpu() -> Result<()> {
+        check(&Device::Cpu)
+    }
+
+    #[test]
+    fn dequantize_w_is_exact_f32_cuda() -> Result<()> {
+        check(&Device::new_cuda(0)?)
+    }
+}

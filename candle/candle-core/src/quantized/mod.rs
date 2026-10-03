@@ -18,8 +18,13 @@ pub mod iq4_nl;
 pub use iq4_nl::{BlockIQ4nl, QK4_NL};
 pub mod mxfp4;
 pub use mxfp4::{BlockMXFP4, QK_MXFP4};
+pub mod ptq1_0;
+pub use ptq1_0::{BlockPTQ1_0, QK_PTQ1_0};
 pub mod nvfp4;
+pub mod iquant;
 pub use nvfp4::{BlockNVFP4, BlockQ8_0x2, QK_NVFP4};
+pub use iquant::{BlockIQ2s, BlockIQ2xs, BlockIQ2xxs, BlockIQ3xxs, BlockIQ4xs, QK_K as QK_K_IQ};
+pub use iquant::BlockIQ3s;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(target_arch = "wasm32"))]
@@ -117,7 +122,16 @@ impl QStorage {
                 GgmlDType::Q1_0 => crate::bail!("Q1_0 is not supported on metal"),
                 GgmlDType::IQ4NL => crate::bail!("IQ4_NL is not supported on metal"),
                 GgmlDType::MXFP4 => crate::bail!("MXFP4 is not supported on metal"),
+                GgmlDType::PTQ1_0 => crate::bail!("PTQ1_0 is not supported on metal"),
                 GgmlDType::NVFP4 => crate::bail!("NVFP4 is not supported on metal"),
+                GgmlDType::IQ2XXS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ4XS
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ3S => {
+                    crate::bail!("i-quant lookup-table types are not supported on metal")
+                }
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::Cuda(d) => match dtype {
@@ -138,7 +152,14 @@ impl QStorage {
                 GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(data)),
                 GgmlDType::IQ4NL => cuda::load_quantized(d, as_t_slice::<BlockIQ4nl>(data)),
                 GgmlDType::MXFP4 => cuda::load_quantized(d, as_t_slice::<BlockMXFP4>(data)),
+                GgmlDType::PTQ1_0 => cuda::load_quantized(d, as_t_slice::<BlockPTQ1_0>(data)),
                 GgmlDType::NVFP4 => cuda::load_quantized(d, as_t_slice::<BlockNVFP4>(data)),
+                GgmlDType::IQ2XXS => cuda::load_quantized(d, as_t_slice::<BlockIQ2xxs>(data)),
+                GgmlDType::IQ3XXS => cuda::load_quantized(d, as_t_slice::<BlockIQ3xxs>(data)),
+                GgmlDType::IQ2S => cuda::load_quantized(d, as_t_slice::<BlockIQ2s>(data)),
+                GgmlDType::IQ4XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4xs>(data)),
+                GgmlDType::IQ2XS => cuda::load_quantized(d, as_t_slice::<BlockIQ2xs>(data)),
+                GgmlDType::IQ3S => cuda::load_quantized(d, as_t_slice::<BlockIQ3s>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
         }
@@ -312,8 +333,22 @@ pub enum GgmlDType {
     IQ4NL,
     /// GGML type 39: 32 weights, E8M0 shared exponent + 32 FP4 (E2M1) indices.
     MXFP4,
+    /// GGML type 143 (PrismML): 128 ternary weights, 5 trits per byte + 2 bytes of 4, f16 scale.
+    PTQ1_0,
     /// GGML type 40: 64 weights, 4 UE4M3 sub-block scales + 64 FP4 (E2M1) indices.
     NVFP4,
+    /// GGML type 16: 256 weights, f16 scale + 256 grid-codebook indices (IQ2_XXS).
+    IQ2XXS,
+    /// GGML type 18: 256 weights, f16 scale + 256 grid-codebook indices (IQ3_XXS).
+    IQ3XXS,
+    /// GGML type 22: 256 weights, f16 scale + 256 grid-codebook indices and 8 group scales (IQ2_S).
+    IQ2S,
+    /// GGML type 23: 256 weights, f16 scale + 6-bit group scales + 128 nibble bytes (IQ4_XS).
+    IQ4XS,
+    /// GGML type 17: 256 weights, f16 scale + 512-entry 9-bit grid codes + 4-bit group scales.
+    IQ2XS,
+    /// GGML type 21: 256 weights, f16 scale + 9-bit grid codes (qs + qh), sign bits, 4-bit scales.
+    IQ3S,
 }
 
 impl GgmlDType {
@@ -338,7 +373,14 @@ impl GgmlDType {
             41 => Self::Q1_0,
             20 => Self::IQ4NL,
             39 => Self::MXFP4,
+            143 => Self::PTQ1_0,
             40 => Self::NVFP4,
+            16 => Self::IQ2XXS,
+            18 => Self::IQ3XXS,
+            22 => Self::IQ2S,
+            23 => Self::IQ4XS,
+            17 => Self::IQ2XS,
+            21 => Self::IQ3S,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -365,7 +407,14 @@ impl GgmlDType {
             Self::Q1_0 => 41,
             Self::IQ4NL => 20,
             Self::MXFP4 => 39,
+            Self::PTQ1_0 => 143,
             Self::NVFP4 => 40,
+            Self::IQ2XXS => 16,
+            Self::IQ3XXS => 18,
+            Self::IQ2S => 22,
+            Self::IQ4XS => 23,
+            Self::IQ2XS => 17,
+            Self::IQ3S => 21,
         }
     }
 
@@ -389,7 +438,14 @@ impl GgmlDType {
             Self::Q1_0 => Box::new(vec![BlockQ1_0::zeros(); elem_count / BlockQ1_0::BLCK_SIZE]),
             Self::IQ4NL => Box::new(vec![BlockIQ4nl::zeros(); elem_count / BlockIQ4nl::BLCK_SIZE]),
             Self::MXFP4 => Box::new(vec![BlockMXFP4::zeros(); elem_count / BlockMXFP4::BLCK_SIZE]),
+            Self::PTQ1_0 => Box::new(vec![BlockPTQ1_0::zeros(); elem_count / BlockPTQ1_0::BLCK_SIZE]),
             Self::NVFP4 => Box::new(vec![BlockNVFP4::zeros(); elem_count / BlockNVFP4::BLCK_SIZE]),
+            Self::IQ2XXS => Box::new(vec![BlockIQ2xxs::zeros(); elem_count / QK_K]),
+            Self::IQ3XXS => Box::new(vec![BlockIQ3xxs::zeros(); elem_count / QK_K]),
+            Self::IQ2S => Box::new(vec![BlockIQ2s::zeros(); elem_count / QK_K]),
+            Self::IQ4XS => Box::new(vec![BlockIQ4xs::zeros(); elem_count / QK_K]),
+            Self::IQ2XS => Box::new(vec![BlockIQ2xs::zeros(); elem_count / QK_K]),
+            Self::IQ3S => Box::new(vec![BlockIQ3s::zeros(); elem_count / QK_K]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -414,7 +470,14 @@ impl GgmlDType {
             Self::Q1_0 => Box::new(as_t_slice::<BlockQ1_0>(data).to_vec()),
             Self::IQ4NL => Box::new(as_t_slice::<BlockIQ4nl>(data).to_vec()),
             Self::MXFP4 => Box::new(as_t_slice::<BlockMXFP4>(data).to_vec()),
+            Self::PTQ1_0 => Box::new(as_t_slice::<BlockPTQ1_0>(data).to_vec()),
             Self::NVFP4 => Box::new(as_t_slice::<BlockNVFP4>(data).to_vec()),
+            Self::IQ2XXS => Box::new(as_t_slice::<BlockIQ2xxs>(data).to_vec()),
+            Self::IQ3XXS => Box::new(as_t_slice::<BlockIQ3xxs>(data).to_vec()),
+            Self::IQ2S => Box::new(as_t_slice::<BlockIQ2s>(data).to_vec()),
+            Self::IQ4XS => Box::new(as_t_slice::<BlockIQ4xs>(data).to_vec()),
+            Self::IQ2XS => Box::new(as_t_slice::<BlockIQ2xs>(data).to_vec()),
+            Self::IQ3S => Box::new(as_t_slice::<BlockIQ3s>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -441,7 +504,14 @@ impl GgmlDType {
             Self::Q1_0 => std::mem::size_of::<BlockQ1_0>(),
             Self::IQ4NL => std::mem::size_of::<BlockIQ4nl>(),
             Self::MXFP4 => std::mem::size_of::<BlockMXFP4>(),
+            Self::PTQ1_0 => std::mem::size_of::<BlockPTQ1_0>(),
             Self::NVFP4 => std::mem::size_of::<BlockNVFP4>(),
+            Self::IQ2XXS => std::mem::size_of::<BlockIQ2xxs>(),
+            Self::IQ3XXS => std::mem::size_of::<BlockIQ3xxs>(),
+            Self::IQ2S => std::mem::size_of::<BlockIQ2s>(),
+            Self::IQ4XS => std::mem::size_of::<BlockIQ4xs>(),
+            Self::IQ2XS => std::mem::size_of::<BlockIQ2xs>(),
+            Self::IQ3S => std::mem::size_of::<BlockIQ3s>(),
         }
     }
 
@@ -460,7 +530,9 @@ impl GgmlDType {
             Self::Q1_0 => QK1_0,
             Self::IQ4NL => QK4_NL,
             Self::MXFP4 => QK_MXFP4,
+            Self::PTQ1_0 => QK_PTQ1_0,
             Self::NVFP4 => QK_NVFP4,
+            Self::IQ2XXS | Self::IQ3XXS | Self::IQ2S | Self::IQ4XS | Self::IQ2XS | Self::IQ3S => QK_K,
         }
     }
 }
@@ -471,6 +543,9 @@ pub trait QuantizedType: Send + Sync {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()>;
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()>;
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
+    /// titan: rows `ids` of a `[rows, row_blocks * block_size]` table, dequantized row by row with
+    /// the same `to_float` as [`Self::dequantize`] (blocks never straddle rows, so the bits match).
+    fn dequantize_rows(&self, ids: &[u32], row_blocks: usize) -> Result<CpuStorage>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
     fn block_size(&self) -> usize;
@@ -512,6 +587,21 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
         let mut ys = vec![0.0f32; elem_count];
         T::to_float(self.as_slice(), &mut ys);
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn dequantize_rows(&self, ids: &[u32], row_blocks: usize) -> Result<CpuStorage> {
+        let row = row_blocks * T::BLCK_SIZE;
+        let mut ys = vec![0.0f32; ids.len() * row];
+        if row > 0 {
+            for (&id, ys) in ids.iter().zip(ys.chunks_exact_mut(row)) {
+                let start = id as usize * row_blocks;
+                let Some(xs) = self.get(start..start + row_blocks) else {
+                    crate::bail!("embedding: id {id} is outside the {}-row table", self.len() / row_blocks)
+                };
+                T::to_float(xs, ys);
+            }
+        }
         Ok(CpuStorage::F32(ys))
     }
 
@@ -724,12 +814,17 @@ impl QTensor {
         self.storage.data()
     }
 
-    /// titan (API backport for mistral.rs v0.9.4): quantized row lookup `ids -> [.., hidden]` (f32).
-    /// candle 66a8cf1 has CPU / Metal / CUDA `get_rows` kernels for this; the fork's kernels are the
-    /// cuda-oxide reference set, so rows come from a full dequantization and an index_select
-    /// (correct, but slow for large vocabularies; the titan GGUF models embed on their own).
+    /// titan (API backport for mistral.rs v0.9.4): quantized row lookup `ids -> [.., hidden]` (f32),
+    /// on the table's device. Only the looked-up rows are dequantized: on the CPU each row's blocks go
+    /// through the dtype's `to_float`, on CUDA the rows' block bytes are gathered on the device and
+    /// dequantized by the same kernel (or the same host routine, for the dtypes whose CUDA
+    /// dequantize runs on the host). Rows are whole blocks and every format dequantizes block by
+    /// block, so the result is bit-identical to dequantizing the whole table and index-selecting
+    /// (m4/emb/embcheck). Dequantizing the whole table on every call cost 2.3 ms per forward on
+    /// Spark-X2.5 (131072 x 2560 Q6_K) and a 3.75 GiB transient on gemma4-12b (262144 x 3840 Q6_K).
+    /// Metal tables and CUDA tables of 4 GiB or more keep the full dequantization.
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
-        let (_rows, hidden) = self.shape.dims2()?;
+        let (rows, hidden) = self.shape.dims2()?;
         let mut out_shape = ids.dims().to_vec();
         out_shape.push(hidden);
         let device = self.device();
@@ -737,8 +832,35 @@ impl QTensor {
             .to_device(&device)?
             .to_dtype(crate::DType::U32)?
             .flatten_all()?;
-        let w = self.dequantize(&device)?;
-        w.index_select(&ids, 0)?.reshape(out_shape)
+        let n = ids.elem_count();
+        if n == 0 {
+            return Tensor::zeros(out_shape, crate::DType::F32, &device);
+        }
+        let dtype = self.dtype();
+        let row_blocks = hidden / dtype.block_size();
+        let storage = match &self.storage {
+            QStorage::Cpu(s) => Some(Storage::Cpu(s.dequantize_rows(&ids.to_vec1::<u32>()?, row_blocks)?)),
+            QStorage::Cuda(s) => {
+                let ids = ids.contiguous()?;
+                let (ids_s, ids_l) = ids.storage_and_layout();
+                let Storage::Cuda(ids_s) = &*ids_s else {
+                    crate::bail!("embedding: ids are not on the table's CUDA device")
+                };
+                let picked = s.gather_rows(rows, row_blocks * dtype.type_size(), ids_s, ids_l)?;
+                match picked {
+                    Some(picked) => Some(Storage::Cuda(picked.dequantize(n * hidden)?)),
+                    None => None,
+                }
+            }
+            QStorage::Metal(_) => None,
+        };
+        match storage {
+            Some(storage) => {
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(storage, (n, hidden), none, false).reshape(out_shape)
+            }
+            None => self.dequantize(&device)?.index_select(&ids, 0)?.reshape(out_shape),
+        }
     }
 
     /// titan (API backport for mistral.rs v0.9.4): candle 66a8cf1 fuses same-lhs m==1 CPU matmuls

@@ -52,7 +52,25 @@ mod cref {
                                                     ne0: i64, ne1: i64, act: i32, s: *mut c_void);
         pub fn launch_mmq_quantize_glu_q8_1_D2S6_f32(g: *const f32, u: *const f32, ids: *const i32, vy: *mut c_void, ne00: i64, s01: i64,
                                                      ne0: i64, ne1: i64, act: i32, s: *mut c_void);
+        pub fn launch_mmq_quantize_glu_q8_1_D4(g: *const c_void, u: *const c_void, ids: *const i32, vy: *mut c_void, type_x: i32, ne00: i64,
+                                               s01: i64, ne0: i64, ne1: i64, act: i32, s: *mut c_void);
+        pub fn launch_mmq_quantize_glu_q8_1_DS4(g: *const c_void, u: *const c_void, ids: *const i32, vy: *mut c_void, type_x: i32, ne00: i64,
+                                                s01: i64, ne0: i64, ne1: i64, act: i32, s: *mut c_void);
+        pub fn launch_mmq_quantize_glu_q8_1_D2S6(g: *const c_void, u: *const c_void, ids: *const i32, vy: *mut c_void, type_x: i32, ne00: i64,
+                                                 s01: i64, ne0: i64, ne1: i64, act: i32, s: *mut c_void);
     }
+}
+
+/// The void-pointer (`<input_t>`-templated) GLU quantize launchers: `type_x` 0 f32, 1 f16, 30 bf16.
+type GluTypedFn =
+    unsafe extern "C" fn(*const c_void, *const c_void, *const i32, *mut c_void, i32, i64, i64, i64, i64, i32, *mut c_void);
+
+fn glu_typed_pair(layout: usize) -> (GluTypedFn, GluTypedFn) {
+    [
+        (cref::launch_mmq_quantize_glu_q8_1_D4 as GluTypedFn, rs::launch_mmq_quantize_glu_q8_1_D4 as GluTypedFn),
+        (cref::launch_mmq_quantize_glu_q8_1_DS4, rs::launch_mmq_quantize_glu_q8_1_DS4),
+        (cref::launch_mmq_quantize_glu_q8_1_D2S6, rs::launch_mmq_quantize_glu_q8_1_D2S6),
+    ][layout]
 }
 
 fn quant_pair(layout: usize) -> (QuantFn, QuantFn) {
@@ -285,12 +303,14 @@ fn fixup_cmp(g: &mut G, fam: &str, label: &str, init: &[u8], c1: &[u8], r: &[u8]
 /// One MoE MMQ case: `ne` experts with the given token counts (a sorted compact layout: expert e
 /// owns y columns bounds[e]..bounds[e+1]); ids_dst a random permutation of the assignment rows.
 #[allow(clippy::too_many_arguments)]
-fn moe_case(g: &mut G, q: &QType, k: usize, nrows: usize, counts: &[usize], extra_max: usize, nsm: i32, random_y: bool, sk: usize) {
+fn moe_case(g: &mut G, q: &QType, k: usize, nrows: usize, counts: &[usize], extra_max: usize, nsm: i32, random_y: bool, sk: usize, packed: bool) {
     let stream = g.s(sk);
     let ne = counts.len();
     let total: usize = counts.iter().sum();
     let ncols_max = counts.iter().copied().max().unwrap_or(0) + extra_max;
-    let label = format!("{} moe k={k} rows={nrows} counts={counts:?} ncols_max={ncols_max} nsm={nsm} yrand={random_y} s={}", q.name, sk % 2);
+    // packed: dst column stride 2 * nrows (fast_mmq::grouped_pair_packed writes gate and up into one buffer)
+    let sc = if packed { 2 * nrows } else { nrows };
+    let label = format!("{} moe k={k} rows={nrows} counts={counts:?} ncols_max={ncols_max} nsm={nsm} yrand={random_y} stride_col_dst={sc} s={}", q.name, sk % 2);
     let x = weights(&mut g.rng, q, ne * nrows * k / q.qk);
     let yb = activations(g, q, k, total.max(1), random_y, stream);
     let xb = Buf::new(&x);
@@ -309,15 +329,40 @@ fn moe_case(g: &mut G, q: &QType, k: usize, nrows: usize, counts: &[usize], extr
     }
     let ids = Buf::new(&perm.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     let eb = Buf::new(&bounds.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let dst0 = g.rng.bytes(nrows * total * 4 + 64);
+    let dst0 = g.rng.bytes(sc * total * 4 + 64);
     let fix0 = g.rng.bytes(nsm.max(1) as usize * 128 * 128 * 4);
+    if packed {
+        // The C launcher is not meant for stride_col_dst != nrows (it bounds the rows by it and fills the gap rows
+        // from past the weight rows), so the reference is the C result at stride nrows, scattered into the packed
+        // layout on the host: real rows bit-identical, gap rows untouched. Same tiles / stream-k split (nrows_x).
+        let dst_c0 = g.rng.bytes(nrows * total * 4 + 64);
+        let (dc, fc) = (Buf::new(&dst_c0), Buf::new(&fix0));
+        let (dr, fr) = (Buf::new(&dst0), Buf::new(&fix0));
+        let rust = if g.self_test { q.moe.0 } else { q.moe.1 };
+        unsafe {
+            (q.moe.0)(fc.p(), xb.p(), yb.p(), ids.p() as *const i32, eb.p() as *const i32, dc.p(), k as i64, nrows as i64, total as i64,
+                    (k / q.qk) as i64, nrows as i64, ne as i64, ncols_max as i64, 1200, nsm, SMPBO_REAL, 32, stream);
+            rust(fr.p(), xb.p(), yb.p(), ids.p() as *const i32, eb.p() as *const i32, dr.p(), k as i64, nrows as i64, total as i64,
+                 (k / q.qk) as i64, sc as i64, ne as i64, ncols_max as i64, 1200, nsm, SMPBO_REAL, 32, stream);
+        }
+        sync(&label);
+        let (c, r) = (dc.read(), dr.read());
+        let mut want = dst0.clone();
+        for col in 0..total {
+            want[col * sc * 4..col * sc * 4 + nrows * 4].copy_from_slice(&c[col * nrows * 4..(col + 1) * nrows * 4]);
+        }
+        let fam = format!("mmq_{}", q.name);
+        g.t.calls(&format!("{fam}_moe_packed"), 2);
+        g.t.cmp(&format!("{fam}_moe_packed"), &format!("{label}: dst vs C at stride nrows, scattered"), &dst0, &want, &r);
+        return;
+    }
     let mut outs = vec![];
     for f in [q.moe.0, if g.self_test { q.moe.0 } else { q.moe.1 }, q.moe.0] {
         let dst = Buf::new(&dst0);
         let fix = Buf::new(&fix0);
         unsafe {
             f(fix.p(), xb.p(), yb.p(), ids.p() as *const i32, eb.p() as *const i32, dst.p(), k as i64, nrows as i64, total as i64,
-              (k / q.qk) as i64, nrows as i64, ne as i64, ncols_max as i64, 1200, nsm, SMPBO_REAL, 32, stream)
+              (k / q.qk) as i64, sc as i64, ne as i64, ncols_max as i64, 1200, nsm, SMPBO_REAL, 32, stream)
         };
         sync(&label);
         outs.push((dst.read(), fix.read()));
@@ -414,6 +459,42 @@ fn glu_case(g: &mut G, layout: usize, k: usize, s01: usize, ne1: usize, with_ids
     g.t.cmp("mmq_quantize_glu", &label, &y0, &outs[0], &outs[1]);
 }
 
+/// One fused GLU quantize case through the `<input_t>`-templated (void-pointer) launcher:
+/// `type_x` 0 f32, 1 f16, 30 bf16. gate / up are encoded in the target type, so the kernel's
+/// `(input_t)act(g) * (input_t)u` rounding is what is compared.
+#[allow(clippy::too_many_arguments)]
+fn glu_typed_case(g: &mut G, layout: usize, type_x: i32, k: usize, s01: usize, ne1: usize, with_ids: bool, act: i32, sk: usize) {
+    let stream = g.s(sk);
+    let label = format!("quantize_glu_t layout={layout} type_x={type_x} k={k} s01={s01} ne1={ne1} ids={with_ids} act={act}");
+    let ne0 = pad(pad(k, 512), 128);
+    let nx = s01 * ne1 + 16;
+    let gv: Vec<f32> = (0..nx).map(|_| mmq_f32(&mut g.rng) * 2.0).collect();
+    let uv: Vec<f32> = (0..nx).map(|_| mmq_f32(&mut g.rng)).collect();
+    let t = match type_x {
+        0 => 2,
+        1 => 1,
+        _ => 0,
+    };
+    let gb = Buf::new(&encode(&mut g.rng, t, &gv, 16));
+    let ub = Buf::new(&encode(&mut g.rng, t, &uv, 16));
+    let ids: Vec<u8> = (0..ne1).flat_map(|_| (g.rng.below(ne1 as u64) as i32).to_le_bytes()).collect();
+    let idb = Buf::new(&ids);
+    let y0 = g.rng.bytes(ne1 * ne0 / 128 * 144 + 144);
+    let (c, r) = glu_typed_pair(layout);
+    let mut outs = vec![];
+    for f in [c, if g.self_test { c } else { r }] {
+        let yb = Buf::new(&y0);
+        unsafe {
+            f(gb.p(), ub.p(), if with_ids { idb.p() as *const i32 } else { std::ptr::null() }, yb.p(), type_x, k as i64,
+              s01 as i64, ne0 as i64, ne1 as i64, act, stream)
+        };
+        sync(&label);
+        outs.push(yb.read());
+    }
+    g.t.calls("mmq_quantize_glu_t", 2);
+    g.t.cmp("mmq_quantize_glu_t", &label, &y0, &outs[0], &outs[1]);
+}
+
 pub fn run(g: &mut G, only: &Option<Vec<String>>, run: &mut HashSet<String>) {
     let want = |f: &str| only.as_ref().is_none_or(|o| o.iter().any(|n| n == f));
     let quick = std::env::var("MRQC_QUICK").is_ok();
@@ -439,6 +520,17 @@ pub fn run(g: &mut G, only: &Option<Vec<String>>, run: &mut HashSet<String>) {
                     for &ne1 in &[1usize, 5, 64] {
                         sk += 1;
                         glu_case(g, layout, k, k + ds, ne1, ne1 % 2 == 1, act, sk);
+                    }
+                }
+            }
+
+            for &type_x in &[0, 1, 30] {
+                for act in -1..5 {
+                    for &(k, ds) in &[(256usize, 0usize), (300, 3), (1000, 4), (4096, 12), (130, 1), (3, 0)] {
+                        for &ne1 in &[1usize, 5, 64] {
+                            sk += 1;
+                            glu_typed_case(g, layout, type_x, k, k + ds, ne1, ne1 % 2 == 1, act, sk);
+                        }
                     }
                 }
             }
@@ -507,7 +599,12 @@ pub fn run(g: &mut G, only: &Option<Vec<String>>, run: &mut HashSet<String>) {
                     continue;
                 }
                 sk += 1;
-                moe_case(g, &q, k, nr, counts, extra, nsm, (mi + nsm as usize) % 2 == 1, sk);
+                moe_case(g, &q, k, nr, counts, extra, nsm, (mi + nsm as usize) % 2 == 1, sk, false);
+                // redcell2: the packed gate/up layout (dst column stride 2 * nrows) on every shape at the real SM count
+                if nsm == NSM_REAL {
+                    sk += 1;
+                    moe_case(g, &q, k, nr, counts, extra, nsm, mi % 2 == 0, sk, true);
+                }
             }
         }
         run.insert(q.name.to_string());

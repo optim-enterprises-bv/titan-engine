@@ -51,6 +51,13 @@ const DEEPSEEK_V3_REGEXES: &[&str] = &[
     "[\\x{4e00}-\\x{9fa5}\\x{3040}-\\x{309f}\\x{30a0}-\\x{30ff}]+",
     "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\\r\\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
 ];
+// llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_SPARK2_5 (= the HF tokenizer.json Splits + Digits(individual))
+const SPARK2_5_REGEXES: &[&str] = &[
+    "\\p{N}{1,3}",
+    "[\\x{4e00}-\\x{9fa5}\\x{3040}-\\x{309f}\\x{30a0}-\\x{30ff}]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\\r\\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+|[\\r\\n]|\\s+(?!\\S)|\\s+",
+    "\\p{N}",
+];
 const GPT4O_REGEX: &str = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const TEKKEN_REGEX: &str = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const GGML_TOKEN_TYPE_NORMAL: i32 = 1;
@@ -295,6 +302,7 @@ enum BpePreTokenizerKind {
     DeepSeekV3,
     Gpt4O,
     Tekken,
+    Spark2_5,
 }
 
 #[derive(Debug)]
@@ -388,6 +396,12 @@ fn bpe_pre_tokenizer_spec(pre: Option<&str>) -> Result<BpePreTokenizerSpec> {
             kind: BpePreTokenizerKind::Tekken,
             regexes: &[TEKKEN_REGEX],
             ignore_merges: true,
+            normalize_nfc: false,
+        },
+        "spark2_5" => BpePreTokenizerSpec {
+            kind: BpePreTokenizerKind::Spark2_5,
+            regexes: SPARK2_5_REGEXES,
+            ignore_merges: false,
             normalize_nfc: false,
         },
         _ => {
@@ -1177,6 +1191,7 @@ mod tests {
             ("hunyuan", BpePreTokenizerKind::Qwen2, false, false, 1),
             ("gpt-4o", BpePreTokenizerKind::Gpt4O, false, false, 1),
             ("tekken", BpePreTokenizerKind::Tekken, true, false, 1),
+            ("spark2_5", BpePreTokenizerKind::Spark2_5, false, false, 4),
         ];
 
         for (pre, kind, ignore_merges, normalize_nfc, regex_count) in cases {
@@ -1321,6 +1336,36 @@ mod tests {
         let gguf_decoded = decode(&gguf_tokenizer, &tokens, true)?;
         assert_eq!(hf_decoded, gguf_decoded);
 
+        Ok(())
+    }
+
+    // G0: ids from `llama-tokenize --ids --no-bos --no-escape` (m4/g4s/tok/mkfix.py), special tokens parsed
+    #[test]
+    #[ignore = "requires TITAN_TOK_FIXTURE=<fixture.json> and TITAN_TOK_GGUF=<model.gguf>"]
+    fn gguf_tokenizer_matches_llama_cpp_fixture() -> Result<()> {
+        let fixture = std::env::var("TITAN_TOK_FIXTURE")?;
+        let archive = mistralrs_quant::GgufArchive::open_file(std::env::var("TITAN_TOK_GGUF")?)?;
+        let tokenizer = convert_gguf_metadata_to_hf_tokenizer(archive.metadata())?.tokenizer;
+        let cases: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let mut mismatches = 0;
+        for case in &cases {
+            let text = case["text"].as_str().unwrap();
+            let expected = case["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>();
+            let actual = tokenizer
+                .encode_fast(text, false)
+                .map_err(anyhow::Error::msg)?;
+            if actual.get_ids() != expected.as_slice() {
+                mismatches += 1;
+                eprintln!("mismatch: {:?}", text.chars().take(60).collect::<String>());
+            }
+        }
+        eprintln!("G0: {}/{} identical", cases.len() - mismatches, cases.len());
+        assert_eq!(mismatches, 0);
         Ok(())
     }
 }

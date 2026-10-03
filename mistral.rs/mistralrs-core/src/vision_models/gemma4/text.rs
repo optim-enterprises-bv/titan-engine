@@ -77,6 +77,114 @@ fn kv_shared_layer_index(cfg: &Gemma4TextConfig, layer_idx: usize) -> Result<Opt
         })
 }
 
+/// `TITAN_G4_MEMLOG` (debug) level: 1 logs VRAM per layer (`g4_memlog`), 2 also the layer outputs' sum and
+/// max |x| (`g4_probe`, NaN / Inf localisation). 0 (default): off, one cached env lookup.
+fn g4_memlog_level() -> u8 {
+    static L: mistralrs_quant::titan_cfg::GenCell<u8> = mistralrs_quant::titan_cfg::GenCell::new();
+    *L.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_G4_MEMLOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// `TITAN_G4_MEMLOG >= 2`: log `t`'s F32 sum (NaN / Inf if any element is) and max |x|.
+fn g4_probe(t: &Tensor, what: impl FnOnce() -> String) -> Result<()> {
+    if g4_memlog_level() < 2 {
+        return Ok(());
+    }
+    let f = t.to_dtype(DType::F32)?;
+    let sum = f.sum_all()?.to_scalar::<f32>()?;
+    let max = f.abs()?.max_all()?.to_scalar::<f32>()?;
+    tracing::info!("g4 probe {}: sum {sum}, max |x| {max}", what());
+    Ok(())
+}
+
+/// `TITAN_G4_ATTN_F32=1` (experiment): prompt attention (more than one query row) on F32 copies of q, k, v and
+/// the mask; the KV cache stays in the model dtype. Off by default.
+fn g4_attn_f32() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_G4_ATTN_F32").is_ok_and(|v| v == "1"))
+}
+
+/// gemma4 attention numerics (titan).
+/// - `TITAN_G4_ATTN_FLASH` (default 1): prompt attention on the oxide flash-prefill kernels (head dim 256 with the
+///   1024-key window on sliding layers, 512 on full layers) instead of the eager masked path; 0: eager.
+///   `TITAN_G4_FLASH_DECODE` (default 1): decode rows on the same kernels (bf16), at any context length.
+/// - llama.cpp's precision layout when the model runs in F32 (`--dtype f32`: residual stream, norms, softcaps, router
+///   and every activation between ops in F32, quantized matmuls with F32 output): `TITAN_G4_KV16` (default 1) keeps
+///   the KV cache in F16 (not F32) and runs attention, prompt and decode, on F16 q / K / V with F32 accumulation and F32
+///   output (flash-prefill f16 kernels, any length). 0: F32 cache and eager F32 attention.
+struct G4Prec {
+    flash: bool,
+    flash_decode: bool,
+    kv16: bool,
+}
+
+fn g4_prec() -> &'static G4Prec {
+    static P: mistralrs_quant::titan_cfg::GenCell<G4Prec> = mistralrs_quant::titan_cfg::GenCell::new();
+    P.get_or_init(|| {
+        let var = |n: &str| mistralrs_quant::titan_cfg::var(n).ok();
+        let p = G4Prec {
+            flash: var("TITAN_G4_ATTN_FLASH").is_none_or(|v| v != "0"),
+            flash_decode: var("TITAN_G4_FLASH_DECODE").is_none_or(|v| v != "0"),
+            kv16: var("TITAN_G4_KV16").is_none_or(|v| v != "0"),
+        };
+        tracing::info!("titan gemma4 attention: flash {} (decode rows {}), f16 KV under F32 activations {}", p.flash, p.flash_decode, p.kv16);
+        p
+    })
+}
+
+/// `TITAN_G4_DUMP=DIR` (debug): on prompt passes, write the last token's row of `t` (b, s, n) as raw little-endian
+/// f32 to DIR/NAME-LAYER.f32 (llama.cpp eval-callback names: kqv_out, attn_out, l_out), overwritten per pass.
+fn g4_dump(t: &Tensor, name: &str, layer: usize) -> Result<()> {
+    static D: mistralrs_quant::titan_cfg::GenCell<Option<String>> = mistralrs_quant::titan_cfg::GenCell::new();
+    let Some(dir) = D.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_G4_DUMP").ok()) else {
+        return Ok(());
+    };
+    let (_, s, _) = t.dims3()?;
+    if s < 2 {
+        return Ok(());
+    }
+    let row: Vec<f32> = t.narrow(1, s - 1, 1)?.contiguous()?.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+    let bytes: Vec<u8> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(format!("{dir}/{name}-{layer}.f32"), bytes).map_err(candle_core::Error::wrap)
+}
+
+/// `TITAN_G4_MEMLOG>=1` (debug): synchronise, log the stream-ordered pool's used bytes and the peak since the
+/// previous call (`what`), then reset that peak.
+#[allow(unused_variables)]
+fn g4_memlog(dev: &Device, what: impl FnOnce() -> String) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(d) = dev {
+        use candle_core::cuda_backend::cudarc::driver::sys;
+        if g4_memlog_level() == 0 {
+            return Ok(());
+        }
+        let stream = d.cuda_stream();
+        stream.synchronize().map_err(candle_core::Error::wrap)?;
+        let ctx = stream.context();
+        if !ctx.has_async_alloc() {
+            return Ok(());
+        }
+        ctx.bind_to_thread().map_err(candle_core::Error::wrap)?;
+        let mut pool = std::ptr::null_mut();
+        if unsafe { sys::cuDeviceGetMemPool(&mut pool, ctx.cu_device()) } != sys::CUresult::CUDA_SUCCESS {
+            return Ok(());
+        }
+        use sys::CUmemPool_attribute::*;
+        let get = |attr| {
+            let mut v = 0u64;
+            unsafe { sys::cuMemPoolGetAttribute(pool, attr, (&mut v as *mut u64).cast()) };
+            v >> 20
+        };
+        let (used, peak, reserved) =
+            (get(CU_MEMPOOL_ATTR_USED_MEM_CURRENT), get(CU_MEMPOOL_ATTR_USED_MEM_HIGH), get(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT));
+        let mut zero = 0u64;
+        unsafe { sys::cuMemPoolSetAttribute(pool, CU_MEMPOOL_ATTR_USED_MEM_HIGH, (&mut zero as *mut u64).cast()) };
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
+        tracing::info!("g4 memlog {}: pool used {used} MiB, peak since last {peak} MiB, reserved {reserved} MiB, device free {} MiB", what(), free >> 20);
+    }
+    Ok(())
+}
+
 fn select_paged_mm_prefix_path(
     requires_noncausal: bool,
     is_paged: bool,
@@ -709,6 +817,15 @@ impl Attention {
                     let dk = donor_cache.appended_k()?.unwrap().to_device(q.device())?;
                     let dv = donor_cache.appended_v()?.unwrap().to_device(q.device())?;
                     (dk, dv)
+                } else if self.kv16(&q) {
+                    // llama.cpp layout: the F32 k / v rounded once to the F16 cache. The engine preallocates a
+                    // sequence's cache in the activation dtype (F32); an empty one is dropped so that the first
+                    // append allocates it in F16.
+                    let cache = &mut kv_caches[self.layer_idx];
+                    if cache.current_seq_len() == 0 {
+                        cache.reset();
+                    }
+                    cache.append(&k.as_ref().unwrap().to_dtype(DType::F16)?, &v.as_ref().unwrap().to_dtype(DType::F16)?)?
                 } else {
                     kv_caches[self.layer_idx].append(k.as_ref().unwrap(), v.as_ref().unwrap())?
                 };
@@ -768,10 +885,38 @@ impl Attention {
                 };
                 let mask = match adjust_mask(mask.as_option_tensor())? {
                     Some(t) => AttentionMask::Custom(t),
+                    // skipped host masks (flash prompt pass): keep the marker for `eager_mask`
+                    None if matches!(mask, AttentionMask::CausalFlash) => AttentionMask::CausalFlash,
                     None => AttentionMask::None,
                 };
 
-                Sdpa.run_attention(&q, &k, &v, &mask, flash_params, &self.sdpa_params)?
+                g4_memlog(q.device(), || {
+                    let m = match &mask {
+                        AttentionMask::Custom(t) => format!("custom {:?} on {:?}", t.dims(), t.device().location()),
+                        AttentionMask::None => "none".into(),
+                        _ => "causal-flash".into(),
+                    };
+                    format!("L{} before attn q {:?} k {:?} mask {m}", self.layer_idx, q.dims(), k.dims())
+                })?;
+                let out = if self.kv16(&q) && k.dtype() == DType::F16 {
+                    self.attend_f16(&q, &k, &v, &mask, flash_params)?
+                } else if let Some(o) = self.flash_prompt(&q, &k, &v, flash_params)? {
+                    o
+                } else if q_len > 1 && g4_attn_f32() {
+                    let mask = self.eager_mask(mask, &q, &k)?;
+                    let f = |t: &Tensor| t.to_dtype(DType::F32);
+                    let mask = match &mask {
+                        AttentionMask::Custom(t) => AttentionMask::Custom(f(t)?),
+                        other => other.clone(),
+                    };
+                    Sdpa.run_attention(&f(&q)?, &f(&k)?, &f(&v)?, &mask, flash_params, &self.sdpa_params)?
+                        .to_dtype(q.dtype())?
+                } else {
+                    let mask = self.eager_mask(mask, &q, &k)?;
+                    Sdpa.run_attention(&q, &k, &v, &mask, flash_params, &self.sdpa_params)?
+                };
+                g4_memlog(q.device(), || format!("L{} attn", self.layer_idx))?;
+                out
             }
         };
 
@@ -782,8 +927,68 @@ impl Attention {
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
         };
+        g4_dump(&attn_output, "kqv_out", self.layer_idx)?;
         let res = self.o_proj.forward(&attn_output)?;
         Ok(res)
+    }
+
+    /// Prompt attention (q (b, h, s, d) after RoPE, k / v the cache's (b, kvh, kv_len, d)) on the flash-prefill
+    /// kernels when `TITAN_G4_ATTN_FLASH` allows, the pass is causal and the shapes are supported; else None.
+    fn flash_prompt(&self, q: &Tensor, k: &Tensor, v: &Tensor, flash_params: Option<&FlashParams>) -> Result<Option<Tensor>> {
+        let (_, _, rows, _) = q.dims4()?;
+        // a decode row sees every cached key (the sliding layers' cache view is already clamped to the window,
+        // the kernel's window repeats that), so it needs no causal flag and takes the kernel at any length
+        let decode = rows == 1 && g4_prec().flash_decode;
+        if !g4_prec().flash
+            || (!decode
+                && (rows < 2
+                    || !flash_params.is_some_and(|p| p.causal)
+                    || !crate::attention::flash_prefill_wanted(rows, k.dim(2)?)))
+            || !crate::attention::flash_prefill_any_supported(q, k, v)
+        {
+            return Ok(None);
+        }
+        let win = if self.is_sliding { self.sdpa_params.sliding_window.unwrap_or(0) } else { 0 };
+        Ok(Some(crate::attention::flash_prefill_any(q, k, v, self.sdpa_params.softmax_scale, win, false)?))
+    }
+
+    /// A prompt pass whose host masks were skipped (`CausalFlash`) on the eager path: the causal (+ sliding window)
+    /// mask built for these rows and keys; anything else unchanged.
+    fn eager_mask(&self, mask: AttentionMask, q: &Tensor, k: &Tensor) -> Result<AttentionMask> {
+        let rows = q.dim(2)?;
+        if rows < 2 || !matches!(mask, AttentionMask::CausalFlash) {
+            return Ok(mask);
+        }
+        let win = if self.is_sliding { self.sdpa_params.sliding_window } else { None };
+        Ok(match crate::attention::eager_attention_mask(rows, k.dim(2)?, true, win, q.dtype(), q.device())? {
+            Some(m) => AttentionMask::Custom(m),
+            None => mask,
+        })
+    }
+
+    /// F32 activations with the F16 KV cache (`TITAN_G4_KV16`, default on under `--dtype f32`, not on shared layers).
+    fn kv16(&self, q: &Tensor) -> bool {
+        q.dtype() == DType::F32 && q.device().is_cuda() && self.kv_shared_layer_index.is_none() && g4_prec().kv16
+    }
+
+    /// Attention of F32 q over the F16 cache `k`, `v` as llama.cpp does it: q rounded to F16, F16 products with F32
+    /// accumulation and softmax, F32 output; prompt passes and decode rows alike on the flash-prefill f16 kernels
+    /// (causal, the sliding layers' 1024-key window). Fallback (shapes the kernels do not take, non-causal passes):
+    /// eager F32 on the F16 values.
+    fn attend_f16(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &AttentionMask, flash_params: Option<&FlashParams>) -> Result<Tensor> {
+        let (_, _, rows, _) = q.dims4()?;
+        let q16 = q.to_dtype(DType::F16)?;
+        let causal = rows == 1 || flash_params.is_some_and(|p| p.causal);
+        if causal && crate::attention::flash_prefill_any_supported(&q16, k, v) {
+            let win = if self.is_sliding { self.sdpa_params.sliding_window.unwrap_or(0) } else { 0 };
+            return crate::attention::flash_prefill_any(&q16, k, v, self.sdpa_params.softmax_scale, win, true);
+        }
+        let f = |t: &Tensor| t.to_dtype(DType::F32);
+        let mask = match self.eager_mask(mask.clone(), q, k)? {
+            AttentionMask::Custom(t) => AttentionMask::Custom(f(&t)?),
+            other => other,
+        };
+        Sdpa.run_attention(&f(&q16)?, &f(k)?, &f(v)?, &mask, flash_params, &self.sdpa_params)
     }
 }
 
@@ -1193,13 +1398,18 @@ impl DecoderLayer {
                 &self.pre_feedforward_layernorm,
             )?;
 
-        self.forward_post_attn(
+        g4_dump(&post_attn, "attn_out", self.layer_idx)?;
+        let out = self.forward_post_attn(
             post_attn,
             pre_ff_normed,
             next_input_layernorm,
             per_layer_input,
             layer_scalar_override,
-        )
+        )?;
+        g4_dump(&out.0, "l_out", self.layer_idx)?;
+        g4_memlog(out.0.device(), || format!("L{} ffn", self.layer_idx))?;
+        g4_probe(&out.0, || format!("L{} out", self.layer_idx))?;
+        Ok(out)
     }
 
     /// Block-diffusion canvas pass: bidirectional attention reading the KV cache without
@@ -1268,7 +1478,13 @@ impl DecoderLayer {
             let topk_ids_u32 = topk_ids.reshape((b * s, ()))?.to_dtype(DType::U32)?;
             let topk_weights = topk_weights.reshape((b * s, ()))?.to_dtype(DType::F32)?;
 
+            if g4_memlog_level() >= 2 {
+                g4_probe(&mlp_out, || format!("L{} shared mlp", self.layer_idx))?;
+                g4_probe(&topk_weights, || format!("L{} router weights", self.layer_idx))?;
+                g4_probe(&topk_ids_u32, || format!("L{} router ids", self.layer_idx))?;
+            }
             let moe_result = moe.forward(&moe_input, topk_weights, &topk_ids_u32)?;
+            g4_probe(&moe_result, || format!("L{} experts", self.layer_idx))?;
             let moe_normed = moe_result.apply(post_ff_2)?;
 
             // Combine branches, then apply post_feedforward_layernorm (matches HF line 1694)
@@ -1894,6 +2110,7 @@ impl TextModel {
     }
 
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        // A quantized (GGUF) table dequantizes only the looked-up rows: candle's QTensor::embedding.
         self.embed_tokens.embedding_forward(input_ids, self.dtype)? * self.embed_tokens_scale
     }
 
@@ -2234,6 +2451,23 @@ impl TextModel {
                     Some(&flash_params),
                 )
             } else {
+                // titan: a first causal prompt chunk whose every layer takes the flash-prefill kernels (they
+                // apply causality and the sliding window themselves) needs no mask: skip the host-built
+                // (rows x keys) masks and pass CausalFlash (materialised on the device by `eager_mask` if a
+                // layer ever falls back to the eager path).
+                let kv_end = ctx.seqlen_offsets().iter().copied().max().unwrap_or(0) + q_len;
+                let flash_all = q_len > 1
+                    && is_first_prompt_chunk
+                    && !ctx.is_paged()
+                    && input_ids.dim(0)? == 1
+                    && xs.device().is_cuda()
+                    && flash_params.causal
+                    && !force_eager_full_attention
+                    && ((xs.dtype() == DType::F32 && g4_prec().kv16)
+                        || (g4_prec().flash && crate::attention::flash_prefill_wanted(q_len, kv_end)));
+                if flash_all {
+                    (AttentionMask::CausalFlash, AttentionMask::CausalFlash, Some(&flash_params))
+                } else {
                 // Keep full-attention layers on flash-attn when their head dim is
                 // supported. PagedAttention still needs a non-None prompt mask
                 // (CausalFlash is enough) to route prompt chunks through SDPA
@@ -2278,6 +2512,7 @@ impl TextModel {
                 };
 
                 (attention_mask, sliding_attention_mask, Some(&flash_params))
+                }
             };
 
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;

@@ -14,7 +14,7 @@ use crate::{
 };
 
 const DIRECT_GGUF_DTYPES: &str =
-    "F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q2_K through Q8_K";
+    "F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K through Q8_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and PTQ1_0";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GgufTensorBinding {
@@ -156,6 +156,30 @@ impl GgufTensorBinding {
         match self {
             Self::Tensor(name) => Some(name),
             _ => None,
+        }
+    }
+
+    /// Every GGUF tensor this binding reads.
+    fn source_tensors<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Tensor(name) | Self::Mxfp4Blocks(name) | Self::Mxfp4Scales(name) => {
+                out.push(name)
+            }
+            Self::Slice { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Permute { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Affine { input, .. }
+            | Self::Log { input }
+            | Self::InverseSoftplus { input }
+            | Self::Cast { input, .. } => input.source_tensors(out),
+            Self::Concat { inputs, .. }
+            | Self::Stack { inputs, .. }
+            | Self::Interleave { inputs, .. } => {
+                for input in inputs {
+                    input.source_tensors(out);
+                }
+            }
         }
     }
 
@@ -886,6 +910,48 @@ impl QuantizedWeightSource for GgufWeightSource {
         };
         self.binding_pack_factor(&weight_name, binding, dtype)
             .map(Some)
+    }
+
+    /// Exact resident bytes: each GGUF tensor any binding reads, once (quantized tensors at their file size, dense
+    /// ones at `dtype`), attributed to its `blk.N` layer. Not the single integer pack factor of `pack_factor`,
+    /// which rounds every quant type down to a whole divisor of the dtype (Q5_K / Q6_K -> 2: 8 bits per weight
+    /// charged for ~5.7) and so overstates a K-quant model by ~40%. Counting per tensor rather than per binding
+    /// also charges a fused tensor bound as several slices (Gemma 4's `ffn_gate_up_exps`) or a tied head once.
+    fn resident_inventory(
+        &self,
+        num_layers: usize,
+        dtype: DType,
+    ) -> Result<Option<(Vec<usize>, usize)>> {
+        let mut sources = Vec::new();
+        for binding in self.bindings.values() {
+            binding.source_tensors(&mut sources);
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        let mut layers = vec![0usize; num_layers];
+        let mut other = 0usize;
+        for name in sources {
+            let info = self.archive.tensor_info(name)?;
+            let bytes = if matches!(info.dtype().raw(), 0 | 1 | 30) {
+                info.shape().iter().product::<usize>() * dtype.size_in_bytes()
+            } else {
+                info.byte_len()
+                    .ok_or_else(|| Error::msg(format!("GGUF tensor `{name}` has no byte range")))?
+            };
+            let layer = name
+                .strip_prefix("blk.")
+                .and_then(|n| n.split_once('.'))
+                .and_then(|(l, _)| l.parse::<usize>().ok())
+                .filter(|&l| l < num_layers);
+            match layer {
+                Some(l) => layers[l] += bytes,
+                None => other += bytes,
+            }
+        }
+        if layers.contains(&0) {
+            return Ok(None);
+        }
+        Ok(Some((layers, other)))
     }
 }
 

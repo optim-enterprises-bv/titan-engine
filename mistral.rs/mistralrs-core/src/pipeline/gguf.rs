@@ -17,6 +17,7 @@ use crate::gguf::{
         ensure_gemma3_vision_config, gemma3_text_uses_language_model_prefix,
         prepare_gemma3_text_config,
     },
+    gemma4_config::{prepare_gemma4_text_config, TensorShapes},
     get_gguf_chat_template, get_gguf_chat_template_from_metadata,
     multimodal_bindings::build_gemma4_bindings,
     multimodal_vision_registry::resolve_native_multimodal_gguf,
@@ -81,7 +82,6 @@ mod titan;
 
 const PROJECTOR_REQUIRED_ARCHITECTURES: &[&str] = &[
     "gemma3n",
-    "gemma4",
     "llama4",
     "muse-glimmer",
     "qwen2vl",
@@ -604,6 +604,21 @@ impl GGUFLoader {
                 },
             );
         }
+        // titan: text-only Gemma 4 (dense and MoE) through the multimodal model's text tower
+        if architecture.eq_ignore_ascii_case("gemma4") {
+            return self.load_native_gemma4_text(
+                archive,
+                NativeNormalLoadArgs {
+                    paths,
+                    dtype,
+                    device,
+                    silent,
+                    mapper,
+                    in_situ_quant,
+                    paged_attn_config,
+                },
+            );
+        }
         let metadata_keys = archive
             .metadata()
             .keys()
@@ -708,6 +723,13 @@ impl GGUFLoader {
                 imatrix: self.config.imatrix.clone(),
                 calibration_file: self.config.calibration_file.clone(),
                 hf_cache_path: self.config.hf_cache_path.clone(),
+                // only loaders with a runtime_config cap accept it; the others bail on Some
+                max_model_len: self.config.max_model_len.filter(|_| {
+                    matches!(
+                        loader_type,
+                        crate::NormalLoaderType::Spark2_5 | crate::NormalLoaderType::Qwen3_5
+                    )
+                }),
                 matformer_config_path: self.config.matformer_config_path.clone(),
                 matformer_slice_name: self.config.matformer_slice_name.clone(),
                 ..Default::default()
@@ -803,6 +825,112 @@ impl GGUFLoader {
         }
         let loader =
             loader.build_with_source(MultimodalLoaderType::Gemma3, source, self.kind.clone());
+        loader.load_model_from_path(
+            paths,
+            dtype,
+            device,
+            silent,
+            mapper,
+            in_situ_quant,
+            paged_attn_config,
+        )
+    }
+
+    /// titan: Gemma 4 without its projector. The config comes from `config.json` when one is
+    /// present (towers dropped) and is otherwise synthesized from the GGUF metadata.
+    fn load_native_gemma4_text(
+        &self,
+        archive: Arc<mistralrs_quant::GgufArchive>,
+        args: NativeNormalLoadArgs<'_>,
+    ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let NativeNormalLoadArgs {
+            paths,
+            dtype,
+            device,
+            silent,
+            mapper,
+            in_situ_quant,
+            paged_attn_config,
+        } = args;
+        let external_config = if paths.get_config_filename().as_os_str().is_empty() {
+            None
+        } else {
+            Some(fs::read_to_string(paths.get_config_filename())?)
+        };
+        let shapes: TensorShapes = archive
+            .tensors()
+            .iter()
+            .map(|(name, info)| (name.clone(), info.shape().to_vec()))
+            .collect();
+        let rope_freqs = match archive.tensor_info("rope_freqs.weight") {
+            Ok(info) => {
+                anyhow::ensure!(
+                    info.dtype().raw() == 0,
+                    "Gemma 4 `rope_freqs.weight` must be F32, got {}",
+                    info.dtype().name()
+                );
+                let data = archive.tensor_data("rope_freqs.weight")?;
+                Some(
+                    data.bytes()
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Err(_) => None,
+        };
+        let config = prepare_gemma4_text_config(
+            external_config.as_deref(),
+            archive.metadata(),
+            &shapes,
+            rope_freqs.as_deref(),
+        )?;
+        let config = prepare_native_multimodal_config(&MultimodalLoaderType::Gemma4, &config)?;
+        let config = stamp_qk_rope_layout(&config, RopePairing::HalfSplit)?;
+        validate_native_dynamic_lora(self.dynamic_lora.as_ref(), RopePairing::HalfSplit, "gemma4")?;
+        let bindings = build_gemma4_bindings(&archive)?;
+        let internal_dtype = dtype.try_into_dtype(&[device])?;
+        let source = Arc::new(mistralrs_quant::GgufWeightSource::new(
+            archive.clone(),
+            &bindings,
+            internal_dtype,
+        )?);
+        let weights = source.sharded_var_builder(Device::Cpu);
+        let tokenizer = self.resolve_tokenizer(paths, archive.metadata())?;
+        let generation_config = self.resolve_generation_config(paths, &tokenizer);
+        let gguf_chat_template =
+            if paths.get_template_filename().is_none() && self.chat_template.is_none() {
+                get_gguf_chat_template_from_metadata(archive.metadata())?
+            } else {
+                None
+            };
+        let source = PreparedMultimodalSource {
+            config,
+            weights,
+            tokenizer: tokenizer.conversion.tokenizer,
+            generation_config,
+            chat_template: gguf_chat_template,
+            bos_token: tokenizer.conversion.bos,
+            eos_token: tokenizer.conversion.eos,
+            unk_token: tokenizer.conversion.unk,
+            processor_config: None,
+            preprocessor_config: None,
+            source_weight_files: paths.get_weight_filenames().to_vec(),
+            rope_pairing: RopePairing::HalfSplit,
+        };
+        let mut loader = MultimodalLoaderBuilder::new(
+            self.config.multimodal_config(),
+            None,
+            None,
+            Some(self.quantized_model_id.clone()),
+            self.jinja_explicit.clone(),
+        )
+        .with_encoder_cache_memory_bytes(self.encoder_cache_memory_bytes);
+        if let Some(dynamic_lora) = self.dynamic_lora.as_ref() {
+            loader = loader.with_lora(dynamic_lora.adapters.clone(), dynamic_lora.runtime);
+        }
+        let loader =
+            loader.build_with_source(MultimodalLoaderType::Gemma4, source, self.kind.clone());
         loader.load_model_from_path(
             paths,
             dtype,
@@ -1155,6 +1283,24 @@ impl Loader for GGUFLoader {
         if titan_text {
             warn!("titan GGUF model: ignoring the multimodal projector (text-only fork-local loader)");
         }
+        // titan: Gemma 4 multimodal needs the original config.json; without one (and without a
+        // `--tok-model-id` to fetch it) load the text tower alone instead of failing
+        let gemma4_text = self.mmproj_filenames.is_some()
+            && !titan_text
+            && self.model_id.is_none()
+            && paths.get_config_filename().as_os_str().is_empty()
+            && matches!(
+                mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?
+                    .metadata_value("general.architecture"),
+                Some(candle_core::quantized::gguf_file::Value::String(arch)) if arch == "gemma4"
+            );
+        if gemma4_text {
+            warn!(
+                "Gemma 4 GGUF without config.json: ignoring the multimodal projector and loading \
+                 the text model only (pass `--tok-model-id` for vision)"
+            );
+        }
+        let titan_text = titan_text || gemma4_text;
         if let Some(mmproj_filenames) = self.mmproj_filenames.as_ref().filter(|_| !titan_text) {
             let mmproj_paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths_gguf!(
                 LocalModelPaths,
@@ -1647,7 +1793,7 @@ mod tests {
         assert!(!requires_multimodal_projector("QWEN35"));
         assert!(!requires_multimodal_projector("gemma3"));
         assert!(requires_multimodal_projector("gemma3n"));
-        assert!(requires_multimodal_projector("gemma4"));
+        assert!(!requires_multimodal_projector("gemma4"));
         assert!(!requires_multimodal_projector("qwen35moe"));
         assert!(!requires_multimodal_projector("mistral3"));
         assert!(requires_multimodal_projector("muse-glimmer"));

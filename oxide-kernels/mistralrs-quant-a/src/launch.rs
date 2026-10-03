@@ -747,14 +747,15 @@ macro_rules! moe_launchers {
             let (mut g, mut u, mut x, mut i, mut o, mut n, mut k, mut b, mut t, mut kp, mut a) = (gate_weights, up_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, act_type);
             unsafe { launch($fgk, (gx as u32, topk as u32, batch as u32), (32, 4, 1), 0, stream, &mut args!(g, u, x, i, o, n, k, b, t, kp, a)) };
         }
-        /// grid ((n + 15) / 16, topk, batch), block (32, 4).
+        /// grid ((n + 3) / 4, 1, batch), block (32, 4): one row per warp, all top-k slots in slot order
+        /// (deterministic; the reference's (ceil(n / 16), topk, batch) grid adds the slots with float atomics).
         pub unsafe extern "C" fn $da(
             all_weights: *const c_void, all_inputs: *const c_void, indices: *const u32, topk_weights: *const f32, all_outputs: *mut f32,
             n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, stream: *mut c_void,
         ) {
-            let gx = n.wrapping_add(15) / 16;
+            let gx = n.wrapping_add(3) / 4;
             let (mut w, mut x, mut i, mut tw, mut o, mut n, mut k, mut b, mut t, mut kp) = (all_weights, all_inputs, indices, topk_weights, all_outputs, n, k, batch, topk, k_padded);
-            unsafe { launch($dak, (gx as u32, topk as u32, batch as u32), (32, 4, 1), 0, stream, &mut args!(w, x, i, tw, o, n, k, b, t, kp)) };
+            unsafe { launch($dak, (gx as u32, 1, batch as u32), (32, 4, 1), 0, stream, &mut args!(w, x, i, tw, o, n, k, b, t, kp)) };
         }
     )*};
 }
@@ -770,6 +771,12 @@ moe_launchers! {
     launch_indexed_moe_forward_q5k_q8_1 "indexed_moe_forward_q5k_q8_1" launch_moe_gemv_fused_gate_up_q5k_q8_1 "moe_gemv_fused_gate_up_q5k_q8_1" launch_moe_gemv_down_aggregate_q5k_q8_1 "moe_gemv_down_aggregate_q5k_q8_1";
     launch_indexed_moe_forward_q6k_q8_1 "indexed_moe_forward_q6k_q8_1" launch_moe_gemv_fused_gate_up_q6k_q8_1 "moe_gemv_fused_gate_up_q6k_q8_1" launch_moe_gemv_down_aggregate_q6k_q8_1 "moe_gemv_down_aggregate_q6k_q8_1";
     launch_indexed_moe_forward_q8_1_q8_1 "indexed_moe_forward_q8_1_q8_1" launch_moe_gemv_fused_gate_up_q8_1_q8_1 "moe_gemv_fused_gate_up_q8_1_q8_1" launch_moe_gemv_down_aggregate_q8_1_q8_1 "moe_gemv_down_aggregate_q8_1_q8_1";
+    launch_indexed_moe_forward_iq2_xxs_q8_1 "indexed_moe_forward_iq2_xxs_q8_1" launch_moe_gemv_fused_gate_up_iq2_xxs_q8_1 "moe_gemv_fused_gate_up_iq2_xxs_q8_1" launch_moe_gemv_down_aggregate_iq2_xxs_q8_1 "moe_gemv_down_aggregate_iq2_xxs_q8_1";
+    launch_indexed_moe_forward_iq2_xs_q8_1 "indexed_moe_forward_iq2_xs_q8_1" launch_moe_gemv_fused_gate_up_iq2_xs_q8_1 "moe_gemv_fused_gate_up_iq2_xs_q8_1" launch_moe_gemv_down_aggregate_iq2_xs_q8_1 "moe_gemv_down_aggregate_iq2_xs_q8_1";
+    launch_indexed_moe_forward_iq3_xxs_q8_1 "indexed_moe_forward_iq3_xxs_q8_1" launch_moe_gemv_fused_gate_up_iq3_xxs_q8_1 "moe_gemv_fused_gate_up_iq3_xxs_q8_1" launch_moe_gemv_down_aggregate_iq3_xxs_q8_1 "moe_gemv_down_aggregate_iq3_xxs_q8_1";
+    launch_indexed_moe_forward_iq4_xs_q8_1 "indexed_moe_forward_iq4_xs_q8_1" launch_moe_gemv_fused_gate_up_iq4_xs_q8_1 "moe_gemv_fused_gate_up_iq4_xs_q8_1" launch_moe_gemv_down_aggregate_iq4_xs_q8_1 "moe_gemv_down_aggregate_iq4_xs_q8_1";
+    launch_indexed_moe_forward_iq4_nl_q8_1 "indexed_moe_forward_iq4_nl_q8_1" launch_moe_gemv_fused_gate_up_iq4_nl_q8_1 "moe_gemv_fused_gate_up_iq4_nl_q8_1" launch_moe_gemv_down_aggregate_iq4_nl_q8_1 "moe_gemv_down_aggregate_iq4_nl_q8_1";
+    launch_indexed_moe_forward_iq2_s_q8_1 "indexed_moe_forward_iq2_s_q8_1" launch_moe_gemv_fused_gate_up_iq2_s_q8_1 "moe_gemv_fused_gate_up_iq2_s_q8_1" launch_moe_gemv_down_aggregate_iq2_s_q8_1 "moe_gemv_down_aggregate_iq2_s_q8_1";
 }
 
 // ================================================================================================
@@ -790,7 +797,8 @@ pub unsafe extern "C" fn launch_moe_dispatch(
         launch("moe_dispatch_prefix_sum_kernel", (1, 1, 1), (1, 1, 1), 0, stream, &mut args!(c, b, ne));
         let _ = sys::cuMemcpyDtoDAsync_v2(expert_cursors as sys::CUdeviceptr, expert_bounds as sys::CUdeviceptr, bytes, s);
         let (mut t, mut cu, mut so, mut ss, mut n, mut tk) = (topk_ids, expert_cursors, sorted_token_ids, sorted_source_ids, total_assignments, topk);
-        launch("moe_dispatch_scatter_kernel", (blocks as u32, 1, 1), (256, 1, 1), 0, stream, &mut args!(t, cu, so, ss, n, tk));
+        // stable scatter (one warp per expert, index order); the reference scatters with atomics
+        launch("moe_dispatch_scatter_stable_kernel", (num_experts as u32, 1, 1), (32, 1, 1), 0, stream, &mut args!(t, cu, so, ss, n, tk));
     }
 }
 

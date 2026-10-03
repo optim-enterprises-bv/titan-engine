@@ -167,11 +167,20 @@ fn bind_block_tensor(
         "attn_qkv" if matches!(loader, NormalLoaderType::Phi3) => {
             Some(format!("{p}.self_attn.qkv_proj.{suffix}"))
         }
+        "attn_qkv" if matches!(loader, NormalLoaderType::Spark2_5) => {
+            Some(format!("{p}.self_attn.q_k_v_proj.{suffix}"))
+        }
+        "attn_gate" if matches!(loader, NormalLoaderType::Spark2_5) => {
+            Some(format!("{p}.self_attn.g_proj.{suffix}"))
+        }
         "attn_output" => Some(format!(
             "{p}.self_attn.{}.{suffix}",
             if matches!(loader, NormalLoaderType::Phi2) {
                 "dense"
-            } else if matches!(loader, NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe) {
+            } else if matches!(
+                loader,
+                NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Spark2_5
+            ) {
                 "out_proj"
             } else {
                 "o_proj"

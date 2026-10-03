@@ -185,6 +185,48 @@ fn calculate_value_block_shape(
     )
 }
 
+/// One chunk of eager attention scores (`attention::ATTENTION_CHUNK_SCORE_ELEMS`, 16 Mi elements) as F32 softmax
+/// input and output plus its activation-dtype copy, charged as elements of a 2-byte activation dtype.
+const PREFILL_ATTN_CHUNK_ELEMS: usize = 80 << 20;
+
+/// Key count from which eager GQA attention runs grouped with score chunks capped at 16 Mi elements
+/// (`attention::GQA_GROUPED_MIN_KV`); below it a chunk is 1024 query rows x every head x every key.
+const EAGER_GROUPED_MIN_KV: usize = 4096;
+
+/// Transient device elements (activation dtype) of one prefill pass over a prompt of up to `seq_len` tokens. The
+/// non-paged path does not chunk prompts, so a prompt of the full context runs in one forward:
+/// - `masks` `seq_len x seq_len` attention masks in the activation dtype, each built from a u8 mask of the same
+///   shape (half an element of a 2-byte dtype);
+/// - the widest per-token working set of one decoder layer: the MLP's gate, up and their product (`mlp_width`
+///   each) or attention's q / k / v (`attn_width` = q + k + v width) with their RoPE'd and transposed copies,
+///   plus the residual stream, the norm output and the layer output (`hidden` each);
+/// - one chunk of eager attention scores; for models whose prompt attention is eager (`eager_heads` > 0, not the
+///   flash-prefill kernels), prompts under 4096 keys take 1024-row chunks over all heads (F16 scores and their F32
+///   softmax: 4 elements each), which peaks just under 4096 tokens and can exceed the long-prompt figure.
+pub(crate) fn prefill_act_elems(
+    seq_len: usize,
+    batch: usize,
+    hidden: usize,
+    mlp_width: usize,
+    attn_width: usize,
+    masks: usize,
+    eager_heads: usize,
+) -> usize {
+    let per_token = (3 * mlp_width).max(3 * attn_width) + 3 * hidden;
+    let at = |s: usize| masks * batch * s * s * 3 / 2 + batch * s * per_token + PREFILL_ATTN_CHUNK_ELEMS;
+    let short = seq_len.min(EAGER_GROUPED_MIN_KV - 1);
+    let short_scores = eager_heads * batch * short.min(1024) * short * 4;
+    at(seq_len).max(at(short) + short_scores)
+}
+
+/// Largest activation reserve the map makes on a device: half its usable memory. A prompt whose prefill
+/// transients exceed that cannot run on the device in one pass at any mapping that also holds weights and KV;
+/// reserving it all would only push every layer to the CPU. Longer prompts fail (CUDA OOM, the request errors,
+/// the engine recovers) instead of the whole model running from host memory.
+fn activation_reserve(act_bytes: usize, usable: usize) -> usize {
+    act_bytes.min(usable / 2)
+}
+
 macro_rules! b_to_mb {
     ($x:expr) => {
         $x / (1024 * 1024)
@@ -342,8 +384,14 @@ pub fn get_device_layers(
             (per_layer as f64 * loader.kv_cache_layer_fraction(config)?).ceil() as usize
         }
     };
-    // Per paged layer; hybrid models leave the recurrent/linear layers out of the cache entirely.
-    let kv_cache_bytes = kv_cache_elems * dtype.size_in_bytes();
+    // Per paged layer; hybrid models leave the recurrent/linear layers out of the cache entirely. The non-paged
+    // cache is held in the loader's KV dtype (paged blocks are sized in `dtype` above).
+    let kv_dtype = if has_paged_attn {
+        dtype
+    } else {
+        loader.kv_cache_dtype(config, dtype)?
+    };
+    let kv_cache_bytes = kv_cache_elems * kv_dtype.size_in_bytes();
     let kv_bytes_for_layer = |idx: usize| {
         if model_cfg.layer_has_paged_kv_cache(idx) {
             kv_cache_bytes
@@ -370,6 +418,43 @@ pub fn get_device_layers(
         let a = MemoryUsage.query(&Device::Cpu)?.available();
         avail.push((a, Device::Cpu));
     }
+
+    // Non-paged: cap the activation reserve (paged attention sized its KV budget from the uncapped value above).
+    let (mapped_max, non_mapped_max) = if has_paged_attn {
+        (mapped_max, non_mapped_max)
+    } else {
+        let usable = avail.first().map_or(usize::MAX, |(a, d)| device_memory_cap(*a, d));
+        let act = non_mapped_max.max(mapped_max);
+        if activation_reserve(act, usable) < act {
+            warn!(
+                "Prefill activations of a {max_seq_len}-token prompt (~{} MB) exceed half the primary device's usable memory; reserving {} MB, so prompts that long will not fit on the device.",
+                b_to_mb!(act),
+                b_to_mb!(activation_reserve(act, usable)),
+            );
+        }
+        (
+            activation_reserve(mapped_max, usable),
+            activation_reserve(non_mapped_max, usable),
+        )
+    };
+    info!(
+        "Automatic device map estimate: weights {} MiB in {} layers ({}-{} MiB each) + {} MiB not mapped; KV cache {} MiB per KV layer ({:?}, {} of {} layers) = {} MiB; activations {} MiB on the primary device, {} MiB on others; {} MiB post-load reservation; primary device {} MiB available, {} MiB usable.",
+        b_to_mb!(layer_sizes_in_bytes.iter().sum::<usize>()),
+        layer_sizes_in_bytes.len(),
+        b_to_mb!(layer_sizes_in_bytes.iter().copied().min().unwrap_or(0)),
+        b_to_mb!(layer_sizes_in_bytes.iter().copied().max().unwrap_or(0)),
+        b_to_mb!(non_mapped_size_in_bytes),
+        b_to_mb!(kv_cache_bytes),
+        kv_dtype,
+        (0..num_layers).filter(|&i| model_cfg.layer_has_paged_kv_cache(i)).count(),
+        num_layers,
+        b_to_mb!((0..num_layers).map(kv_bytes_for_layer).sum::<usize>() + extra_kv_bytes),
+        b_to_mb!(non_mapped_max.max(mapped_max)),
+        b_to_mb!(mapped_max),
+        b_to_mb!(base_device_memory_reservation_bytes),
+        b_to_mb!(avail.first().map_or(0, |(a, _)| *a)),
+        b_to_mb!(avail.first().map_or(0, |(a, d)| device_memory_cap(*a, d))),
+    );
 
     avail.reverse();
     layer_sizes_in_bytes.reverse();
@@ -427,14 +512,19 @@ pub fn get_device_layers(
                 base_device_memory_reservation_bytes,
             ])
         } else {
-            checked_memory_sum([remaining, mapped_max, remaining_kv_bytes])
+            checked_memory_sum([
+                remaining,
+                if dev.is_cpu() { 0 } else { mapped_max },
+                remaining_kv_bytes,
+            ])
         };
 
         let layers_on_dev = if required_whole_capacity.is_some_and(|required| cap >= required) {
             remaining = 0;
             num_layers - layer
         } else {
-            let mut used = mapped_max;
+            // The CPU is the last resort: its prompt transients come out of host memory, not a reserve.
+            let mut used = if dev.is_cpu() { 0 } else { mapped_max };
             let mut used_weight_bytes = 0usize;
             let mut count = 0;
             if ordinal == 0 {
@@ -622,4 +712,122 @@ mod tests {
             }
         ));
     }
+
+    // Arithmetic of the automatic map's estimate against what titan measured (m4/devmap window 2, RTX 5080 laptop,
+    // 15933 MiB; TITAN_DEVMAP_LOG pool peaks, every model pinned all-GPU, prompt transient = pool peak - pool used
+    // before the step - the step's new KV). Weights come from the GGUF inventory (file bytes per tensor).
+    const MIB: usize = 1 << 20;
+    const USABLE_MIB: usize = 15117; // "primary device 15629 MiB available, 15117 MiB usable" (qwen3 load)
+
+    fn kv_bytes_per_token(loader: &dyn DeviceMappedModelLoader, config: &str, dtype: DType) -> usize {
+        let cfg = loader.model_config(config).unwrap();
+        let per_layer = cfg.num_kv_heads() * (cfg.k_head_dim() + cfg.v_head_dim());
+        let frac = loader.kv_cache_layer_fraction(config).unwrap();
+        let kv_dtype = loader.kv_cache_dtype(config, dtype).unwrap();
+        (per_layer as f64 * frac * cfg.num_layers() as f64) as usize * kv_dtype.size_in_bytes()
+    }
+
+    fn qwen3_14b() -> String {
+        r#"{"vocab_size": 151936, "hidden_size": 5120, "intermediate_size": 17408, "num_hidden_layers": 40,
+            "num_attention_heads": 40, "num_key_value_heads": 8, "hidden_act": "silu",
+            "max_position_embeddings": 40960, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "sliding_window": null, "head_dim": 128, "quantization_config": null,
+            "tie_word_embeddings": false, "max_window_layers": 40, "use_sliding_window": false}"#
+            .to_string()
+    }
+
+    fn text(s: usize) -> AutoDeviceMapParams {
+        AutoDeviceMapParams::Text { max_seq_len: s, max_batch_size: 1 }
+    }
+
+    fn mm(s: usize) -> AutoDeviceMapParams {
+        AutoDeviceMapParams::Multimodal {
+            max_seq_len: s,
+            max_batch_size: 1,
+            max_image_shape: (1024, 1024),
+            max_num_images: 1,
+        }
+    }
+
+    #[test]
+    fn devmap_qwen3_14b_estimate() {
+        let loader = super::super::Qwen3Loader;
+        let cfg = qwen3_14b();
+        // KV: 40 layers x 2 x 8 heads x 128 x 2 B = 160 KiB per token (10 GiB at 64k, 2.5 GiB at 16k).
+        assert_eq!(kv_bytes_per_token(&loader, &cfg, DType::F16), 40 * 4096);
+        let act = |s| loader.mapped_max_act_size_elems(&cfg, &text(s)).unwrap() * 2;
+        // Flash-prefill prompt attention (models/qwen3.rs), measured beyond weights and KV (window 4, prefix cache
+        // off, all 40 layers): 444 / 792 / 1441 / 2063 MiB at 3992 / 7992 / 11976 / 16184 tokens.
+        for (s, mib) in [(3992, 444), (7992, 792), (11976, 1441), (16184, 2063)] {
+            assert!(act(s) >= mib * MIB && act(s) <= mib * MIB * 2, "{s}: {}", act(s) / MIB);
+        }
+        // 16k: 8902 + 1118 MiB weights + 2560 MiB KV + activations fit the usable 15117 MiB (a 16184-token prompt
+        // ran with all 40 layers on the GPU, pool peak 14779 MiB).
+        let total = (8902 + 1118 + 2560) * MIB + act(16384);
+        assert!(total <= USABLE_MIB * MIB, "{}", total / MIB);
+        assert!(total >= (14779 - 10143 + 10020) * MIB, "{}", total / MIB);
+        // 64k: one full-length prompt's transients exceed half the device; the reserve is capped there.
+        assert!(act(65536) > USABLE_MIB * MIB / 2);
+        assert_eq!(activation_reserve(act(65536), USABLE_MIB * MIB), USABLE_MIB * MIB / 2);
+    }
+
+    fn gemma4(layers: usize, hidden: usize, inter: usize, global_kv: usize, moe: bool) -> String {
+        let types = (0..layers)
+            .map(|i| if (i + 1) % 6 == 0 { "\"full_attention\"" } else { "\"sliding_attention\"" })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let moe = if moe {
+            r#", "enable_moe_block": true, "num_experts": 128, "top_k_experts": 8, "moe_intermediate_size": 704"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"architectures": ["Gemma4ForCausalLM"], "text_config": {{
+                "hidden_size": {hidden}, "intermediate_size": {inter}, "num_hidden_layers": {layers},
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 256, "global_head_dim": 512,
+                "num_global_key_value_heads": {global_kv}, "sliding_window": 1024, "final_logit_softcapping": 30.0,
+                "vocab_size": 262144, "tie_word_embeddings": true, "layer_types": [{types}]{moe}}}}}"#
+        )
+    }
+
+    #[test]
+    fn devmap_gemma4_12b_estimate() {
+        let loader = super::super::Gemma4Loader;
+        let cfg = gemma4(48, 3840, 15360, 1, false);
+        // --dtype f32 keeps the cache in F16: 40 sliding x 2 x 8 x 256 + 8 full x 2 x 1 x 512, x 2 B.
+        assert_eq!(loader.kv_cache_dtype(&cfg, DType::F32).unwrap(), DType::F16);
+        assert_eq!(loader.kv_cache_dtype(&cfg, DType::BF16).unwrap(), DType::BF16);
+        assert_eq!(kv_bytes_per_token(&loader, &cfg, DType::F32), 344_064);
+        let act = |s, b| loader.mapped_max_act_size_elems(&cfg, &mm(s)).unwrap() * b;
+        // Measured transients: f32 7998 tokens 1852 MiB, bf16 12095 tokens 1403 MiB.
+        assert!(act(7998, 4) >= 1852 * MIB && act(7998, 4) <= 1852 * MIB * 17 / 10, "{}", act(7998, 4) / MIB);
+        assert!(act(12095, 2) >= 1403 * MIB && act(12095, 2) <= 1403 * MIB * 18 / 10, "{}", act(12095, 2) / MIB);
+        // Both deployed contexts fit all 48 layers: 6637 MiB weights + KV + activations.
+        for (s, b, kv) in [(11264, 4, DType::F32), (12288, 2, DType::BF16)] {
+            let total = 6637 * MIB + s * kv_bytes_per_token(&loader, &cfg, kv) + act(s, b);
+            assert!(total <= 15149 * MIB, "{s}: {}", total / MIB);
+        }
+    }
+
+    #[test]
+    fn devmap_redcell_26b_estimate() {
+        let loader = super::super::Gemma4Loader;
+        let cfg = gemma4(30, 2816, 2112, 2, true);
+        // 25 sliding x 2 x 8 x 256 + 5 full x 2 x 2 x 512, x 2 B (bf16).
+        assert_eq!(kv_bytes_per_token(&loader, &cfg, DType::BF16), 225_280);
+        let act = |s| loader.mapped_max_act_size_elems(&cfg, &mm(s)).unwrap() * 2;
+        // Measured: 7998 tokens, 1289 MiB.
+        assert!(act(7998) >= 1289 * MIB && act(7998) <= 1289 * MIB * 13 / 10, "{}", act(7998) / MIB);
+        // 11676 MiB of weights (the GGUF; the old per-binding count charged the fused gate_up experts twice).
+        let total = 11676 * MIB + 8192 * kv_bytes_per_token(&loader, &cfg, DType::BF16) + act(8192);
+        assert!(total <= 15149 * MIB, "{}", total / MIB);
+    }
+
+    #[test]
+    fn devmap_activation_reserve_caps_at_half_the_device() {
+        assert_eq!(activation_reserve(3 << 30, 15 << 30), 3 << 30);
+        assert_eq!(activation_reserve(20 << 30, 15 << 30), (15 << 30) / 2);
+        assert_eq!(prefill_act_elems(1, 1, 0, 0, 0, 0, 0), PREFILL_ATTN_CHUNK_ELEMS);
+    }
+
 }

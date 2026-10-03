@@ -303,6 +303,8 @@ pub struct MistralRsForServerBuilder {
     code_exec_config: Option<mistralrs_core::CodeExecutionConfig>,
     /// Shell execution configuration
     shell_config: Option<mistralrs_core::ShellConfig>,
+    /// titan swap mode: `models` load on demand in this process, one resident at a time by default.
+    titan_swap: Option<mistralrs_core::TitanSwapPolicy>,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -350,6 +352,7 @@ impl Default for MistralRsForServerBuilder {
             disable_eos_stop: false,
             code_exec_config: None,
             shell_config: None,
+            titan_swap: None,
         }
     }
 }
@@ -694,6 +697,13 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// titan swap mode (see `mistralrs_core::TitanSwapPolicy`): with `models`, only the policy's default
+    /// model loads now; every other one loads when a request names it, after the resident one is unloaded.
+    pub fn with_titan_swap(mut self, policy: mistralrs_core::TitanSwapPolicy) -> Self {
+        self.titan_swap = Some(policy);
+        self
+    }
+
     /// Attach an MTP assistant if provided.
     pub fn with_mtp_config_optional(mut self, config: Option<MtpConfig>) -> Self {
         if let Some(config) = config {
@@ -802,8 +812,11 @@ impl MistralRsForServerBuilder {
     ///     .build()
     ///     .await?;
     /// ```
-    pub async fn build(self) -> Result<SharedMistralRsState> {
+    pub async fn build(mut self) -> Result<SharedMistralRsState> {
         candle_core::utils::init_global_threadpool();
+        if let Some(policy) = self.titan_swap.take() {
+            return self.build_titan_swap(policy).await;
+        }
         // Determine if we're in single-model or multi-model mode
         if !self.models.is_empty() {
             self.build_multi_model().await
@@ -960,6 +973,170 @@ impl MistralRsForServerBuilder {
 
         let mistralrs = builder.build().await;
 
+        Ok(mistralrs)
+    }
+
+    /// Build a titan swap instance: the default model loaded, the rest registered unloaded.
+    async fn build_titan_swap(self, policy: mistralrs_core::TitanSwapPolicy) -> Result<SharedMistralRsState> {
+        use mistralrs_core::{
+            EngineConfig, MistralRsConfig, Modalities, ModelCategory, ModelKind, SupportedModality, UnloadedModelState,
+        };
+        if self.models.is_empty() {
+            anyhow::bail!("titan swap mode needs [[models]]");
+        }
+        let device = if let Some(device) = self.device.clone() {
+            device
+        } else {
+            init_device(self.cpu, self.seed)?
+        };
+        info!(
+            "titan swap: {} MiB VRAM free before any model, host RSS {} MiB",
+            mistralrs_core::titan_device_free(&device) >> 20,
+            mistralrs_core::titan_host_rss() >> 20
+        );
+        let paged_attn = configure_paged_attn(&device, self.paged_attn);
+        let cache_config = init_cache_config(
+            self.paged_attn_block_size,
+            self.paged_attn_gpu_mem,
+            self.paged_attn_gpu_mem_usage,
+            self.paged_ctxt_len,
+            self.paged_cache_type,
+            !paged_attn,
+        )?
+        .map(|config| config.with_serving_capacity(self.max_seqs))
+        .transpose()?;
+
+        let mut default = None;
+        let mut rest = Vec::new();
+        let mut seen = HashSet::new();
+        for mc in &self.models {
+            let id = mc.alias.clone().unwrap_or_else(|| mc.model_id.clone());
+            if !seen.insert(id.clone()) {
+                anyhow::bail!("titan swap: model id `{id}` appears twice");
+            }
+            let dtype = get_model_dtype(&mc.model)?;
+            let params = get_auto_device_map_params(&mc.model)?;
+            let mapper = init_mapper(&mc.num_device_layers.clone().or(self.num_device_layers.clone()), &params);
+            let isq = mc
+                .in_situ_quant
+                .as_ref()
+                .or(self.in_situ_quant.as_ref())
+                .map(|isq| parse_isq_value(isq, Some(&device)).map_err(|e| anyhow::anyhow!("{e}")))
+                .transpose()?;
+            let lc = ModelLoaderConfig {
+                model_selected: mc.model.clone(),
+                token_source: self.token_source.clone(),
+                hf_revision: None,
+                dtype,
+                device: device.clone(),
+                device_map_setting: mapper,
+                isq,
+                paged_attn_config: cache_config,
+                silent: false,
+                chat_template: mc.chat_template.clone().or(self.chat_template.clone()),
+                jinja_explicit: mc.jinja_explicit.clone().or(self.jinja_explicit.clone()),
+                max_model_len: mc.max_model_len.or(self.max_model_len),
+                hf_config_overrides: mc.hf_config_overrides.clone().or(self.hf_config_overrides.clone()),
+                mtp_config: None,
+                encoder_cache_memory_bytes: mc
+                    .encoder_cache_memory_bytes
+                    .map(NonZeroUsize::get)
+                    .or(self.encoder_cache_memory_bytes),
+            };
+            if id == policy.default_model {
+                default = Some((id, lc));
+            } else {
+                rest.push((id, lc, params.max_seq_len()));
+            }
+        }
+        let (default_id, lc) = default.with_context(|| format!("titan swap: default model `{}` is not in [[models]]", policy.default_model))?;
+
+        let t0 = std::time::Instant::now();
+        mistralrs_core::titan_cfg::begin_model(policy.settings(&default_id));
+        let loader: Box<dyn Loader> = LoaderBuilder::new(lc.model_selected.clone())
+            .with_no_kv_cache(self.no_kv_cache)
+            .with_chat_template(lc.chat_template.clone())
+            .with_jinja_explicit(lc.jinja_explicit.clone())
+            .with_max_model_len(lc.max_model_len)
+            .with_hf_config_overrides(lc.hf_config_overrides.clone())
+            .with_mtp(false)
+            .with_encoder_cache_memory_bytes(lc.encoder_cache_memory_bytes)
+            .build()?;
+        mistralrs_instance_info(&*loader);
+        let pipeline: LoadedPipeline = loader.load_model_from_hf(
+            None,
+            self.token_source.clone(),
+            &lc.dtype,
+            &device,
+            false,
+            lc.device_map_setting.clone(),
+            lc.isq,
+            lc.paged_attn_config,
+        )?;
+        info!(
+            "titan swap: loaded {default_id} in {:.1} s: {} MiB VRAM free, host RSS {} MiB",
+            t0.elapsed().as_secs_f64(),
+            mistralrs_core::titan_device_free(&device) >> 20,
+            mistralrs_core::titan_host_rss() >> 20
+        );
+        let scheduler_config = init_scheduler_config(
+            &cache_config,
+            &pipeline,
+            self.max_seqs,
+            self.max_num_batched_tokens.get(),
+            self.max_prefill_chunk_tokens.get(),
+            self.max_decode_steps_before_prefill.get(),
+        )
+        .await;
+        let search_embedding_model = get_search_embedding_model(self.enable_search, self.search_embedding_model);
+        let mut builder = MistralRsBuilder::new(pipeline, scheduler_config.clone(), !self.interactive_mode, search_embedding_model)
+            .with_opt_log(self.log.clone())
+            .with_no_kv_cache(self.no_kv_cache)
+            .with_prefix_cache_n(policy.prefix_cache_n(&default_id, self.prefix_cache_n))
+            .with_disable_eos_stop(self.disable_eos_stop)
+            .with_loader_config(lc)
+            .with_model_id(default_id.clone());
+        if let Some(mcp_config) = self.mcp_client_config.clone() {
+            builder = builder.with_mcp_client(mcp_config);
+        }
+        if let Some(code_exec_config) = self.code_exec_config.clone() {
+            builder = builder.with_code_execution(code_exec_config);
+        }
+        if let Some(shell_config) = self.shell_config.clone() {
+            builder = builder.with_shell_execution(shell_config);
+        }
+        let mistralrs = builder.build().await;
+
+        let text = || vec![SupportedModality::Text];
+        for (id, lc, max_seq_len) in rest {
+            let state = UnloadedModelState {
+                scheduler_config: scheduler_config.clone(),
+                engine_config: EngineConfig {
+                    no_kv_cache: self.no_kv_cache,
+                    no_prefix_cache: false,
+                    prefix_cache_n: policy.prefix_cache_n(&id, self.prefix_cache_n),
+                    disable_eos_stop: self.disable_eos_stop,
+                    throughput_logging_enabled: !self.interactive_mode,
+                    search_embedding_model,
+                    search_callback: self.search_callback.clone(),
+                    tool_callbacks: HashMap::new(),
+                },
+                mcp_client_config: self.mcp_client_config.clone(),
+                category: ModelCategory::Text,
+                mistralrs_config: MistralRsConfig {
+                    kind: ModelKind::Normal,
+                    device: device.clone(),
+                    category: ModelCategory::Text,
+                    modalities: Modalities { input: text(), output: text() },
+                    max_seq_len: Some(max_seq_len),
+                    generation_defaults: None,
+                },
+                loader_config: lc,
+            };
+            mistralrs.register_unloaded_model(&id, state).map_err(|e| anyhow::anyhow!("{e}"))?;
+            info!("titan swap: registered {id} (loads on first request)");
+        }
+        mistralrs.set_titan_swap(policy);
         Ok(mistralrs)
     }
 

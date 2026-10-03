@@ -39,6 +39,7 @@ const KNOWN_DTYPES: &[GgmlDType] = &[
     GgmlDType::IQ4NL,
     GgmlDType::MXFP4,
     GgmlDType::NVFP4,
+    GgmlDType::PTQ1_0,
     // Add newer ones here if Candle adds more
 ];
 

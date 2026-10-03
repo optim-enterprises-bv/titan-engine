@@ -1,0 +1,660 @@
+    /// `-x` [neg.ftz.f32] selected by `flip`, then `+ other` [add.ftz.f32]: one butterfly half as nvcc
+    /// emits `(bit == 0) ? val + other : other - val` (fwht.cu).
+    #[inline(always)]
+    pub fn bfly(val: f32, other: f32, flip: bool) -> f32 {
+        let r: f32;
+        let f = flip as u32;
+        unsafe {
+            ptx_asm!(
+                "{ .reg .f32 n, s; .reg .pred p; setp.ne.b32 p, %3, 0; neg.ftz.f32 n, %1; selp.f32 s, n, %1, p; add.ftz.f32 %0, s, %2; }",
+                out("=f") r, in("f") val, in("f") other, in("r") f, options(register_only)
+            );
+        }
+        r
+    }
+    /// fast-math `a + b` / `a - b` as the reference PTX writes them (no .rn: ptxas treats them alike).
+    #[inline(always)]
+    pub fn addf(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("add.ftz.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+    #[inline(always)]
+    pub fn subf(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("sub.ftz.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+    /// fast-math `a * b` without .rn (the reference's scale / sign multiplies).
+    #[inline(always)]
+    pub fn mulf(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("mul.ftz.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // PT activation quantizer: `quantize_q8_1<pt = true>` (quantize.cu). The q8_1 float program of
+    // quantize_q8_1 (abs/max.ftz and add.ftz butterflies over the 32-value warp, div.approx.ftz for
+    // amax / 127 and x / d, fast-math roundf), stored in the planar-transposed layout of
+    // mmvq-ptq1_0.cuh: per column (stride ne0 * 9 / 8 bytes) plane t = 0..7 holds byte e % 16 of
+    // element kb * 128 + 16 * t + e % 16 at ((t * nblk + kb) * 16 + e % 16), plane 8 the half2 (d, sum)
+    // of each 32-value sub-block at (ne0 & ~127) + kb * 16 + (e / 32) * 4.
+
+    /// Store one quantized value (and, for the first lane of its 32-value group, the (d, sum) pair).
+    #[inline(always)]
+    pub unsafe fn pt_store(vy: *mut u8, row_cont: i64, ne0: i64, i0: i64, q: i32, d: f32, sum: f32) {
+        let ycol = vy.offset(row_cont.wrapping_mul(ne0.wrapping_add(((ne0 as u64) >> 3) as i64)) as isize);
+        let nblk = ((ne0 as u64) >> 7) as i64;
+        let kb = ((i0 as u64) >> 7) as i64;
+        let e = i0 & 127;
+        let off = (((e >> 4).wrapping_mul(nblk).wrapping_add(kb)) << 4) | (i0 & 15);
+        *ycol.offset(off as isize) = q as u8;
+        if (row_cont.wrapping_mul(ne0).wrapping_add(i0) & 31) != 0 {
+            return;
+        }
+        let ds = ycol.offset(((ne0 & !127) + (kb << 4) + ((e >> 5) << 2)) as isize) as *mut u32;
+        *ds = (f2h(d) as u32) | ((f2h(sum) as u32) << 16);
+    }
+
+    /// Params: x, vy, ne00, s01, s02, s03, ne0, ne1, ne2 (uint3); grid (ceil(ne0/256), ne1, ne2*ne3), block 256.
+    #[inline(always)]
+    pub unsafe fn quantize_pt<S: Src>(
+        x: *const S, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: u32, ne2_mp: u32, ne2_l: u32, ne2_d: u32,
+    ) {
+        let i0 = ((thread::blockDim_x() as u64) * (thread::blockIdx_x() as u64)).wrapping_add(thread::threadIdx_x() as u64) as i64;
+        if i0 >= ne0 {
+            return;
+        }
+        let z = thread::blockIdx_z();
+        let i3 = fastdiv(z, ne2_mp, ne2_l);
+        let i2 = (z as i64).wrapping_sub((i3 as u64 * ne2_d as u64) as i64);
+        let i3 = i3 as i64;
+        let i1 = thread::blockIdx_y() as i64;
+        let xi = if i0 < ne00 {
+            let ix = s01.wrapping_mul(i1).wrapping_add(i0).wrapping_add(s03.wrapping_mul(i3)).wrapping_add(i2.wrapping_mul(s02));
+            S::ld(x.offset(ix as isize))
+        } else {
+            0.0
+        };
+        let mut amax = absf(xi);
+        let mut k = 0;
+        while k < 5 {
+            unroll!();
+            amax = fmax(amax, warp::shuffle_xor_f32_sync(0xffff_ffff, amax, 16 >> k));
+            k += 1;
+        }
+        let mut sum = xi;
+        let mut k = 0;
+        while k < 5 {
+            unroll!();
+            sum = add(sum, warp::shuffle_xor_f32_sync(0xffff_ffff, sum, 16 >> k));
+            k += 1;
+        }
+        let d = div_approx(amax, 127.0);
+        let q = if amax == 0.0 { 0 } else { roundi(div_approx(xi, d)) };
+        let row_cont = ((ne1 as u64 * z as u64) as i64).wrapping_add(i1);
+        pt_store(vy, row_cont, ne0, i0, q, d, sum);
+    }
+
+    #[kernel]
+    pub unsafe fn ptq1_0_quantize_pt_f32(x: *const f32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: u32, ne2_mp: u32, ne2_l: u32, ne2_d: u32) {
+        quantize_pt(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_mp, ne2_l, ne2_d)
+    }
+    #[kernel]
+    pub unsafe fn ptq1_0_quantize_pt_bf16(x: *const u16, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: u32, ne2_mp: u32, ne2_l: u32, ne2_d: u32) {
+        quantize_pt(x as *const B, vy, ne00, s01, s02, s03, ne0, ne1, ne2_mp, ne2_l, ne2_d)
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Hadamard: `fwht_cuda_block<1024, 256, float, has_signs>` (fwht.cu), one 1024-value row per block
+    // of 256 threads; thread t holds values t + 256 j (j < 4). Load `mul.ftz(scale, x)` (then
+    // `mul.ftz(., sign)` with pre-signs, the fused MUL + FWHT of ggml_cuda_op_fwht_signed), butterflies
+    // over lanes (shuffles), over warps (shared memory) and over the 4 registers; `(bit == 0) ? v + o :
+    // o - v` as neg.ftz + selp + add.ftz. MODE 0: no signs; 1: signs before the transform (activation
+    // side of a folded weight); 2: signs after it (`ggml_mul(fwht(z), signs)`, the inverse applied to a
+    // latent embedding row; a +-1 multiply is exact, so fusing it into the store changes no bit).
+
+    /// The transform of this thread's 4 values of row `r` (in registers) through all 10 stages.
+    #[inline(always)]
+    pub unsafe fn fwht_1024(reg: &mut [f32; 4]) {
+        static mut S: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let s = SharedArray::as_raw_mut_ptr(&raw mut S);
+        let tid = thread::threadIdx_x() as i32;
+        let lane = tid & 31;
+        let mut k = 0;
+        while k < 5 {
+            unroll!();
+            let h = 1i32 << k;
+            let mut j = 0;
+            while j < 4 {
+                unroll!();
+                let o = warp::shuffle_xor_f32_sync(0xffff_ffff, reg[j], h as u32);
+                reg[j] = bfly(reg[j], o, (lane & h) != 0);
+                j += 1;
+            }
+            k += 1;
+        }
+        let mut k = 5;
+        while k < 8 {
+            unroll!();
+            let h = 1i32 << k;
+            let mut j = 0;
+            while j < 4 {
+                unroll!();
+                *s.add(j * 256 + tid as usize) = reg[j];
+                j += 1;
+            }
+            thread::sync_threads();
+            let mut j = 0;
+            while j < 4 {
+                unroll!();
+                let o = *s.add(j * 256 + (tid ^ h) as usize);
+                reg[j] = bfly(reg[j], o, (tid & h) != 0);
+                j += 1;
+            }
+            thread::sync_threads();
+            k += 1;
+        }
+        // h = 256 (step 1), h = 512 (step 2)
+        let (a0, a1, a2, a3) = (addf(reg[0], reg[1]), subf(reg[0], reg[1]), addf(reg[2], reg[3]), subf(reg[2], reg[3]));
+        reg[0] = addf(a0, a2);
+        reg[2] = subf(a0, a2);
+        reg[1] = addf(a1, a3);
+        reg[3] = subf(a1, a3);
+    }
+
+    /// Row r's 4 values of this thread after load + transform.
+    #[inline(always)]
+    pub unsafe fn fwht_row<S: Src, const MODE: u32>(src: *const S, r: i64, scale: f32, signs: *const f32, n_blk: i32) -> [f32; 4] {
+        let tid = thread::threadIdx_x() as usize;
+        let src = src.offset(r.wrapping_mul(1024) as isize);
+        let srow = signs.offset(((r as i32) % n_blk.max(1)) as isize * 1024);
+        let mut reg = [0f32; 4];
+        let mut j = 0;
+        while j < 4 {
+            unroll!();
+            let mut v = mulf(scale, S::ld(src.add(j * 256 + tid)));
+            if MODE == 1 {
+                v = mulf(v, *srow.add(j * 256 + tid));
+            }
+            reg[j] = v;
+            j += 1;
+        }
+        fwht_1024(&mut reg);
+        reg
+    }
+
+    /// Params: src, dst (f32), n_rows (i64, rows of 1024), scale, signs, n_blk; grid n_rows, block 256.
+    #[inline(always)]
+    pub unsafe fn fwht<S: Src, const MODE: u32>(src: *const S, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        let r = thread::blockIdx_x() as i64;
+        if r >= n_rows {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let reg = fwht_row::<S, MODE>(src, r, scale, signs, n_blk);
+        let dst = dst.offset(r.wrapping_mul(1024) as isize);
+        let srow = signs.offset(((r as i32) % n_blk.max(1)) as isize * 1024);
+        let mut j = 0;
+        while j < 4 {
+            unroll!();
+            let v = if MODE == 2 { mulf(reg[j], *srow.add(j * 256 + tid)) } else { reg[j] };
+            *dst.add(j * 256 + tid) = v;
+            j += 1;
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_f32_m0(src: *const f32, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<f32, 0>(src, dst, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_f32_m1(src: *const f32, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<f32, 1>(src, dst, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_f32_m2(src: *const f32, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<f32, 2>(src, dst, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_bf16_m0(src: *const u16, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<B, 0>(src as *const B, dst, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_bf16_m1(src: *const u16, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<B, 1>(src as *const B, dst, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_bf16_m2(src: *const u16, dst: *mut f32, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht::<B, 2>(src as *const B, dst, n_rows, scale, signs, n_blk)
+    }
+
+    /// Fused `fwht_cuda_block` + `quantize_q8_1<pt = true>`: the transform of row r (block b = r % n_blk of
+    /// token t = r / n_blk) quantized straight into token t's PT column (ne0 = n_blk * 1024 values, a
+    /// multiple of 512, so no padding). Every value's float program is the two reference kernels':
+    /// the 32-value group of a quantization block is one warp's lanes for one register j.
+    /// Params: src, vy, n_rows, scale, signs, n_blk; grid n_rows, block 256.
+    #[inline(always)]
+    pub unsafe fn fwht_q8pt<S: Src, const MODE: u32>(src: *const S, vy: *mut u8, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        let r = thread::blockIdx_x() as i64;
+        if r >= n_rows {
+            return;
+        }
+        let tid = thread::threadIdx_x() as i64;
+        let reg = fwht_row::<S, MODE>(src, r, scale, signs, n_blk);
+        let nb = n_blk as i64;
+        let t = r / nb;
+        let b = r - t * nb;
+        let ne0 = nb * 1024;
+        let mut j = 0;
+        while j < 4 {
+            unroll!();
+            let xi = reg[j];
+            let mut amax = absf(xi);
+            let mut k = 0;
+            while k < 5 {
+                unroll!();
+                amax = fmax(amax, warp::shuffle_xor_f32_sync(0xffff_ffff, amax, 16 >> k));
+                k += 1;
+            }
+            let mut sum = xi;
+            let mut k = 0;
+            while k < 5 {
+                unroll!();
+                sum = add(sum, warp::shuffle_xor_f32_sync(0xffff_ffff, sum, 16 >> k));
+                k += 1;
+            }
+            let d = div_approx(amax, 127.0);
+            let q = if amax == 0.0 { 0 } else { roundi(div_approx(xi, d)) };
+            pt_store(vy, t, ne0, b * 1024 + j as i64 * 256 + tid, q, d, sum);
+            j += 1;
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_q8pt_f32_m0(src: *const f32, vy: *mut u8, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht_q8pt::<f32, 0>(src, vy, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_q8pt_f32_m1(src: *const f32, vy: *mut u8, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht_q8pt::<f32, 1>(src, vy, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_q8pt_bf16_m0(src: *const u16, vy: *mut u8, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht_q8pt::<B, 0>(src as *const B, vy, n_rows, scale, signs, n_blk)
+    }
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn ptq1_0_fwht_q8pt_bf16_m1(src: *const u16, vy: *mut u8, n_rows: i64, scale: f32, signs: *const f32, n_blk: i32) {
+        fwht_q8pt::<B, 1>(src as *const B, vy, n_rows, scale, signs, n_blk)
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Decode / verify mat-vec: `mul_mat_vec_ptq1_0_pt<ncols, 4, has_fusion, has_gate>` (mmvq-ptq1_0.cuh,
+    // sudoingX bonsai2 v1.1 = PrismML-Eng/llama.cpp#218). Work items (4-row group, K block) of a CTA of
+    // `rows_per_cta` rows, 128 threads; per item and column: 5 + 5 + 2 trit steps of dp4a on the PT
+    // activation planes, `acc = fma.rn.ftz(d8_k, (float) sumi_k, acc)` after each 32-value sub-block
+    // (acc from +0), `mul.rn.ftz(d_w, acc)` to shared memory; then one warp per (row, column): lane-strided
+    // add.ftz from +0 over the K blocks, butterfly xor 16..1. Per-column arithmetic is independent of
+    // the column count (bit-identical rows for any batch 1..4). With the gate: the second weight's dots
+    // in a second partials array, then `up * silu(gate)` (SWIGLU: g / (1 + ex2.approx(g * -log2 e)),
+    // div.approx) or `up * gate` (other ops), as the reference's epilogue.
+
+    /// Per-NC constants (unrolled loop bounds must be associated consts).
+    pub struct Nc<const NC: usize>;
+    impl<const NC: usize> Nc<NC> {
+        pub const N: usize = NC;
+    }
+
+    #[inline(always)]
+    unsafe fn ldv4(p: *const u8) -> [u32; 4] {
+        let (a, b, c, d): (u32, u32, u32, u32);
+        ptx_asm!("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];", out("=r") a, out("=r") b, out("=r") c, out("=r") d, in("l") p as u64, options(register_only));
+        [a, b, c, d]
+    }
+    #[inline(always)]
+    unsafe fn ld32(p: *const u8) -> u32 {
+        let r: u32;
+        ptx_asm!("ld.global.b32 %0, [%1];", out("=r") r, in("l") p as u64, options(register_only));
+        r
+    }
+    #[inline(always)]
+    unsafe fn ld16(p: *const u8) -> u32 {
+        let r: u32;
+        ptx_asm!("ld.global.u16 %0, [%1];", out("=r") r, in("l") p as u64, options(register_only));
+        r
+    }
+
+    /// One base-3 digit of four bytes held as two 16-bit-lane words -> four weights (-1, 0, 1) as signed bytes.
+    #[inline(always)]
+    fn trit_step(vlo: &mut u32, vhi: &mut u32) -> u32 {
+        let wlo = vlo.wrapping_mul(3);
+        let whi = vhi.wrapping_mul(3);
+        *vlo = wlo & 0x00FF00FF;
+        *vhi = whi & 0x00FF00FF;
+        byte_perm(wlo, whi, 0x7531).wrapping_add(0x7F7F7F7F) ^ 0x8080_8080
+    }
+
+    /// `acc[j][i] = fma(d8_k, (float) sumi[j][i], acc[j][i]); sumi = 0` for sub-block K.
+    #[inline(always)]
+    fn fold<const NC: usize, const K: usize>(acc: &mut [[f32; 4]; NC], sumi: &mut [[i32; 4]; NC], ds: &[[u32; 4]; NC]) {
+        let mut j = 0;
+        while j < Nc::<NC>::N {
+            unroll!();
+            let d8 = h2f(ds[j][K] & 0xFFFF);
+            let mut i = 0;
+            while i < 4 {
+                unroll!();
+                acc[j][i] = fma(d8, sumi[j][i] as f32, acc[j][i]);
+                sumi[j][i] = 0;
+                i += 1;
+            }
+            j += 1;
+        }
+    }
+
+    /// ptq1_0_pt_block_dot<NC, 4>: the 4 rows' block `kbx` against the NC activation columns.
+    #[inline(always)]
+    unsafe fn pt_block_dot<const NC: usize>(bq: &[*const u8; 4], ycol: &[*const u8; NC], kbx: i32, nblk: i32, res: &mut [[f32; 4]; NC]) {
+        let mut ds = [[0u32; 4]; NC];
+        let mut j = 0;
+        while j < Nc::<NC>::N {
+            unroll!();
+            ds[j] = ldv4(ycol[j].offset(((8 * nblk + kbx) as isize) * 16));
+            j += 1;
+        }
+        let mut sumi = [[0i32; 4]; NC];
+        let mut acc = [[0f32; 4]; NC];
+        let mut vlo = [[0u32; 4]; 4];
+        let mut vhi = [[0u32; 4]; 4];
+        let mut i = 0;
+        while i < 4 {
+            unroll!();
+            let mut g = 0;
+            while g < 4 {
+                unroll!();
+                let packed = ld32(bq[i].add(4 * g));
+                vlo[i][g] = byte_perm(packed, 0, 0x4140);
+                vhi[i][g] = byte_perm(packed, 0, 0x4342);
+                g += 1;
+            }
+            i += 1;
+        }
+        let mut t = 0;
+        while t < 5 {
+            unroll!();
+            let mut u = [[0u32; 4]; NC];
+            let mut j = 0;
+            while j < Nc::<NC>::N {
+                unroll!();
+                u[j] = ldv4(ycol[j].offset(((t as i32 * nblk + kbx) as isize) * 16));
+                j += 1;
+            }
+            let mut i = 0;
+            while i < 4 {
+                unroll!();
+                let mut g = 0;
+                while g < 4 {
+                    unroll!();
+                    let q = trit_step(&mut vlo[i][g], &mut vhi[i][g]);
+                    let mut j = 0;
+                    while j < Nc::<NC>::N {
+                        unroll!();
+                        sumi[j][i] = dp4a(q, u[j][g], sumi[j][i]);
+                        j += 1;
+                    }
+                    g += 1;
+                }
+                i += 1;
+            }
+            if t == 1 {
+                fold::<NC, 0>(&mut acc, &mut sumi, &ds);
+            }
+            if t == 3 {
+                fold::<NC, 1>(&mut acc, &mut sumi, &ds);
+            }
+            t += 1;
+        }
+        // qs[16..23]: element 80 + 8 t + 4 g + b, words 20 + 2 t + g of planes 5, 6, 7
+        let mut vlo2 = [[0u32; 2]; 4];
+        let mut vhi2 = [[0u32; 2]; 4];
+        let mut i = 0;
+        while i < 4 {
+            unroll!();
+            let mut g = 0;
+            while g < 2 {
+                unroll!();
+                let packed = ld32(bq[i].add(16 + 4 * g));
+                vlo2[i][g] = byte_perm(packed, 0, 0x4140);
+                vhi2[i][g] = byte_perm(packed, 0, 0x4342);
+                g += 1;
+            }
+            i += 1;
+        }
+        let mut u2 = [[0u32; 4]; NC];
+        let mut t = 0;
+        while t < 5 {
+            unroll!();
+            if t % 2 == 0 {
+                let mut j = 0;
+                while j < Nc::<NC>::N {
+                    unroll!();
+                    u2[j] = ldv4(ycol[j].offset((((5 + t / 2) as i32 * nblk + kbx) as isize) * 16));
+                    j += 1;
+                }
+            }
+            let mut i = 0;
+            while i < 4 {
+                unroll!();
+                let mut g = 0;
+                while g < 2 {
+                    unroll!();
+                    let q = trit_step(&mut vlo2[i][g], &mut vhi2[i][g]);
+                    let w = (20 + 2 * t + g) & 3;
+                    let mut j = 0;
+                    while j < Nc::<NC>::N {
+                        unroll!();
+                        sumi[j][i] = dp4a(q, u2[j][w], sumi[j][i]);
+                        j += 1;
+                    }
+                    g += 1;
+                }
+                i += 1;
+            }
+            if t == 1 {
+                fold::<NC, 2>(&mut acc, &mut sumi, &ds);
+            }
+            t += 1;
+        }
+        // qh: element 120 + 2 t + h, words 30, 31 (upper half of plane 7, still in u2)
+        let mut i = 0;
+        while i < 4 {
+            unroll!();
+            let h = ld16(bq[i].add(24));
+            let mut v = (h & 0xFF) | ((h >> 8) << 16);
+            let mut t = 0;
+            while t < 2 {
+                unroll!();
+                let w0 = v.wrapping_mul(3);
+                v = w0 & 0x00FF00FF;
+                let w1 = v.wrapping_mul(3);
+                v = w1 & 0x00FF00FF;
+                let q = byte_perm(w0, w1, 0x7531).wrapping_add(0x7F7F7F7F) ^ 0x8080_8080;
+                let mut j = 0;
+                while j < Nc::<NC>::N {
+                    unroll!();
+                    sumi[j][i] = dp4a(q, u2[j][2 + t], sumi[j][i]);
+                    j += 1;
+                }
+                t += 1;
+            }
+            i += 1;
+        }
+        fold::<NC, 3>(&mut acc, &mut sumi, &ds);
+        let mut i = 0;
+        while i < 4 {
+            unroll!();
+            let d = h2f(ld16(bq[i].add(26)));
+            let mut j = 0;
+            while j < Nc::<NC>::N {
+                unroll!();
+                res[j][i] = mul(d, acc[j][i]);
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// `up * silu(gate)` as the SWIGLU epilogue's PTX.
+    #[inline(always)]
+    pub fn swiglu_mul(up: f32, g: f32) -> f32 {
+        let r: f32;
+        unsafe {
+            ptx_asm!(
+                "{ .reg .f32 t, e, d, s; mul.ftz.f32 t, %2, 0fBFB8AA3B; ex2.approx.ftz.f32 e, t; add.ftz.f32 d, e, 0f3F800000; div.approx.ftz.f32 s, %2, d; mul.ftz.f32 %0, %1, s; }",
+                out("=f") r, in("f") up, in("f") g, options(register_only)
+            );
+        }
+        r
+    }
+
+    /// Params (reference ABI): vx, vy, fusion {x_bias, gate, gate_bias, x_scale, gate_scale: u64; glu_op: u32,
+    /// pad}, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta (i32), bpr (uint3).
+    /// Grid ceil(nrows_x / rows_per_cta), block 128, dynamic smem NC * rows_per_cta * bpr * 4 (x2 with the gate).
+    #[inline(always)]
+    pub unsafe fn mmvq_pt<const NC: usize, const GLU: bool, D: Dst>(
+        vx: *const u8, vy: *const u8, x_bias: *const f32, gate: *const u8, gate_bias: *const f32, glu_op: u32, dst: *mut D,
+        ncols_x: i32, nrows_x: i32, stride_row_x: i32, stride_col_y: i32, stride_col_dst: i32, rows_per_cta: i32,
+        bpr_mp: u32, bpr_l: u32,
+    ) {
+        let partials = DynamicSharedArray::<f32>::get();
+        let bpr = ncols_x / 128;
+        let nblk = ((ncols_x + 511) / 512) * 4;
+        let row0 = rows_per_cta.wrapping_mul(thread::blockIdx_x() as i32);
+        let tid = thread::threadIdx_x() as i32;
+        let pgate = partials.wrapping_add((NC as i32 * rows_per_cta * bpr) as usize);
+
+        let mut ycol = [vy; NC];
+        let mut j = 0;
+        while j < Nc::<NC>::N {
+            unroll!();
+            ycol[j] = vy.offset(((j as i32).wrapping_mul(stride_col_y) as isize) * 36);
+            j += 1;
+        }
+        let n_items = (rows_per_cta / 4) * bpr;
+        let mut idx = tid;
+        while idx < n_items {
+            let rg = fastdiv(idx as u32, bpr_mp, bpr_l) as i32;
+            let kbx = idx - rg * bpr;
+            let mut bq = [vx; 4];
+            let mut i = 0;
+            while i < 4 {
+                unroll!();
+                let mut row = row0 + rg * 4 + i as i32;
+                row = if row < nrows_x { row } else { nrows_x - 1 };
+                bq[i] = vx.offset((((row as i64) * (stride_row_x as i64) + kbx as i64) * 28) as isize);
+                i += 1;
+            }
+            let mut dots = [[0f32; 4]; NC];
+            pt_block_dot::<NC>(&bq, &ycol, kbx, nblk, &mut dots);
+            let mut j = 0;
+            while j < Nc::<NC>::N {
+                unroll!();
+                let mut i = 0;
+                while i < 4 {
+                    unroll!();
+                    *partials.add((((j as i32) * rows_per_cta + rg * 4 + i as i32) * bpr + kbx) as usize) = dots[j][i];
+                    i += 1;
+                }
+                j += 1;
+            }
+            if GLU {
+                let mut bg = [gate; 4];
+                let mut i = 0;
+                while i < 4 {
+                    unroll!();
+                    let mut row = row0 + rg * 4 + i as i32;
+                    row = if row < nrows_x { row } else { nrows_x - 1 };
+                    bg[i] = gate.offset((((row as i64) * (stride_row_x as i64) + kbx as i64) * 28) as isize);
+                    i += 1;
+                }
+                pt_block_dot::<NC>(&bg, &ycol, kbx, nblk, &mut dots);
+                let mut j = 0;
+                while j < Nc::<NC>::N {
+                    unroll!();
+                    let mut i = 0;
+                    while i < 4 {
+                        unroll!();
+                        *pgate.add((((j as i32) * rows_per_cta + rg * 4 + i as i32) * bpr + kbx) as usize) = dots[j][i];
+                        i += 1;
+                    }
+                    j += 1;
+                }
+            }
+            idx += 128;
+        }
+        thread::sync_threads();
+
+        let warp_id = tid / 32;
+        let lane = tid % 32;
+        let mut w = warp_id;
+        while w < rows_per_cta * NC as i32 {
+            let j = w / rows_per_cta;
+            let r = w - j * rows_per_cta;
+            let row = row0 + r;
+            let mut sum = 0f32;
+            let mut sum_gate = 0f32;
+            let mut kbx = lane;
+            while kbx < bpr {
+                sum = add(sum, *partials.add(((j * rows_per_cta + r) * bpr + kbx) as usize));
+                if GLU {
+                    sum_gate = add(sum_gate, *pgate.add(((j * rows_per_cta + r) * bpr + kbx) as usize));
+                }
+                kbx += 32;
+            }
+            let mut k = 0;
+            while k < 5 {
+                unroll!();
+                sum = add(sum, warp::shuffle_xor_f32_sync(0xffff_ffff, sum, 16 >> k));
+                k += 1;
+            }
+            if GLU {
+                let mut k = 0;
+                while k < 5 {
+                    unroll!();
+                    sum_gate = add(sum_gate, warp::shuffle_xor_f32_sync(0xffff_ffff, sum_gate, 16 >> k));
+                    k += 1;
+                }
+            }
+            if lane == 0 && row < nrows_x {
+                let o = j.wrapping_mul(stride_col_dst).wrapping_add(row);
+                let mut result = sum;
+                if GLU {
+                    if !x_bias.is_null() {
+                        result = addf(result, *x_bias.offset(o as isize));
+                    }
+                    let mut gv = sum_gate;
+                    if !gate_bias.is_null() {
+                        gv = addf(gv, *gate_bias.offset(o as isize));
+                    }
+                    result = if glu_op == 2 { swiglu_mul(result, gv) } else { mulf(result, gv) };
+                }
+                D::st(dst.offset(o as isize), result);
+            }
+            w += 4;
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // MMQ quantizer: `quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false, false>` of the bonsai2 branch
+    // (the acecd56 float program; the trailing gate / norm_weight / norm_scale pointers are unused).

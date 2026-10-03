@@ -75,6 +75,16 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn gather_rows(
+        &self,
+        _rows: usize,
+        _row_bytes: usize,
+        _ids: &CudaStorage,
+        _ids_l: &crate::Layout,
+    ) -> Result<Option<Self>> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,

@@ -44,6 +44,7 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         sandbox,
         models,
         default_model_id,
+        titan_swap,
     } = cfg;
 
     if server.observability_config().metrics {
@@ -102,7 +103,28 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         builder = builder.add_model_config(config);
     }
 
-    if let Some(default_model_id) = default_model_id {
+    if let Some(swap) = titan_swap {
+        let name = |m: &crate::config::ModelEntry| m.name.clone().unwrap_or_else(|| m.model_id.clone());
+        let default_model = default_model_id.clone().unwrap_or_else(|| name(&models[0]));
+        let policy = mistralrs_core::TitanSwapPolicy {
+            default_model,
+            max_resident: swap.max_resident.unwrap_or(mistralrs_core::TITAN_DEFAULT_MAX_RESIDENT),
+            models: models
+                .iter()
+                .map(|m| {
+                    let t = m.titan.clone().unwrap_or_default();
+                    let settings = mistralrs_core::TitanModelSettings {
+                        env: t.env_strings(),
+                        idle_ttl: t.idle_ttl_secs.filter(|s| *s > 0).map(std::time::Duration::from_secs),
+                        prefix_cache_n: t.prefix_cache_n,
+                    };
+                    (name(m), settings)
+                })
+                .collect(),
+        };
+        info!("titan swap mode: {} models, default {}, at most {} resident", models.len(), policy.default_model, policy.max_resident);
+        builder = builder.with_titan_swap(policy);
+    } else if let Some(default_model_id) = default_model_id {
         builder = builder.with_default_model_id(default_model_id);
     }
 
@@ -372,14 +394,16 @@ async fn build_model_configs(
         let model_selected = convert_to_model_selected(&model_type, &matformer)?;
 
         let resolved_loader_id = crate::commands::serve::model_id_of(&model_type);
-        let mut config = ModelConfig::new(entry.model_id.clone(), model_selected);
+        let mut config = ModelConfig::new(entry.name.clone().unwrap_or_else(|| entry.model_id.clone()), model_selected);
         if let Some(max_model_len) = entry.max_model_len {
             config = config.with_max_model_len(max_model_len);
         }
         if let Some(overrides) = entry.hf_overrides.clone() {
             config = config.with_hf_config_overrides(overrides);
         }
-        if resolved_loader_id != entry.model_id {
+        if let Some(name) = entry.name.as_ref() {
+            config = config.with_alias(name.clone());
+        } else if resolved_loader_id != entry.model_id {
             config = config.with_alias(entry.model_id.clone());
         }
 

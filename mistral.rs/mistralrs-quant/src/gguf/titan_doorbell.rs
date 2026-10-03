@@ -18,7 +18,7 @@ use candle_core::{
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
 
 use super::onepass::{self, Misses, Out};
 use super::{titan_pfs, TieredExperts, MAX_LOOKAHEAD, NOT_RESIDENT};
@@ -52,9 +52,9 @@ const DEFAULT_SPIN_US: u64 = 2000;
 /// `TITAN_DOORBELL_COLLECT=blocks[,threads]` (default 1,512): the shape of the wait-and-copy kernel; 0 = a one-thread
 /// wait kernel, then a separate scatter.
 fn collect_shape() -> (u32, u32) {
-    static S: OnceLock<(u32, u32)> = OnceLock::new();
+    static S: crate::titan_cfg::GenCell<(u32, u32)> = crate::titan_cfg::GenCell::new();
     *S.get_or_init(|| {
-        let v = std::env::var("TITAN_DOORBELL_COLLECT").unwrap_or_default();
+        let v = crate::titan_cfg::var("TITAN_DOORBELL_COLLECT").unwrap_or_default();
         let mut it = v.split(',').map(|x| x.trim().parse::<u32>().ok());
         let blocks = it.next().flatten().unwrap_or(DEFAULT_COLLECT_BLOCKS);
         let threads = it.next().flatten().unwrap_or(DEFAULT_COLLECT_THREADS).clamp(32, 1024);
@@ -63,8 +63,8 @@ fn collect_shape() -> (u32, u32) {
 }
 
 pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_DOORBELL").is_ok_and(|v| v == "1"))
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_DOORBELL").is_ok_and(|v| v == "1"))
 }
 
 /// Byte offsets of the mapped regions, sized for the first layer's shapes.
@@ -130,24 +130,49 @@ pub(super) struct Doorbell {
     host: *mut u8,
     dev_base: u64,
     layout: Layout,
-    seq: CudaSlice<u32>,
+    /// The device sequence counter, freed by `shutdown` (the struct itself stays leaked), and its address.
+    seq: Mutex<Option<CudaSlice<u32>>>,
+    seq_dev: u64,
+    ctx: std::sync::Arc<candle_core::cuda::cudarc::driver::CudaContext>,
     queue: Mutex<VecDeque<Job>>,
     wake: Condvar,
     sleeping: AtomicBool,
     failed: AtomicBool,
     spin: std::time::Duration,
+    /// Model unload (`release`): the host thread exits and the mapped memory is freed.
+    stop: AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 unsafe impl Send for Doorbell {}
 unsafe impl Sync for Doorbell {}
 
-static DOORBELL: OnceLock<std::result::Result<&'static Doorbell, String>> = OnceLock::new();
+/// The doorbell of the current settings generation (one per loaded model: the layout is sized for its first layer's
+/// shapes). `release` retires it; the next forward builds a new one.
+#[allow(clippy::type_complexity)]
+static DOORBELL: Mutex<Option<(u64, std::result::Result<&'static Doorbell, String>)>> = Mutex::new(None);
+
+/// Model unload or OOM recovery: stop the doorbell's host thread and free its mapped memory. The (small) struct stays
+/// leaked.
+pub(crate) fn release() {
+    let cur = DOORBELL.lock().unwrap().take();
+    if let Some((_, Ok(db))) = cur {
+        db.shutdown();
+    }
+}
 
 impl Doorbell {
     /// The process's doorbell, created (buffers, device counter, host thread) by the first call.
     fn get(dev: &CudaDevice, lay: Layout) -> Result<&'static Doorbell> {
-        let r = DOORBELL.get_or_init(|| Self::create(dev, lay).map(|d| &*Box::leak(Box::new(d))).map_err(|e| e.to_string()));
-        match r {
+        let g = crate::titan_cfg::generation();
+        let mut cur = DOORBELL.lock().unwrap();
+        if !matches!(&*cur, Some((cg, _)) if *cg == g) {
+            if let Some((_, Ok(old))) = cur.take() {
+                old.shutdown();
+            }
+            *cur = Some((g, Self::create(dev, lay).map(|d| &*Box::leak(Box::new(d))).map_err(|e| e.to_string())));
+        }
+        match &cur.as_ref().expect("set above").1 {
             Ok(d) => Ok(*d),
             Err(e) => candle_core::bail!("titan doorbell: {e}"),
         }
@@ -162,8 +187,9 @@ impl Doorbell {
         let mut dev_base: sys::CUdeviceptr = 0;
         unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev_base, host as *mut std::ffi::c_void, 0) }.result().w()?;
         let seq = dev.alloc_zeros::<u32>(1)?;
+        let seq_dev = slice_ptr(&seq, 0).0;
         candle_core::backend::BackendDevice::synchronize(dev)?;
-        let spin_us = std::env::var("TITAN_TIERED_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SPIN_US);
+        let spin_us = crate::titan_cfg::var("TITAN_TIERED_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SPIN_US);
         tracing::info!(
             "titan doorbell: {} KiB mapped host memory, up to {MAX_ROWS} rows x top-{}, {}",
             layout.len >> 10,
@@ -174,20 +200,43 @@ impl Doorbell {
             host,
             dev_base,
             layout,
-            seq,
+            seq: Mutex::new(Some(seq)),
+            seq_dev,
+            ctx: stream.context().clone(),
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             sleeping: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             spin: std::time::Duration::from_micros(spin_us),
+            stop: AtomicBool::new(false),
+            thread: Mutex::new(None),
         })
     }
 
     fn start(&'static self) {
-        static STARTED: OnceLock<()> = OnceLock::new();
-        STARTED.get_or_init(|| {
-            std::thread::Builder::new().name("titan-doorbell".into()).spawn(move || self.serve()).expect("spawn titan-doorbell");
-        });
+        let mut t = self.thread.lock().unwrap();
+        if t.is_none() && !self.stop.load(Ordering::Acquire) {
+            *t = Some(std::thread::Builder::new().name("titan-doorbell".into()).spawn(move || self.serve()).expect("spawn titan-doorbell"));
+        }
+    }
+
+    fn shutdown(&'static self) {
+        if self.stop.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let _q = self.queue.lock().unwrap();
+            self.wake.notify_all();
+        }
+        if let Some(t) = self.thread.lock().unwrap().take() {
+            let _ = t.join();
+        }
+        let ctx = self.ctx.clone();
+        if ctx.bind_to_thread().is_ok() {
+            drop(self.seq.lock().unwrap().take());
+            let _ = unsafe { sys::cuMemFreeHost(self.host as *mut std::ffi::c_void) };
+        }
+        tracing::info!("titan doorbell: released {} KiB mapped host memory", self.layout.len >> 10);
     }
 
     fn ctl(&self, word: usize) -> *mut u32 {
@@ -206,8 +255,8 @@ impl Doorbell {
         Ok(())
     }
 
-    fn seq_ptr(&self) -> (u64, candle_core::cuda::cudarc::driver::SyncOnDrop<'_>) {
-        slice_ptr(&self.seq, 0)
+    fn seq_ptr(&self) -> (u64, ()) {
+        (self.seq_dev, ())
     }
 
     /// Copy `n_ids` ids from `ids_ptr` and `xq_bytes` from `xq_ptr` to the regions at `ids_off` / `xq_off`, then
@@ -278,12 +327,15 @@ impl Doorbell {
         }
     }
 
-    fn next_job(&self) -> Job {
+    fn next_job(&self) -> Option<Job> {
         let t0 = std::time::Instant::now();
         let mut spins = 0u32;
         loop {
             if let Some(j) = self.queue.lock().unwrap().pop_front() {
-                return j;
+                return Some(j);
+            }
+            if self.stop.load(Ordering::Acquire) {
+                return None;
             }
             spins += 1;
             if spins % 64 == 0 && t0.elapsed() > self.spin {
@@ -292,7 +344,10 @@ impl Doorbell {
                 loop {
                     if let Some(j) = q.pop_front() {
                         self.sleeping.store(false, Ordering::SeqCst);
-                        return j;
+                        return Some(j);
+                    }
+                    if self.stop.load(Ordering::Acquire) {
+                        return None;
                     }
                     q = self.wake.wait(q).unwrap();
                 }
@@ -314,7 +369,7 @@ impl Doorbell {
                 return Some(p);
             }
             spins += 1;
-            if spins % 1024 == 0 && t0.elapsed() > PUB_TIMEOUT {
+            if spins % 1024 == 0 && (t0.elapsed() > PUB_TIMEOUT || self.stop.load(Ordering::Acquire)) {
                 return None;
             }
             std::hint::spin_loop();
@@ -339,7 +394,9 @@ impl Doorbell {
     fn serve(&'static self) {
         let mut last = 0u32;
         loop {
-            let job = self.next_job();
+            let Some(job) = self.next_job() else {
+                return;
+            };
             let Some(s) = self.wait_pub(last) else {
                 tracing::warn!("titan doorbell: no publish within {PUB_TIMEOUT:?}; job dropped");
                 continue;

@@ -708,6 +708,13 @@ impl Engine {
         if let Some(retention) = paged_block_retention {
             prefix_cacher.attach_paged_block_retention(retention);
         }
+        // titan: read while this model's settings are installed (swap mode: `[models.titan] prefix_cache_max_mib`)
+        prefix_cacher.set_max_device_bytes(
+            mistralrs_quant::titan_cfg::var("TITAN_PREFIX_CACHE_DEVICE_MIB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|mib| mib << 20),
+        );
 
         Ok(Self {
             tx,

@@ -1,0 +1,10 @@
+[package]
+name = "cpuonly"
+version = "0.1.0"
+edition = "2021"
+
+# m4/emb: a plain CPU build of the emb candle-core (no cuda feature), for the iquant cfg fix.
+[dependencies]
+candle-core = { path = "~/titan-engine/top-emb/candle/candle-core" }
+
+[workspace]

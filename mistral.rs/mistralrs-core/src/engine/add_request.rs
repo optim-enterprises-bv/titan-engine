@@ -715,7 +715,9 @@ impl Engine {
                         model_metadata.v_head_dim_for_layer(layer_idx),
                     );
 
-                    let k_seq_cache = match Tensor::zeros(k_shape, dtype, &device) {
+                    // a shape / dtype template only (NormalCacheManager::set_none_cache allocates the real cache on the
+                    // layer's device): one element broadcast, not a prompt-sized buffer per layer on the main device
+                    let k_seq_cache = match Tensor::zeros((), dtype, &device).and_then(|t| t.broadcast_as(k_shape)) {
                         Ok(x) => x,
                         Err(err) => {
                             request
@@ -732,7 +734,7 @@ impl Engine {
                     let v_seq_cache = if k_shape == v_shape {
                         k_seq_cache.clone()
                     } else {
-                        match Tensor::zeros(v_shape, dtype, &device) {
+                        match Tensor::zeros((), dtype, &device).and_then(|t| t.broadcast_as(v_shape)) {
                             Ok(x) => x,
                             Err(err) => {
                                 request

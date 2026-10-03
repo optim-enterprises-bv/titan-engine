@@ -28,7 +28,7 @@ pub use normal_loaders::{
     HunYuanDenseV1Loader, HunYuanMoEV1Loader, Lfm2Loader, LlamaLoader, MistralLoader,
     MixtralLoader, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
     Phi2Loader, Phi3Loader, Phi3_5MoELoader, Qwen2Loader, Qwen3Loader, Qwen3MoELoader,
-    Qwen3NextLoader, Qwen3_5TextLoader, SmolLm3Loader, Starcoder2Loader,
+    Qwen3NextLoader, Qwen3_5TextLoader, SmolLm3Loader, Spark2_5Loader, Starcoder2Loader,
 };
 
 pub use multimodal_loaders::{
@@ -835,6 +835,11 @@ pub trait DeviceMappedModelLoader {
     /// override this so automatic device mapping does not budget a KV cache for every layer.
     fn kv_cache_layer_fraction(&self, _config: &str) -> Result<f64> {
         Ok(1.0)
+    }
+    /// Element type of the (non-paged) KV cache when the model runs in `dtype`. Models that keep their cache in
+    /// another type than the activations (Gemma 4 under `--dtype f32`: F16) override this.
+    fn kv_cache_dtype(&self, _config: &str, dtype: DType) -> Result<DType> {
+        Ok(dtype)
     }
 
     fn checkpoint_layer_index(&self, _config: &str, tensor_name: &str) -> Option<usize> {

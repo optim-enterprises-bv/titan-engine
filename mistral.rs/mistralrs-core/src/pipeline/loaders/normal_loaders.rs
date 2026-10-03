@@ -228,6 +228,8 @@ pub enum NormalLoaderType {
     Lfm2,
     #[serde(rename = "lfm2_moe")]
     Lfm2Moe,
+    #[serde(rename = "spark2_5")]
+    Spark2_5,
 }
 
 // https://github.com/huggingface/transformers/blob/cff06aac6fad28019930be03f5d467055bf62177/src/transformers/models/auto/modeling_auto.py#L448
@@ -260,6 +262,7 @@ impl NormalLoaderType {
             Self::Qwen3_5 => "Qwen3_5ForCausalLM",
             Self::Lfm2 => "Lfm2ForCausalLM",
             Self::Lfm2Moe => "Lfm2MoeForCausalLM",
+            Self::Spark2_5 => "Spark2_5ForCausalLM",
         }
     }
 
@@ -291,6 +294,7 @@ impl NormalLoaderType {
             Self::Qwen3_5 => "qwen3_5_text",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2_moe",
+            Self::Spark2_5 => "spark2_5",
         }
     }
 
@@ -322,6 +326,7 @@ impl NormalLoaderType {
             "Qwen3_5ForCausalLM" => Ok(Self::Qwen3_5),
             "Lfm2ForCausalLM" => Ok(Self::Lfm2),
             "Lfm2MoeForCausalLM" => Ok(Self::Lfm2Moe),
+            "Spark2_5ForCausalLM" => Ok(Self::Spark2_5),
             other => anyhow::bail!(
                 "Unsupported Hugging Face Transformers -CausalLM model class `{other}`. Please raise an issue."
             ),
@@ -359,7 +364,8 @@ impl FromStr for NormalLoaderType {
             "qwen3_5" => Ok(Self::Qwen3_5),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2_moe" => Ok(Self::Lfm2Moe),
-            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`, `hunyuanv1dense`, `hunyuanv1moe`, `qwen3next`, `qwen3_5`, `lfm2`, `lfm2_moe`.")),
+            "spark2_5" => Ok(Self::Spark2_5),
+            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`, `hunyuanv1dense`, `hunyuanv1moe`, `qwen3next`, `qwen3_5`, `lfm2`, `lfm2_moe`, `spark2_5`.")),
         }
     }
 }
@@ -393,6 +399,7 @@ impl Display for NormalLoaderType {
             Self::Qwen3_5 => write!(f, "qwen3_5"),
             Self::Lfm2 => write!(f, "lfm2"),
             Self::Lfm2Moe => write!(f, "lfm2_moe"),
+            Self::Spark2_5 => write!(f, "spark2_5"),
         }
     }
 }
@@ -455,6 +462,7 @@ impl AutoNormalLoader {
             NormalLoaderType::Qwen3_5 => Ok(Box::new(Qwen3_5TextLoader)),
             NormalLoaderType::Lfm2 => Ok(Box::new(Lfm2Loader)),
             NormalLoaderType::Lfm2Moe => Ok(Box::new(Lfm2Loader)),
+            NormalLoaderType::Spark2_5 => Ok(Box::new(Spark2_5Loader)),
         }
     }
 }
@@ -3427,12 +3435,42 @@ impl DeviceMappedModelLoader for Qwen3Loader {
         };
 
         let cfg: models::qwen3::Config = serde_json::from_str(config)?;
-
-        Ok(
-            max_batch_size
-                * cfg.num_attention_heads
-                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
-        )
+        // One unchunked prefill of the whole context (not one attention chunk: the MLP and the causal mask grow
+        // with the prompt). Measured on qwen3-14b (m4/devmap window 3, all 40 layers on the GPU, prefix cache
+        // off): an 8k prompt's transients are 1914 MiB beyond its KV, ~117 Ki F16 elements per token besides the
+        // mask, more than the MLP (3 x 17408) or attention working set alone; the two are charged together
+        // (4 x intermediate + 4 x q/k/v width per token, `prefill_act_elems` takes the max of 3 x each).
+        let attn = (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim();
+        // Prompts from TITAN_ATTN_FLASH_PREFILL_MIN keys take the flash-prefill kernels (models/qwen3.rs): no mask, no
+        // score chunks, the MLP in 4096-token passes. Measured on qwen3-14b, all 40 layers on the GPU, prefix cache
+        // off (m4/devmap window 4): 444 / 792 / 1441 / 2063 MiB beyond the weights and the prompt's KV at
+        // 3992 / 7992 / 11976 / 16184 tokens, ~128 KiB per token; charged 13.5 x hidden F16 elements (135 KiB at
+        // hidden 5120) per token plus 128 MiB. Shorter prompts stay eager: their peak is the eager figure below
+        // 1024 keys.
+        let flash = |n: &str| mistralrs_quant::titan_cfg::var(n).map(|v| v != "0").unwrap_or(true);
+        if flash("TITAN_QWEN3_FLASH") && flash("TITAN_ATTN_FLASH_PREFILL") {
+            let s = *max_seq_len;
+            let eager_short = super::auto_device_map::prefill_act_elems(
+                s.min(1023),
+                *max_batch_size,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                attn,
+                1,
+                cfg.num_attention_heads,
+            );
+            let flash_long = *max_batch_size * s * (27 * cfg.hidden_size / 2) + (64 << 20);
+            return Ok(eager_short.max(flash_long));
+        }
+        Ok(super::auto_device_map::prefill_act_elems(
+            *max_seq_len,
+            *max_batch_size,
+            cfg.hidden_size,
+            (4 * cfg.intermediate_size + 4 * attn).div_ceil(3),
+            attn,
+            1,
+            cfg.num_attention_heads,
+        ))
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -6150,6 +6188,210 @@ impl DeviceMappedModelLoader for Qwen3_5TextLoader {
     }
 }
 
+// ======================== Spark2.5 loader
+
+/// [`NormalLoader`] for a Spark2.5 model.
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct Spark2_5Loader;
+
+fn parse_spark2_5_config(config: &str) -> Result<crate::models::spark2_5::Config> {
+    let cfg: crate::models::spark2_5::Config = serde_json::from_str(config)?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+impl NormalModelLoader for Spark2_5Loader {
+    // the RoPE tables are sized by max_position_embeddings (1M upstream, ~640 MB)
+    fn runtime_config<'a>(
+        &self,
+        config: &'a str,
+        max_model_len: Option<usize>,
+    ) -> Result<Cow<'a, str>> {
+        let Some(max_model_len) = max_model_len else {
+            return Ok(Cow::Borrowed(config));
+        };
+        anyhow::ensure!(max_model_len > 0, "max_model_len must be greater than zero");
+        let mut value: serde_json::Value = serde_json::from_str(config)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Spark2.5 config must be a JSON object"))?;
+        let current = object
+            .get("max_position_embeddings")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("Spark2.5 config needs `max_position_embeddings`"))?;
+        if current as usize <= max_model_len {
+            return Ok(Cow::Borrowed(config));
+        }
+        object.insert(
+            "max_position_embeddings".to_string(),
+            serde_json::Value::from(max_model_len),
+        );
+        Ok(Cow::Owned(serde_json::to_string(&value)?))
+    }
+
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg = parse_spark2_5_config(config)?;
+        Ok(Box::new(models::spark2_5::Model::new(
+            &cfg,
+            vb,
+            self.is_gptx_for(config, &normal_loading_metadata)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        anyhow::bail!("Spark2.5 does not support X-LoRA")
+    }
+
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        Ok(Box::new(parse_spark2_5_config(config)?))
+    }
+}
+
+impl IsqModelLoader for Spark2_5Loader {
+    fn promoted_isq_predicates(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"^model\.embed_tokens\.weight$")?,
+            Regex::new(r"^lm_head\.(weight|bias)$")?,
+        ])
+    }
+
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.(q_k_v_proj|g_proj|out_proj)\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|bias)$")?,
+        ])
+    }
+
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for Spark2_5Loader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+        let cfg = parse_spark2_5_config(config)?;
+        // One unchunked prefill of the whole context; sliding and full layers each build their own mask.
+        Ok(super::auto_device_map::prefill_act_elems(
+            *max_seq_len,
+            *max_batch_size,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim,
+            2,
+            cfg.num_attention_heads,
+        ))
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        quantization: Option<&super::AutoDeviceMapQuantization<'_>>,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg = parse_spark2_5_config(config)?;
+        let (embed_tokens_pack_factor, lm_head_pack_factor) =
+            super::language_model_pack_factors_with_aliases(
+                quantization,
+                &["model.embed_tokens.weight"],
+                &["lm_head.weight"],
+                cfg.tie_word_embeddings,
+                dtype,
+                weight_pack_factor,
+            )?;
+        let embed_tokens = cfg.hidden_size * cfg.vocab_size / embed_tokens_pack_factor;
+        let lm_head = if cfg.tie_word_embeddings {
+            0
+        } else {
+            cfg.hidden_size * cfg.vocab_size / lm_head_pack_factor
+        };
+        Ok((embed_tokens + lm_head + cfg.hidden_size) * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg = parse_spark2_5_config(config)?;
+        let q_dim = cfg.head_dim * cfg.num_attention_heads;
+        let kv_dim = cfg.head_dim * cfg.num_key_value_heads;
+        let attention = cfg.hidden_size * (q_dim + 2 * kv_dim + cfg.num_attention_heads)
+            / weight_pack_factor
+            + q_dim * cfg.hidden_size / weight_pack_factor;
+        let mlp = cfg.hidden_size * cfg.intermediate_size * 3 / weight_pack_factor;
+        let per_layer = cfg.hidden_size * 2 + attention + mlp;
+        Ok(vec![
+            per_layer * dtype.size_in_bytes();
+            cfg.num_hidden_layers
+        ])
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        Ok(parse_spark2_5_config(config)?.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg = parse_spark2_5_config(config)?;
+        Ok(Box::new(ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: None,
+            k_head_dim: cfg.head_dim,
+            v_head_dim: cfg.head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        }))
+    }
+}
+
 // ======================== LFM2 loader
 
 /// [`NormalLoader`] for an LFM2 hybrid attention/short-conv model.
@@ -7213,7 +7455,7 @@ mod tests {
 
     #[test]
     fn concrete_normal_loaders_scope_promoted_isq_tensors() {
-        let loaders: [(&str, &dyn IsqModelLoader); 25] = [
+        let loaders: [(&str, &dyn IsqModelLoader); 26] = [
             ("MistralLoader", &MistralLoader),
             ("GemmaLoader", &GemmaLoader),
             ("LlamaLoader", &LlamaLoader),
@@ -7239,6 +7481,7 @@ mod tests {
             ("Qwen3NextLoader", &Qwen3NextLoader),
             ("Qwen3_5TextLoader", &Qwen3_5TextLoader),
             ("Lfm2Loader", &Lfm2Loader),
+            ("Spark2_5Loader", &Spark2_5Loader),
         ];
 
         for (loader_name, loader) in loaders {

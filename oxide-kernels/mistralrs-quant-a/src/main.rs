@@ -15,7 +15,7 @@ mod gate;
 pub mod launch;
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicI32, DeviceAtomicU32};
-use cuda_device::{DynamicSharedArray, SharedArray, bf16x2, convert, dotprod, f16x2, float, kernel, thread, warp};
+use cuda_device::{DynamicSharedArray, SharedArray, bf16x2, convert, dotprod, f16x2, float, kernel, ptx_asm, thread, warp};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -1619,6 +1619,7 @@ mod kernels {
     #[inline(always)]
     pub fn fmt_params<const FMT: u32>() -> (i32, i32, i32, i32) {
         match FMT {
+
             0 => (32, 4, 2, 18),
             1 => (32, 4, 2, 20),
             2 => (32, 4, 2, 22),
@@ -1629,8 +1630,3975 @@ mod kernels {
             7 => (256, 32, 2, 144),
             8 => (256, 32, 2, 176),
             9 => (256, 32, 1, 210),
+            11 => (256, 16, 2, 66), // iq2_xxs (GGML type 16)
+            18 => (256, 16, 2, 98), // iq3_xxs: QR3_XXS=4 -> qi=QK_K/(4*QR)=16, vdr=2 (qi/vdr=8)
+            23 => (256, 32, 4, 136), // iq4_xs (GGML type 23)
+            20 => (32, 4, 2, 18), // iq4_nl (GGML type 20): QI4_NL = 4, VDR_IQ4_NL_Q8_1_MMVQ = 2
+            17 => (256, 16, 2, 74), // iq2_xs (GGML type 17)
+            22 => (256, 16, 2, 82), // iq2_s (GGML type 22)
             _ => (32, 8, 2, 36),
         }
+    }
+
+
+    // ==========================================================================================
+    // IQ2_XXS (GGML type 16): fused MoE for the low-bit "UD" artifacts. Table helpers and the
+    // sign/scale handling are lifted from the gated oxide-kernels/iq2_xxs crate, which is
+    // bit-identical to llama.cpp acecd56; only the call convention differs.
+    // ==========================================================================================
+
+    /// `__vsub4(a, b)`: per-byte subtract, each byte independent and wrapping. No borrow.
+    /// (NOT `vsubss4` -- that one saturates.)
+    #[inline(always)]
+    pub fn vsub4_wrap(a: u32, b: u32) -> u32 {
+        let (a0, a1, a2, a3) = (a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF);
+        let (b0, b1, b2, b3) = (b & 0xFF, (b >> 8) & 0xFF, (b >> 16) & 0xFF, (b >> 24) & 0xFF);
+        (a0.wrapping_sub(b0) & 0xFF)
+            | ((a1.wrapping_sub(b1) & 0xFF) << 8)
+            | ((a2.wrapping_sub(b2) & 0xFF) << 16)
+            | ((a3.wrapping_sub(b3) & 0xFF) << 24)
+    }
+
+    /// `__vcmpne4(a, 0)`: 0xff in every byte that is non-zero.
+    #[inline(always)]
+    pub fn vcmpne4_zero(a: u32) -> u32 {
+        let (x, y, z, w) = (a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF);
+        (if x != 0 { 0xFFu32 } else { 0 })
+            | (if y != 0 { 0xFF00u32 } else { 0 })
+            | (if z != 0 { 0xFF_0000u32 } else { 0 })
+            | (if w != 0 { 0xFF00_0000u32 } else { 0 })
+    }
+
+    /// `get_int_b2(x, i)`: two `u16` loads (a 66-byte block is only 2-byte aligned).
+    #[inline(always)]
+
+    pub unsafe fn get_b4(x: *const u8, i: i32) -> u32 {
+        // Assembled from two 16-bit reads: `qs` sits at an even (not 4-byte) offset
+        // inside the i-quant blocks (xb + 2), so a plain u32 deref raises
+        // CUDA_ERROR_MISALIGNED_ADDRESS.
+        let p = x.add(4 * i as usize) as *const u16;
+        (*p as u32) | ((*p.add(1) as u32) << 16)
+    }
+
+    pub fn byte_perm(a: u32, b: u32, s: u32) -> u32 {
+        let r: u32;
+        let s = s & 0x7777;
+        unsafe { ptx_asm!("prmt.b32 %0, %1, %2, %3;", out("=r") r, in("r") a, in("r") b, in("r") s, options(register_only)); }
+        r
+    }
+
+    pub const I4_TABLE: [u32; 4] = [0xBFAD9881, 0xF6EADDCF, 0x26190D01, 0x71594535];
+
+    pub fn i4_table16(q4: u32) -> (u32, u32) {
+            let sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
+            let lo0 = byte_perm(I4_TABLE[0], I4_TABLE[1], q4);
+            let hi0 = byte_perm(I4_TABLE[2], I4_TABLE[3], q4);
+            let t0 = byte_perm(lo0, hi0, sel);
+            let lo1 = byte_perm(I4_TABLE[0], I4_TABLE[1], q4 >> 16);
+            let hi1 = byte_perm(I4_TABLE[2], I4_TABLE[3], q4 >> 16);
+            let t1 = byte_perm(lo1, hi1, sel >> 16);
+            (byte_perm(t0, t1, 0x6420), byte_perm(t0, t1, 0x7531))
+        }
+
+    pub unsafe fn i4_group_scale6(x: *const u8, group: usize) -> u32 {
+            let lo = *x.add(4 + group / 2) as u32;
+            let hi = *(x.add(2) as *const u16) as u32;
+            ((lo >> (4 * (group as u32 % 2))) & 0xF) | (((hi >> (2 * group as u32)) & 3) << 4)
+        }
+
+    pub fn i3_grid(i: u32) -> u32 {
+            let mut v: u32 = 0;
+            if i == 0u32 { v = 0x04040404u32 as u32; }
+            if i == 1u32 { v = 0x04040414u32 as u32; }
+            if i == 2u32 { v = 0x04040424u32 as u32; }
+            if i == 3u32 { v = 0x04040c0cu32 as u32; }
+            if i == 4u32 { v = 0x04040c1cu32 as u32; }
+            if i == 5u32 { v = 0x04040c3eu32 as u32; }
+            if i == 6u32 { v = 0x04041404u32 as u32; }
+            if i == 7u32 { v = 0x04041414u32 as u32; }
+            if i == 8u32 { v = 0x04041c0cu32 as u32; }
+            if i == 9u32 { v = 0x04042414u32 as u32; }
+            if i == 10u32 { v = 0x04043e1cu32 as u32; }
+            if i == 11u32 { v = 0x04043e2cu32 as u32; }
+            if i == 12u32 { v = 0x040c040cu32 as u32; }
+            if i == 13u32 { v = 0x040c041cu32 as u32; }
+            if i == 14u32 { v = 0x040c0c04u32 as u32; }
+            if i == 15u32 { v = 0x040c0c14u32 as u32; }
+            if i == 16u32 { v = 0x040c140cu32 as u32; }
+            if i == 17u32 { v = 0x040c142cu32 as u32; }
+            if i == 18u32 { v = 0x040c1c04u32 as u32; }
+            if i == 19u32 { v = 0x040c1c14u32 as u32; }
+            if i == 20u32 { v = 0x040c240cu32 as u32; }
+            if i == 21u32 { v = 0x040c2c24u32 as u32; }
+            if i == 22u32 { v = 0x040c3e04u32 as u32; }
+            if i == 23u32 { v = 0x04140404u32 as u32; }
+            if i == 24u32 { v = 0x04140414u32 as u32; }
+            if i == 25u32 { v = 0x04140424u32 as u32; }
+            if i == 26u32 { v = 0x04140c0cu32 as u32; }
+            if i == 27u32 { v = 0x04141404u32 as u32; }
+            if i == 28u32 { v = 0x04141414u32 as u32; }
+            if i == 29u32 { v = 0x04141c0cu32 as u32; }
+            if i == 30u32 { v = 0x04141c1cu32 as u32; }
+            if i == 31u32 { v = 0x04141c3eu32 as u32; }
+            if i == 32u32 { v = 0x04142c0cu32 as u32; }
+            if i == 33u32 { v = 0x04142c3eu32 as u32; }
+            if i == 34u32 { v = 0x04143e2cu32 as u32; }
+            if i == 35u32 { v = 0x041c040cu32 as u32; }
+            if i == 36u32 { v = 0x041c043eu32 as u32; }
+            if i == 37u32 { v = 0x041c0c04u32 as u32; }
+            if i == 38u32 { v = 0x041c0c14u32 as u32; }
+            if i == 39u32 { v = 0x041c142cu32 as u32; }
+            if i == 40u32 { v = 0x041c3e04u32 as u32; }
+            if i == 41u32 { v = 0x04240c1cu32 as u32; }
+            if i == 42u32 { v = 0x04241c3eu32 as u32; }
+            if i == 43u32 { v = 0x04242424u32 as u32; }
+            if i == 44u32 { v = 0x04242c3eu32 as u32; }
+            if i == 45u32 { v = 0x04243e1cu32 as u32; }
+            if i == 46u32 { v = 0x04243e2cu32 as u32; }
+            if i == 47u32 { v = 0x042c040cu32 as u32; }
+            if i == 48u32 { v = 0x042c043eu32 as u32; }
+            if i == 49u32 { v = 0x042c1c14u32 as u32; }
+            if i == 50u32 { v = 0x042c2c14u32 as u32; }
+            if i == 51u32 { v = 0x04341c2cu32 as u32; }
+            if i == 52u32 { v = 0x04343424u32 as u32; }
+            if i == 53u32 { v = 0x043e0c04u32 as u32; }
+            if i == 54u32 { v = 0x043e0c24u32 as u32; }
+            if i == 55u32 { v = 0x043e0c34u32 as u32; }
+            if i == 56u32 { v = 0x043e241cu32 as u32; }
+            if i == 57u32 { v = 0x043e340cu32 as u32; }
+            if i == 58u32 { v = 0x0c04040cu32 as u32; }
+            if i == 59u32 { v = 0x0c04041cu32 as u32; }
+            if i == 60u32 { v = 0x0c040c04u32 as u32; }
+            if i == 61u32 { v = 0x0c040c14u32 as u32; }
+            if i == 62u32 { v = 0x0c04140cu32 as u32; }
+            if i == 63u32 { v = 0x0c04141cu32 as u32; }
+            if i == 64u32 { v = 0x0c041c04u32 as u32; }
+            if i == 65u32 { v = 0x0c041c14u32 as u32; }
+            if i == 66u32 { v = 0x0c041c24u32 as u32; }
+            if i == 67u32 { v = 0x0c04243eu32 as u32; }
+            if i == 68u32 { v = 0x0c042c04u32 as u32; }
+            if i == 69u32 { v = 0x0c0c0404u32 as u32; }
+            if i == 70u32 { v = 0x0c0c0414u32 as u32; }
+            if i == 71u32 { v = 0x0c0c0c0cu32 as u32; }
+            if i == 72u32 { v = 0x0c0c1404u32 as u32; }
+            if i == 73u32 { v = 0x0c0c1414u32 as u32; }
+            if i == 74u32 { v = 0x0c14040cu32 as u32; }
+            if i == 75u32 { v = 0x0c14041cu32 as u32; }
+            if i == 76u32 { v = 0x0c140c04u32 as u32; }
+            if i == 77u32 { v = 0x0c140c14u32 as u32; }
+            if i == 78u32 { v = 0x0c14140cu32 as u32; }
+            if i == 79u32 { v = 0x0c141c04u32 as u32; }
+            if i == 80u32 { v = 0x0c143e14u32 as u32; }
+            if i == 81u32 { v = 0x0c1c0404u32 as u32; }
+            if i == 82u32 { v = 0x0c1c0414u32 as u32; }
+            if i == 83u32 { v = 0x0c1c1404u32 as u32; }
+            if i == 84u32 { v = 0x0c1c1c0cu32 as u32; }
+            if i == 85u32 { v = 0x0c1c2434u32 as u32; }
+            if i == 86u32 { v = 0x0c1c3434u32 as u32; }
+            if i == 87u32 { v = 0x0c24040cu32 as u32; }
+            if i == 88u32 { v = 0x0c24042cu32 as u32; }
+            if i == 89u32 { v = 0x0c242c04u32 as u32; }
+            if i == 90u32 { v = 0x0c2c1404u32 as u32; }
+            if i == 91u32 { v = 0x0c2c1424u32 as u32; }
+            if i == 92u32 { v = 0x0c2c2434u32 as u32; }
+            if i == 93u32 { v = 0x0c2c3e0cu32 as u32; }
+            if i == 94u32 { v = 0x0c34042cu32 as u32; }
+            if i == 95u32 { v = 0x0c3e1414u32 as u32; }
+            if i == 96u32 { v = 0x0c3e2404u32 as u32; }
+            if i == 97u32 { v = 0x14040404u32 as u32; }
+            if i == 98u32 { v = 0x14040414u32 as u32; }
+            if i == 99u32 { v = 0x14040c0cu32 as u32; }
+            if i == 100u32 { v = 0x14040c1cu32 as u32; }
+            if i == 101u32 { v = 0x14041404u32 as u32; }
+            if i == 102u32 { v = 0x14041414u32 as u32; }
+            if i == 103u32 { v = 0x14041434u32 as u32; }
+            if i == 104u32 { v = 0x14041c0cu32 as u32; }
+            if i == 105u32 { v = 0x14042414u32 as u32; }
+            if i == 106u32 { v = 0x140c040cu32 as u32; }
+            if i == 107u32 { v = 0x140c041cu32 as u32; }
+            if i == 108u32 { v = 0x140c042cu32 as u32; }
+            if i == 109u32 { v = 0x140c0c04u32 as u32; }
+            if i == 110u32 { v = 0x140c0c14u32 as u32; }
+            if i == 111u32 { v = 0x140c140cu32 as u32; }
+            if i == 112u32 { v = 0x140c1c04u32 as u32; }
+            if i == 113u32 { v = 0x140c341cu32 as u32; }
+            if i == 114u32 { v = 0x140c343eu32 as u32; }
+            if i == 115u32 { v = 0x140c3e04u32 as u32; }
+            if i == 116u32 { v = 0x14140404u32 as u32; }
+            if i == 117u32 { v = 0x14140414u32 as u32; }
+            if i == 118u32 { v = 0x14140c0cu32 as u32; }
+            if i == 119u32 { v = 0x14140c3eu32 as u32; }
+            if i == 120u32 { v = 0x14141404u32 as u32; }
+            if i == 121u32 { v = 0x14141414u32 as u32; }
+            if i == 122u32 { v = 0x14141c3eu32 as u32; }
+            if i == 123u32 { v = 0x14142404u32 as u32; }
+            if i == 124u32 { v = 0x14142c2cu32 as u32; }
+            if i == 125u32 { v = 0x141c040cu32 as u32; }
+            if i == 126u32 { v = 0x141c0c04u32 as u32; }
+            if i == 127u32 { v = 0x141c0c24u32 as u32; }
+            if i == 128u32 { v = 0x141c3e04u32 as u32; }
+            if i == 129u32 { v = 0x141c3e24u32 as u32; }
+            if i == 130u32 { v = 0x14241c2cu32 as u32; }
+            if i == 131u32 { v = 0x14242c1cu32 as u32; }
+            if i == 132u32 { v = 0x142c041cu32 as u32; }
+            if i == 133u32 { v = 0x142c143eu32 as u32; }
+            if i == 134u32 { v = 0x142c240cu32 as u32; }
+            if i == 135u32 { v = 0x142c3e24u32 as u32; }
+            if i == 136u32 { v = 0x143e040cu32 as u32; }
+            if i == 137u32 { v = 0x143e041cu32 as u32; }
+            if i == 138u32 { v = 0x143e0c34u32 as u32; }
+            if i == 139u32 { v = 0x143e242cu32 as u32; }
+            if i == 140u32 { v = 0x1c04040cu32 as u32; }
+            if i == 141u32 { v = 0x1c040c04u32 as u32; }
+            if i == 142u32 { v = 0x1c040c14u32 as u32; }
+            if i == 143u32 { v = 0x1c04140cu32 as u32; }
+            if i == 144u32 { v = 0x1c04141cu32 as u32; }
+            if i == 145u32 { v = 0x1c042c04u32 as u32; }
+            if i == 146u32 { v = 0x1c04342cu32 as u32; }
+            if i == 147u32 { v = 0x1c043e14u32 as u32; }
+            if i == 148u32 { v = 0x1c0c0404u32 as u32; }
+            if i == 149u32 { v = 0x1c0c0414u32 as u32; }
+            if i == 150u32 { v = 0x1c0c1404u32 as u32; }
+            if i == 151u32 { v = 0x1c0c1c0cu32 as u32; }
+            if i == 152u32 { v = 0x1c0c2424u32 as u32; }
+            if i == 153u32 { v = 0x1c0c2434u32 as u32; }
+            if i == 154u32 { v = 0x1c14040cu32 as u32; }
+            if i == 155u32 { v = 0x1c14041cu32 as u32; }
+            if i == 156u32 { v = 0x1c140c04u32 as u32; }
+            if i == 157u32 { v = 0x1c14142cu32 as u32; }
+            if i == 158u32 { v = 0x1c142c14u32 as u32; }
+            if i == 159u32 { v = 0x1c143e14u32 as u32; }
+            if i == 160u32 { v = 0x1c1c0c0cu32 as u32; }
+            if i == 161u32 { v = 0x1c1c1c1cu32 as u32; }
+            if i == 162u32 { v = 0x1c241c04u32 as u32; }
+            if i == 163u32 { v = 0x1c24243eu32 as u32; }
+            if i == 164u32 { v = 0x1c243e14u32 as u32; }
+            if i == 165u32 { v = 0x1c2c0404u32 as u32; }
+            if i == 166u32 { v = 0x1c2c0434u32 as u32; }
+            if i == 167u32 { v = 0x1c2c1414u32 as u32; }
+            if i == 168u32 { v = 0x1c2c2c2cu32 as u32; }
+            if i == 169u32 { v = 0x1c340c24u32 as u32; }
+            if i == 170u32 { v = 0x1c341c34u32 as u32; }
+            if i == 171u32 { v = 0x1c34341cu32 as u32; }
+            if i == 172u32 { v = 0x1c3e1c1cu32 as u32; }
+            if i == 173u32 { v = 0x1c3e3404u32 as u32; }
+            if i == 174u32 { v = 0x24040424u32 as u32; }
+            if i == 175u32 { v = 0x24040c3eu32 as u32; }
+            if i == 176u32 { v = 0x24041c2cu32 as u32; }
+            if i == 177u32 { v = 0x24041c3eu32 as u32; }
+            if i == 178u32 { v = 0x24042c1cu32 as u32; }
+            if i == 179u32 { v = 0x24042c3eu32 as u32; }
+            if i == 180u32 { v = 0x240c3e24u32 as u32; }
+            if i == 181u32 { v = 0x24141404u32 as u32; }
+            if i == 182u32 { v = 0x24141c3eu32 as u32; }
+            if i == 183u32 { v = 0x24142404u32 as u32; }
+            if i == 184u32 { v = 0x24143404u32 as u32; }
+            if i == 185u32 { v = 0x24143434u32 as u32; }
+            if i == 186u32 { v = 0x241c043eu32 as u32; }
+            if i == 187u32 { v = 0x241c242cu32 as u32; }
+            if i == 188u32 { v = 0x24240424u32 as u32; }
+            if i == 189u32 { v = 0x24242c0cu32 as u32; }
+            if i == 190u32 { v = 0x24243424u32 as u32; }
+            if i == 191u32 { v = 0x242c142cu32 as u32; }
+            if i == 192u32 { v = 0x242c241cu32 as u32; }
+            if i == 193u32 { v = 0x242c3e04u32 as u32; }
+            if i == 194u32 { v = 0x243e042cu32 as u32; }
+            if i == 195u32 { v = 0x243e0c04u32 as u32; }
+            if i == 196u32 { v = 0x243e0c14u32 as u32; }
+            if i == 197u32 { v = 0x243e1c04u32 as u32; }
+            if i == 198u32 { v = 0x2c040c14u32 as u32; }
+            if i == 199u32 { v = 0x2c04240cu32 as u32; }
+            if i == 200u32 { v = 0x2c043e04u32 as u32; }
+            if i == 201u32 { v = 0x2c0c0404u32 as u32; }
+            if i == 202u32 { v = 0x2c0c0434u32 as u32; }
+            if i == 203u32 { v = 0x2c0c1434u32 as u32; }
+            if i == 204u32 { v = 0x2c0c2c2cu32 as u32; }
+            if i == 205u32 { v = 0x2c140c24u32 as u32; }
+            if i == 206u32 { v = 0x2c141c14u32 as u32; }
+            if i == 207u32 { v = 0x2c143e14u32 as u32; }
+            if i == 208u32 { v = 0x2c1c0414u32 as u32; }
+            if i == 209u32 { v = 0x2c1c2c1cu32 as u32; }
+            if i == 210u32 { v = 0x2c240c04u32 as u32; }
+            if i == 211u32 { v = 0x2c24141cu32 as u32; }
+            if i == 212u32 { v = 0x2c24143eu32 as u32; }
+            if i == 213u32 { v = 0x2c243e14u32 as u32; }
+            if i == 214u32 { v = 0x2c2c0414u32 as u32; }
+            if i == 215u32 { v = 0x2c2c1c0cu32 as u32; }
+            if i == 216u32 { v = 0x2c342c04u32 as u32; }
+            if i == 217u32 { v = 0x2c3e1424u32 as u32; }
+            if i == 218u32 { v = 0x2c3e2414u32 as u32; }
+            if i == 219u32 { v = 0x34041424u32 as u32; }
+            if i == 220u32 { v = 0x34042424u32 as u32; }
+            if i == 221u32 { v = 0x34042434u32 as u32; }
+            if i == 222u32 { v = 0x34043424u32 as u32; }
+            if i == 223u32 { v = 0x340c140cu32 as u32; }
+            if i == 224u32 { v = 0x340c340cu32 as u32; }
+            if i == 225u32 { v = 0x34140c3eu32 as u32; }
+            if i == 226u32 { v = 0x34143424u32 as u32; }
+            if i == 227u32 { v = 0x341c1c04u32 as u32; }
+            if i == 228u32 { v = 0x341c1c34u32 as u32; }
+            if i == 229u32 { v = 0x34242424u32 as u32; }
+            if i == 230u32 { v = 0x342c042cu32 as u32; }
+            if i == 231u32 { v = 0x342c2c14u32 as u32; }
+            if i == 232u32 { v = 0x34341c1cu32 as u32; }
+            if i == 233u32 { v = 0x343e041cu32 as u32; }
+            if i == 234u32 { v = 0x343e140cu32 as u32; }
+            if i == 235u32 { v = 0x3e04041cu32 as u32; }
+            if i == 236u32 { v = 0x3e04042cu32 as u32; }
+            if i == 237u32 { v = 0x3e04043eu32 as u32; }
+            if i == 238u32 { v = 0x3e040c04u32 as u32; }
+            if i == 239u32 { v = 0x3e041c14u32 as u32; }
+            if i == 240u32 { v = 0x3e042c14u32 as u32; }
+            if i == 241u32 { v = 0x3e0c1434u32 as u32; }
+            if i == 242u32 { v = 0x3e0c2404u32 as u32; }
+            if i == 243u32 { v = 0x3e140c14u32 as u32; }
+            if i == 244u32 { v = 0x3e14242cu32 as u32; }
+            if i == 245u32 { v = 0x3e142c14u32 as u32; }
+            if i == 246u32 { v = 0x3e1c0404u32 as u32; }
+            if i == 247u32 { v = 0x3e1c0c2cu32 as u32; }
+            if i == 248u32 { v = 0x3e1c1c1cu32 as u32; }
+            if i == 249u32 { v = 0x3e1c3404u32 as u32; }
+            if i == 250u32 { v = 0x3e24140cu32 as u32; }
+            if i == 251u32 { v = 0x3e24240cu32 as u32; }
+            if i == 252u32 { v = 0x3e2c0404u32 as u32; }
+            if i == 253u32 { v = 0x3e2c0414u32 as u32; }
+            if i == 254u32 { v = 0x3e2c1424u32 as u32; }
+            if i == 255u32 { v = 0x3e341c04u32 as u32; }
+            v
+        }
+
+    pub unsafe fn get_b2(x: *const u8, i: i32) -> u32 {
+        let p = x.add(4 * i as usize) as *const u16;
+        (*p as u32) | ((*p.add(1) as u32) << 16)
+    }
+
+pub fn popc7(v: u32) -> u32 {
+        let mut x = v & 0x7F;
+        let mut n = 0u32;
+        while x != 0 {
+            n += x & 1;
+            x >>= 1;
+        }
+        n
+    }
+
+pub fn unpack_ksigns(v: u32) -> u32 {
+        let p = popc7(v) & 1;
+        let s = (v & 0x7F) ^ (p << 7);
+        s.wrapping_mul(0x0101_0101)
+    }
+
+pub fn grid_lo(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x0808082bu32; }
+        if i == 2u32 { v = 0x08081919u32; }
+        if i == 3u32 { v = 0x08082b08u32; }
+        if i == 4u32 { v = 0x08082b2bu32; }
+        if i == 5u32 { v = 0x08190819u32; }
+        if i == 6u32 { v = 0x08191908u32; }
+        if i == 7u32 { v = 0x082b0808u32; }
+        if i == 8u32 { v = 0x082b082bu32; }
+        if i == 9u32 { v = 0x082b2b08u32; }
+        if i == 10u32 { v = 0x082b2b2bu32; }
+        if i == 11u32 { v = 0x19080819u32; }
+        if i == 12u32 { v = 0x19081908u32; }
+        if i == 13u32 { v = 0x19190808u32; }
+        if i == 14u32 { v = 0x19192b08u32; }
+        if i == 15u32 { v = 0x192b0819u32; }
+        if i == 16u32 { v = 0x192b1908u32; }
+        if i == 17u32 { v = 0x2b080808u32; }
+        if i == 18u32 { v = 0x2b08082bu32; }
+        if i == 19u32 { v = 0x2b082b2bu32; }
+        if i == 20u32 { v = 0x2b2b082bu32; }
+        if i == 21u32 { v = 0x08080819u32; }
+        if i == 22u32 { v = 0x08081908u32; }
+        if i == 23u32 { v = 0x08190808u32; }
+        if i == 24u32 { v = 0x08191919u32; }
+        if i == 25u32 { v = 0x19080808u32; }
+        if i == 26u32 { v = 0x2b081908u32; }
+        if i == 27u32 { v = 0x2b192b08u32; }
+        if i == 28u32 { v = 0x08080808u32; }
+        if i == 29u32 { v = 0x0808082bu32; }
+        if i == 30u32 { v = 0x082b082bu32; }
+        if i == 31u32 { v = 0x2b08082bu32; }
+        if i == 32u32 { v = 0x08080819u32; }
+        if i == 33u32 { v = 0x08081908u32; }
+        if i == 34u32 { v = 0x08190808u32; }
+        if i == 35u32 { v = 0x082b0819u32; }
+        if i == 36u32 { v = 0x082b1908u32; }
+        if i == 37u32 { v = 0x19080808u32; }
+        if i == 38u32 { v = 0x1908082bu32; }
+        if i == 39u32 { v = 0x19082b08u32; }
+        if i == 40u32 { v = 0x192b0808u32; }
+        if i == 41u32 { v = 0x2b080819u32; }
+        if i == 42u32 { v = 0x2b081908u32; }
+        if i == 43u32 { v = 0x2b190808u32; }
+        if i == 44u32 { v = 0x2b2b1908u32; }
+        if i == 45u32 { v = 0x08080808u32; }
+        if i == 46u32 { v = 0x0808082bu32; }
+        if i == 47u32 { v = 0x08082b08u32; }
+        if i == 48u32 { v = 0x082b0808u32; }
+        if i == 49u32 { v = 0x1908192bu32; }
+        if i == 50u32 { v = 0x192b2b19u32; }
+        if i == 51u32 { v = 0x2b080808u32; }
+        if i == 52u32 { v = 0x2b190819u32; }
+        if i == 53u32 { v = 0x08082b19u32; }
+        if i == 54u32 { v = 0x08190808u32; }
+        if i == 55u32 { v = 0x19080808u32; }
+        if i == 56u32 { v = 0x2b081908u32; }
+        if i == 57u32 { v = 0x2b2b1908u32; }
+        if i == 58u32 { v = 0x08080808u32; }
+        if i == 59u32 { v = 0x08081919u32; }
+        if i == 60u32 { v = 0x08082b08u32; }
+        if i == 61u32 { v = 0x08191908u32; }
+        if i == 62u32 { v = 0x082b2b08u32; }
+        if i == 63u32 { v = 0x19080819u32; }
+        if i == 64u32 { v = 0x19081908u32; }
+        if i == 65u32 { v = 0x19190808u32; }
+        if i == 66u32 { v = 0x1919082bu32; }
+        if i == 67u32 { v = 0x2b082b08u32; }
+        if i == 68u32 { v = 0x08081908u32; }
+        if i == 69u32 { v = 0x19080808u32; }
+        if i == 70u32 { v = 0x0808082bu32; }
+        if i == 71u32 { v = 0x08191908u32; }
+        if i == 72u32 { v = 0x08080819u32; }
+        if i == 73u32 { v = 0x08081908u32; }
+        if i == 74u32 { v = 0x08190808u32; }
+        if i == 75u32 { v = 0x082b0819u32; }
+        if i == 76u32 { v = 0x19080808u32; }
+        if i == 77u32 { v = 0x192b0808u32; }
+        if i == 78u32 { v = 0x2b081908u32; }
+        if i == 79u32 { v = 0x2b190808u32; }
+        if i == 80u32 { v = 0x2b191919u32; }
+        if i == 81u32 { v = 0x08080808u32; }
+        if i == 82u32 { v = 0x08082b08u32; }
+        if i == 83u32 { v = 0x082b0808u32; }
+        if i == 84u32 { v = 0x19190808u32; }
+        if i == 85u32 { v = 0x19192b2bu32; }
+        if i == 86u32 { v = 0x2b080808u32; }
+        if i == 87u32 { v = 0x082b1908u32; }
+        if i == 88u32 { v = 0x19081919u32; }
+        if i == 89u32 { v = 0x08080808u32; }
+        if i == 90u32 { v = 0x08082b08u32; }
+        if i == 91u32 { v = 0x082b0808u32; }
+        if i == 92u32 { v = 0x082b1919u32; }
+        if i == 93u32 { v = 0x19082b19u32; }
+        if i == 94u32 { v = 0x2b080808u32; }
+        if i == 95u32 { v = 0x08192b08u32; }
+        if i == 96u32 { v = 0x192b082bu32; }
+        if i == 97u32 { v = 0x08080808u32; }
+        if i == 98u32 { v = 0x0819192bu32; }
+        if i == 99u32 { v = 0x08080819u32; }
+        if i == 100u32 { v = 0x08081908u32; }
+        if i == 101u32 { v = 0x08190808u32; }
+        if i == 102u32 { v = 0x19080808u32; }
+        if i == 103u32 { v = 0x2b080819u32; }
+        if i == 104u32 { v = 0x08080808u32; }
+        if i == 105u32 { v = 0x08081919u32; }
+        if i == 106u32 { v = 0x2b2b0808u32; }
+        if i == 107u32 { v = 0x19190819u32; }
+        if i == 108u32 { v = 0x08080808u32; }
+        if i == 109u32 { v = 0x0808082bu32; }
+        if i == 110u32 { v = 0x08082b2bu32; }
+        if i == 111u32 { v = 0x19081908u32; }
+        if i == 112u32 { v = 0x192b0819u32; }
+        if i == 113u32 { v = 0x2b080808u32; }
+        if i == 114u32 { v = 0x2b08082bu32; }
+        if i == 115u32 { v = 0x082b2b19u32; }
+        if i == 116u32 { v = 0x19082b08u32; }
+        if i == 117u32 { v = 0x08080808u32; }
+        if i == 118u32 { v = 0x0808082bu32; }
+        if i == 119u32 { v = 0x08080819u32; }
+        if i == 120u32 { v = 0x08081908u32; }
+        if i == 121u32 { v = 0x08190808u32; }
+        if i == 122u32 { v = 0x19080808u32; }
+        if i == 123u32 { v = 0x1919192bu32; }
+        if i == 124u32 { v = 0x08080808u32; }
+        if i == 125u32 { v = 0x19080819u32; }
+        if i == 126u32 { v = 0x192b1908u32; }
+        if i == 127u32 { v = 0x2b190808u32; }
+        if i == 128u32 { v = 0x08082b08u32; }
+        if i == 129u32 { v = 0x082b0808u32; }
+        if i == 130u32 { v = 0x2b191908u32; }
+        if i == 131u32 { v = 0x19081908u32; }
+        if i == 132u32 { v = 0x08080819u32; }
+        if i == 133u32 { v = 0x08081908u32; }
+        if i == 134u32 { v = 0x08190808u32; }
+        if i == 135u32 { v = 0x08192b08u32; }
+        if i == 136u32 { v = 0x082b0819u32; }
+        if i == 137u32 { v = 0x082b1908u32; }
+        if i == 138u32 { v = 0x19080808u32; }
+        if i == 139u32 { v = 0x19082b08u32; }
+        if i == 140u32 { v = 0x1919192bu32; }
+        if i == 141u32 { v = 0x192b0808u32; }
+        if i == 142u32 { v = 0x2b080819u32; }
+        if i == 143u32 { v = 0x2b081908u32; }
+        if i == 144u32 { v = 0x2b190808u32; }
+        if i == 145u32 { v = 0x08080808u32; }
+        if i == 146u32 { v = 0x082b0808u32; }
+        if i == 147u32 { v = 0x192b0819u32; }
+        if i == 148u32 { v = 0x2b080808u32; }
+        if i == 149u32 { v = 0x2b081919u32; }
+        if i == 150u32 { v = 0x08080819u32; }
+        if i == 151u32 { v = 0x08190808u32; }
+        if i == 152u32 { v = 0x19082b08u32; }
+        if i == 153u32 { v = 0x1919192bu32; }
+        if i == 154u32 { v = 0x192b2b08u32; }
+        if i == 155u32 { v = 0x08080808u32; }
+        if i == 156u32 { v = 0x08082b08u32; }
+        if i == 157u32 { v = 0x082b0808u32; }
+        if i == 158u32 { v = 0x2b080808u32; }
+        if i == 159u32 { v = 0x2b192b19u32; }
+        if i == 160u32 { v = 0x0819082bu32; }
+        if i == 161u32 { v = 0x082b1908u32; }
+        if i == 162u32 { v = 0x08080808u32; }
+        if i == 163u32 { v = 0x08080819u32; }
+        if i == 164u32 { v = 0x08081908u32; }
+        if i == 165u32 { v = 0x08190808u32; }
+        if i == 166u32 { v = 0x19080808u32; }
+        if i == 167u32 { v = 0x19081919u32; }
+        if i == 168u32 { v = 0x08080808u32; }
+        if i == 169u32 { v = 0x19192b08u32; }
+        if i == 170u32 { v = 0x192b0819u32; }
+        if i == 171u32 { v = 0x2b08082bu32; }
+        if i == 172u32 { v = 0x19081919u32; }
+        if i == 173u32 { v = 0x2b190808u32; }
+        if i == 174u32 { v = 0x08080808u32; }
+        if i == 175u32 { v = 0x08082b08u32; }
+        if i == 176u32 { v = 0x08190819u32; }
+        if i == 177u32 { v = 0x08192b19u32; }
+        if i == 178u32 { v = 0x082b0808u32; }
+        if i == 179u32 { v = 0x2b080808u32; }
+        if i == 180u32 { v = 0x2b082b08u32; }
+        if i == 181u32 { v = 0x08081908u32; }
+        if i == 182u32 { v = 0x1908082bu32; }
+        if i == 183u32 { v = 0x2b2b1908u32; }
+        if i == 184u32 { v = 0x2b190819u32; }
+        if i == 185u32 { v = 0x2b190808u32; }
+        if i == 186u32 { v = 0x2b19082bu32; }
+        if i == 187u32 { v = 0x08082b2bu32; }
+        if i == 188u32 { v = 0x08080819u32; }
+        if i == 189u32 { v = 0x19191908u32; }
+        if i == 190u32 { v = 0x08080808u32; }
+        if i == 191u32 { v = 0x08190819u32; }
+        if i == 192u32 { v = 0x08192b19u32; }
+        if i == 193u32 { v = 0x192b1908u32; }
+        if i == 194u32 { v = 0x19080808u32; }
+        if i == 195u32 { v = 0x08082b08u32; }
+        if i == 196u32 { v = 0x08081908u32; }
+        if i == 197u32 { v = 0x08190808u32; }
+        if i == 198u32 { v = 0x19080808u32; }
+        if i == 199u32 { v = 0x192b2b08u32; }
+        if i == 200u32 { v = 0x08080808u32; }
+        if i == 201u32 { v = 0x19191919u32; }
+        if i == 202u32 { v = 0x08192b08u32; }
+        if i == 203u32 { v = 0x192b0808u32; }
+        if i == 204u32 { v = 0x08080808u32; }
+        if i == 205u32 { v = 0x08081919u32; }
+        if i == 206u32 { v = 0x08190808u32; }
+        if i == 207u32 { v = 0x0819082bu32; }
+        if i == 208u32 { v = 0x2b081908u32; }
+        if i == 209u32 { v = 0x1908082bu32; }
+        if i == 210u32 { v = 0x08080808u32; }
+        if i == 211u32 { v = 0x0808082bu32; }
+        if i == 212u32 { v = 0x08082b2bu32; }
+        if i == 213u32 { v = 0x19080819u32; }
+        if i == 214u32 { v = 0x2b08082bu32; }
+        if i == 215u32 { v = 0x08081908u32; }
+        if i == 216u32 { v = 0x08192b08u32; }
+        if i == 217u32 { v = 0x19080808u32; }
+        if i == 218u32 { v = 0x08190819u32; }
+        if i == 219u32 { v = 0x08080819u32; }
+        if i == 220u32 { v = 0x08081908u32; }
+        if i == 221u32 { v = 0x08190808u32; }
+        if i == 222u32 { v = 0x08191919u32; }
+        if i == 223u32 { v = 0x19080808u32; }
+        if i == 224u32 { v = 0x192b0808u32; }
+        if i == 225u32 { v = 0x08080808u32; }
+        if i == 226u32 { v = 0x1908192bu32; }
+        if i == 227u32 { v = 0x2b191908u32; }
+        if i == 228u32 { v = 0x08082b19u32; }
+        if i == 229u32 { v = 0x19080808u32; }
+        if i == 230u32 { v = 0x192b0808u32; }
+        if i == 231u32 { v = 0x0808082bu32; }
+        if i == 232u32 { v = 0x08081908u32; }
+        if i == 233u32 { v = 0x08190819u32; }
+        if i == 234u32 { v = 0x08081908u32; }
+        if i == 235u32 { v = 0x08190808u32; }
+        if i == 236u32 { v = 0x082b1908u32; }
+        if i == 237u32 { v = 0x19080808u32; }
+        if i == 238u32 { v = 0x2b2b0819u32; }
+        if i == 239u32 { v = 0x0819192bu32; }
+        if i == 240u32 { v = 0x2b080808u32; }
+        if i == 241u32 { v = 0x19081919u32; }
+        if i == 242u32 { v = 0x08080808u32; }
+        if i == 243u32 { v = 0x082b082bu32; }
+        if i == 244u32 { v = 0x19081908u32; }
+        if i == 245u32 { v = 0x19190819u32; }
+        if i == 246u32 { v = 0x2b080819u32; }
+        if i == 247u32 { v = 0x082b0808u32; }
+        if i == 248u32 { v = 0x0808082bu32; }
+        if i == 249u32 { v = 0x19190808u32; }
+        if i == 250u32 { v = 0x2b081919u32; }
+        if i == 251u32 { v = 0x08082b19u32; }
+        if i == 252u32 { v = 0x08080808u32; }
+        if i == 253u32 { v = 0x08192b08u32; }
+        if i == 254u32 { v = 0x19190808u32; }
+        if i == 255u32 { v = 0x08081908u32; }
+        v
+    }
+
+pub fn grid_hi(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x08080808u32; }
+        if i == 2u32 { v = 0x08080808u32; }
+        if i == 3u32 { v = 0x08080808u32; }
+        if i == 4u32 { v = 0x08080808u32; }
+        if i == 5u32 { v = 0x08080808u32; }
+        if i == 6u32 { v = 0x08080808u32; }
+        if i == 7u32 { v = 0x08080808u32; }
+        if i == 8u32 { v = 0x08080808u32; }
+        if i == 9u32 { v = 0x08080808u32; }
+        if i == 10u32 { v = 0x08080808u32; }
+        if i == 11u32 { v = 0x08080808u32; }
+        if i == 12u32 { v = 0x08080808u32; }
+        if i == 13u32 { v = 0x08080808u32; }
+        if i == 14u32 { v = 0x08080808u32; }
+        if i == 15u32 { v = 0x08080808u32; }
+        if i == 16u32 { v = 0x08080808u32; }
+        if i == 17u32 { v = 0x08080808u32; }
+        if i == 18u32 { v = 0x08080808u32; }
+        if i == 19u32 { v = 0x08080808u32; }
+        if i == 20u32 { v = 0x08080808u32; }
+        if i == 21u32 { v = 0x08080819u32; }
+        if i == 22u32 { v = 0x08080819u32; }
+        if i == 23u32 { v = 0x08080819u32; }
+        if i == 24u32 { v = 0x08080819u32; }
+        if i == 25u32 { v = 0x08080819u32; }
+        if i == 26u32 { v = 0x08080819u32; }
+        if i == 27u32 { v = 0x08080819u32; }
+        if i == 28u32 { v = 0x0808082bu32; }
+        if i == 29u32 { v = 0x0808082bu32; }
+        if i == 30u32 { v = 0x0808082bu32; }
+        if i == 31u32 { v = 0x0808082bu32; }
+        if i == 32u32 { v = 0x08081908u32; }
+        if i == 33u32 { v = 0x08081908u32; }
+        if i == 34u32 { v = 0x08081908u32; }
+        if i == 35u32 { v = 0x08081908u32; }
+        if i == 36u32 { v = 0x08081908u32; }
+        if i == 37u32 { v = 0x08081908u32; }
+        if i == 38u32 { v = 0x08081908u32; }
+        if i == 39u32 { v = 0x08081908u32; }
+        if i == 40u32 { v = 0x08081908u32; }
+        if i == 41u32 { v = 0x08081908u32; }
+        if i == 42u32 { v = 0x08081908u32; }
+        if i == 43u32 { v = 0x08081908u32; }
+        if i == 44u32 { v = 0x08081908u32; }
+        if i == 45u32 { v = 0x08081919u32; }
+        if i == 46u32 { v = 0x08081919u32; }
+        if i == 47u32 { v = 0x08081919u32; }
+        if i == 48u32 { v = 0x08081919u32; }
+        if i == 49u32 { v = 0x08081919u32; }
+        if i == 50u32 { v = 0x08081919u32; }
+        if i == 51u32 { v = 0x08081919u32; }
+        if i == 52u32 { v = 0x08081919u32; }
+        if i == 53u32 { v = 0x0808192bu32; }
+        if i == 54u32 { v = 0x0808192bu32; }
+        if i == 55u32 { v = 0x0808192bu32; }
+        if i == 56u32 { v = 0x0808192bu32; }
+        if i == 57u32 { v = 0x0808192bu32; }
+        if i == 58u32 { v = 0x08082b08u32; }
+        if i == 59u32 { v = 0x08082b08u32; }
+        if i == 60u32 { v = 0x08082b08u32; }
+        if i == 61u32 { v = 0x08082b08u32; }
+        if i == 62u32 { v = 0x08082b08u32; }
+        if i == 63u32 { v = 0x08082b08u32; }
+        if i == 64u32 { v = 0x08082b08u32; }
+        if i == 65u32 { v = 0x08082b08u32; }
+        if i == 66u32 { v = 0x08082b08u32; }
+        if i == 67u32 { v = 0x08082b08u32; }
+        if i == 68u32 { v = 0x08082b19u32; }
+        if i == 69u32 { v = 0x08082b19u32; }
+        if i == 70u32 { v = 0x08082b2bu32; }
+        if i == 71u32 { v = 0x08082b2bu32; }
+        if i == 72u32 { v = 0x08190808u32; }
+        if i == 73u32 { v = 0x08190808u32; }
+        if i == 74u32 { v = 0x08190808u32; }
+        if i == 75u32 { v = 0x08190808u32; }
+        if i == 76u32 { v = 0x08190808u32; }
+        if i == 77u32 { v = 0x08190808u32; }
+        if i == 78u32 { v = 0x08190808u32; }
+        if i == 79u32 { v = 0x08190808u32; }
+        if i == 80u32 { v = 0x08190808u32; }
+        if i == 81u32 { v = 0x08190819u32; }
+        if i == 82u32 { v = 0x08190819u32; }
+        if i == 83u32 { v = 0x08190819u32; }
+        if i == 84u32 { v = 0x08190819u32; }
+        if i == 85u32 { v = 0x08190819u32; }
+        if i == 86u32 { v = 0x08190819u32; }
+        if i == 87u32 { v = 0x0819082bu32; }
+        if i == 88u32 { v = 0x0819082bu32; }
+        if i == 89u32 { v = 0x08191908u32; }
+        if i == 90u32 { v = 0x08191908u32; }
+        if i == 91u32 { v = 0x08191908u32; }
+        if i == 92u32 { v = 0x08191908u32; }
+        if i == 93u32 { v = 0x08191908u32; }
+        if i == 94u32 { v = 0x08191908u32; }
+        if i == 95u32 { v = 0x08191919u32; }
+        if i == 96u32 { v = 0x08191919u32; }
+        if i == 97u32 { v = 0x0819192bu32; }
+        if i == 98u32 { v = 0x0819192bu32; }
+        if i == 99u32 { v = 0x08192b08u32; }
+        if i == 100u32 { v = 0x08192b08u32; }
+        if i == 101u32 { v = 0x08192b08u32; }
+        if i == 102u32 { v = 0x08192b08u32; }
+        if i == 103u32 { v = 0x08192b08u32; }
+        if i == 104u32 { v = 0x08192b19u32; }
+        if i == 105u32 { v = 0x08192b19u32; }
+        if i == 106u32 { v = 0x08192b19u32; }
+        if i == 107u32 { v = 0x08192b2bu32; }
+        if i == 108u32 { v = 0x082b0808u32; }
+        if i == 109u32 { v = 0x082b0808u32; }
+        if i == 110u32 { v = 0x082b0808u32; }
+        if i == 111u32 { v = 0x082b0808u32; }
+        if i == 112u32 { v = 0x082b0808u32; }
+        if i == 113u32 { v = 0x082b0808u32; }
+        if i == 114u32 { v = 0x082b0808u32; }
+        if i == 115u32 { v = 0x082b0819u32; }
+        if i == 116u32 { v = 0x082b0819u32; }
+        if i == 117u32 { v = 0x082b082bu32; }
+        if i == 118u32 { v = 0x082b082bu32; }
+        if i == 119u32 { v = 0x082b1908u32; }
+        if i == 120u32 { v = 0x082b1908u32; }
+        if i == 121u32 { v = 0x082b1908u32; }
+        if i == 122u32 { v = 0x082b1908u32; }
+        if i == 123u32 { v = 0x082b1908u32; }
+        if i == 124u32 { v = 0x082b1919u32; }
+        if i == 125u32 { v = 0x082b1919u32; }
+        if i == 126u32 { v = 0x082b1919u32; }
+        if i == 127u32 { v = 0x082b192bu32; }
+        if i == 128u32 { v = 0x082b2b08u32; }
+        if i == 129u32 { v = 0x082b2b08u32; }
+        if i == 130u32 { v = 0x082b2b08u32; }
+        if i == 131u32 { v = 0x082b2b2bu32; }
+        if i == 132u32 { v = 0x19080808u32; }
+        if i == 133u32 { v = 0x19080808u32; }
+        if i == 134u32 { v = 0x19080808u32; }
+        if i == 135u32 { v = 0x19080808u32; }
+        if i == 136u32 { v = 0x19080808u32; }
+        if i == 137u32 { v = 0x19080808u32; }
+        if i == 138u32 { v = 0x19080808u32; }
+        if i == 139u32 { v = 0x19080808u32; }
+        if i == 140u32 { v = 0x19080808u32; }
+        if i == 141u32 { v = 0x19080808u32; }
+        if i == 142u32 { v = 0x19080808u32; }
+        if i == 143u32 { v = 0x19080808u32; }
+        if i == 144u32 { v = 0x19080808u32; }
+        if i == 145u32 { v = 0x19080819u32; }
+        if i == 146u32 { v = 0x19080819u32; }
+        if i == 147u32 { v = 0x19080819u32; }
+        if i == 148u32 { v = 0x19080819u32; }
+        if i == 149u32 { v = 0x19080819u32; }
+        if i == 150u32 { v = 0x1908082bu32; }
+        if i == 151u32 { v = 0x1908082bu32; }
+        if i == 152u32 { v = 0x1908082bu32; }
+        if i == 153u32 { v = 0x1908082bu32; }
+        if i == 154u32 { v = 0x1908082bu32; }
+        if i == 155u32 { v = 0x19081908u32; }
+        if i == 156u32 { v = 0x19081908u32; }
+        if i == 157u32 { v = 0x19081908u32; }
+        if i == 158u32 { v = 0x19081908u32; }
+        if i == 159u32 { v = 0x19081908u32; }
+        if i == 160u32 { v = 0x19081919u32; }
+        if i == 161u32 { v = 0x19081919u32; }
+        if i == 162u32 { v = 0x1908192bu32; }
+        if i == 163u32 { v = 0x19082b08u32; }
+        if i == 164u32 { v = 0x19082b08u32; }
+        if i == 165u32 { v = 0x19082b08u32; }
+        if i == 166u32 { v = 0x19082b08u32; }
+        if i == 167u32 { v = 0x19082b08u32; }
+        if i == 168u32 { v = 0x19082b19u32; }
+        if i == 169u32 { v = 0x19082b19u32; }
+        if i == 170u32 { v = 0x19082b19u32; }
+        if i == 171u32 { v = 0x19082b19u32; }
+        if i == 172u32 { v = 0x19082b2bu32; }
+        if i == 173u32 { v = 0x19082b2bu32; }
+        if i == 174u32 { v = 0x19190808u32; }
+        if i == 175u32 { v = 0x19190808u32; }
+        if i == 176u32 { v = 0x19190808u32; }
+        if i == 177u32 { v = 0x19190808u32; }
+        if i == 178u32 { v = 0x19190808u32; }
+        if i == 179u32 { v = 0x19190808u32; }
+        if i == 180u32 { v = 0x19190808u32; }
+        if i == 181u32 { v = 0x19190819u32; }
+        if i == 182u32 { v = 0x19190819u32; }
+        if i == 183u32 { v = 0x19190819u32; }
+        if i == 184u32 { v = 0x1919082bu32; }
+        if i == 185u32 { v = 0x19191908u32; }
+        if i == 186u32 { v = 0x19191908u32; }
+        if i == 187u32 { v = 0x19191919u32; }
+        if i == 188u32 { v = 0x1919192bu32; }
+        if i == 189u32 { v = 0x1919192bu32; }
+        if i == 190u32 { v = 0x19192b08u32; }
+        if i == 191u32 { v = 0x19192b08u32; }
+        if i == 192u32 { v = 0x19192b08u32; }
+        if i == 193u32 { v = 0x19192b08u32; }
+        if i == 194u32 { v = 0x19192b19u32; }
+        if i == 195u32 { v = 0x19192b2bu32; }
+        if i == 196u32 { v = 0x192b0808u32; }
+        if i == 197u32 { v = 0x192b0808u32; }
+        if i == 198u32 { v = 0x192b0808u32; }
+        if i == 199u32 { v = 0x192b0808u32; }
+        if i == 200u32 { v = 0x192b0819u32; }
+        if i == 201u32 { v = 0x192b0819u32; }
+        if i == 202u32 { v = 0x192b082bu32; }
+        if i == 203u32 { v = 0x192b082bu32; }
+        if i == 204u32 { v = 0x192b1908u32; }
+        if i == 205u32 { v = 0x192b1908u32; }
+        if i == 206u32 { v = 0x192b1919u32; }
+        if i == 207u32 { v = 0x192b1919u32; }
+        if i == 208u32 { v = 0x192b1919u32; }
+        if i == 209u32 { v = 0x192b2b08u32; }
+        if i == 210u32 { v = 0x2b080808u32; }
+        if i == 211u32 { v = 0x2b080808u32; }
+        if i == 212u32 { v = 0x2b080808u32; }
+        if i == 213u32 { v = 0x2b080808u32; }
+        if i == 214u32 { v = 0x2b080808u32; }
+        if i == 215u32 { v = 0x2b080819u32; }
+        if i == 216u32 { v = 0x2b080819u32; }
+        if i == 217u32 { v = 0x2b080819u32; }
+        if i == 218u32 { v = 0x2b08082bu32; }
+        if i == 219u32 { v = 0x2b081908u32; }
+        if i == 220u32 { v = 0x2b081908u32; }
+        if i == 221u32 { v = 0x2b081908u32; }
+        if i == 222u32 { v = 0x2b081908u32; }
+        if i == 223u32 { v = 0x2b081908u32; }
+        if i == 224u32 { v = 0x2b081908u32; }
+        if i == 225u32 { v = 0x2b081919u32; }
+        if i == 226u32 { v = 0x2b081919u32; }
+        if i == 227u32 { v = 0x2b081919u32; }
+        if i == 228u32 { v = 0x2b08192bu32; }
+        if i == 229u32 { v = 0x2b08192bu32; }
+        if i == 230u32 { v = 0x2b08192bu32; }
+        if i == 231u32 { v = 0x2b082b08u32; }
+        if i == 232u32 { v = 0x2b082b19u32; }
+        if i == 233u32 { v = 0x2b082b2bu32; }
+        if i == 234u32 { v = 0x2b190808u32; }
+        if i == 235u32 { v = 0x2b190808u32; }
+        if i == 236u32 { v = 0x2b190808u32; }
+        if i == 237u32 { v = 0x2b190808u32; }
+        if i == 238u32 { v = 0x2b190808u32; }
+        if i == 239u32 { v = 0x2b190819u32; }
+        if i == 240u32 { v = 0x2b190819u32; }
+        if i == 241u32 { v = 0x2b19082bu32; }
+        if i == 242u32 { v = 0x2b191908u32; }
+        if i == 243u32 { v = 0x2b191908u32; }
+        if i == 244u32 { v = 0x2b191908u32; }
+        if i == 245u32 { v = 0x2b191919u32; }
+        if i == 246u32 { v = 0x2b192b08u32; }
+        if i == 247u32 { v = 0x2b192b19u32; }
+        if i == 248u32 { v = 0x2b2b0808u32; }
+        if i == 249u32 { v = 0x2b2b0808u32; }
+        if i == 250u32 { v = 0x2b2b0808u32; }
+        if i == 251u32 { v = 0x2b2b0819u32; }
+        if i == 252u32 { v = 0x2b2b082bu32; }
+        if i == 253u32 { v = 0x2b2b1908u32; }
+        if i == 254u32 { v = 0x2b2b2b08u32; }
+        if i == 255u32 { v = 0x2b2b2b19u32; }
+        v
+    }
+pub fn s_grid_lo(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x0808082bu32; }
+        if i == 2u32 { v = 0x08081919u32; }
+        if i == 3u32 { v = 0x08082b08u32; }
+        if i == 4u32 { v = 0x08082b2bu32; }
+        if i == 5u32 { v = 0x08190819u32; }
+        if i == 6u32 { v = 0x08191908u32; }
+        if i == 7u32 { v = 0x0819192bu32; }
+        if i == 8u32 { v = 0x08192b19u32; }
+        if i == 9u32 { v = 0x082b0808u32; }
+        if i == 10u32 { v = 0x082b082bu32; }
+        if i == 11u32 { v = 0x082b1919u32; }
+        if i == 12u32 { v = 0x082b2b08u32; }
+        if i == 13u32 { v = 0x19080819u32; }
+        if i == 14u32 { v = 0x19081908u32; }
+        if i == 15u32 { v = 0x1908192bu32; }
+        if i == 16u32 { v = 0x19082b19u32; }
+        if i == 17u32 { v = 0x19190808u32; }
+        if i == 18u32 { v = 0x1919082bu32; }
+        if i == 19u32 { v = 0x19191919u32; }
+        if i == 20u32 { v = 0x19192b08u32; }
+        if i == 21u32 { v = 0x192b0819u32; }
+        if i == 22u32 { v = 0x192b1908u32; }
+        if i == 23u32 { v = 0x192b192bu32; }
+        if i == 24u32 { v = 0x192b2b19u32; }
+        if i == 25u32 { v = 0x2b080808u32; }
+        if i == 26u32 { v = 0x2b08082bu32; }
+        if i == 27u32 { v = 0x2b081919u32; }
+        if i == 28u32 { v = 0x2b082b08u32; }
+        if i == 29u32 { v = 0x2b190819u32; }
+        if i == 30u32 { v = 0x2b191908u32; }
+        if i == 31u32 { v = 0x2b2b0808u32; }
+        if i == 32u32 { v = 0x2b2b1919u32; }
+        if i == 33u32 { v = 0x2b2b2b2bu32; }
+        if i == 34u32 { v = 0x08080819u32; }
+        if i == 35u32 { v = 0x08081908u32; }
+        if i == 36u32 { v = 0x0808192bu32; }
+        if i == 37u32 { v = 0x08082b19u32; }
+        if i == 38u32 { v = 0x08190808u32; }
+        if i == 39u32 { v = 0x0819082bu32; }
+        if i == 40u32 { v = 0x08191919u32; }
+        if i == 41u32 { v = 0x08192b08u32; }
+        if i == 42u32 { v = 0x082b0819u32; }
+        if i == 43u32 { v = 0x082b1908u32; }
+        if i == 44u32 { v = 0x19080808u32; }
+        if i == 45u32 { v = 0x1908082bu32; }
+        if i == 46u32 { v = 0x19081919u32; }
+        if i == 47u32 { v = 0x19082b08u32; }
+        if i == 48u32 { v = 0x19190819u32; }
+        if i == 49u32 { v = 0x19191908u32; }
+        if i == 50u32 { v = 0x1919192bu32; }
+        if i == 51u32 { v = 0x19192b19u32; }
+        if i == 52u32 { v = 0x192b0808u32; }
+        if i == 53u32 { v = 0x192b1919u32; }
+        if i == 54u32 { v = 0x192b2b08u32; }
+        if i == 55u32 { v = 0x2b080819u32; }
+        if i == 56u32 { v = 0x2b081908u32; }
+        if i == 57u32 { v = 0x2b190808u32; }
+        if i == 58u32 { v = 0x2b19082bu32; }
+        if i == 59u32 { v = 0x2b191919u32; }
+        if i == 60u32 { v = 0x2b2b0819u32; }
+        if i == 61u32 { v = 0x2b2b1908u32; }
+        if i == 62u32 { v = 0x08080808u32; }
+        if i == 63u32 { v = 0x0808082bu32; }
+        if i == 64u32 { v = 0x08081919u32; }
+        if i == 65u32 { v = 0x08082b08u32; }
+        if i == 66u32 { v = 0x08190819u32; }
+        if i == 67u32 { v = 0x08191908u32; }
+        if i == 68u32 { v = 0x082b0808u32; }
+        if i == 69u32 { v = 0x082b2b2bu32; }
+        if i == 70u32 { v = 0x19080819u32; }
+        if i == 71u32 { v = 0x19081908u32; }
+        if i == 72u32 { v = 0x1908192bu32; }
+        if i == 73u32 { v = 0x19082b19u32; }
+        if i == 74u32 { v = 0x19190808u32; }
+        if i == 75u32 { v = 0x19191919u32; }
+        if i == 76u32 { v = 0x2b080808u32; }
+        if i == 77u32 { v = 0x2b081919u32; }
+        if i == 78u32 { v = 0x2b082b2bu32; }
+        if i == 79u32 { v = 0x2b191908u32; }
+        if i == 80u32 { v = 0x2b2b082bu32; }
+        if i == 81u32 { v = 0x08080819u32; }
+        if i == 82u32 { v = 0x08081908u32; }
+        if i == 83u32 { v = 0x0808192bu32; }
+        if i == 84u32 { v = 0x08082b19u32; }
+        if i == 85u32 { v = 0x08190808u32; }
+        if i == 86u32 { v = 0x0819082bu32; }
+        if i == 87u32 { v = 0x08191919u32; }
+        if i == 88u32 { v = 0x08192b08u32; }
+        if i == 89u32 { v = 0x082b0819u32; }
+        if i == 90u32 { v = 0x082b1908u32; }
+        if i == 91u32 { v = 0x082b192bu32; }
+        if i == 92u32 { v = 0x082b2b19u32; }
+        if i == 93u32 { v = 0x19080808u32; }
+        if i == 94u32 { v = 0x1908082bu32; }
+        if i == 95u32 { v = 0x19081919u32; }
+        if i == 96u32 { v = 0x19082b08u32; }
+        if i == 97u32 { v = 0x19082b2bu32; }
+        if i == 98u32 { v = 0x19190819u32; }
+        if i == 99u32 { v = 0x19191908u32; }
+        if i == 100u32 { v = 0x1919192bu32; }
+        if i == 101u32 { v = 0x19192b19u32; }
+        if i == 102u32 { v = 0x192b0808u32; }
+        if i == 103u32 { v = 0x192b082bu32; }
+        if i == 104u32 { v = 0x192b1919u32; }
+        if i == 105u32 { v = 0x2b080819u32; }
+        if i == 106u32 { v = 0x2b081908u32; }
+        if i == 107u32 { v = 0x2b08192bu32; }
+        if i == 108u32 { v = 0x2b082b19u32; }
+        if i == 109u32 { v = 0x2b190808u32; }
+        if i == 110u32 { v = 0x2b191919u32; }
+        if i == 111u32 { v = 0x2b192b08u32; }
+        if i == 112u32 { v = 0x2b2b0819u32; }
+        if i == 113u32 { v = 0x2b2b1908u32; }
+        if i == 114u32 { v = 0x08080808u32; }
+        if i == 115u32 { v = 0x0808082bu32; }
+        if i == 116u32 { v = 0x08081919u32; }
+        if i == 117u32 { v = 0x08082b08u32; }
+        if i == 118u32 { v = 0x08082b2bu32; }
+        if i == 119u32 { v = 0x08190819u32; }
+        if i == 120u32 { v = 0x08191908u32; }
+        if i == 121u32 { v = 0x0819192bu32; }
+        if i == 122u32 { v = 0x08192b19u32; }
+        if i == 123u32 { v = 0x082b0808u32; }
+        if i == 124u32 { v = 0x082b1919u32; }
+        if i == 125u32 { v = 0x082b2b08u32; }
+        if i == 126u32 { v = 0x19080819u32; }
+        if i == 127u32 { v = 0x19081908u32; }
+        if i == 128u32 { v = 0x1908192bu32; }
+        if i == 129u32 { v = 0x19082b19u32; }
+        if i == 130u32 { v = 0x19190808u32; }
+        if i == 131u32 { v = 0x1919082bu32; }
+        if i == 132u32 { v = 0x19191919u32; }
+        if i == 133u32 { v = 0x19192b08u32; }
+        if i == 134u32 { v = 0x192b0819u32; }
+        if i == 135u32 { v = 0x192b1908u32; }
+        if i == 136u32 { v = 0x2b080808u32; }
+        if i == 137u32 { v = 0x2b08082bu32; }
+        if i == 138u32 { v = 0x2b081919u32; }
+        if i == 139u32 { v = 0x2b082b08u32; }
+        if i == 140u32 { v = 0x2b190819u32; }
+        if i == 141u32 { v = 0x2b191908u32; }
+        if i == 142u32 { v = 0x2b2b0808u32; }
+        if i == 143u32 { v = 0x08080819u32; }
+        if i == 144u32 { v = 0x08081908u32; }
+        if i == 145u32 { v = 0x0808192bu32; }
+        if i == 146u32 { v = 0x08082b19u32; }
+        if i == 147u32 { v = 0x08190808u32; }
+        if i == 148u32 { v = 0x08191919u32; }
+        if i == 149u32 { v = 0x19080808u32; }
+        if i == 150u32 { v = 0x19081919u32; }
+        if i == 151u32 { v = 0x19082b08u32; }
+        if i == 152u32 { v = 0x19190819u32; }
+        if i == 153u32 { v = 0x19191908u32; }
+        if i == 154u32 { v = 0x192b0808u32; }
+        if i == 155u32 { v = 0x2b080819u32; }
+        if i == 156u32 { v = 0x2b081908u32; }
+        if i == 157u32 { v = 0x2b190808u32; }
+        if i == 158u32 { v = 0x08080808u32; }
+        if i == 159u32 { v = 0x0808082bu32; }
+        if i == 160u32 { v = 0x08081919u32; }
+        if i == 161u32 { v = 0x08082b08u32; }
+        if i == 162u32 { v = 0x08190819u32; }
+        if i == 163u32 { v = 0x08191908u32; }
+        if i == 164u32 { v = 0x0819192bu32; }
+        if i == 165u32 { v = 0x08192b19u32; }
+        if i == 166u32 { v = 0x082b0808u32; }
+        if i == 167u32 { v = 0x082b1919u32; }
+        if i == 168u32 { v = 0x082b2b2bu32; }
+        if i == 169u32 { v = 0x19080819u32; }
+        if i == 170u32 { v = 0x19081908u32; }
+        if i == 171u32 { v = 0x1908192bu32; }
+        if i == 172u32 { v = 0x19082b19u32; }
+        if i == 173u32 { v = 0x19190808u32; }
+        if i == 174u32 { v = 0x1919082bu32; }
+        if i == 175u32 { v = 0x19191919u32; }
+        if i == 176u32 { v = 0x19192b08u32; }
+        if i == 177u32 { v = 0x192b0819u32; }
+        if i == 178u32 { v = 0x192b1908u32; }
+        if i == 179u32 { v = 0x2b080808u32; }
+        if i == 180u32 { v = 0x2b081919u32; }
+        if i == 181u32 { v = 0x2b191908u32; }
+        if i == 182u32 { v = 0x2b2b2b2bu32; }
+        if i == 183u32 { v = 0x08080819u32; }
+        if i == 184u32 { v = 0x08081908u32; }
+        if i == 185u32 { v = 0x08190808u32; }
+        if i == 186u32 { v = 0x0819082bu32; }
+        if i == 187u32 { v = 0x08191919u32; }
+        if i == 188u32 { v = 0x08192b08u32; }
+        if i == 189u32 { v = 0x082b0819u32; }
+        if i == 190u32 { v = 0x19080808u32; }
+        if i == 191u32 { v = 0x19081919u32; }
+        if i == 192u32 { v = 0x19082b08u32; }
+        if i == 193u32 { v = 0x19190819u32; }
+        if i == 194u32 { v = 0x19191908u32; }
+        if i == 195u32 { v = 0x192b0808u32; }
+        if i == 196u32 { v = 0x2b080819u32; }
+        if i == 197u32 { v = 0x2b190808u32; }
+        if i == 198u32 { v = 0x08080808u32; }
+        if i == 199u32 { v = 0x08190819u32; }
+        if i == 200u32 { v = 0x08191908u32; }
+        if i == 201u32 { v = 0x082b082bu32; }
+        if i == 202u32 { v = 0x082b2b08u32; }
+        if i == 203u32 { v = 0x082b2b2bu32; }
+        if i == 204u32 { v = 0x19190808u32; }
+        if i == 205u32 { v = 0x2b192b19u32; }
+        if i == 206u32 { v = 0x08080819u32; }
+        if i == 207u32 { v = 0x08081908u32; }
+        if i == 208u32 { v = 0x0808192bu32; }
+        if i == 209u32 { v = 0x08082b19u32; }
+        if i == 210u32 { v = 0x08190808u32; }
+        if i == 211u32 { v = 0x0819082bu32; }
+        if i == 212u32 { v = 0x08191919u32; }
+        if i == 213u32 { v = 0x08192b08u32; }
+        if i == 214u32 { v = 0x082b0819u32; }
+        if i == 215u32 { v = 0x082b1908u32; }
+        if i == 216u32 { v = 0x082b192bu32; }
+        if i == 217u32 { v = 0x19080808u32; }
+        if i == 218u32 { v = 0x1908082bu32; }
+        if i == 219u32 { v = 0x19081919u32; }
+        if i == 220u32 { v = 0x19082b08u32; }
+        if i == 221u32 { v = 0x19190819u32; }
+        if i == 222u32 { v = 0x19191908u32; }
+        if i == 223u32 { v = 0x1919192bu32; }
+        if i == 224u32 { v = 0x19192b19u32; }
+        if i == 225u32 { v = 0x192b0808u32; }
+        if i == 226u32 { v = 0x192b082bu32; }
+        if i == 227u32 { v = 0x192b1919u32; }
+        if i == 228u32 { v = 0x192b2b08u32; }
+        if i == 229u32 { v = 0x2b080819u32; }
+        if i == 230u32 { v = 0x2b081908u32; }
+        if i == 231u32 { v = 0x2b08192bu32; }
+        if i == 232u32 { v = 0x2b190808u32; }
+        if i == 233u32 { v = 0x2b191919u32; }
+        if i == 234u32 { v = 0x2b192b08u32; }
+        if i == 235u32 { v = 0x2b2b0819u32; }
+        if i == 236u32 { v = 0x2b2b1908u32; }
+        if i == 237u32 { v = 0x08080808u32; }
+        if i == 238u32 { v = 0x0808082bu32; }
+        if i == 239u32 { v = 0x08081919u32; }
+        if i == 240u32 { v = 0x08082b08u32; }
+        if i == 241u32 { v = 0x08082b2bu32; }
+        if i == 242u32 { v = 0x08190819u32; }
+        if i == 243u32 { v = 0x08191908u32; }
+        if i == 244u32 { v = 0x0819192bu32; }
+        if i == 245u32 { v = 0x08192b19u32; }
+        if i == 246u32 { v = 0x082b0808u32; }
+        if i == 247u32 { v = 0x082b082bu32; }
+        if i == 248u32 { v = 0x082b1919u32; }
+        if i == 249u32 { v = 0x082b2b08u32; }
+        if i == 250u32 { v = 0x19080819u32; }
+        if i == 251u32 { v = 0x19081908u32; }
+        if i == 252u32 { v = 0x1908192bu32; }
+        if i == 253u32 { v = 0x19082b19u32; }
+        if i == 254u32 { v = 0x19190808u32; }
+        if i == 255u32 { v = 0x1919082bu32; }
+        if i == 256u32 { v = 0x19191919u32; }
+        if i == 257u32 { v = 0x19192b08u32; }
+        if i == 258u32 { v = 0x192b0819u32; }
+        if i == 259u32 { v = 0x192b1908u32; }
+        if i == 260u32 { v = 0x2b080808u32; }
+        if i == 261u32 { v = 0x2b08082bu32; }
+        if i == 262u32 { v = 0x2b081919u32; }
+        if i == 263u32 { v = 0x2b082b08u32; }
+        if i == 264u32 { v = 0x2b190819u32; }
+        if i == 265u32 { v = 0x2b191908u32; }
+        if i == 266u32 { v = 0x08080819u32; }
+        if i == 267u32 { v = 0x08081908u32; }
+        if i == 268u32 { v = 0x08082b19u32; }
+        if i == 269u32 { v = 0x08190808u32; }
+        if i == 270u32 { v = 0x08191919u32; }
+        if i == 271u32 { v = 0x082b0819u32; }
+        if i == 272u32 { v = 0x082b1908u32; }
+        if i == 273u32 { v = 0x19080808u32; }
+        if i == 274u32 { v = 0x19081919u32; }
+        if i == 275u32 { v = 0x19190819u32; }
+        if i == 276u32 { v = 0x19191908u32; }
+        if i == 277u32 { v = 0x2b080819u32; }
+        if i == 278u32 { v = 0x2b081908u32; }
+        if i == 279u32 { v = 0x2b190808u32; }
+        if i == 280u32 { v = 0x08080808u32; }
+        if i == 281u32 { v = 0x0808082bu32; }
+        if i == 282u32 { v = 0x08081919u32; }
+        if i == 283u32 { v = 0x08082b08u32; }
+        if i == 284u32 { v = 0x08190819u32; }
+        if i == 285u32 { v = 0x08191908u32; }
+        if i == 286u32 { v = 0x0819192bu32; }
+        if i == 287u32 { v = 0x08192b19u32; }
+        if i == 288u32 { v = 0x082b0808u32; }
+        if i == 289u32 { v = 0x082b1919u32; }
+        if i == 290u32 { v = 0x082b2b08u32; }
+        if i == 291u32 { v = 0x19080819u32; }
+        if i == 292u32 { v = 0x19081908u32; }
+        if i == 293u32 { v = 0x1908192bu32; }
+        if i == 294u32 { v = 0x19082b19u32; }
+        if i == 295u32 { v = 0x19190808u32; }
+        if i == 296u32 { v = 0x1919082bu32; }
+        if i == 297u32 { v = 0x19191919u32; }
+        if i == 298u32 { v = 0x19192b08u32; }
+        if i == 299u32 { v = 0x192b0819u32; }
+        if i == 300u32 { v = 0x192b1908u32; }
+        if i == 301u32 { v = 0x2b080808u32; }
+        if i == 302u32 { v = 0x2b08082bu32; }
+        if i == 303u32 { v = 0x2b081919u32; }
+        if i == 304u32 { v = 0x2b082b08u32; }
+        if i == 305u32 { v = 0x2b190819u32; }
+        if i == 306u32 { v = 0x2b191908u32; }
+        if i == 307u32 { v = 0x2b2b0808u32; }
+        if i == 308u32 { v = 0x08080819u32; }
+        if i == 309u32 { v = 0x08081908u32; }
+        if i == 310u32 { v = 0x0808192bu32; }
+        if i == 311u32 { v = 0x08082b19u32; }
+        if i == 312u32 { v = 0x08190808u32; }
+        if i == 313u32 { v = 0x0819082bu32; }
+        if i == 314u32 { v = 0x08191919u32; }
+        if i == 315u32 { v = 0x08192b08u32; }
+        if i == 316u32 { v = 0x082b0819u32; }
+        if i == 317u32 { v = 0x082b1908u32; }
+        if i == 318u32 { v = 0x19080808u32; }
+        if i == 319u32 { v = 0x1908082bu32; }
+        if i == 320u32 { v = 0x19081919u32; }
+        if i == 321u32 { v = 0x19082b08u32; }
+        if i == 322u32 { v = 0x19190819u32; }
+        if i == 323u32 { v = 0x19191908u32; }
+        if i == 324u32 { v = 0x192b0808u32; }
+        if i == 325u32 { v = 0x2b080819u32; }
+        if i == 326u32 { v = 0x2b081908u32; }
+        if i == 327u32 { v = 0x2b190808u32; }
+        if i == 328u32 { v = 0x08080808u32; }
+        if i == 329u32 { v = 0x08081919u32; }
+        if i == 330u32 { v = 0x08082b08u32; }
+        if i == 331u32 { v = 0x08190819u32; }
+        if i == 332u32 { v = 0x08191908u32; }
+        if i == 333u32 { v = 0x082b0808u32; }
+        if i == 334u32 { v = 0x19080819u32; }
+        if i == 335u32 { v = 0x19081908u32; }
+        if i == 336u32 { v = 0x19190808u32; }
+        if i == 337u32 { v = 0x2b080808u32; }
+        if i == 338u32 { v = 0x2b2b2b2bu32; }
+        if i == 339u32 { v = 0x08080819u32; }
+        if i == 340u32 { v = 0x08081908u32; }
+        if i == 341u32 { v = 0x0808192bu32; }
+        if i == 342u32 { v = 0x08082b19u32; }
+        if i == 343u32 { v = 0x08190808u32; }
+        if i == 344u32 { v = 0x08191919u32; }
+        if i == 345u32 { v = 0x08192b08u32; }
+        if i == 346u32 { v = 0x082b0819u32; }
+        if i == 347u32 { v = 0x19080808u32; }
+        if i == 348u32 { v = 0x1908082bu32; }
+        if i == 349u32 { v = 0x19081919u32; }
+        if i == 350u32 { v = 0x19082b08u32; }
+        if i == 351u32 { v = 0x19190819u32; }
+        if i == 352u32 { v = 0x19191908u32; }
+        if i == 353u32 { v = 0x192b0808u32; }
+        if i == 354u32 { v = 0x2b080819u32; }
+        if i == 355u32 { v = 0x2b081908u32; }
+        if i == 356u32 { v = 0x08080808u32; }
+        if i == 357u32 { v = 0x0808082bu32; }
+        if i == 358u32 { v = 0x08081919u32; }
+        if i == 359u32 { v = 0x08082b08u32; }
+        if i == 360u32 { v = 0x08190819u32; }
+        if i == 361u32 { v = 0x08191908u32; }
+        if i == 362u32 { v = 0x082b0808u32; }
+        if i == 363u32 { v = 0x19080819u32; }
+        if i == 364u32 { v = 0x19081908u32; }
+        if i == 365u32 { v = 0x19190808u32; }
+        if i == 366u32 { v = 0x192b2b19u32; }
+        if i == 367u32 { v = 0x2b2b082bu32; }
+        if i == 368u32 { v = 0x08081908u32; }
+        if i == 369u32 { v = 0x08190808u32; }
+        if i == 370u32 { v = 0x19080808u32; }
+        if i == 371u32 { v = 0x1919192bu32; }
+        if i == 372u32 { v = 0x08080808u32; }
+        if i == 373u32 { v = 0x0808082bu32; }
+        if i == 374u32 { v = 0x08081919u32; }
+        if i == 375u32 { v = 0x08082b08u32; }
+        if i == 376u32 { v = 0x08190819u32; }
+        if i == 377u32 { v = 0x08191908u32; }
+        if i == 378u32 { v = 0x0819192bu32; }
+        if i == 379u32 { v = 0x08192b19u32; }
+        if i == 380u32 { v = 0x082b0808u32; }
+        if i == 381u32 { v = 0x082b1919u32; }
+        if i == 382u32 { v = 0x082b2b2bu32; }
+        if i == 383u32 { v = 0x19080819u32; }
+        if i == 384u32 { v = 0x19081908u32; }
+        if i == 385u32 { v = 0x19190808u32; }
+        if i == 386u32 { v = 0x1919082bu32; }
+        if i == 387u32 { v = 0x19191919u32; }
+        if i == 388u32 { v = 0x192b1908u32; }
+        if i == 389u32 { v = 0x2b080808u32; }
+        if i == 390u32 { v = 0x2b082b2bu32; }
+        if i == 391u32 { v = 0x2b191908u32; }
+        if i == 392u32 { v = 0x2b2b2b2bu32; }
+        if i == 393u32 { v = 0x08080819u32; }
+        if i == 394u32 { v = 0x08081908u32; }
+        if i == 395u32 { v = 0x08190808u32; }
+        if i == 396u32 { v = 0x0819082bu32; }
+        if i == 397u32 { v = 0x08191919u32; }
+        if i == 398u32 { v = 0x082b0819u32; }
+        if i == 399u32 { v = 0x19080808u32; }
+        if i == 400u32 { v = 0x1908082bu32; }
+        if i == 401u32 { v = 0x19081919u32; }
+        if i == 402u32 { v = 0x19190819u32; }
+        if i == 403u32 { v = 0x19191908u32; }
+        if i == 404u32 { v = 0x192b0808u32; }
+        if i == 405u32 { v = 0x2b080819u32; }
+        if i == 406u32 { v = 0x2b081908u32; }
+        if i == 407u32 { v = 0x2b190808u32; }
+        if i == 408u32 { v = 0x08080808u32; }
+        if i == 409u32 { v = 0x08082b2bu32; }
+        if i == 410u32 { v = 0x082b082bu32; }
+        if i == 411u32 { v = 0x082b2b08u32; }
+        if i == 412u32 { v = 0x082b2b2bu32; }
+        if i == 413u32 { v = 0x19081908u32; }
+        if i == 414u32 { v = 0x19190808u32; }
+        if i == 415u32 { v = 0x2b082b08u32; }
+        if i == 416u32 { v = 0x2b082b2bu32; }
+        if i == 417u32 { v = 0x2b2b2b08u32; }
+        if i == 418u32 { v = 0x08080819u32; }
+        if i == 419u32 { v = 0x08081908u32; }
+        if i == 420u32 { v = 0x0808192bu32; }
+        if i == 421u32 { v = 0x08082b19u32; }
+        if i == 422u32 { v = 0x08190808u32; }
+        if i == 423u32 { v = 0x08191919u32; }
+        if i == 424u32 { v = 0x08192b08u32; }
+        if i == 425u32 { v = 0x082b0819u32; }
+        if i == 426u32 { v = 0x082b1908u32; }
+        if i == 427u32 { v = 0x19080808u32; }
+        if i == 428u32 { v = 0x1908082bu32; }
+        if i == 429u32 { v = 0x19081919u32; }
+        if i == 430u32 { v = 0x19082b08u32; }
+        if i == 431u32 { v = 0x19190819u32; }
+        if i == 432u32 { v = 0x19191908u32; }
+        if i == 433u32 { v = 0x192b0808u32; }
+        if i == 434u32 { v = 0x2b080819u32; }
+        if i == 435u32 { v = 0x2b081908u32; }
+        if i == 436u32 { v = 0x2b190808u32; }
+        if i == 437u32 { v = 0x08080808u32; }
+        if i == 438u32 { v = 0x08081919u32; }
+        if i == 439u32 { v = 0x08082b08u32; }
+        if i == 440u32 { v = 0x08190819u32; }
+        if i == 441u32 { v = 0x08191908u32; }
+        if i == 442u32 { v = 0x082b0808u32; }
+        if i == 443u32 { v = 0x19080819u32; }
+        if i == 444u32 { v = 0x19081908u32; }
+        if i == 445u32 { v = 0x19190808u32; }
+        if i == 446u32 { v = 0x192b192bu32; }
+        if i == 447u32 { v = 0x2b080808u32; }
+        if i == 448u32 { v = 0x08080819u32; }
+        if i == 449u32 { v = 0x08081908u32; }
+        if i == 450u32 { v = 0x08190808u32; }
+        if i == 451u32 { v = 0x19080808u32; }
+        if i == 452u32 { v = 0x19192b19u32; }
+        if i == 453u32 { v = 0x08080808u32; }
+        if i == 454u32 { v = 0x08081919u32; }
+        if i == 455u32 { v = 0x08190819u32; }
+        if i == 456u32 { v = 0x08191908u32; }
+        if i == 457u32 { v = 0x19080819u32; }
+        if i == 458u32 { v = 0x19081908u32; }
+        if i == 459u32 { v = 0x19190808u32; }
+        if i == 460u32 { v = 0x2b082b2bu32; }
+        if i == 461u32 { v = 0x2b2b2b2bu32; }
+        if i == 462u32 { v = 0x08080819u32; }
+        if i == 463u32 { v = 0x08081908u32; }
+        if i == 464u32 { v = 0x08190808u32; }
+        if i == 465u32 { v = 0x2b191919u32; }
+        if i == 466u32 { v = 0x08082b2bu32; }
+        if i == 467u32 { v = 0x082b082bu32; }
+        if i == 468u32 { v = 0x192b1908u32; }
+        if i == 469u32 { v = 0x2b082b08u32; }
+        if i == 470u32 { v = 0x2b082b2bu32; }
+        if i == 471u32 { v = 0x08080819u32; }
+        if i == 472u32 { v = 0x08081908u32; }
+        if i == 473u32 { v = 0x0808192bu32; }
+        if i == 474u32 { v = 0x08082b19u32; }
+        if i == 475u32 { v = 0x08190808u32; }
+        if i == 476u32 { v = 0x0819082bu32; }
+        if i == 477u32 { v = 0x08191919u32; }
+        if i == 478u32 { v = 0x08192b08u32; }
+        if i == 479u32 { v = 0x08192b2bu32; }
+        if i == 480u32 { v = 0x082b0819u32; }
+        if i == 481u32 { v = 0x082b1908u32; }
+        if i == 482u32 { v = 0x082b192bu32; }
+        if i == 483u32 { v = 0x19080808u32; }
+        if i == 484u32 { v = 0x1908082bu32; }
+        if i == 485u32 { v = 0x19081919u32; }
+        if i == 486u32 { v = 0x19082b08u32; }
+        if i == 487u32 { v = 0x19082b2bu32; }
+        if i == 488u32 { v = 0x19190819u32; }
+        if i == 489u32 { v = 0x19191908u32; }
+        if i == 490u32 { v = 0x1919192bu32; }
+        if i == 491u32 { v = 0x19192b19u32; }
+        if i == 492u32 { v = 0x192b0808u32; }
+        if i == 493u32 { v = 0x192b082bu32; }
+        if i == 494u32 { v = 0x192b1919u32; }
+        if i == 495u32 { v = 0x2b080819u32; }
+        if i == 496u32 { v = 0x2b081908u32; }
+        if i == 497u32 { v = 0x2b190808u32; }
+        if i == 498u32 { v = 0x2b191919u32; }
+        if i == 499u32 { v = 0x2b192b08u32; }
+        if i == 500u32 { v = 0x2b2b0819u32; }
+        if i == 501u32 { v = 0x2b2b1908u32; }
+        if i == 502u32 { v = 0x08080808u32; }
+        if i == 503u32 { v = 0x0808082bu32; }
+        if i == 504u32 { v = 0x08081919u32; }
+        if i == 505u32 { v = 0x08082b08u32; }
+        if i == 506u32 { v = 0x08190819u32; }
+        if i == 507u32 { v = 0x08191908u32; }
+        if i == 508u32 { v = 0x0819192bu32; }
+        if i == 509u32 { v = 0x08192b19u32; }
+        if i == 510u32 { v = 0x082b0808u32; }
+        if i == 511u32 { v = 0x082b082bu32; }
+        if i == 512u32 { v = 0x082b1919u32; }
+        if i == 513u32 { v = 0x19080819u32; }
+        if i == 514u32 { v = 0x19081908u32; }
+        if i == 515u32 { v = 0x1908192bu32; }
+        if i == 516u32 { v = 0x19082b19u32; }
+        if i == 517u32 { v = 0x19190808u32; }
+        if i == 518u32 { v = 0x1919082bu32; }
+        if i == 519u32 { v = 0x19191919u32; }
+        if i == 520u32 { v = 0x19192b08u32; }
+        if i == 521u32 { v = 0x192b0819u32; }
+        if i == 522u32 { v = 0x192b1908u32; }
+        if i == 523u32 { v = 0x2b080808u32; }
+        if i == 524u32 { v = 0x2b08082bu32; }
+        if i == 525u32 { v = 0x2b081919u32; }
+        if i == 526u32 { v = 0x2b082b08u32; }
+        if i == 527u32 { v = 0x2b190819u32; }
+        if i == 528u32 { v = 0x2b191908u32; }
+        if i == 529u32 { v = 0x2b2b0808u32; }
+        if i == 530u32 { v = 0x08080819u32; }
+        if i == 531u32 { v = 0x08081908u32; }
+        if i == 532u32 { v = 0x08190808u32; }
+        if i == 533u32 { v = 0x0819082bu32; }
+        if i == 534u32 { v = 0x08191919u32; }
+        if i == 535u32 { v = 0x08192b08u32; }
+        if i == 536u32 { v = 0x082b1908u32; }
+        if i == 537u32 { v = 0x19080808u32; }
+        if i == 538u32 { v = 0x19081919u32; }
+        if i == 539u32 { v = 0x19082b08u32; }
+        if i == 540u32 { v = 0x19190819u32; }
+        if i == 541u32 { v = 0x19191908u32; }
+        if i == 542u32 { v = 0x192b0808u32; }
+        if i == 543u32 { v = 0x2b080819u32; }
+        if i == 544u32 { v = 0x2b081908u32; }
+        if i == 545u32 { v = 0x08080808u32; }
+        if i == 546u32 { v = 0x0808082bu32; }
+        if i == 547u32 { v = 0x08081919u32; }
+        if i == 548u32 { v = 0x08082b08u32; }
+        if i == 549u32 { v = 0x08082b2bu32; }
+        if i == 550u32 { v = 0x08190819u32; }
+        if i == 551u32 { v = 0x08191908u32; }
+        if i == 552u32 { v = 0x0819192bu32; }
+        if i == 553u32 { v = 0x08192b19u32; }
+        if i == 554u32 { v = 0x082b0808u32; }
+        if i == 555u32 { v = 0x082b082bu32; }
+        if i == 556u32 { v = 0x082b1919u32; }
+        if i == 557u32 { v = 0x082b2b08u32; }
+        if i == 558u32 { v = 0x19080819u32; }
+        if i == 559u32 { v = 0x19081908u32; }
+        if i == 560u32 { v = 0x1908192bu32; }
+        if i == 561u32 { v = 0x19082b19u32; }
+        if i == 562u32 { v = 0x19190808u32; }
+        if i == 563u32 { v = 0x1919082bu32; }
+        if i == 564u32 { v = 0x19191919u32; }
+        if i == 565u32 { v = 0x19192b08u32; }
+        if i == 566u32 { v = 0x192b0819u32; }
+        if i == 567u32 { v = 0x192b1908u32; }
+        if i == 568u32 { v = 0x2b080808u32; }
+        if i == 569u32 { v = 0x2b08082bu32; }
+        if i == 570u32 { v = 0x2b081919u32; }
+        if i == 571u32 { v = 0x2b082b08u32; }
+        if i == 572u32 { v = 0x2b190819u32; }
+        if i == 573u32 { v = 0x2b191908u32; }
+        if i == 574u32 { v = 0x2b2b0808u32; }
+        if i == 575u32 { v = 0x08080819u32; }
+        if i == 576u32 { v = 0x08081908u32; }
+        if i == 577u32 { v = 0x0808192bu32; }
+        if i == 578u32 { v = 0x08082b19u32; }
+        if i == 579u32 { v = 0x08190808u32; }
+        if i == 580u32 { v = 0x0819082bu32; }
+        if i == 581u32 { v = 0x08191919u32; }
+        if i == 582u32 { v = 0x08192b08u32; }
+        if i == 583u32 { v = 0x082b0819u32; }
+        if i == 584u32 { v = 0x082b1908u32; }
+        if i == 585u32 { v = 0x19080808u32; }
+        if i == 586u32 { v = 0x1908082bu32; }
+        if i == 587u32 { v = 0x19081919u32; }
+        if i == 588u32 { v = 0x19082b08u32; }
+        if i == 589u32 { v = 0x19190819u32; }
+        if i == 590u32 { v = 0x19191908u32; }
+        if i == 591u32 { v = 0x192b0808u32; }
+        if i == 592u32 { v = 0x192b2b2bu32; }
+        if i == 593u32 { v = 0x2b080819u32; }
+        if i == 594u32 { v = 0x2b081908u32; }
+        if i == 595u32 { v = 0x2b190808u32; }
+        if i == 596u32 { v = 0x08080808u32; }
+        if i == 597u32 { v = 0x0808082bu32; }
+        if i == 598u32 { v = 0x08081919u32; }
+        if i == 599u32 { v = 0x08082b08u32; }
+        if i == 600u32 { v = 0x08190819u32; }
+        if i == 601u32 { v = 0x08191908u32; }
+        if i == 602u32 { v = 0x082b0808u32; }
+        if i == 603u32 { v = 0x19080819u32; }
+        if i == 604u32 { v = 0x19081908u32; }
+        if i == 605u32 { v = 0x19190808u32; }
+        if i == 606u32 { v = 0x2b080808u32; }
+        if i == 607u32 { v = 0x2b2b1919u32; }
+        if i == 608u32 { v = 0x08080819u32; }
+        if i == 609u32 { v = 0x08081908u32; }
+        if i == 610u32 { v = 0x08082b19u32; }
+        if i == 611u32 { v = 0x08190808u32; }
+        if i == 612u32 { v = 0x0819082bu32; }
+        if i == 613u32 { v = 0x08191919u32; }
+        if i == 614u32 { v = 0x08192b08u32; }
+        if i == 615u32 { v = 0x082b0819u32; }
+        if i == 616u32 { v = 0x082b1908u32; }
+        if i == 617u32 { v = 0x19080808u32; }
+        if i == 618u32 { v = 0x1908082bu32; }
+        if i == 619u32 { v = 0x19081919u32; }
+        if i == 620u32 { v = 0x19082b08u32; }
+        if i == 621u32 { v = 0x19190819u32; }
+        if i == 622u32 { v = 0x19191908u32; }
+        if i == 623u32 { v = 0x192b0808u32; }
+        if i == 624u32 { v = 0x2b081908u32; }
+        if i == 625u32 { v = 0x2b190808u32; }
+        if i == 626u32 { v = 0x08080808u32; }
+        if i == 627u32 { v = 0x0808082bu32; }
+        if i == 628u32 { v = 0x08081919u32; }
+        if i == 629u32 { v = 0x08082b08u32; }
+        if i == 630u32 { v = 0x08190819u32; }
+        if i == 631u32 { v = 0x08191908u32; }
+        if i == 632u32 { v = 0x082b0808u32; }
+        if i == 633u32 { v = 0x19080819u32; }
+        if i == 634u32 { v = 0x19081908u32; }
+        if i == 635u32 { v = 0x19190808u32; }
+        if i == 636u32 { v = 0x2b080808u32; }
+        if i == 637u32 { v = 0x2b19192bu32; }
+        if i == 638u32 { v = 0x08080819u32; }
+        if i == 639u32 { v = 0x08081908u32; }
+        if i == 640u32 { v = 0x08190808u32; }
+        if i == 641u32 { v = 0x19080808u32; }
+        if i == 642u32 { v = 0x08080808u32; }
+        if i == 643u32 { v = 0x0808082bu32; }
+        if i == 644u32 { v = 0x08081919u32; }
+        if i == 645u32 { v = 0x08082b08u32; }
+        if i == 646u32 { v = 0x08190819u32; }
+        if i == 647u32 { v = 0x08191908u32; }
+        if i == 648u32 { v = 0x0819192bu32; }
+        if i == 649u32 { v = 0x08192b19u32; }
+        if i == 650u32 { v = 0x082b0808u32; }
+        if i == 651u32 { v = 0x082b082bu32; }
+        if i == 652u32 { v = 0x082b1919u32; }
+        if i == 653u32 { v = 0x082b2b08u32; }
+        if i == 654u32 { v = 0x19080819u32; }
+        if i == 655u32 { v = 0x19081908u32; }
+        if i == 656u32 { v = 0x1908192bu32; }
+        if i == 657u32 { v = 0x19082b19u32; }
+        if i == 658u32 { v = 0x19190808u32; }
+        if i == 659u32 { v = 0x1919082bu32; }
+        if i == 660u32 { v = 0x19191919u32; }
+        if i == 661u32 { v = 0x19192b08u32; }
+        if i == 662u32 { v = 0x192b0819u32; }
+        if i == 663u32 { v = 0x192b1908u32; }
+        if i == 664u32 { v = 0x2b080808u32; }
+        if i == 665u32 { v = 0x2b08082bu32; }
+        if i == 666u32 { v = 0x2b081919u32; }
+        if i == 667u32 { v = 0x2b082b08u32; }
+        if i == 668u32 { v = 0x2b190819u32; }
+        if i == 669u32 { v = 0x2b191908u32; }
+        if i == 670u32 { v = 0x08080819u32; }
+        if i == 671u32 { v = 0x08081908u32; }
+        if i == 672u32 { v = 0x0808192bu32; }
+        if i == 673u32 { v = 0x08082b19u32; }
+        if i == 674u32 { v = 0x08190808u32; }
+        if i == 675u32 { v = 0x0819082bu32; }
+        if i == 676u32 { v = 0x08191919u32; }
+        if i == 677u32 { v = 0x08192b08u32; }
+        if i == 678u32 { v = 0x082b0819u32; }
+        if i == 679u32 { v = 0x082b1908u32; }
+        if i == 680u32 { v = 0x19080808u32; }
+        if i == 681u32 { v = 0x1908082bu32; }
+        if i == 682u32 { v = 0x19081919u32; }
+        if i == 683u32 { v = 0x19082b08u32; }
+        if i == 684u32 { v = 0x19190819u32; }
+        if i == 685u32 { v = 0x19191908u32; }
+        if i == 686u32 { v = 0x192b0808u32; }
+        if i == 687u32 { v = 0x2b080819u32; }
+        if i == 688u32 { v = 0x2b081908u32; }
+        if i == 689u32 { v = 0x2b190808u32; }
+        if i == 690u32 { v = 0x08080808u32; }
+        if i == 691u32 { v = 0x08081919u32; }
+        if i == 692u32 { v = 0x08082b08u32; }
+        if i == 693u32 { v = 0x08190819u32; }
+        if i == 694u32 { v = 0x08191908u32; }
+        if i == 695u32 { v = 0x082b0808u32; }
+        if i == 696u32 { v = 0x19080819u32; }
+        if i == 697u32 { v = 0x19081908u32; }
+        if i == 698u32 { v = 0x19190808u32; }
+        if i == 699u32 { v = 0x192b2b19u32; }
+        if i == 700u32 { v = 0x2b080808u32; }
+        if i == 701u32 { v = 0x08080819u32; }
+        if i == 702u32 { v = 0x08081908u32; }
+        if i == 703u32 { v = 0x0808192bu32; }
+        if i == 704u32 { v = 0x08082b19u32; }
+        if i == 705u32 { v = 0x08190808u32; }
+        if i == 706u32 { v = 0x0819082bu32; }
+        if i == 707u32 { v = 0x08191919u32; }
+        if i == 708u32 { v = 0x08192b08u32; }
+        if i == 709u32 { v = 0x082b0819u32; }
+        if i == 710u32 { v = 0x082b1908u32; }
+        if i == 711u32 { v = 0x19080808u32; }
+        if i == 712u32 { v = 0x1908082bu32; }
+        if i == 713u32 { v = 0x19081919u32; }
+        if i == 714u32 { v = 0x19082b08u32; }
+        if i == 715u32 { v = 0x19190819u32; }
+        if i == 716u32 { v = 0x19191908u32; }
+        if i == 717u32 { v = 0x192b0808u32; }
+        if i == 718u32 { v = 0x2b080819u32; }
+        if i == 719u32 { v = 0x2b081908u32; }
+        if i == 720u32 { v = 0x2b190808u32; }
+        if i == 721u32 { v = 0x08080808u32; }
+        if i == 722u32 { v = 0x0808082bu32; }
+        if i == 723u32 { v = 0x08081919u32; }
+        if i == 724u32 { v = 0x08082b08u32; }
+        if i == 725u32 { v = 0x08190819u32; }
+        if i == 726u32 { v = 0x08191908u32; }
+        if i == 727u32 { v = 0x082b0808u32; }
+        if i == 728u32 { v = 0x19080819u32; }
+        if i == 729u32 { v = 0x19081908u32; }
+        if i == 730u32 { v = 0x19190808u32; }
+        if i == 731u32 { v = 0x2b080808u32; }
+        if i == 732u32 { v = 0x08080819u32; }
+        if i == 733u32 { v = 0x08081908u32; }
+        if i == 734u32 { v = 0x08190808u32; }
+        if i == 735u32 { v = 0x082b192bu32; }
+        if i == 736u32 { v = 0x19080808u32; }
+        if i == 737u32 { v = 0x08080808u32; }
+        if i == 738u32 { v = 0x0808082bu32; }
+        if i == 739u32 { v = 0x08081919u32; }
+        if i == 740u32 { v = 0x08082b08u32; }
+        if i == 741u32 { v = 0x08190819u32; }
+        if i == 742u32 { v = 0x08191908u32; }
+        if i == 743u32 { v = 0x082b0808u32; }
+        if i == 744u32 { v = 0x19080819u32; }
+        if i == 745u32 { v = 0x19081908u32; }
+        if i == 746u32 { v = 0x19190808u32; }
+        if i == 747u32 { v = 0x19192b2bu32; }
+        if i == 748u32 { v = 0x2b080808u32; }
+        if i == 749u32 { v = 0x08080819u32; }
+        if i == 750u32 { v = 0x08081908u32; }
+        if i == 751u32 { v = 0x08190808u32; }
+        if i == 752u32 { v = 0x19080808u32; }
+        if i == 753u32 { v = 0x08080808u32; }
+        if i == 754u32 { v = 0x08192b19u32; }
+        if i == 755u32 { v = 0x2b081919u32; }
+        if i == 756u32 { v = 0x2b2b2b08u32; }
+        if i == 757u32 { v = 0x08080819u32; }
+        if i == 758u32 { v = 0x08081908u32; }
+        if i == 759u32 { v = 0x0808192bu32; }
+        if i == 760u32 { v = 0x08190808u32; }
+        if i == 761u32 { v = 0x0819082bu32; }
+        if i == 762u32 { v = 0x08191919u32; }
+        if i == 763u32 { v = 0x08192b08u32; }
+        if i == 764u32 { v = 0x082b0819u32; }
+        if i == 765u32 { v = 0x082b1908u32; }
+        if i == 766u32 { v = 0x19080808u32; }
+        if i == 767u32 { v = 0x19081919u32; }
+        if i == 768u32 { v = 0x19082b08u32; }
+        if i == 769u32 { v = 0x19190819u32; }
+        if i == 770u32 { v = 0x19191908u32; }
+        if i == 771u32 { v = 0x192b0808u32; }
+        if i == 772u32 { v = 0x2b081908u32; }
+        if i == 773u32 { v = 0x2b190808u32; }
+        if i == 774u32 { v = 0x08080808u32; }
+        if i == 775u32 { v = 0x0808082bu32; }
+        if i == 776u32 { v = 0x08081919u32; }
+        if i == 777u32 { v = 0x08082b08u32; }
+        if i == 778u32 { v = 0x08190819u32; }
+        if i == 779u32 { v = 0x08191908u32; }
+        if i == 780u32 { v = 0x082b0808u32; }
+        if i == 781u32 { v = 0x19080819u32; }
+        if i == 782u32 { v = 0x19081908u32; }
+        if i == 783u32 { v = 0x19190808u32; }
+        if i == 784u32 { v = 0x2b080808u32; }
+        if i == 785u32 { v = 0x2b192b19u32; }
+        if i == 786u32 { v = 0x08081908u32; }
+        if i == 787u32 { v = 0x08190808u32; }
+        if i == 788u32 { v = 0x19080808u32; }
+        if i == 789u32 { v = 0x1919192bu32; }
+        if i == 790u32 { v = 0x2b2b0819u32; }
+        if i == 791u32 { v = 0x08080808u32; }
+        if i == 792u32 { v = 0x08081919u32; }
+        if i == 793u32 { v = 0x08082b08u32; }
+        if i == 794u32 { v = 0x08190819u32; }
+        if i == 795u32 { v = 0x08191908u32; }
+        if i == 796u32 { v = 0x082b0808u32; }
+        if i == 797u32 { v = 0x19080819u32; }
+        if i == 798u32 { v = 0x19081908u32; }
+        if i == 799u32 { v = 0x19190808u32; }
+        if i == 800u32 { v = 0x2b080808u32; }
+        if i == 801u32 { v = 0x08080819u32; }
+        if i == 802u32 { v = 0x08081908u32; }
+        if i == 803u32 { v = 0x08190808u32; }
+        if i == 804u32 { v = 0x19080808u32; }
+        if i == 805u32 { v = 0x19082b2bu32; }
+        if i == 806u32 { v = 0x192b2b08u32; }
+        if i == 807u32 { v = 0x2b19082bu32; }
+        if i == 808u32 { v = 0x08080808u32; }
+        if i == 809u32 { v = 0x2b191908u32; }
+        if i == 810u32 { v = 0x08080819u32; }
+        if i == 811u32 { v = 0x08081908u32; }
+        if i == 812u32 { v = 0x08190808u32; }
+        if i == 813u32 { v = 0x192b1919u32; }
+        if i == 814u32 { v = 0x2b192b08u32; }
+        if i == 815u32 { v = 0x08080808u32; }
+        if i == 816u32 { v = 0x082b2b2bu32; }
+        if i == 817u32 { v = 0x1908082bu32; }
+        if i == 818u32 { v = 0x2b2b0819u32; }
+        if i == 819u32 { v = 0x08080808u32; }
+        if i == 820u32 { v = 0x0808082bu32; }
+        if i == 821u32 { v = 0x08081919u32; }
+        if i == 822u32 { v = 0x08082b08u32; }
+        if i == 823u32 { v = 0x08190819u32; }
+        if i == 824u32 { v = 0x08191908u32; }
+        if i == 825u32 { v = 0x08192b19u32; }
+        if i == 826u32 { v = 0x082b0808u32; }
+        if i == 827u32 { v = 0x082b1919u32; }
+        if i == 828u32 { v = 0x19080819u32; }
+        if i == 829u32 { v = 0x19081908u32; }
+        if i == 830u32 { v = 0x19190808u32; }
+        if i == 831u32 { v = 0x1919082bu32; }
+        if i == 832u32 { v = 0x19191919u32; }
+        if i == 833u32 { v = 0x19192b08u32; }
+        if i == 834u32 { v = 0x192b0819u32; }
+        if i == 835u32 { v = 0x2b080808u32; }
+        if i == 836u32 { v = 0x2b081919u32; }
+        if i == 837u32 { v = 0x2b190819u32; }
+        if i == 838u32 { v = 0x2b191908u32; }
+        if i == 839u32 { v = 0x08080819u32; }
+        if i == 840u32 { v = 0x08081908u32; }
+        if i == 841u32 { v = 0x08082b19u32; }
+        if i == 842u32 { v = 0x08190808u32; }
+        if i == 843u32 { v = 0x0819082bu32; }
+        if i == 844u32 { v = 0x08191919u32; }
+        if i == 845u32 { v = 0x08192b08u32; }
+        if i == 846u32 { v = 0x082b0819u32; }
+        if i == 847u32 { v = 0x082b1908u32; }
+        if i == 848u32 { v = 0x19080808u32; }
+        if i == 849u32 { v = 0x1908082bu32; }
+        if i == 850u32 { v = 0x19081919u32; }
+        if i == 851u32 { v = 0x19082b08u32; }
+        if i == 852u32 { v = 0x19190819u32; }
+        if i == 853u32 { v = 0x19191908u32; }
+        if i == 854u32 { v = 0x2b080819u32; }
+        if i == 855u32 { v = 0x2b081908u32; }
+        if i == 856u32 { v = 0x2b190808u32; }
+        if i == 857u32 { v = 0x2b2b2b19u32; }
+        if i == 858u32 { v = 0x08080808u32; }
+        if i == 859u32 { v = 0x08081919u32; }
+        if i == 860u32 { v = 0x08082b2bu32; }
+        if i == 861u32 { v = 0x08190819u32; }
+        if i == 862u32 { v = 0x08191908u32; }
+        if i == 863u32 { v = 0x19080819u32; }
+        if i == 864u32 { v = 0x19081908u32; }
+        if i == 865u32 { v = 0x19190808u32; }
+        if i == 866u32 { v = 0x08080819u32; }
+        if i == 867u32 { v = 0x08081908u32; }
+        if i == 868u32 { v = 0x0808192bu32; }
+        if i == 869u32 { v = 0x08082b19u32; }
+        if i == 870u32 { v = 0x08190808u32; }
+        if i == 871u32 { v = 0x0819082bu32; }
+        if i == 872u32 { v = 0x08191919u32; }
+        if i == 873u32 { v = 0x08192b08u32; }
+        if i == 874u32 { v = 0x082b0819u32; }
+        if i == 875u32 { v = 0x19080808u32; }
+        if i == 876u32 { v = 0x1908082bu32; }
+        if i == 877u32 { v = 0x19081919u32; }
+        if i == 878u32 { v = 0x19082b08u32; }
+        if i == 879u32 { v = 0x19190819u32; }
+        if i == 880u32 { v = 0x19191908u32; }
+        if i == 881u32 { v = 0x192b0808u32; }
+        if i == 882u32 { v = 0x2b080819u32; }
+        if i == 883u32 { v = 0x2b081908u32; }
+        if i == 884u32 { v = 0x2b190808u32; }
+        if i == 885u32 { v = 0x08080808u32; }
+        if i == 886u32 { v = 0x0808082bu32; }
+        if i == 887u32 { v = 0x08081919u32; }
+        if i == 888u32 { v = 0x08082b08u32; }
+        if i == 889u32 { v = 0x08190819u32; }
+        if i == 890u32 { v = 0x08191908u32; }
+        if i == 891u32 { v = 0x082b0808u32; }
+        if i == 892u32 { v = 0x19080819u32; }
+        if i == 893u32 { v = 0x19081908u32; }
+        if i == 894u32 { v = 0x19190808u32; }
+        if i == 895u32 { v = 0x2b080808u32; }
+        if i == 896u32 { v = 0x2b082b2bu32; }
+        if i == 897u32 { v = 0x08080819u32; }
+        if i == 898u32 { v = 0x08081908u32; }
+        if i == 899u32 { v = 0x08190808u32; }
+        if i == 900u32 { v = 0x082b2b19u32; }
+        if i == 901u32 { v = 0x19080808u32; }
+        if i == 902u32 { v = 0x08080808u32; }
+        if i == 903u32 { v = 0x08081919u32; }
+        if i == 904u32 { v = 0x08190819u32; }
+        if i == 905u32 { v = 0x08191908u32; }
+        if i == 906u32 { v = 0x19080819u32; }
+        if i == 907u32 { v = 0x19081908u32; }
+        if i == 908u32 { v = 0x19190808u32; }
+        if i == 909u32 { v = 0x2b2b082bu32; }
+        if i == 910u32 { v = 0x08080819u32; }
+        if i == 911u32 { v = 0x08081908u32; }
+        if i == 912u32 { v = 0x19080808u32; }
+        if i == 913u32 { v = 0x192b1919u32; }
+        if i == 914u32 { v = 0x082b082bu32; }
+        if i == 915u32 { v = 0x19192b08u32; }
+        if i == 916u32 { v = 0x19192b2bu32; }
+        if i == 917u32 { v = 0x2b08082bu32; }
+        if i == 918u32 { v = 0x2b2b082bu32; }
+        if i == 919u32 { v = 0x08080819u32; }
+        if i == 920u32 { v = 0x08081908u32; }
+        if i == 921u32 { v = 0x08082b19u32; }
+        if i == 922u32 { v = 0x08190808u32; }
+        if i == 923u32 { v = 0x0819082bu32; }
+        if i == 924u32 { v = 0x08191919u32; }
+        if i == 925u32 { v = 0x08192b08u32; }
+        if i == 926u32 { v = 0x082b1908u32; }
+        if i == 927u32 { v = 0x19080808u32; }
+        if i == 928u32 { v = 0x1908082bu32; }
+        if i == 929u32 { v = 0x19081919u32; }
+        if i == 930u32 { v = 0x19082b08u32; }
+        if i == 931u32 { v = 0x19190819u32; }
+        if i == 932u32 { v = 0x19191908u32; }
+        if i == 933u32 { v = 0x192b0808u32; }
+        if i == 934u32 { v = 0x2b080819u32; }
+        if i == 935u32 { v = 0x2b081908u32; }
+        if i == 936u32 { v = 0x2b190808u32; }
+        if i == 937u32 { v = 0x08080808u32; }
+        if i == 938u32 { v = 0x08081919u32; }
+        if i == 939u32 { v = 0x08190819u32; }
+        if i == 940u32 { v = 0x08191908u32; }
+        if i == 941u32 { v = 0x19080819u32; }
+        if i == 942u32 { v = 0x19081908u32; }
+        if i == 943u32 { v = 0x19190808u32; }
+        if i == 944u32 { v = 0x19192b2bu32; }
+        if i == 945u32 { v = 0x08080819u32; }
+        if i == 946u32 { v = 0x08081908u32; }
+        if i == 947u32 { v = 0x08190808u32; }
+        if i == 948u32 { v = 0x19080808u32; }
+        if i == 949u32 { v = 0x2b2b192bu32; }
+        if i == 950u32 { v = 0x08080808u32; }
+        if i == 951u32 { v = 0x0808082bu32; }
+        if i == 952u32 { v = 0x08081919u32; }
+        if i == 953u32 { v = 0x08082b08u32; }
+        if i == 954u32 { v = 0x08190819u32; }
+        if i == 955u32 { v = 0x08191908u32; }
+        if i == 956u32 { v = 0x082b0808u32; }
+        if i == 957u32 { v = 0x19080819u32; }
+        if i == 958u32 { v = 0x19081908u32; }
+        if i == 959u32 { v = 0x19190808u32; }
+        if i == 960u32 { v = 0x2b080808u32; }
+        if i == 961u32 { v = 0x2b19192bu32; }
+        if i == 962u32 { v = 0x08080819u32; }
+        if i == 963u32 { v = 0x08081908u32; }
+        if i == 964u32 { v = 0x08190808u32; }
+        if i == 965u32 { v = 0x19080808u32; }
+        if i == 966u32 { v = 0x2b192b08u32; }
+        if i == 967u32 { v = 0x2b2b0819u32; }
+        if i == 968u32 { v = 0x08080808u32; }
+        if i == 969u32 { v = 0x1908192bu32; }
+        if i == 970u32 { v = 0x192b1908u32; }
+        if i == 971u32 { v = 0x08080819u32; }
+        if i == 972u32 { v = 0x08081908u32; }
+        if i == 973u32 { v = 0x08190808u32; }
+        if i == 974u32 { v = 0x082b192bu32; }
+        if i == 975u32 { v = 0x19080808u32; }
+        if i == 976u32 { v = 0x2b2b2b19u32; }
+        if i == 977u32 { v = 0x08080808u32; }
+        if i == 978u32 { v = 0x19082b19u32; }
+        if i == 979u32 { v = 0x1919082bu32; }
+        if i == 980u32 { v = 0x2b190808u32; }
+        if i == 981u32 { v = 0x08080808u32; }
+        if i == 982u32 { v = 0x08081919u32; }
+        if i == 983u32 { v = 0x08082b2bu32; }
+        if i == 984u32 { v = 0x08191908u32; }
+        if i == 985u32 { v = 0x082b082bu32; }
+        if i == 986u32 { v = 0x082b2b2bu32; }
+        if i == 987u32 { v = 0x19080819u32; }
+        if i == 988u32 { v = 0x19081908u32; }
+        if i == 989u32 { v = 0x19190808u32; }
+        if i == 990u32 { v = 0x2b2b082bu32; }
+        if i == 991u32 { v = 0x2b2b2b2bu32; }
+        if i == 992u32 { v = 0x19080808u32; }
+        if i == 993u32 { v = 0x192b1919u32; }
+        if i == 994u32 { v = 0x0808082bu32; }
+        if i == 995u32 { v = 0x08082b2bu32; }
+        if i == 996u32 { v = 0x082b082bu32; }
+        if i == 997u32 { v = 0x082b2b08u32; }
+        if i == 998u32 { v = 0x082b2b2bu32; }
+        if i == 999u32 { v = 0x2b08082bu32; }
+        if i == 1000u32 { v = 0x2b082b08u32; }
+        if i == 1001u32 { v = 0x2b082b2bu32; }
+        if i == 1002u32 { v = 0x2b2b2b08u32; }
+        if i == 1003u32 { v = 0x08080819u32; }
+        if i == 1004u32 { v = 0x08081908u32; }
+        if i == 1005u32 { v = 0x08190808u32; }
+        if i == 1006u32 { v = 0x19080808u32; }
+        if i == 1007u32 { v = 0x2b082b19u32; }
+        if i == 1008u32 { v = 0x2b2b1908u32; }
+        if i == 1009u32 { v = 0x08080808u32; }
+        if i == 1010u32 { v = 0x08192b19u32; }
+        if i == 1011u32 { v = 0x19190819u32; }
+        if i == 1012u32 { v = 0x08082b2bu32; }
+        if i == 1013u32 { v = 0x082b2b08u32; }
+        if i == 1014u32 { v = 0x2b2b082bu32; }
+        if i == 1015u32 { v = 0x19191908u32; }
+        if i == 1016u32 { v = 0x2b08192bu32; }
+        if i == 1017u32 { v = 0x08082b08u32; }
+        if i == 1018u32 { v = 0x08082b2bu32; }
+        if i == 1019u32 { v = 0x082b0808u32; }
+        if i == 1020u32 { v = 0x082b082bu32; }
+        if i == 1021u32 { v = 0x082b2b08u32; }
+        if i == 1022u32 { v = 0x2b082b08u32; }
+        if i == 1023u32 { v = 0x2b2b2b2bu32; }
+        v
+    }
+
+pub fn s_grid_hi(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x08080808u32; }
+        if i == 2u32 { v = 0x08080808u32; }
+        if i == 3u32 { v = 0x08080808u32; }
+        if i == 4u32 { v = 0x08080808u32; }
+        if i == 5u32 { v = 0x08080808u32; }
+        if i == 6u32 { v = 0x08080808u32; }
+        if i == 7u32 { v = 0x08080808u32; }
+        if i == 8u32 { v = 0x08080808u32; }
+        if i == 9u32 { v = 0x08080808u32; }
+        if i == 10u32 { v = 0x08080808u32; }
+        if i == 11u32 { v = 0x08080808u32; }
+        if i == 12u32 { v = 0x08080808u32; }
+        if i == 13u32 { v = 0x08080808u32; }
+        if i == 14u32 { v = 0x08080808u32; }
+        if i == 15u32 { v = 0x08080808u32; }
+        if i == 16u32 { v = 0x08080808u32; }
+        if i == 17u32 { v = 0x08080808u32; }
+        if i == 18u32 { v = 0x08080808u32; }
+        if i == 19u32 { v = 0x08080808u32; }
+        if i == 20u32 { v = 0x08080808u32; }
+        if i == 21u32 { v = 0x08080808u32; }
+        if i == 22u32 { v = 0x08080808u32; }
+        if i == 23u32 { v = 0x08080808u32; }
+        if i == 24u32 { v = 0x08080808u32; }
+        if i == 25u32 { v = 0x08080808u32; }
+        if i == 26u32 { v = 0x08080808u32; }
+        if i == 27u32 { v = 0x08080808u32; }
+        if i == 28u32 { v = 0x08080808u32; }
+        if i == 29u32 { v = 0x08080808u32; }
+        if i == 30u32 { v = 0x08080808u32; }
+        if i == 31u32 { v = 0x08080808u32; }
+        if i == 32u32 { v = 0x08080808u32; }
+        if i == 33u32 { v = 0x08080808u32; }
+        if i == 34u32 { v = 0x08080819u32; }
+        if i == 35u32 { v = 0x08080819u32; }
+        if i == 36u32 { v = 0x08080819u32; }
+        if i == 37u32 { v = 0x08080819u32; }
+        if i == 38u32 { v = 0x08080819u32; }
+        if i == 39u32 { v = 0x08080819u32; }
+        if i == 40u32 { v = 0x08080819u32; }
+        if i == 41u32 { v = 0x08080819u32; }
+        if i == 42u32 { v = 0x08080819u32; }
+        if i == 43u32 { v = 0x08080819u32; }
+        if i == 44u32 { v = 0x08080819u32; }
+        if i == 45u32 { v = 0x08080819u32; }
+        if i == 46u32 { v = 0x08080819u32; }
+        if i == 47u32 { v = 0x08080819u32; }
+        if i == 48u32 { v = 0x08080819u32; }
+        if i == 49u32 { v = 0x08080819u32; }
+        if i == 50u32 { v = 0x08080819u32; }
+        if i == 51u32 { v = 0x08080819u32; }
+        if i == 52u32 { v = 0x08080819u32; }
+        if i == 53u32 { v = 0x08080819u32; }
+        if i == 54u32 { v = 0x08080819u32; }
+        if i == 55u32 { v = 0x08080819u32; }
+        if i == 56u32 { v = 0x08080819u32; }
+        if i == 57u32 { v = 0x08080819u32; }
+        if i == 58u32 { v = 0x08080819u32; }
+        if i == 59u32 { v = 0x08080819u32; }
+        if i == 60u32 { v = 0x08080819u32; }
+        if i == 61u32 { v = 0x08080819u32; }
+        if i == 62u32 { v = 0x0808082bu32; }
+        if i == 63u32 { v = 0x0808082bu32; }
+        if i == 64u32 { v = 0x0808082bu32; }
+        if i == 65u32 { v = 0x0808082bu32; }
+        if i == 66u32 { v = 0x0808082bu32; }
+        if i == 67u32 { v = 0x0808082bu32; }
+        if i == 68u32 { v = 0x0808082bu32; }
+        if i == 69u32 { v = 0x0808082bu32; }
+        if i == 70u32 { v = 0x0808082bu32; }
+        if i == 71u32 { v = 0x0808082bu32; }
+        if i == 72u32 { v = 0x0808082bu32; }
+        if i == 73u32 { v = 0x0808082bu32; }
+        if i == 74u32 { v = 0x0808082bu32; }
+        if i == 75u32 { v = 0x0808082bu32; }
+        if i == 76u32 { v = 0x0808082bu32; }
+        if i == 77u32 { v = 0x0808082bu32; }
+        if i == 78u32 { v = 0x0808082bu32; }
+        if i == 79u32 { v = 0x0808082bu32; }
+        if i == 80u32 { v = 0x0808082bu32; }
+        if i == 81u32 { v = 0x08081908u32; }
+        if i == 82u32 { v = 0x08081908u32; }
+        if i == 83u32 { v = 0x08081908u32; }
+        if i == 84u32 { v = 0x08081908u32; }
+        if i == 85u32 { v = 0x08081908u32; }
+        if i == 86u32 { v = 0x08081908u32; }
+        if i == 87u32 { v = 0x08081908u32; }
+        if i == 88u32 { v = 0x08081908u32; }
+        if i == 89u32 { v = 0x08081908u32; }
+        if i == 90u32 { v = 0x08081908u32; }
+        if i == 91u32 { v = 0x08081908u32; }
+        if i == 92u32 { v = 0x08081908u32; }
+        if i == 93u32 { v = 0x08081908u32; }
+        if i == 94u32 { v = 0x08081908u32; }
+        if i == 95u32 { v = 0x08081908u32; }
+        if i == 96u32 { v = 0x08081908u32; }
+        if i == 97u32 { v = 0x08081908u32; }
+        if i == 98u32 { v = 0x08081908u32; }
+        if i == 99u32 { v = 0x08081908u32; }
+        if i == 100u32 { v = 0x08081908u32; }
+        if i == 101u32 { v = 0x08081908u32; }
+        if i == 102u32 { v = 0x08081908u32; }
+        if i == 103u32 { v = 0x08081908u32; }
+        if i == 104u32 { v = 0x08081908u32; }
+        if i == 105u32 { v = 0x08081908u32; }
+        if i == 106u32 { v = 0x08081908u32; }
+        if i == 107u32 { v = 0x08081908u32; }
+        if i == 108u32 { v = 0x08081908u32; }
+        if i == 109u32 { v = 0x08081908u32; }
+        if i == 110u32 { v = 0x08081908u32; }
+        if i == 111u32 { v = 0x08081908u32; }
+        if i == 112u32 { v = 0x08081908u32; }
+        if i == 113u32 { v = 0x08081908u32; }
+        if i == 114u32 { v = 0x08081919u32; }
+        if i == 115u32 { v = 0x08081919u32; }
+        if i == 116u32 { v = 0x08081919u32; }
+        if i == 117u32 { v = 0x08081919u32; }
+        if i == 118u32 { v = 0x08081919u32; }
+        if i == 119u32 { v = 0x08081919u32; }
+        if i == 120u32 { v = 0x08081919u32; }
+        if i == 121u32 { v = 0x08081919u32; }
+        if i == 122u32 { v = 0x08081919u32; }
+        if i == 123u32 { v = 0x08081919u32; }
+        if i == 124u32 { v = 0x08081919u32; }
+        if i == 125u32 { v = 0x08081919u32; }
+        if i == 126u32 { v = 0x08081919u32; }
+        if i == 127u32 { v = 0x08081919u32; }
+        if i == 128u32 { v = 0x08081919u32; }
+        if i == 129u32 { v = 0x08081919u32; }
+        if i == 130u32 { v = 0x08081919u32; }
+        if i == 131u32 { v = 0x08081919u32; }
+        if i == 132u32 { v = 0x08081919u32; }
+        if i == 133u32 { v = 0x08081919u32; }
+        if i == 134u32 { v = 0x08081919u32; }
+        if i == 135u32 { v = 0x08081919u32; }
+        if i == 136u32 { v = 0x08081919u32; }
+        if i == 137u32 { v = 0x08081919u32; }
+        if i == 138u32 { v = 0x08081919u32; }
+        if i == 139u32 { v = 0x08081919u32; }
+        if i == 140u32 { v = 0x08081919u32; }
+        if i == 141u32 { v = 0x08081919u32; }
+        if i == 142u32 { v = 0x08081919u32; }
+        if i == 143u32 { v = 0x0808192bu32; }
+        if i == 144u32 { v = 0x0808192bu32; }
+        if i == 145u32 { v = 0x0808192bu32; }
+        if i == 146u32 { v = 0x0808192bu32; }
+        if i == 147u32 { v = 0x0808192bu32; }
+        if i == 148u32 { v = 0x0808192bu32; }
+        if i == 149u32 { v = 0x0808192bu32; }
+        if i == 150u32 { v = 0x0808192bu32; }
+        if i == 151u32 { v = 0x0808192bu32; }
+        if i == 152u32 { v = 0x0808192bu32; }
+        if i == 153u32 { v = 0x0808192bu32; }
+        if i == 154u32 { v = 0x0808192bu32; }
+        if i == 155u32 { v = 0x0808192bu32; }
+        if i == 156u32 { v = 0x0808192bu32; }
+        if i == 157u32 { v = 0x0808192bu32; }
+        if i == 158u32 { v = 0x08082b08u32; }
+        if i == 159u32 { v = 0x08082b08u32; }
+        if i == 160u32 { v = 0x08082b08u32; }
+        if i == 161u32 { v = 0x08082b08u32; }
+        if i == 162u32 { v = 0x08082b08u32; }
+        if i == 163u32 { v = 0x08082b08u32; }
+        if i == 164u32 { v = 0x08082b08u32; }
+        if i == 165u32 { v = 0x08082b08u32; }
+        if i == 166u32 { v = 0x08082b08u32; }
+        if i == 167u32 { v = 0x08082b08u32; }
+        if i == 168u32 { v = 0x08082b08u32; }
+        if i == 169u32 { v = 0x08082b08u32; }
+        if i == 170u32 { v = 0x08082b08u32; }
+        if i == 171u32 { v = 0x08082b08u32; }
+        if i == 172u32 { v = 0x08082b08u32; }
+        if i == 173u32 { v = 0x08082b08u32; }
+        if i == 174u32 { v = 0x08082b08u32; }
+        if i == 175u32 { v = 0x08082b08u32; }
+        if i == 176u32 { v = 0x08082b08u32; }
+        if i == 177u32 { v = 0x08082b08u32; }
+        if i == 178u32 { v = 0x08082b08u32; }
+        if i == 179u32 { v = 0x08082b08u32; }
+        if i == 180u32 { v = 0x08082b08u32; }
+        if i == 181u32 { v = 0x08082b08u32; }
+        if i == 182u32 { v = 0x08082b08u32; }
+        if i == 183u32 { v = 0x08082b19u32; }
+        if i == 184u32 { v = 0x08082b19u32; }
+        if i == 185u32 { v = 0x08082b19u32; }
+        if i == 186u32 { v = 0x08082b19u32; }
+        if i == 187u32 { v = 0x08082b19u32; }
+        if i == 188u32 { v = 0x08082b19u32; }
+        if i == 189u32 { v = 0x08082b19u32; }
+        if i == 190u32 { v = 0x08082b19u32; }
+        if i == 191u32 { v = 0x08082b19u32; }
+        if i == 192u32 { v = 0x08082b19u32; }
+        if i == 193u32 { v = 0x08082b19u32; }
+        if i == 194u32 { v = 0x08082b19u32; }
+        if i == 195u32 { v = 0x08082b19u32; }
+        if i == 196u32 { v = 0x08082b19u32; }
+        if i == 197u32 { v = 0x08082b19u32; }
+        if i == 198u32 { v = 0x08082b2bu32; }
+        if i == 199u32 { v = 0x08082b2bu32; }
+        if i == 200u32 { v = 0x08082b2bu32; }
+        if i == 201u32 { v = 0x08082b2bu32; }
+        if i == 202u32 { v = 0x08082b2bu32; }
+        if i == 203u32 { v = 0x08082b2bu32; }
+        if i == 204u32 { v = 0x08082b2bu32; }
+        if i == 205u32 { v = 0x08082b2bu32; }
+        if i == 206u32 { v = 0x08190808u32; }
+        if i == 207u32 { v = 0x08190808u32; }
+        if i == 208u32 { v = 0x08190808u32; }
+        if i == 209u32 { v = 0x08190808u32; }
+        if i == 210u32 { v = 0x08190808u32; }
+        if i == 211u32 { v = 0x08190808u32; }
+        if i == 212u32 { v = 0x08190808u32; }
+        if i == 213u32 { v = 0x08190808u32; }
+        if i == 214u32 { v = 0x08190808u32; }
+        if i == 215u32 { v = 0x08190808u32; }
+        if i == 216u32 { v = 0x08190808u32; }
+        if i == 217u32 { v = 0x08190808u32; }
+        if i == 218u32 { v = 0x08190808u32; }
+        if i == 219u32 { v = 0x08190808u32; }
+        if i == 220u32 { v = 0x08190808u32; }
+        if i == 221u32 { v = 0x08190808u32; }
+        if i == 222u32 { v = 0x08190808u32; }
+        if i == 223u32 { v = 0x08190808u32; }
+        if i == 224u32 { v = 0x08190808u32; }
+        if i == 225u32 { v = 0x08190808u32; }
+        if i == 226u32 { v = 0x08190808u32; }
+        if i == 227u32 { v = 0x08190808u32; }
+        if i == 228u32 { v = 0x08190808u32; }
+        if i == 229u32 { v = 0x08190808u32; }
+        if i == 230u32 { v = 0x08190808u32; }
+        if i == 231u32 { v = 0x08190808u32; }
+        if i == 232u32 { v = 0x08190808u32; }
+        if i == 233u32 { v = 0x08190808u32; }
+        if i == 234u32 { v = 0x08190808u32; }
+        if i == 235u32 { v = 0x08190808u32; }
+        if i == 236u32 { v = 0x08190808u32; }
+        if i == 237u32 { v = 0x08190819u32; }
+        if i == 238u32 { v = 0x08190819u32; }
+        if i == 239u32 { v = 0x08190819u32; }
+        if i == 240u32 { v = 0x08190819u32; }
+        if i == 241u32 { v = 0x08190819u32; }
+        if i == 242u32 { v = 0x08190819u32; }
+        if i == 243u32 { v = 0x08190819u32; }
+        if i == 244u32 { v = 0x08190819u32; }
+        if i == 245u32 { v = 0x08190819u32; }
+        if i == 246u32 { v = 0x08190819u32; }
+        if i == 247u32 { v = 0x08190819u32; }
+        if i == 248u32 { v = 0x08190819u32; }
+        if i == 249u32 { v = 0x08190819u32; }
+        if i == 250u32 { v = 0x08190819u32; }
+        if i == 251u32 { v = 0x08190819u32; }
+        if i == 252u32 { v = 0x08190819u32; }
+        if i == 253u32 { v = 0x08190819u32; }
+        if i == 254u32 { v = 0x08190819u32; }
+        if i == 255u32 { v = 0x08190819u32; }
+        if i == 256u32 { v = 0x08190819u32; }
+        if i == 257u32 { v = 0x08190819u32; }
+        if i == 258u32 { v = 0x08190819u32; }
+        if i == 259u32 { v = 0x08190819u32; }
+        if i == 260u32 { v = 0x08190819u32; }
+        if i == 261u32 { v = 0x08190819u32; }
+        if i == 262u32 { v = 0x08190819u32; }
+        if i == 263u32 { v = 0x08190819u32; }
+        if i == 264u32 { v = 0x08190819u32; }
+        if i == 265u32 { v = 0x08190819u32; }
+        if i == 266u32 { v = 0x0819082bu32; }
+        if i == 267u32 { v = 0x0819082bu32; }
+        if i == 268u32 { v = 0x0819082bu32; }
+        if i == 269u32 { v = 0x0819082bu32; }
+        if i == 270u32 { v = 0x0819082bu32; }
+        if i == 271u32 { v = 0x0819082bu32; }
+        if i == 272u32 { v = 0x0819082bu32; }
+        if i == 273u32 { v = 0x0819082bu32; }
+        if i == 274u32 { v = 0x0819082bu32; }
+        if i == 275u32 { v = 0x0819082bu32; }
+        if i == 276u32 { v = 0x0819082bu32; }
+        if i == 277u32 { v = 0x0819082bu32; }
+        if i == 278u32 { v = 0x0819082bu32; }
+        if i == 279u32 { v = 0x0819082bu32; }
+        if i == 280u32 { v = 0x08191908u32; }
+        if i == 281u32 { v = 0x08191908u32; }
+        if i == 282u32 { v = 0x08191908u32; }
+        if i == 283u32 { v = 0x08191908u32; }
+        if i == 284u32 { v = 0x08191908u32; }
+        if i == 285u32 { v = 0x08191908u32; }
+        if i == 286u32 { v = 0x08191908u32; }
+        if i == 287u32 { v = 0x08191908u32; }
+        if i == 288u32 { v = 0x08191908u32; }
+        if i == 289u32 { v = 0x08191908u32; }
+        if i == 290u32 { v = 0x08191908u32; }
+        if i == 291u32 { v = 0x08191908u32; }
+        if i == 292u32 { v = 0x08191908u32; }
+        if i == 293u32 { v = 0x08191908u32; }
+        if i == 294u32 { v = 0x08191908u32; }
+        if i == 295u32 { v = 0x08191908u32; }
+        if i == 296u32 { v = 0x08191908u32; }
+        if i == 297u32 { v = 0x08191908u32; }
+        if i == 298u32 { v = 0x08191908u32; }
+        if i == 299u32 { v = 0x08191908u32; }
+        if i == 300u32 { v = 0x08191908u32; }
+        if i == 301u32 { v = 0x08191908u32; }
+        if i == 302u32 { v = 0x08191908u32; }
+        if i == 303u32 { v = 0x08191908u32; }
+        if i == 304u32 { v = 0x08191908u32; }
+        if i == 305u32 { v = 0x08191908u32; }
+        if i == 306u32 { v = 0x08191908u32; }
+        if i == 307u32 { v = 0x08191908u32; }
+        if i == 308u32 { v = 0x08191919u32; }
+        if i == 309u32 { v = 0x08191919u32; }
+        if i == 310u32 { v = 0x08191919u32; }
+        if i == 311u32 { v = 0x08191919u32; }
+        if i == 312u32 { v = 0x08191919u32; }
+        if i == 313u32 { v = 0x08191919u32; }
+        if i == 314u32 { v = 0x08191919u32; }
+        if i == 315u32 { v = 0x08191919u32; }
+        if i == 316u32 { v = 0x08191919u32; }
+        if i == 317u32 { v = 0x08191919u32; }
+        if i == 318u32 { v = 0x08191919u32; }
+        if i == 319u32 { v = 0x08191919u32; }
+        if i == 320u32 { v = 0x08191919u32; }
+        if i == 321u32 { v = 0x08191919u32; }
+        if i == 322u32 { v = 0x08191919u32; }
+        if i == 323u32 { v = 0x08191919u32; }
+        if i == 324u32 { v = 0x08191919u32; }
+        if i == 325u32 { v = 0x08191919u32; }
+        if i == 326u32 { v = 0x08191919u32; }
+        if i == 327u32 { v = 0x08191919u32; }
+        if i == 328u32 { v = 0x0819192bu32; }
+        if i == 329u32 { v = 0x0819192bu32; }
+        if i == 330u32 { v = 0x0819192bu32; }
+        if i == 331u32 { v = 0x0819192bu32; }
+        if i == 332u32 { v = 0x0819192bu32; }
+        if i == 333u32 { v = 0x0819192bu32; }
+        if i == 334u32 { v = 0x0819192bu32; }
+        if i == 335u32 { v = 0x0819192bu32; }
+        if i == 336u32 { v = 0x0819192bu32; }
+        if i == 337u32 { v = 0x0819192bu32; }
+        if i == 338u32 { v = 0x0819192bu32; }
+        if i == 339u32 { v = 0x08192b08u32; }
+        if i == 340u32 { v = 0x08192b08u32; }
+        if i == 341u32 { v = 0x08192b08u32; }
+        if i == 342u32 { v = 0x08192b08u32; }
+        if i == 343u32 { v = 0x08192b08u32; }
+        if i == 344u32 { v = 0x08192b08u32; }
+        if i == 345u32 { v = 0x08192b08u32; }
+        if i == 346u32 { v = 0x08192b08u32; }
+        if i == 347u32 { v = 0x08192b08u32; }
+        if i == 348u32 { v = 0x08192b08u32; }
+        if i == 349u32 { v = 0x08192b08u32; }
+        if i == 350u32 { v = 0x08192b08u32; }
+        if i == 351u32 { v = 0x08192b08u32; }
+        if i == 352u32 { v = 0x08192b08u32; }
+        if i == 353u32 { v = 0x08192b08u32; }
+        if i == 354u32 { v = 0x08192b08u32; }
+        if i == 355u32 { v = 0x08192b08u32; }
+        if i == 356u32 { v = 0x08192b19u32; }
+        if i == 357u32 { v = 0x08192b19u32; }
+        if i == 358u32 { v = 0x08192b19u32; }
+        if i == 359u32 { v = 0x08192b19u32; }
+        if i == 360u32 { v = 0x08192b19u32; }
+        if i == 361u32 { v = 0x08192b19u32; }
+        if i == 362u32 { v = 0x08192b19u32; }
+        if i == 363u32 { v = 0x08192b19u32; }
+        if i == 364u32 { v = 0x08192b19u32; }
+        if i == 365u32 { v = 0x08192b19u32; }
+        if i == 366u32 { v = 0x08192b19u32; }
+        if i == 367u32 { v = 0x08192b19u32; }
+        if i == 368u32 { v = 0x08192b2bu32; }
+        if i == 369u32 { v = 0x08192b2bu32; }
+        if i == 370u32 { v = 0x08192b2bu32; }
+        if i == 371u32 { v = 0x08192b2bu32; }
+        if i == 372u32 { v = 0x082b0808u32; }
+        if i == 373u32 { v = 0x082b0808u32; }
+        if i == 374u32 { v = 0x082b0808u32; }
+        if i == 375u32 { v = 0x082b0808u32; }
+        if i == 376u32 { v = 0x082b0808u32; }
+        if i == 377u32 { v = 0x082b0808u32; }
+        if i == 378u32 { v = 0x082b0808u32; }
+        if i == 379u32 { v = 0x082b0808u32; }
+        if i == 380u32 { v = 0x082b0808u32; }
+        if i == 381u32 { v = 0x082b0808u32; }
+        if i == 382u32 { v = 0x082b0808u32; }
+        if i == 383u32 { v = 0x082b0808u32; }
+        if i == 384u32 { v = 0x082b0808u32; }
+        if i == 385u32 { v = 0x082b0808u32; }
+        if i == 386u32 { v = 0x082b0808u32; }
+        if i == 387u32 { v = 0x082b0808u32; }
+        if i == 388u32 { v = 0x082b0808u32; }
+        if i == 389u32 { v = 0x082b0808u32; }
+        if i == 390u32 { v = 0x082b0808u32; }
+        if i == 391u32 { v = 0x082b0808u32; }
+        if i == 392u32 { v = 0x082b0808u32; }
+        if i == 393u32 { v = 0x082b0819u32; }
+        if i == 394u32 { v = 0x082b0819u32; }
+        if i == 395u32 { v = 0x082b0819u32; }
+        if i == 396u32 { v = 0x082b0819u32; }
+        if i == 397u32 { v = 0x082b0819u32; }
+        if i == 398u32 { v = 0x082b0819u32; }
+        if i == 399u32 { v = 0x082b0819u32; }
+        if i == 400u32 { v = 0x082b0819u32; }
+        if i == 401u32 { v = 0x082b0819u32; }
+        if i == 402u32 { v = 0x082b0819u32; }
+        if i == 403u32 { v = 0x082b0819u32; }
+        if i == 404u32 { v = 0x082b0819u32; }
+        if i == 405u32 { v = 0x082b0819u32; }
+        if i == 406u32 { v = 0x082b0819u32; }
+        if i == 407u32 { v = 0x082b0819u32; }
+        if i == 408u32 { v = 0x082b082bu32; }
+        if i == 409u32 { v = 0x082b082bu32; }
+        if i == 410u32 { v = 0x082b082bu32; }
+        if i == 411u32 { v = 0x082b082bu32; }
+        if i == 412u32 { v = 0x082b082bu32; }
+        if i == 413u32 { v = 0x082b082bu32; }
+        if i == 414u32 { v = 0x082b082bu32; }
+        if i == 415u32 { v = 0x082b082bu32; }
+        if i == 416u32 { v = 0x082b082bu32; }
+        if i == 417u32 { v = 0x082b082bu32; }
+        if i == 418u32 { v = 0x082b1908u32; }
+        if i == 419u32 { v = 0x082b1908u32; }
+        if i == 420u32 { v = 0x082b1908u32; }
+        if i == 421u32 { v = 0x082b1908u32; }
+        if i == 422u32 { v = 0x082b1908u32; }
+        if i == 423u32 { v = 0x082b1908u32; }
+        if i == 424u32 { v = 0x082b1908u32; }
+        if i == 425u32 { v = 0x082b1908u32; }
+        if i == 426u32 { v = 0x082b1908u32; }
+        if i == 427u32 { v = 0x082b1908u32; }
+        if i == 428u32 { v = 0x082b1908u32; }
+        if i == 429u32 { v = 0x082b1908u32; }
+        if i == 430u32 { v = 0x082b1908u32; }
+        if i == 431u32 { v = 0x082b1908u32; }
+        if i == 432u32 { v = 0x082b1908u32; }
+        if i == 433u32 { v = 0x082b1908u32; }
+        if i == 434u32 { v = 0x082b1908u32; }
+        if i == 435u32 { v = 0x082b1908u32; }
+        if i == 436u32 { v = 0x082b1908u32; }
+        if i == 437u32 { v = 0x082b1919u32; }
+        if i == 438u32 { v = 0x082b1919u32; }
+        if i == 439u32 { v = 0x082b1919u32; }
+        if i == 440u32 { v = 0x082b1919u32; }
+        if i == 441u32 { v = 0x082b1919u32; }
+        if i == 442u32 { v = 0x082b1919u32; }
+        if i == 443u32 { v = 0x082b1919u32; }
+        if i == 444u32 { v = 0x082b1919u32; }
+        if i == 445u32 { v = 0x082b1919u32; }
+        if i == 446u32 { v = 0x082b1919u32; }
+        if i == 447u32 { v = 0x082b1919u32; }
+        if i == 448u32 { v = 0x082b192bu32; }
+        if i == 449u32 { v = 0x082b192bu32; }
+        if i == 450u32 { v = 0x082b192bu32; }
+        if i == 451u32 { v = 0x082b192bu32; }
+        if i == 452u32 { v = 0x082b192bu32; }
+        if i == 453u32 { v = 0x082b2b08u32; }
+        if i == 454u32 { v = 0x082b2b08u32; }
+        if i == 455u32 { v = 0x082b2b08u32; }
+        if i == 456u32 { v = 0x082b2b08u32; }
+        if i == 457u32 { v = 0x082b2b08u32; }
+        if i == 458u32 { v = 0x082b2b08u32; }
+        if i == 459u32 { v = 0x082b2b08u32; }
+        if i == 460u32 { v = 0x082b2b08u32; }
+        if i == 461u32 { v = 0x082b2b08u32; }
+        if i == 462u32 { v = 0x082b2b19u32; }
+        if i == 463u32 { v = 0x082b2b19u32; }
+        if i == 464u32 { v = 0x082b2b19u32; }
+        if i == 465u32 { v = 0x082b2b19u32; }
+        if i == 466u32 { v = 0x082b2b2bu32; }
+        if i == 467u32 { v = 0x082b2b2bu32; }
+        if i == 468u32 { v = 0x082b2b2bu32; }
+        if i == 469u32 { v = 0x082b2b2bu32; }
+        if i == 470u32 { v = 0x082b2b2bu32; }
+        if i == 471u32 { v = 0x19080808u32; }
+        if i == 472u32 { v = 0x19080808u32; }
+        if i == 473u32 { v = 0x19080808u32; }
+        if i == 474u32 { v = 0x19080808u32; }
+        if i == 475u32 { v = 0x19080808u32; }
+        if i == 476u32 { v = 0x19080808u32; }
+        if i == 477u32 { v = 0x19080808u32; }
+        if i == 478u32 { v = 0x19080808u32; }
+        if i == 479u32 { v = 0x19080808u32; }
+        if i == 480u32 { v = 0x19080808u32; }
+        if i == 481u32 { v = 0x19080808u32; }
+        if i == 482u32 { v = 0x19080808u32; }
+        if i == 483u32 { v = 0x19080808u32; }
+        if i == 484u32 { v = 0x19080808u32; }
+        if i == 485u32 { v = 0x19080808u32; }
+        if i == 486u32 { v = 0x19080808u32; }
+        if i == 487u32 { v = 0x19080808u32; }
+        if i == 488u32 { v = 0x19080808u32; }
+        if i == 489u32 { v = 0x19080808u32; }
+        if i == 490u32 { v = 0x19080808u32; }
+        if i == 491u32 { v = 0x19080808u32; }
+        if i == 492u32 { v = 0x19080808u32; }
+        if i == 493u32 { v = 0x19080808u32; }
+        if i == 494u32 { v = 0x19080808u32; }
+        if i == 495u32 { v = 0x19080808u32; }
+        if i == 496u32 { v = 0x19080808u32; }
+        if i == 497u32 { v = 0x19080808u32; }
+        if i == 498u32 { v = 0x19080808u32; }
+        if i == 499u32 { v = 0x19080808u32; }
+        if i == 500u32 { v = 0x19080808u32; }
+        if i == 501u32 { v = 0x19080808u32; }
+        if i == 502u32 { v = 0x19080819u32; }
+        if i == 503u32 { v = 0x19080819u32; }
+        if i == 504u32 { v = 0x19080819u32; }
+        if i == 505u32 { v = 0x19080819u32; }
+        if i == 506u32 { v = 0x19080819u32; }
+        if i == 507u32 { v = 0x19080819u32; }
+        if i == 508u32 { v = 0x19080819u32; }
+        if i == 509u32 { v = 0x19080819u32; }
+        if i == 510u32 { v = 0x19080819u32; }
+        if i == 511u32 { v = 0x19080819u32; }
+        if i == 512u32 { v = 0x19080819u32; }
+        if i == 513u32 { v = 0x19080819u32; }
+        if i == 514u32 { v = 0x19080819u32; }
+        if i == 515u32 { v = 0x19080819u32; }
+        if i == 516u32 { v = 0x19080819u32; }
+        if i == 517u32 { v = 0x19080819u32; }
+        if i == 518u32 { v = 0x19080819u32; }
+        if i == 519u32 { v = 0x19080819u32; }
+        if i == 520u32 { v = 0x19080819u32; }
+        if i == 521u32 { v = 0x19080819u32; }
+        if i == 522u32 { v = 0x19080819u32; }
+        if i == 523u32 { v = 0x19080819u32; }
+        if i == 524u32 { v = 0x19080819u32; }
+        if i == 525u32 { v = 0x19080819u32; }
+        if i == 526u32 { v = 0x19080819u32; }
+        if i == 527u32 { v = 0x19080819u32; }
+        if i == 528u32 { v = 0x19080819u32; }
+        if i == 529u32 { v = 0x19080819u32; }
+        if i == 530u32 { v = 0x1908082bu32; }
+        if i == 531u32 { v = 0x1908082bu32; }
+        if i == 532u32 { v = 0x1908082bu32; }
+        if i == 533u32 { v = 0x1908082bu32; }
+        if i == 534u32 { v = 0x1908082bu32; }
+        if i == 535u32 { v = 0x1908082bu32; }
+        if i == 536u32 { v = 0x1908082bu32; }
+        if i == 537u32 { v = 0x1908082bu32; }
+        if i == 538u32 { v = 0x1908082bu32; }
+        if i == 539u32 { v = 0x1908082bu32; }
+        if i == 540u32 { v = 0x1908082bu32; }
+        if i == 541u32 { v = 0x1908082bu32; }
+        if i == 542u32 { v = 0x1908082bu32; }
+        if i == 543u32 { v = 0x1908082bu32; }
+        if i == 544u32 { v = 0x1908082bu32; }
+        if i == 545u32 { v = 0x19081908u32; }
+        if i == 546u32 { v = 0x19081908u32; }
+        if i == 547u32 { v = 0x19081908u32; }
+        if i == 548u32 { v = 0x19081908u32; }
+        if i == 549u32 { v = 0x19081908u32; }
+        if i == 550u32 { v = 0x19081908u32; }
+        if i == 551u32 { v = 0x19081908u32; }
+        if i == 552u32 { v = 0x19081908u32; }
+        if i == 553u32 { v = 0x19081908u32; }
+        if i == 554u32 { v = 0x19081908u32; }
+        if i == 555u32 { v = 0x19081908u32; }
+        if i == 556u32 { v = 0x19081908u32; }
+        if i == 557u32 { v = 0x19081908u32; }
+        if i == 558u32 { v = 0x19081908u32; }
+        if i == 559u32 { v = 0x19081908u32; }
+        if i == 560u32 { v = 0x19081908u32; }
+        if i == 561u32 { v = 0x19081908u32; }
+        if i == 562u32 { v = 0x19081908u32; }
+        if i == 563u32 { v = 0x19081908u32; }
+        if i == 564u32 { v = 0x19081908u32; }
+        if i == 565u32 { v = 0x19081908u32; }
+        if i == 566u32 { v = 0x19081908u32; }
+        if i == 567u32 { v = 0x19081908u32; }
+        if i == 568u32 { v = 0x19081908u32; }
+        if i == 569u32 { v = 0x19081908u32; }
+        if i == 570u32 { v = 0x19081908u32; }
+        if i == 571u32 { v = 0x19081908u32; }
+        if i == 572u32 { v = 0x19081908u32; }
+        if i == 573u32 { v = 0x19081908u32; }
+        if i == 574u32 { v = 0x19081908u32; }
+        if i == 575u32 { v = 0x19081919u32; }
+        if i == 576u32 { v = 0x19081919u32; }
+        if i == 577u32 { v = 0x19081919u32; }
+        if i == 578u32 { v = 0x19081919u32; }
+        if i == 579u32 { v = 0x19081919u32; }
+        if i == 580u32 { v = 0x19081919u32; }
+        if i == 581u32 { v = 0x19081919u32; }
+        if i == 582u32 { v = 0x19081919u32; }
+        if i == 583u32 { v = 0x19081919u32; }
+        if i == 584u32 { v = 0x19081919u32; }
+        if i == 585u32 { v = 0x19081919u32; }
+        if i == 586u32 { v = 0x19081919u32; }
+        if i == 587u32 { v = 0x19081919u32; }
+        if i == 588u32 { v = 0x19081919u32; }
+        if i == 589u32 { v = 0x19081919u32; }
+        if i == 590u32 { v = 0x19081919u32; }
+        if i == 591u32 { v = 0x19081919u32; }
+        if i == 592u32 { v = 0x19081919u32; }
+        if i == 593u32 { v = 0x19081919u32; }
+        if i == 594u32 { v = 0x19081919u32; }
+        if i == 595u32 { v = 0x19081919u32; }
+        if i == 596u32 { v = 0x1908192bu32; }
+        if i == 597u32 { v = 0x1908192bu32; }
+        if i == 598u32 { v = 0x1908192bu32; }
+        if i == 599u32 { v = 0x1908192bu32; }
+        if i == 600u32 { v = 0x1908192bu32; }
+        if i == 601u32 { v = 0x1908192bu32; }
+        if i == 602u32 { v = 0x1908192bu32; }
+        if i == 603u32 { v = 0x1908192bu32; }
+        if i == 604u32 { v = 0x1908192bu32; }
+        if i == 605u32 { v = 0x1908192bu32; }
+        if i == 606u32 { v = 0x1908192bu32; }
+        if i == 607u32 { v = 0x1908192bu32; }
+        if i == 608u32 { v = 0x19082b08u32; }
+        if i == 609u32 { v = 0x19082b08u32; }
+        if i == 610u32 { v = 0x19082b08u32; }
+        if i == 611u32 { v = 0x19082b08u32; }
+        if i == 612u32 { v = 0x19082b08u32; }
+        if i == 613u32 { v = 0x19082b08u32; }
+        if i == 614u32 { v = 0x19082b08u32; }
+        if i == 615u32 { v = 0x19082b08u32; }
+        if i == 616u32 { v = 0x19082b08u32; }
+        if i == 617u32 { v = 0x19082b08u32; }
+        if i == 618u32 { v = 0x19082b08u32; }
+        if i == 619u32 { v = 0x19082b08u32; }
+        if i == 620u32 { v = 0x19082b08u32; }
+        if i == 621u32 { v = 0x19082b08u32; }
+        if i == 622u32 { v = 0x19082b08u32; }
+        if i == 623u32 { v = 0x19082b08u32; }
+        if i == 624u32 { v = 0x19082b08u32; }
+        if i == 625u32 { v = 0x19082b08u32; }
+        if i == 626u32 { v = 0x19082b19u32; }
+        if i == 627u32 { v = 0x19082b19u32; }
+        if i == 628u32 { v = 0x19082b19u32; }
+        if i == 629u32 { v = 0x19082b19u32; }
+        if i == 630u32 { v = 0x19082b19u32; }
+        if i == 631u32 { v = 0x19082b19u32; }
+        if i == 632u32 { v = 0x19082b19u32; }
+        if i == 633u32 { v = 0x19082b19u32; }
+        if i == 634u32 { v = 0x19082b19u32; }
+        if i == 635u32 { v = 0x19082b19u32; }
+        if i == 636u32 { v = 0x19082b19u32; }
+        if i == 637u32 { v = 0x19082b19u32; }
+        if i == 638u32 { v = 0x19082b2bu32; }
+        if i == 639u32 { v = 0x19082b2bu32; }
+        if i == 640u32 { v = 0x19082b2bu32; }
+        if i == 641u32 { v = 0x19082b2bu32; }
+        if i == 642u32 { v = 0x19190808u32; }
+        if i == 643u32 { v = 0x19190808u32; }
+        if i == 644u32 { v = 0x19190808u32; }
+        if i == 645u32 { v = 0x19190808u32; }
+        if i == 646u32 { v = 0x19190808u32; }
+        if i == 647u32 { v = 0x19190808u32; }
+        if i == 648u32 { v = 0x19190808u32; }
+        if i == 649u32 { v = 0x19190808u32; }
+        if i == 650u32 { v = 0x19190808u32; }
+        if i == 651u32 { v = 0x19190808u32; }
+        if i == 652u32 { v = 0x19190808u32; }
+        if i == 653u32 { v = 0x19190808u32; }
+        if i == 654u32 { v = 0x19190808u32; }
+        if i == 655u32 { v = 0x19190808u32; }
+        if i == 656u32 { v = 0x19190808u32; }
+        if i == 657u32 { v = 0x19190808u32; }
+        if i == 658u32 { v = 0x19190808u32; }
+        if i == 659u32 { v = 0x19190808u32; }
+        if i == 660u32 { v = 0x19190808u32; }
+        if i == 661u32 { v = 0x19190808u32; }
+        if i == 662u32 { v = 0x19190808u32; }
+        if i == 663u32 { v = 0x19190808u32; }
+        if i == 664u32 { v = 0x19190808u32; }
+        if i == 665u32 { v = 0x19190808u32; }
+        if i == 666u32 { v = 0x19190808u32; }
+        if i == 667u32 { v = 0x19190808u32; }
+        if i == 668u32 { v = 0x19190808u32; }
+        if i == 669u32 { v = 0x19190808u32; }
+        if i == 670u32 { v = 0x19190819u32; }
+        if i == 671u32 { v = 0x19190819u32; }
+        if i == 672u32 { v = 0x19190819u32; }
+        if i == 673u32 { v = 0x19190819u32; }
+        if i == 674u32 { v = 0x19190819u32; }
+        if i == 675u32 { v = 0x19190819u32; }
+        if i == 676u32 { v = 0x19190819u32; }
+        if i == 677u32 { v = 0x19190819u32; }
+        if i == 678u32 { v = 0x19190819u32; }
+        if i == 679u32 { v = 0x19190819u32; }
+        if i == 680u32 { v = 0x19190819u32; }
+        if i == 681u32 { v = 0x19190819u32; }
+        if i == 682u32 { v = 0x19190819u32; }
+        if i == 683u32 { v = 0x19190819u32; }
+        if i == 684u32 { v = 0x19190819u32; }
+        if i == 685u32 { v = 0x19190819u32; }
+        if i == 686u32 { v = 0x19190819u32; }
+        if i == 687u32 { v = 0x19190819u32; }
+        if i == 688u32 { v = 0x19190819u32; }
+        if i == 689u32 { v = 0x19190819u32; }
+        if i == 690u32 { v = 0x1919082bu32; }
+        if i == 691u32 { v = 0x1919082bu32; }
+        if i == 692u32 { v = 0x1919082bu32; }
+        if i == 693u32 { v = 0x1919082bu32; }
+        if i == 694u32 { v = 0x1919082bu32; }
+        if i == 695u32 { v = 0x1919082bu32; }
+        if i == 696u32 { v = 0x1919082bu32; }
+        if i == 697u32 { v = 0x1919082bu32; }
+        if i == 698u32 { v = 0x1919082bu32; }
+        if i == 699u32 { v = 0x1919082bu32; }
+        if i == 700u32 { v = 0x1919082bu32; }
+        if i == 701u32 { v = 0x19191908u32; }
+        if i == 702u32 { v = 0x19191908u32; }
+        if i == 703u32 { v = 0x19191908u32; }
+        if i == 704u32 { v = 0x19191908u32; }
+        if i == 705u32 { v = 0x19191908u32; }
+        if i == 706u32 { v = 0x19191908u32; }
+        if i == 707u32 { v = 0x19191908u32; }
+        if i == 708u32 { v = 0x19191908u32; }
+        if i == 709u32 { v = 0x19191908u32; }
+        if i == 710u32 { v = 0x19191908u32; }
+        if i == 711u32 { v = 0x19191908u32; }
+        if i == 712u32 { v = 0x19191908u32; }
+        if i == 713u32 { v = 0x19191908u32; }
+        if i == 714u32 { v = 0x19191908u32; }
+        if i == 715u32 { v = 0x19191908u32; }
+        if i == 716u32 { v = 0x19191908u32; }
+        if i == 717u32 { v = 0x19191908u32; }
+        if i == 718u32 { v = 0x19191908u32; }
+        if i == 719u32 { v = 0x19191908u32; }
+        if i == 720u32 { v = 0x19191908u32; }
+        if i == 721u32 { v = 0x19191919u32; }
+        if i == 722u32 { v = 0x19191919u32; }
+        if i == 723u32 { v = 0x19191919u32; }
+        if i == 724u32 { v = 0x19191919u32; }
+        if i == 725u32 { v = 0x19191919u32; }
+        if i == 726u32 { v = 0x19191919u32; }
+        if i == 727u32 { v = 0x19191919u32; }
+        if i == 728u32 { v = 0x19191919u32; }
+        if i == 729u32 { v = 0x19191919u32; }
+        if i == 730u32 { v = 0x19191919u32; }
+        if i == 731u32 { v = 0x19191919u32; }
+        if i == 732u32 { v = 0x1919192bu32; }
+        if i == 733u32 { v = 0x1919192bu32; }
+        if i == 734u32 { v = 0x1919192bu32; }
+        if i == 735u32 { v = 0x1919192bu32; }
+        if i == 736u32 { v = 0x1919192bu32; }
+        if i == 737u32 { v = 0x19192b08u32; }
+        if i == 738u32 { v = 0x19192b08u32; }
+        if i == 739u32 { v = 0x19192b08u32; }
+        if i == 740u32 { v = 0x19192b08u32; }
+        if i == 741u32 { v = 0x19192b08u32; }
+        if i == 742u32 { v = 0x19192b08u32; }
+        if i == 743u32 { v = 0x19192b08u32; }
+        if i == 744u32 { v = 0x19192b08u32; }
+        if i == 745u32 { v = 0x19192b08u32; }
+        if i == 746u32 { v = 0x19192b08u32; }
+        if i == 747u32 { v = 0x19192b08u32; }
+        if i == 748u32 { v = 0x19192b08u32; }
+        if i == 749u32 { v = 0x19192b19u32; }
+        if i == 750u32 { v = 0x19192b19u32; }
+        if i == 751u32 { v = 0x19192b19u32; }
+        if i == 752u32 { v = 0x19192b19u32; }
+        if i == 753u32 { v = 0x19192b2bu32; }
+        if i == 754u32 { v = 0x19192b2bu32; }
+        if i == 755u32 { v = 0x19192b2bu32; }
+        if i == 756u32 { v = 0x19192b2bu32; }
+        if i == 757u32 { v = 0x192b0808u32; }
+        if i == 758u32 { v = 0x192b0808u32; }
+        if i == 759u32 { v = 0x192b0808u32; }
+        if i == 760u32 { v = 0x192b0808u32; }
+        if i == 761u32 { v = 0x192b0808u32; }
+        if i == 762u32 { v = 0x192b0808u32; }
+        if i == 763u32 { v = 0x192b0808u32; }
+        if i == 764u32 { v = 0x192b0808u32; }
+        if i == 765u32 { v = 0x192b0808u32; }
+        if i == 766u32 { v = 0x192b0808u32; }
+        if i == 767u32 { v = 0x192b0808u32; }
+        if i == 768u32 { v = 0x192b0808u32; }
+        if i == 769u32 { v = 0x192b0808u32; }
+        if i == 770u32 { v = 0x192b0808u32; }
+        if i == 771u32 { v = 0x192b0808u32; }
+        if i == 772u32 { v = 0x192b0808u32; }
+        if i == 773u32 { v = 0x192b0808u32; }
+        if i == 774u32 { v = 0x192b0819u32; }
+        if i == 775u32 { v = 0x192b0819u32; }
+        if i == 776u32 { v = 0x192b0819u32; }
+        if i == 777u32 { v = 0x192b0819u32; }
+        if i == 778u32 { v = 0x192b0819u32; }
+        if i == 779u32 { v = 0x192b0819u32; }
+        if i == 780u32 { v = 0x192b0819u32; }
+        if i == 781u32 { v = 0x192b0819u32; }
+        if i == 782u32 { v = 0x192b0819u32; }
+        if i == 783u32 { v = 0x192b0819u32; }
+        if i == 784u32 { v = 0x192b0819u32; }
+        if i == 785u32 { v = 0x192b0819u32; }
+        if i == 786u32 { v = 0x192b082bu32; }
+        if i == 787u32 { v = 0x192b082bu32; }
+        if i == 788u32 { v = 0x192b082bu32; }
+        if i == 789u32 { v = 0x192b082bu32; }
+        if i == 790u32 { v = 0x192b082bu32; }
+        if i == 791u32 { v = 0x192b1908u32; }
+        if i == 792u32 { v = 0x192b1908u32; }
+        if i == 793u32 { v = 0x192b1908u32; }
+        if i == 794u32 { v = 0x192b1908u32; }
+        if i == 795u32 { v = 0x192b1908u32; }
+        if i == 796u32 { v = 0x192b1908u32; }
+        if i == 797u32 { v = 0x192b1908u32; }
+        if i == 798u32 { v = 0x192b1908u32; }
+        if i == 799u32 { v = 0x192b1908u32; }
+        if i == 800u32 { v = 0x192b1908u32; }
+        if i == 801u32 { v = 0x192b1919u32; }
+        if i == 802u32 { v = 0x192b1919u32; }
+        if i == 803u32 { v = 0x192b1919u32; }
+        if i == 804u32 { v = 0x192b1919u32; }
+        if i == 805u32 { v = 0x192b1919u32; }
+        if i == 806u32 { v = 0x192b1919u32; }
+        if i == 807u32 { v = 0x192b1919u32; }
+        if i == 808u32 { v = 0x192b192bu32; }
+        if i == 809u32 { v = 0x192b192bu32; }
+        if i == 810u32 { v = 0x192b2b08u32; }
+        if i == 811u32 { v = 0x192b2b08u32; }
+        if i == 812u32 { v = 0x192b2b08u32; }
+        if i == 813u32 { v = 0x192b2b08u32; }
+        if i == 814u32 { v = 0x192b2b08u32; }
+        if i == 815u32 { v = 0x192b2b19u32; }
+        if i == 816u32 { v = 0x192b2b19u32; }
+        if i == 817u32 { v = 0x192b2b2bu32; }
+        if i == 818u32 { v = 0x192b2b2bu32; }
+        if i == 819u32 { v = 0x2b080808u32; }
+        if i == 820u32 { v = 0x2b080808u32; }
+        if i == 821u32 { v = 0x2b080808u32; }
+        if i == 822u32 { v = 0x2b080808u32; }
+        if i == 823u32 { v = 0x2b080808u32; }
+        if i == 824u32 { v = 0x2b080808u32; }
+        if i == 825u32 { v = 0x2b080808u32; }
+        if i == 826u32 { v = 0x2b080808u32; }
+        if i == 827u32 { v = 0x2b080808u32; }
+        if i == 828u32 { v = 0x2b080808u32; }
+        if i == 829u32 { v = 0x2b080808u32; }
+        if i == 830u32 { v = 0x2b080808u32; }
+        if i == 831u32 { v = 0x2b080808u32; }
+        if i == 832u32 { v = 0x2b080808u32; }
+        if i == 833u32 { v = 0x2b080808u32; }
+        if i == 834u32 { v = 0x2b080808u32; }
+        if i == 835u32 { v = 0x2b080808u32; }
+        if i == 836u32 { v = 0x2b080808u32; }
+        if i == 837u32 { v = 0x2b080808u32; }
+        if i == 838u32 { v = 0x2b080808u32; }
+        if i == 839u32 { v = 0x2b080819u32; }
+        if i == 840u32 { v = 0x2b080819u32; }
+        if i == 841u32 { v = 0x2b080819u32; }
+        if i == 842u32 { v = 0x2b080819u32; }
+        if i == 843u32 { v = 0x2b080819u32; }
+        if i == 844u32 { v = 0x2b080819u32; }
+        if i == 845u32 { v = 0x2b080819u32; }
+        if i == 846u32 { v = 0x2b080819u32; }
+        if i == 847u32 { v = 0x2b080819u32; }
+        if i == 848u32 { v = 0x2b080819u32; }
+        if i == 849u32 { v = 0x2b080819u32; }
+        if i == 850u32 { v = 0x2b080819u32; }
+        if i == 851u32 { v = 0x2b080819u32; }
+        if i == 852u32 { v = 0x2b080819u32; }
+        if i == 853u32 { v = 0x2b080819u32; }
+        if i == 854u32 { v = 0x2b080819u32; }
+        if i == 855u32 { v = 0x2b080819u32; }
+        if i == 856u32 { v = 0x2b080819u32; }
+        if i == 857u32 { v = 0x2b080819u32; }
+        if i == 858u32 { v = 0x2b08082bu32; }
+        if i == 859u32 { v = 0x2b08082bu32; }
+        if i == 860u32 { v = 0x2b08082bu32; }
+        if i == 861u32 { v = 0x2b08082bu32; }
+        if i == 862u32 { v = 0x2b08082bu32; }
+        if i == 863u32 { v = 0x2b08082bu32; }
+        if i == 864u32 { v = 0x2b08082bu32; }
+        if i == 865u32 { v = 0x2b08082bu32; }
+        if i == 866u32 { v = 0x2b081908u32; }
+        if i == 867u32 { v = 0x2b081908u32; }
+        if i == 868u32 { v = 0x2b081908u32; }
+        if i == 869u32 { v = 0x2b081908u32; }
+        if i == 870u32 { v = 0x2b081908u32; }
+        if i == 871u32 { v = 0x2b081908u32; }
+        if i == 872u32 { v = 0x2b081908u32; }
+        if i == 873u32 { v = 0x2b081908u32; }
+        if i == 874u32 { v = 0x2b081908u32; }
+        if i == 875u32 { v = 0x2b081908u32; }
+        if i == 876u32 { v = 0x2b081908u32; }
+        if i == 877u32 { v = 0x2b081908u32; }
+        if i == 878u32 { v = 0x2b081908u32; }
+        if i == 879u32 { v = 0x2b081908u32; }
+        if i == 880u32 { v = 0x2b081908u32; }
+        if i == 881u32 { v = 0x2b081908u32; }
+        if i == 882u32 { v = 0x2b081908u32; }
+        if i == 883u32 { v = 0x2b081908u32; }
+        if i == 884u32 { v = 0x2b081908u32; }
+        if i == 885u32 { v = 0x2b081919u32; }
+        if i == 886u32 { v = 0x2b081919u32; }
+        if i == 887u32 { v = 0x2b081919u32; }
+        if i == 888u32 { v = 0x2b081919u32; }
+        if i == 889u32 { v = 0x2b081919u32; }
+        if i == 890u32 { v = 0x2b081919u32; }
+        if i == 891u32 { v = 0x2b081919u32; }
+        if i == 892u32 { v = 0x2b081919u32; }
+        if i == 893u32 { v = 0x2b081919u32; }
+        if i == 894u32 { v = 0x2b081919u32; }
+        if i == 895u32 { v = 0x2b081919u32; }
+        if i == 896u32 { v = 0x2b081919u32; }
+        if i == 897u32 { v = 0x2b08192bu32; }
+        if i == 898u32 { v = 0x2b08192bu32; }
+        if i == 899u32 { v = 0x2b08192bu32; }
+        if i == 900u32 { v = 0x2b08192bu32; }
+        if i == 901u32 { v = 0x2b08192bu32; }
+        if i == 902u32 { v = 0x2b082b08u32; }
+        if i == 903u32 { v = 0x2b082b08u32; }
+        if i == 904u32 { v = 0x2b082b08u32; }
+        if i == 905u32 { v = 0x2b082b08u32; }
+        if i == 906u32 { v = 0x2b082b08u32; }
+        if i == 907u32 { v = 0x2b082b08u32; }
+        if i == 908u32 { v = 0x2b082b08u32; }
+        if i == 909u32 { v = 0x2b082b08u32; }
+        if i == 910u32 { v = 0x2b082b19u32; }
+        if i == 911u32 { v = 0x2b082b19u32; }
+        if i == 912u32 { v = 0x2b082b19u32; }
+        if i == 913u32 { v = 0x2b082b19u32; }
+        if i == 914u32 { v = 0x2b082b2bu32; }
+        if i == 915u32 { v = 0x2b082b2bu32; }
+        if i == 916u32 { v = 0x2b082b2bu32; }
+        if i == 917u32 { v = 0x2b082b2bu32; }
+        if i == 918u32 { v = 0x2b082b2bu32; }
+        if i == 919u32 { v = 0x2b190808u32; }
+        if i == 920u32 { v = 0x2b190808u32; }
+        if i == 921u32 { v = 0x2b190808u32; }
+        if i == 922u32 { v = 0x2b190808u32; }
+        if i == 923u32 { v = 0x2b190808u32; }
+        if i == 924u32 { v = 0x2b190808u32; }
+        if i == 925u32 { v = 0x2b190808u32; }
+        if i == 926u32 { v = 0x2b190808u32; }
+        if i == 927u32 { v = 0x2b190808u32; }
+        if i == 928u32 { v = 0x2b190808u32; }
+        if i == 929u32 { v = 0x2b190808u32; }
+        if i == 930u32 { v = 0x2b190808u32; }
+        if i == 931u32 { v = 0x2b190808u32; }
+        if i == 932u32 { v = 0x2b190808u32; }
+        if i == 933u32 { v = 0x2b190808u32; }
+        if i == 934u32 { v = 0x2b190808u32; }
+        if i == 935u32 { v = 0x2b190808u32; }
+        if i == 936u32 { v = 0x2b190808u32; }
+        if i == 937u32 { v = 0x2b190819u32; }
+        if i == 938u32 { v = 0x2b190819u32; }
+        if i == 939u32 { v = 0x2b190819u32; }
+        if i == 940u32 { v = 0x2b190819u32; }
+        if i == 941u32 { v = 0x2b190819u32; }
+        if i == 942u32 { v = 0x2b190819u32; }
+        if i == 943u32 { v = 0x2b190819u32; }
+        if i == 944u32 { v = 0x2b190819u32; }
+        if i == 945u32 { v = 0x2b19082bu32; }
+        if i == 946u32 { v = 0x2b19082bu32; }
+        if i == 947u32 { v = 0x2b19082bu32; }
+        if i == 948u32 { v = 0x2b19082bu32; }
+        if i == 949u32 { v = 0x2b19082bu32; }
+        if i == 950u32 { v = 0x2b191908u32; }
+        if i == 951u32 { v = 0x2b191908u32; }
+        if i == 952u32 { v = 0x2b191908u32; }
+        if i == 953u32 { v = 0x2b191908u32; }
+        if i == 954u32 { v = 0x2b191908u32; }
+        if i == 955u32 { v = 0x2b191908u32; }
+        if i == 956u32 { v = 0x2b191908u32; }
+        if i == 957u32 { v = 0x2b191908u32; }
+        if i == 958u32 { v = 0x2b191908u32; }
+        if i == 959u32 { v = 0x2b191908u32; }
+        if i == 960u32 { v = 0x2b191908u32; }
+        if i == 961u32 { v = 0x2b191908u32; }
+        if i == 962u32 { v = 0x2b191919u32; }
+        if i == 963u32 { v = 0x2b191919u32; }
+        if i == 964u32 { v = 0x2b191919u32; }
+        if i == 965u32 { v = 0x2b191919u32; }
+        if i == 966u32 { v = 0x2b191919u32; }
+        if i == 967u32 { v = 0x2b191919u32; }
+        if i == 968u32 { v = 0x2b19192bu32; }
+        if i == 969u32 { v = 0x2b19192bu32; }
+        if i == 970u32 { v = 0x2b19192bu32; }
+        if i == 971u32 { v = 0x2b192b08u32; }
+        if i == 972u32 { v = 0x2b192b08u32; }
+        if i == 973u32 { v = 0x2b192b08u32; }
+        if i == 974u32 { v = 0x2b192b08u32; }
+        if i == 975u32 { v = 0x2b192b08u32; }
+        if i == 976u32 { v = 0x2b192b08u32; }
+        if i == 977u32 { v = 0x2b192b19u32; }
+        if i == 978u32 { v = 0x2b192b19u32; }
+        if i == 979u32 { v = 0x2b192b19u32; }
+        if i == 980u32 { v = 0x2b192b2bu32; }
+        if i == 981u32 { v = 0x2b2b0808u32; }
+        if i == 982u32 { v = 0x2b2b0808u32; }
+        if i == 983u32 { v = 0x2b2b0808u32; }
+        if i == 984u32 { v = 0x2b2b0808u32; }
+        if i == 985u32 { v = 0x2b2b0808u32; }
+        if i == 986u32 { v = 0x2b2b0808u32; }
+        if i == 987u32 { v = 0x2b2b0808u32; }
+        if i == 988u32 { v = 0x2b2b0808u32; }
+        if i == 989u32 { v = 0x2b2b0808u32; }
+        if i == 990u32 { v = 0x2b2b0808u32; }
+        if i == 991u32 { v = 0x2b2b0808u32; }
+        if i == 992u32 { v = 0x2b2b0819u32; }
+        if i == 993u32 { v = 0x2b2b0819u32; }
+        if i == 994u32 { v = 0x2b2b082bu32; }
+        if i == 995u32 { v = 0x2b2b082bu32; }
+        if i == 996u32 { v = 0x2b2b082bu32; }
+        if i == 997u32 { v = 0x2b2b082bu32; }
+        if i == 998u32 { v = 0x2b2b082bu32; }
+        if i == 999u32 { v = 0x2b2b082bu32; }
+        if i == 1000u32 { v = 0x2b2b082bu32; }
+        if i == 1001u32 { v = 0x2b2b082bu32; }
+        if i == 1002u32 { v = 0x2b2b082bu32; }
+        if i == 1003u32 { v = 0x2b2b1908u32; }
+        if i == 1004u32 { v = 0x2b2b1908u32; }
+        if i == 1005u32 { v = 0x2b2b1908u32; }
+        if i == 1006u32 { v = 0x2b2b1908u32; }
+        if i == 1007u32 { v = 0x2b2b1908u32; }
+        if i == 1008u32 { v = 0x2b2b1908u32; }
+        if i == 1009u32 { v = 0x2b2b1919u32; }
+        if i == 1010u32 { v = 0x2b2b1919u32; }
+        if i == 1011u32 { v = 0x2b2b192bu32; }
+        if i == 1012u32 { v = 0x2b2b2b08u32; }
+        if i == 1013u32 { v = 0x2b2b2b08u32; }
+        if i == 1014u32 { v = 0x2b2b2b08u32; }
+        if i == 1015u32 { v = 0x2b2b2b19u32; }
+        if i == 1016u32 { v = 0x2b2b2b19u32; }
+        if i == 1017u32 { v = 0x2b2b2b2bu32; }
+        if i == 1018u32 { v = 0x2b2b2b2bu32; }
+        if i == 1019u32 { v = 0x2b2b2b2bu32; }
+        if i == 1020u32 { v = 0x2b2b2b2bu32; }
+        if i == 1021u32 { v = 0x2b2b2b2bu32; }
+        if i == 1022u32 { v = 0x2b2b2b2bu32; }
+        if i == 1023u32 { v = 0x2b2b2b2bu32; }
+        v
+    }
+
+pub fn xs_grid_lo(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x0808082bu32; }
+        if i == 2u32 { v = 0x08081919u32; }
+        if i == 3u32 { v = 0x08082b08u32; }
+        if i == 4u32 { v = 0x08082b2bu32; }
+        if i == 5u32 { v = 0x08190819u32; }
+        if i == 6u32 { v = 0x08191908u32; }
+        if i == 7u32 { v = 0x0819192bu32; }
+        if i == 8u32 { v = 0x08192b19u32; }
+        if i == 9u32 { v = 0x082b0808u32; }
+        if i == 10u32 { v = 0x082b082bu32; }
+        if i == 11u32 { v = 0x082b1919u32; }
+        if i == 12u32 { v = 0x082b2b08u32; }
+        if i == 13u32 { v = 0x19080819u32; }
+        if i == 14u32 { v = 0x19081908u32; }
+        if i == 15u32 { v = 0x1908192bu32; }
+        if i == 16u32 { v = 0x19082b19u32; }
+        if i == 17u32 { v = 0x19190808u32; }
+        if i == 18u32 { v = 0x1919082bu32; }
+        if i == 19u32 { v = 0x19191919u32; }
+        if i == 20u32 { v = 0x19192b08u32; }
+        if i == 21u32 { v = 0x192b0819u32; }
+        if i == 22u32 { v = 0x192b1908u32; }
+        if i == 23u32 { v = 0x2b080808u32; }
+        if i == 24u32 { v = 0x2b08082bu32; }
+        if i == 25u32 { v = 0x2b081919u32; }
+        if i == 26u32 { v = 0x2b082b08u32; }
+        if i == 27u32 { v = 0x2b190819u32; }
+        if i == 28u32 { v = 0x2b191908u32; }
+        if i == 29u32 { v = 0x2b192b19u32; }
+        if i == 30u32 { v = 0x2b2b0808u32; }
+        if i == 31u32 { v = 0x08080819u32; }
+        if i == 32u32 { v = 0x08081908u32; }
+        if i == 33u32 { v = 0x0808192bu32; }
+        if i == 34u32 { v = 0x08082b19u32; }
+        if i == 35u32 { v = 0x08190808u32; }
+        if i == 36u32 { v = 0x0819082bu32; }
+        if i == 37u32 { v = 0x08191919u32; }
+        if i == 38u32 { v = 0x08192b08u32; }
+        if i == 39u32 { v = 0x08192b2bu32; }
+        if i == 40u32 { v = 0x082b0819u32; }
+        if i == 41u32 { v = 0x082b1908u32; }
+        if i == 42u32 { v = 0x19080808u32; }
+        if i == 43u32 { v = 0x1908082bu32; }
+        if i == 44u32 { v = 0x19081919u32; }
+        if i == 45u32 { v = 0x19082b08u32; }
+        if i == 46u32 { v = 0x19190819u32; }
+        if i == 47u32 { v = 0x19191908u32; }
+        if i == 48u32 { v = 0x192b0808u32; }
+        if i == 49u32 { v = 0x192b2b08u32; }
+        if i == 50u32 { v = 0x2b080819u32; }
+        if i == 51u32 { v = 0x2b081908u32; }
+        if i == 52u32 { v = 0x2b190808u32; }
+        if i == 53u32 { v = 0x08080808u32; }
+        if i == 54u32 { v = 0x0808082bu32; }
+        if i == 55u32 { v = 0x08081919u32; }
+        if i == 56u32 { v = 0x08082b08u32; }
+        if i == 57u32 { v = 0x08190819u32; }
+        if i == 58u32 { v = 0x08191908u32; }
+        if i == 59u32 { v = 0x082b0808u32; }
+        if i == 60u32 { v = 0x19080819u32; }
+        if i == 61u32 { v = 0x19081908u32; }
+        if i == 62u32 { v = 0x19190808u32; }
+        if i == 63u32 { v = 0x19191919u32; }
+        if i == 64u32 { v = 0x2b080808u32; }
+        if i == 65u32 { v = 0x2b082b2bu32; }
+        if i == 66u32 { v = 0x08080819u32; }
+        if i == 67u32 { v = 0x08081908u32; }
+        if i == 68u32 { v = 0x0808192bu32; }
+        if i == 69u32 { v = 0x08082b19u32; }
+        if i == 70u32 { v = 0x08190808u32; }
+        if i == 71u32 { v = 0x0819082bu32; }
+        if i == 72u32 { v = 0x08191919u32; }
+        if i == 73u32 { v = 0x08192b08u32; }
+        if i == 74u32 { v = 0x082b0819u32; }
+        if i == 75u32 { v = 0x082b1908u32; }
+        if i == 76u32 { v = 0x19080808u32; }
+        if i == 77u32 { v = 0x1908082bu32; }
+        if i == 78u32 { v = 0x19081919u32; }
+        if i == 79u32 { v = 0x19082b08u32; }
+        if i == 80u32 { v = 0x19190819u32; }
+        if i == 81u32 { v = 0x19191908u32; }
+        if i == 82u32 { v = 0x1919192bu32; }
+        if i == 83u32 { v = 0x192b0808u32; }
+        if i == 84u32 { v = 0x2b080819u32; }
+        if i == 85u32 { v = 0x2b081908u32; }
+        if i == 86u32 { v = 0x2b190808u32; }
+        if i == 87u32 { v = 0x08080808u32; }
+        if i == 88u32 { v = 0x0808082bu32; }
+        if i == 89u32 { v = 0x08081919u32; }
+        if i == 90u32 { v = 0x08082b08u32; }
+        if i == 91u32 { v = 0x08190819u32; }
+        if i == 92u32 { v = 0x08191908u32; }
+        if i == 93u32 { v = 0x082b0808u32; }
+        if i == 94u32 { v = 0x19080819u32; }
+        if i == 95u32 { v = 0x19081908u32; }
+        if i == 96u32 { v = 0x19190808u32; }
+        if i == 97u32 { v = 0x192b0819u32; }
+        if i == 98u32 { v = 0x2b080808u32; }
+        if i == 99u32 { v = 0x08080819u32; }
+        if i == 100u32 { v = 0x08081908u32; }
+        if i == 101u32 { v = 0x08190808u32; }
+        if i == 102u32 { v = 0x082b192bu32; }
+        if i == 103u32 { v = 0x19080808u32; }
+        if i == 104u32 { v = 0x1908082bu32; }
+        if i == 105u32 { v = 0x2b081908u32; }
+        if i == 106u32 { v = 0x08080808u32; }
+        if i == 107u32 { v = 0x0808082bu32; }
+        if i == 108u32 { v = 0x08081919u32; }
+        if i == 109u32 { v = 0x08082b08u32; }
+        if i == 110u32 { v = 0x08082b2bu32; }
+        if i == 111u32 { v = 0x08190819u32; }
+        if i == 112u32 { v = 0x08191908u32; }
+        if i == 113u32 { v = 0x082b0808u32; }
+        if i == 114u32 { v = 0x082b1919u32; }
+        if i == 115u32 { v = 0x19080819u32; }
+        if i == 116u32 { v = 0x19081908u32; }
+        if i == 117u32 { v = 0x19190808u32; }
+        if i == 118u32 { v = 0x19192b08u32; }
+        if i == 119u32 { v = 0x2b080808u32; }
+        if i == 120u32 { v = 0x2b2b0808u32; }
+        if i == 121u32 { v = 0x2b2b2b2bu32; }
+        if i == 122u32 { v = 0x08080819u32; }
+        if i == 123u32 { v = 0x08081908u32; }
+        if i == 124u32 { v = 0x08190808u32; }
+        if i == 125u32 { v = 0x19080808u32; }
+        if i == 126u32 { v = 0x2b080819u32; }
+        if i == 127u32 { v = 0x2b082b19u32; }
+        if i == 128u32 { v = 0x08080808u32; }
+        if i == 129u32 { v = 0x082b0808u32; }
+        if i == 130u32 { v = 0x082b2b08u32; }
+        if i == 131u32 { v = 0x2b19192bu32; }
+        if i == 132u32 { v = 0x2b2b0808u32; }
+        if i == 133u32 { v = 0x08080819u32; }
+        if i == 134u32 { v = 0x08081908u32; }
+        if i == 135u32 { v = 0x0808192bu32; }
+        if i == 136u32 { v = 0x08082b19u32; }
+        if i == 137u32 { v = 0x08190808u32; }
+        if i == 138u32 { v = 0x0819082bu32; }
+        if i == 139u32 { v = 0x08191919u32; }
+        if i == 140u32 { v = 0x08192b08u32; }
+        if i == 141u32 { v = 0x082b0819u32; }
+        if i == 142u32 { v = 0x082b1908u32; }
+        if i == 143u32 { v = 0x19080808u32; }
+        if i == 144u32 { v = 0x1908082bu32; }
+        if i == 145u32 { v = 0x19081919u32; }
+        if i == 146u32 { v = 0x19082b08u32; }
+        if i == 147u32 { v = 0x19190819u32; }
+        if i == 148u32 { v = 0x19191908u32; }
+        if i == 149u32 { v = 0x192b0808u32; }
+        if i == 150u32 { v = 0x192b2b2bu32; }
+        if i == 151u32 { v = 0x2b080819u32; }
+        if i == 152u32 { v = 0x2b081908u32; }
+        if i == 153u32 { v = 0x2b190808u32; }
+        if i == 154u32 { v = 0x08080808u32; }
+        if i == 155u32 { v = 0x0808082bu32; }
+        if i == 156u32 { v = 0x08081919u32; }
+        if i == 157u32 { v = 0x08082b08u32; }
+        if i == 158u32 { v = 0x08190819u32; }
+        if i == 159u32 { v = 0x08191908u32; }
+        if i == 160u32 { v = 0x082b0808u32; }
+        if i == 161u32 { v = 0x19080819u32; }
+        if i == 162u32 { v = 0x19081908u32; }
+        if i == 163u32 { v = 0x19190808u32; }
+        if i == 164u32 { v = 0x2b080808u32; }
+        if i == 165u32 { v = 0x2b191908u32; }
+        if i == 166u32 { v = 0x2b19192bu32; }
+        if i == 167u32 { v = 0x08080819u32; }
+        if i == 168u32 { v = 0x08081908u32; }
+        if i == 169u32 { v = 0x0808192bu32; }
+        if i == 170u32 { v = 0x08190808u32; }
+        if i == 171u32 { v = 0x19080808u32; }
+        if i == 172u32 { v = 0x192b0808u32; }
+        if i == 173u32 { v = 0x08080808u32; }
+        if i == 174u32 { v = 0x0808082bu32; }
+        if i == 175u32 { v = 0x08081919u32; }
+        if i == 176u32 { v = 0x08082b08u32; }
+        if i == 177u32 { v = 0x08190819u32; }
+        if i == 178u32 { v = 0x08191908u32; }
+        if i == 179u32 { v = 0x082b0808u32; }
+        if i == 180u32 { v = 0x19080819u32; }
+        if i == 181u32 { v = 0x19081908u32; }
+        if i == 182u32 { v = 0x19082b19u32; }
+        if i == 183u32 { v = 0x19190808u32; }
+        if i == 184u32 { v = 0x192b1908u32; }
+        if i == 185u32 { v = 0x2b080808u32; }
+        if i == 186u32 { v = 0x08080819u32; }
+        if i == 187u32 { v = 0x08081908u32; }
+        if i == 188u32 { v = 0x08190808u32; }
+        if i == 189u32 { v = 0x19080808u32; }
+        if i == 190u32 { v = 0x08080808u32; }
+        if i == 191u32 { v = 0x08191908u32; }
+        if i == 192u32 { v = 0x19082b19u32; }
+        if i == 193u32 { v = 0x08080819u32; }
+        if i == 194u32 { v = 0x08081908u32; }
+        if i == 195u32 { v = 0x08190808u32; }
+        if i == 196u32 { v = 0x0819082bu32; }
+        if i == 197u32 { v = 0x19080808u32; }
+        if i == 198u32 { v = 0x19191908u32; }
+        if i == 199u32 { v = 0x2b08192bu32; }
+        if i == 200u32 { v = 0x08080808u32; }
+        if i == 201u32 { v = 0x08081919u32; }
+        if i == 202u32 { v = 0x192b192bu32; }
+        if i == 203u32 { v = 0x19190819u32; }
+        if i == 204u32 { v = 0x2b2b2b19u32; }
+        if i == 205u32 { v = 0x08080808u32; }
+        if i == 206u32 { v = 0x0808082bu32; }
+        if i == 207u32 { v = 0x08081919u32; }
+        if i == 208u32 { v = 0x08082b08u32; }
+        if i == 209u32 { v = 0x08082b2bu32; }
+        if i == 210u32 { v = 0x08190819u32; }
+        if i == 211u32 { v = 0x08191908u32; }
+        if i == 212u32 { v = 0x082b0808u32; }
+        if i == 213u32 { v = 0x19080819u32; }
+        if i == 214u32 { v = 0x19081908u32; }
+        if i == 215u32 { v = 0x19190808u32; }
+        if i == 216u32 { v = 0x2b080808u32; }
+        if i == 217u32 { v = 0x2b2b0808u32; }
+        if i == 218u32 { v = 0x08080819u32; }
+        if i == 219u32 { v = 0x08081908u32; }
+        if i == 220u32 { v = 0x08190808u32; }
+        if i == 221u32 { v = 0x19080808u32; }
+        if i == 222u32 { v = 0x19082b08u32; }
+        if i == 223u32 { v = 0x192b1919u32; }
+        if i == 224u32 { v = 0x08080808u32; }
+        if i == 225u32 { v = 0x082b082bu32; }
+        if i == 226u32 { v = 0x2b080808u32; }
+        if i == 227u32 { v = 0x2b2b2b08u32; }
+        if i == 228u32 { v = 0x08080819u32; }
+        if i == 229u32 { v = 0x08081908u32; }
+        if i == 230u32 { v = 0x08190808u32; }
+        if i == 231u32 { v = 0x082b2b19u32; }
+        if i == 232u32 { v = 0x19080808u32; }
+        if i == 233u32 { v = 0x08080808u32; }
+        if i == 234u32 { v = 0x19080819u32; }
+        if i == 235u32 { v = 0x1919082bu32; }
+        if i == 236u32 { v = 0x2b192b19u32; }
+        if i == 237u32 { v = 0x08080819u32; }
+        if i == 238u32 { v = 0x08192b2bu32; }
+        if i == 239u32 { v = 0x2b2b192bu32; }
+        if i == 240u32 { v = 0x08080808u32; }
+        if i == 241u32 { v = 0x08082b08u32; }
+        if i == 242u32 { v = 0x08082b2bu32; }
+        if i == 243u32 { v = 0x082b0808u32; }
+        if i == 244u32 { v = 0x19191919u32; }
+        if i == 245u32 { v = 0x2b082b08u32; }
+        if i == 246u32 { v = 0x2b2b082bu32; }
+        if i == 247u32 { v = 0x192b2b08u32; }
+        if i == 248u32 { v = 0x2b190808u32; }
+        if i == 249u32 { v = 0x08082b08u32; }
+        if i == 250u32 { v = 0x082b0808u32; }
+        if i == 251u32 { v = 0x2b08082bu32; }
+        if i == 252u32 { v = 0x2b082b08u32; }
+        if i == 253u32 { v = 0x2b082b2bu32; }
+        if i == 254u32 { v = 0x08080819u32; }
+        if i == 255u32 { v = 0x08081908u32; }
+        if i == 256u32 { v = 0x0808192bu32; }
+        if i == 257u32 { v = 0x08082b19u32; }
+        if i == 258u32 { v = 0x08190808u32; }
+        if i == 259u32 { v = 0x0819082bu32; }
+        if i == 260u32 { v = 0x08191919u32; }
+        if i == 261u32 { v = 0x08192b08u32; }
+        if i == 262u32 { v = 0x082b0819u32; }
+        if i == 263u32 { v = 0x082b1908u32; }
+        if i == 264u32 { v = 0x19080808u32; }
+        if i == 265u32 { v = 0x1908082bu32; }
+        if i == 266u32 { v = 0x19081919u32; }
+        if i == 267u32 { v = 0x19082b08u32; }
+        if i == 268u32 { v = 0x19082b2bu32; }
+        if i == 269u32 { v = 0x19190819u32; }
+        if i == 270u32 { v = 0x19191908u32; }
+        if i == 271u32 { v = 0x192b0808u32; }
+        if i == 272u32 { v = 0x192b1919u32; }
+        if i == 273u32 { v = 0x2b080819u32; }
+        if i == 274u32 { v = 0x2b081908u32; }
+        if i == 275u32 { v = 0x2b190808u32; }
+        if i == 276u32 { v = 0x08080808u32; }
+        if i == 277u32 { v = 0x0808082bu32; }
+        if i == 278u32 { v = 0x08081919u32; }
+        if i == 279u32 { v = 0x08082b08u32; }
+        if i == 280u32 { v = 0x08190819u32; }
+        if i == 281u32 { v = 0x08191908u32; }
+        if i == 282u32 { v = 0x082b0808u32; }
+        if i == 283u32 { v = 0x19080819u32; }
+        if i == 284u32 { v = 0x19081908u32; }
+        if i == 285u32 { v = 0x19190808u32; }
+        if i == 286u32 { v = 0x2b080808u32; }
+        if i == 287u32 { v = 0x2b081919u32; }
+        if i == 288u32 { v = 0x2b2b082bu32; }
+        if i == 289u32 { v = 0x08080819u32; }
+        if i == 290u32 { v = 0x08081908u32; }
+        if i == 291u32 { v = 0x08190808u32; }
+        if i == 292u32 { v = 0x0819082bu32; }
+        if i == 293u32 { v = 0x082b2b19u32; }
+        if i == 294u32 { v = 0x19080808u32; }
+        if i == 295u32 { v = 0x08080808u32; }
+        if i == 296u32 { v = 0x0808082bu32; }
+        if i == 297u32 { v = 0x08081919u32; }
+        if i == 298u32 { v = 0x08082b08u32; }
+        if i == 299u32 { v = 0x08190819u32; }
+        if i == 300u32 { v = 0x08191908u32; }
+        if i == 301u32 { v = 0x08192b19u32; }
+        if i == 302u32 { v = 0x082b0808u32; }
+        if i == 303u32 { v = 0x19080819u32; }
+        if i == 304u32 { v = 0x19081908u32; }
+        if i == 305u32 { v = 0x19190808u32; }
+        if i == 306u32 { v = 0x2b080808u32; }
+        if i == 307u32 { v = 0x2b191908u32; }
+        if i == 308u32 { v = 0x08080819u32; }
+        if i == 309u32 { v = 0x08081908u32; }
+        if i == 310u32 { v = 0x08190808u32; }
+        if i == 311u32 { v = 0x082b1908u32; }
+        if i == 312u32 { v = 0x19080808u32; }
+        if i == 313u32 { v = 0x2b192b2bu32; }
+        if i == 314u32 { v = 0x08080808u32; }
+        if i == 315u32 { v = 0x08082b2bu32; }
+        if i == 316u32 { v = 0x19081908u32; }
+        if i == 317u32 { v = 0x19190808u32; }
+        if i == 318u32 { v = 0x08080819u32; }
+        if i == 319u32 { v = 0x08081908u32; }
+        if i == 320u32 { v = 0x08190808u32; }
+        if i == 321u32 { v = 0x19080808u32; }
+        if i == 322u32 { v = 0x19081919u32; }
+        if i == 323u32 { v = 0x19191908u32; }
+        if i == 324u32 { v = 0x192b082bu32; }
+        if i == 325u32 { v = 0x08080808u32; }
+        if i == 326u32 { v = 0x08190819u32; }
+        if i == 327u32 { v = 0x19081908u32; }
+        if i == 328u32 { v = 0x19190808u32; }
+        if i == 329u32 { v = 0x192b2b19u32; }
+        if i == 330u32 { v = 0x08081908u32; }
+        if i == 331u32 { v = 0x08080808u32; }
+        if i == 332u32 { v = 0x0808082bu32; }
+        if i == 333u32 { v = 0x08081919u32; }
+        if i == 334u32 { v = 0x08082b08u32; }
+        if i == 335u32 { v = 0x08190819u32; }
+        if i == 336u32 { v = 0x08191908u32; }
+        if i == 337u32 { v = 0x082b0808u32; }
+        if i == 338u32 { v = 0x082b2b08u32; }
+        if i == 339u32 { v = 0x19080819u32; }
+        if i == 340u32 { v = 0x19081908u32; }
+        if i == 341u32 { v = 0x19190808u32; }
+        if i == 342u32 { v = 0x2b080808u32; }
+        if i == 343u32 { v = 0x08080819u32; }
+        if i == 344u32 { v = 0x08081908u32; }
+        if i == 345u32 { v = 0x08190808u32; }
+        if i == 346u32 { v = 0x08191919u32; }
+        if i == 347u32 { v = 0x19080808u32; }
+        if i == 348u32 { v = 0x1908082bu32; }
+        if i == 349u32 { v = 0x08080808u32; }
+        if i == 350u32 { v = 0x19081908u32; }
+        if i == 351u32 { v = 0x2b2b2b2bu32; }
+        if i == 352u32 { v = 0x08080819u32; }
+        if i == 353u32 { v = 0x08081908u32; }
+        if i == 354u32 { v = 0x08190808u32; }
+        if i == 355u32 { v = 0x082b0819u32; }
+        if i == 356u32 { v = 0x19080808u32; }
+        if i == 357u32 { v = 0x192b0808u32; }
+        if i == 358u32 { v = 0x2b080819u32; }
+        if i == 359u32 { v = 0x2b2b0819u32; }
+        if i == 360u32 { v = 0x08080808u32; }
+        if i == 361u32 { v = 0x08082b08u32; }
+        if i == 362u32 { v = 0x2b080808u32; }
+        if i == 363u32 { v = 0x2b082b08u32; }
+        if i == 364u32 { v = 0x082b0819u32; }
+        if i == 365u32 { v = 0x192b2b08u32; }
+        if i == 366u32 { v = 0x2b2b0819u32; }
+        if i == 367u32 { v = 0x08080808u32; }
+        if i == 368u32 { v = 0x08191908u32; }
+        if i == 369u32 { v = 0x19080819u32; }
+        if i == 370u32 { v = 0x19190808u32; }
+        if i == 371u32 { v = 0x2b192b19u32; }
+        if i == 372u32 { v = 0x08192b2bu32; }
+        if i == 373u32 { v = 0x19080808u32; }
+        if i == 374u32 { v = 0x1908082bu32; }
+        if i == 375u32 { v = 0x2b081919u32; }
+        if i == 376u32 { v = 0x08080819u32; }
+        if i == 377u32 { v = 0x08081908u32; }
+        if i == 378u32 { v = 0x08190808u32; }
+        if i == 379u32 { v = 0x19080808u32; }
+        if i == 380u32 { v = 0x19191908u32; }
+        if i == 381u32 { v = 0x192b082bu32; }
+        if i == 382u32 { v = 0x2b08192bu32; }
+        if i == 383u32 { v = 0x2b2b2b19u32; }
+        if i == 384u32 { v = 0x08080808u32; }
+        if i == 385u32 { v = 0x082b1908u32; }
+        if i == 386u32 { v = 0x19082b2bu32; }
+        if i == 387u32 { v = 0x2b19082bu32; }
+        if i == 388u32 { v = 0x08080808u32; }
+        if i == 389u32 { v = 0x0819192bu32; }
+        if i == 390u32 { v = 0x08190808u32; }
+        if i == 391u32 { v = 0x19080808u32; }
+        if i == 392u32 { v = 0x19081919u32; }
+        if i == 393u32 { v = 0x2b2b1908u32; }
+        if i == 394u32 { v = 0x08080819u32; }
+        if i == 395u32 { v = 0x192b2b2bu32; }
+        if i == 396u32 { v = 0x082b1919u32; }
+        if i == 397u32 { v = 0x0808192bu32; }
+        if i == 398u32 { v = 0x19191908u32; }
+        if i == 399u32 { v = 0x192b082bu32; }
+        if i == 400u32 { v = 0x08080808u32; }
+        if i == 401u32 { v = 0x0808082bu32; }
+        if i == 402u32 { v = 0x08081919u32; }
+        if i == 403u32 { v = 0x08082b08u32; }
+        if i == 404u32 { v = 0x08190819u32; }
+        if i == 405u32 { v = 0x08191908u32; }
+        if i == 406u32 { v = 0x082b0808u32; }
+        if i == 407u32 { v = 0x082b2b2bu32; }
+        if i == 408u32 { v = 0x19080819u32; }
+        if i == 409u32 { v = 0x19081908u32; }
+        if i == 410u32 { v = 0x19190808u32; }
+        if i == 411u32 { v = 0x2b080808u32; }
+        if i == 412u32 { v = 0x2b08082bu32; }
+        if i == 413u32 { v = 0x2b2b2b08u32; }
+        if i == 414u32 { v = 0x2b2b2b2bu32; }
+        if i == 415u32 { v = 0x08080819u32; }
+        if i == 416u32 { v = 0x08081908u32; }
+        if i == 417u32 { v = 0x0808192bu32; }
+        if i == 418u32 { v = 0x08190808u32; }
+        if i == 419u32 { v = 0x19080808u32; }
+        if i == 420u32 { v = 0x19190819u32; }
+        if i == 421u32 { v = 0x19192b19u32; }
+        if i == 422u32 { v = 0x08080808u32; }
+        if i == 423u32 { v = 0x082b0808u32; }
+        if i == 424u32 { v = 0x2b080808u32; }
+        if i == 425u32 { v = 0x2b08082bu32; }
+        if i == 426u32 { v = 0x2b2b0808u32; }
+        if i == 427u32 { v = 0x2b2b2b08u32; }
+        if i == 428u32 { v = 0x08080819u32; }
+        if i == 429u32 { v = 0x08081908u32; }
+        if i == 430u32 { v = 0x08190808u32; }
+        if i == 431u32 { v = 0x0819082bu32; }
+        if i == 432u32 { v = 0x08191919u32; }
+        if i == 433u32 { v = 0x19080808u32; }
+        if i == 434u32 { v = 0x192b0808u32; }
+        if i == 435u32 { v = 0x2b082b19u32; }
+        if i == 436u32 { v = 0x08080808u32; }
+        if i == 437u32 { v = 0x19081908u32; }
+        if i == 438u32 { v = 0x2b2b1919u32; }
+        if i == 439u32 { v = 0x08192b08u32; }
+        if i == 440u32 { v = 0x192b2b2bu32; }
+        if i == 441u32 { v = 0x08080808u32; }
+        if i == 442u32 { v = 0x08082b08u32; }
+        if i == 443u32 { v = 0x082b1919u32; }
+        if i == 444u32 { v = 0x19192b2bu32; }
+        if i == 445u32 { v = 0x2b080808u32; }
+        if i == 446u32 { v = 0x2b08082bu32; }
+        if i == 447u32 { v = 0x2b2b2b08u32; }
+        if i == 448u32 { v = 0x0808192bu32; }
+        if i == 449u32 { v = 0x082b082bu32; }
+        if i == 450u32 { v = 0x2b080808u32; }
+        if i == 451u32 { v = 0x2b082b08u32; }
+        if i == 452u32 { v = 0x2b19192bu32; }
+        if i == 453u32 { v = 0x2b2b2b08u32; }
+        if i == 454u32 { v = 0x08080819u32; }
+        if i == 455u32 { v = 0x08081908u32; }
+        if i == 456u32 { v = 0x08190808u32; }
+        if i == 457u32 { v = 0x19080808u32; }
+        if i == 458u32 { v = 0x1919192bu32; }
+        if i == 459u32 { v = 0x2b081908u32; }
+        if i == 460u32 { v = 0x08080808u32; }
+        if i == 461u32 { v = 0x082b082bu32; }
+        if i == 462u32 { v = 0x192b1908u32; }
+        if i == 463u32 { v = 0x1919192bu32; }
+        if i == 464u32 { v = 0x2b082b19u32; }
+        if i == 465u32 { v = 0x08080808u32; }
+        if i == 466u32 { v = 0x08081919u32; }
+        if i == 467u32 { v = 0x19081908u32; }
+        if i == 468u32 { v = 0x19190808u32; }
+        if i == 469u32 { v = 0x19192b08u32; }
+        if i == 470u32 { v = 0x082b2b19u32; }
+        if i == 471u32 { v = 0x2b190808u32; }
+        if i == 472u32 { v = 0x2b19082bu32; }
+        if i == 473u32 { v = 0x19080819u32; }
+        if i == 474u32 { v = 0x19190819u32; }
+        if i == 475u32 { v = 0x2b2b192bu32; }
+        if i == 476u32 { v = 0x19082b19u32; }
+        if i == 477u32 { v = 0x08191919u32; }
+        if i == 478u32 { v = 0x192b0808u32; }
+        if i == 479u32 { v = 0x08080808u32; }
+        if i == 480u32 { v = 0x0808082bu32; }
+        if i == 481u32 { v = 0x08082b08u32; }
+        if i == 482u32 { v = 0x08082b2bu32; }
+        if i == 483u32 { v = 0x082b0808u32; }
+        if i == 484u32 { v = 0x082b2b2bu32; }
+        if i == 485u32 { v = 0x2b2b0808u32; }
+        if i == 486u32 { v = 0x19190819u32; }
+        if i == 487u32 { v = 0x19192b19u32; }
+        if i == 488u32 { v = 0x2b2b192bu32; }
+        if i == 489u32 { v = 0x08080808u32; }
+        if i == 490u32 { v = 0x0808082bu32; }
+        if i == 491u32 { v = 0x08082b08u32; }
+        if i == 492u32 { v = 0x082b2b2bu32; }
+        if i == 493u32 { v = 0x2b080808u32; }
+        if i == 494u32 { v = 0x2b2b0808u32; }
+        if i == 495u32 { v = 0x19080808u32; }
+        if i == 496u32 { v = 0x2b191919u32; }
+        if i == 497u32 { v = 0x192b1919u32; }
+        if i == 498u32 { v = 0x2b192b08u32; }
+        if i == 499u32 { v = 0x08082b2bu32; }
+        if i == 500u32 { v = 0x082b0808u32; }
+        if i == 501u32 { v = 0x082b082bu32; }
+        if i == 502u32 { v = 0x082b2b08u32; }
+        if i == 503u32 { v = 0x2b2b0808u32; }
+        if i == 504u32 { v = 0x2b2b2b08u32; }
+        if i == 505u32 { v = 0x08081908u32; }
+        if i == 506u32 { v = 0x2b081908u32; }
+        if i == 507u32 { v = 0x2b08192bu32; }
+        if i == 508u32 { v = 0x082b2b08u32; }
+        if i == 509u32 { v = 0x082b2b2bu32; }
+        if i == 510u32 { v = 0x2b190819u32; }
+        if i == 511u32 { v = 0x2b2b2b2bu32; }
+        v
+    }
+
+pub fn xs_grid_hi(i: u32) -> u32 {
+        let mut v: u32 = 0;
+        if i == 0u32 { v = 0x08080808u32; }
+        if i == 1u32 { v = 0x08080808u32; }
+        if i == 2u32 { v = 0x08080808u32; }
+        if i == 3u32 { v = 0x08080808u32; }
+        if i == 4u32 { v = 0x08080808u32; }
+        if i == 5u32 { v = 0x08080808u32; }
+        if i == 6u32 { v = 0x08080808u32; }
+        if i == 7u32 { v = 0x08080808u32; }
+        if i == 8u32 { v = 0x08080808u32; }
+        if i == 9u32 { v = 0x08080808u32; }
+        if i == 10u32 { v = 0x08080808u32; }
+        if i == 11u32 { v = 0x08080808u32; }
+        if i == 12u32 { v = 0x08080808u32; }
+        if i == 13u32 { v = 0x08080808u32; }
+        if i == 14u32 { v = 0x08080808u32; }
+        if i == 15u32 { v = 0x08080808u32; }
+        if i == 16u32 { v = 0x08080808u32; }
+        if i == 17u32 { v = 0x08080808u32; }
+        if i == 18u32 { v = 0x08080808u32; }
+        if i == 19u32 { v = 0x08080808u32; }
+        if i == 20u32 { v = 0x08080808u32; }
+        if i == 21u32 { v = 0x08080808u32; }
+        if i == 22u32 { v = 0x08080808u32; }
+        if i == 23u32 { v = 0x08080808u32; }
+        if i == 24u32 { v = 0x08080808u32; }
+        if i == 25u32 { v = 0x08080808u32; }
+        if i == 26u32 { v = 0x08080808u32; }
+        if i == 27u32 { v = 0x08080808u32; }
+        if i == 28u32 { v = 0x08080808u32; }
+        if i == 29u32 { v = 0x08080808u32; }
+        if i == 30u32 { v = 0x08080808u32; }
+        if i == 31u32 { v = 0x08080819u32; }
+        if i == 32u32 { v = 0x08080819u32; }
+        if i == 33u32 { v = 0x08080819u32; }
+        if i == 34u32 { v = 0x08080819u32; }
+        if i == 35u32 { v = 0x08080819u32; }
+        if i == 36u32 { v = 0x08080819u32; }
+        if i == 37u32 { v = 0x08080819u32; }
+        if i == 38u32 { v = 0x08080819u32; }
+        if i == 39u32 { v = 0x08080819u32; }
+        if i == 40u32 { v = 0x08080819u32; }
+        if i == 41u32 { v = 0x08080819u32; }
+        if i == 42u32 { v = 0x08080819u32; }
+        if i == 43u32 { v = 0x08080819u32; }
+        if i == 44u32 { v = 0x08080819u32; }
+        if i == 45u32 { v = 0x08080819u32; }
+        if i == 46u32 { v = 0x08080819u32; }
+        if i == 47u32 { v = 0x08080819u32; }
+        if i == 48u32 { v = 0x08080819u32; }
+        if i == 49u32 { v = 0x08080819u32; }
+        if i == 50u32 { v = 0x08080819u32; }
+        if i == 51u32 { v = 0x08080819u32; }
+        if i == 52u32 { v = 0x08080819u32; }
+        if i == 53u32 { v = 0x0808082bu32; }
+        if i == 54u32 { v = 0x0808082bu32; }
+        if i == 55u32 { v = 0x0808082bu32; }
+        if i == 56u32 { v = 0x0808082bu32; }
+        if i == 57u32 { v = 0x0808082bu32; }
+        if i == 58u32 { v = 0x0808082bu32; }
+        if i == 59u32 { v = 0x0808082bu32; }
+        if i == 60u32 { v = 0x0808082bu32; }
+        if i == 61u32 { v = 0x0808082bu32; }
+        if i == 62u32 { v = 0x0808082bu32; }
+        if i == 63u32 { v = 0x0808082bu32; }
+        if i == 64u32 { v = 0x0808082bu32; }
+        if i == 65u32 { v = 0x0808082bu32; }
+        if i == 66u32 { v = 0x08081908u32; }
+        if i == 67u32 { v = 0x08081908u32; }
+        if i == 68u32 { v = 0x08081908u32; }
+        if i == 69u32 { v = 0x08081908u32; }
+        if i == 70u32 { v = 0x08081908u32; }
+        if i == 71u32 { v = 0x08081908u32; }
+        if i == 72u32 { v = 0x08081908u32; }
+        if i == 73u32 { v = 0x08081908u32; }
+        if i == 74u32 { v = 0x08081908u32; }
+        if i == 75u32 { v = 0x08081908u32; }
+        if i == 76u32 { v = 0x08081908u32; }
+        if i == 77u32 { v = 0x08081908u32; }
+        if i == 78u32 { v = 0x08081908u32; }
+        if i == 79u32 { v = 0x08081908u32; }
+        if i == 80u32 { v = 0x08081908u32; }
+        if i == 81u32 { v = 0x08081908u32; }
+        if i == 82u32 { v = 0x08081908u32; }
+        if i == 83u32 { v = 0x08081908u32; }
+        if i == 84u32 { v = 0x08081908u32; }
+        if i == 85u32 { v = 0x08081908u32; }
+        if i == 86u32 { v = 0x08081908u32; }
+        if i == 87u32 { v = 0x08081919u32; }
+        if i == 88u32 { v = 0x08081919u32; }
+        if i == 89u32 { v = 0x08081919u32; }
+        if i == 90u32 { v = 0x08081919u32; }
+        if i == 91u32 { v = 0x08081919u32; }
+        if i == 92u32 { v = 0x08081919u32; }
+        if i == 93u32 { v = 0x08081919u32; }
+        if i == 94u32 { v = 0x08081919u32; }
+        if i == 95u32 { v = 0x08081919u32; }
+        if i == 96u32 { v = 0x08081919u32; }
+        if i == 97u32 { v = 0x08081919u32; }
+        if i == 98u32 { v = 0x08081919u32; }
+        if i == 99u32 { v = 0x0808192bu32; }
+        if i == 100u32 { v = 0x0808192bu32; }
+        if i == 101u32 { v = 0x0808192bu32; }
+        if i == 102u32 { v = 0x0808192bu32; }
+        if i == 103u32 { v = 0x0808192bu32; }
+        if i == 104u32 { v = 0x0808192bu32; }
+        if i == 105u32 { v = 0x0808192bu32; }
+        if i == 106u32 { v = 0x08082b08u32; }
+        if i == 107u32 { v = 0x08082b08u32; }
+        if i == 108u32 { v = 0x08082b08u32; }
+        if i == 109u32 { v = 0x08082b08u32; }
+        if i == 110u32 { v = 0x08082b08u32; }
+        if i == 111u32 { v = 0x08082b08u32; }
+        if i == 112u32 { v = 0x08082b08u32; }
+        if i == 113u32 { v = 0x08082b08u32; }
+        if i == 114u32 { v = 0x08082b08u32; }
+        if i == 115u32 { v = 0x08082b08u32; }
+        if i == 116u32 { v = 0x08082b08u32; }
+        if i == 117u32 { v = 0x08082b08u32; }
+        if i == 118u32 { v = 0x08082b08u32; }
+        if i == 119u32 { v = 0x08082b08u32; }
+        if i == 120u32 { v = 0x08082b08u32; }
+        if i == 121u32 { v = 0x08082b08u32; }
+        if i == 122u32 { v = 0x08082b19u32; }
+        if i == 123u32 { v = 0x08082b19u32; }
+        if i == 124u32 { v = 0x08082b19u32; }
+        if i == 125u32 { v = 0x08082b19u32; }
+        if i == 126u32 { v = 0x08082b19u32; }
+        if i == 127u32 { v = 0x08082b19u32; }
+        if i == 128u32 { v = 0x08082b2bu32; }
+        if i == 129u32 { v = 0x08082b2bu32; }
+        if i == 130u32 { v = 0x08082b2bu32; }
+        if i == 131u32 { v = 0x08082b2bu32; }
+        if i == 132u32 { v = 0x08082b2bu32; }
+        if i == 133u32 { v = 0x08190808u32; }
+        if i == 134u32 { v = 0x08190808u32; }
+        if i == 135u32 { v = 0x08190808u32; }
+        if i == 136u32 { v = 0x08190808u32; }
+        if i == 137u32 { v = 0x08190808u32; }
+        if i == 138u32 { v = 0x08190808u32; }
+        if i == 139u32 { v = 0x08190808u32; }
+        if i == 140u32 { v = 0x08190808u32; }
+        if i == 141u32 { v = 0x08190808u32; }
+        if i == 142u32 { v = 0x08190808u32; }
+        if i == 143u32 { v = 0x08190808u32; }
+        if i == 144u32 { v = 0x08190808u32; }
+        if i == 145u32 { v = 0x08190808u32; }
+        if i == 146u32 { v = 0x08190808u32; }
+        if i == 147u32 { v = 0x08190808u32; }
+        if i == 148u32 { v = 0x08190808u32; }
+        if i == 149u32 { v = 0x08190808u32; }
+        if i == 150u32 { v = 0x08190808u32; }
+        if i == 151u32 { v = 0x08190808u32; }
+        if i == 152u32 { v = 0x08190808u32; }
+        if i == 153u32 { v = 0x08190808u32; }
+        if i == 154u32 { v = 0x08190819u32; }
+        if i == 155u32 { v = 0x08190819u32; }
+        if i == 156u32 { v = 0x08190819u32; }
+        if i == 157u32 { v = 0x08190819u32; }
+        if i == 158u32 { v = 0x08190819u32; }
+        if i == 159u32 { v = 0x08190819u32; }
+        if i == 160u32 { v = 0x08190819u32; }
+        if i == 161u32 { v = 0x08190819u32; }
+        if i == 162u32 { v = 0x08190819u32; }
+        if i == 163u32 { v = 0x08190819u32; }
+        if i == 164u32 { v = 0x08190819u32; }
+        if i == 165u32 { v = 0x08190819u32; }
+        if i == 166u32 { v = 0x08190819u32; }
+        if i == 167u32 { v = 0x0819082bu32; }
+        if i == 168u32 { v = 0x0819082bu32; }
+        if i == 169u32 { v = 0x0819082bu32; }
+        if i == 170u32 { v = 0x0819082bu32; }
+        if i == 171u32 { v = 0x0819082bu32; }
+        if i == 172u32 { v = 0x0819082bu32; }
+        if i == 173u32 { v = 0x08191908u32; }
+        if i == 174u32 { v = 0x08191908u32; }
+        if i == 175u32 { v = 0x08191908u32; }
+        if i == 176u32 { v = 0x08191908u32; }
+        if i == 177u32 { v = 0x08191908u32; }
+        if i == 178u32 { v = 0x08191908u32; }
+        if i == 179u32 { v = 0x08191908u32; }
+        if i == 180u32 { v = 0x08191908u32; }
+        if i == 181u32 { v = 0x08191908u32; }
+        if i == 182u32 { v = 0x08191908u32; }
+        if i == 183u32 { v = 0x08191908u32; }
+        if i == 184u32 { v = 0x08191908u32; }
+        if i == 185u32 { v = 0x08191908u32; }
+        if i == 186u32 { v = 0x08191919u32; }
+        if i == 187u32 { v = 0x08191919u32; }
+        if i == 188u32 { v = 0x08191919u32; }
+        if i == 189u32 { v = 0x08191919u32; }
+        if i == 190u32 { v = 0x0819192bu32; }
+        if i == 191u32 { v = 0x0819192bu32; }
+        if i == 192u32 { v = 0x0819192bu32; }
+        if i == 193u32 { v = 0x08192b08u32; }
+        if i == 194u32 { v = 0x08192b08u32; }
+        if i == 195u32 { v = 0x08192b08u32; }
+        if i == 196u32 { v = 0x08192b08u32; }
+        if i == 197u32 { v = 0x08192b08u32; }
+        if i == 198u32 { v = 0x08192b08u32; }
+        if i == 199u32 { v = 0x08192b08u32; }
+        if i == 200u32 { v = 0x08192b19u32; }
+        if i == 201u32 { v = 0x08192b19u32; }
+        if i == 202u32 { v = 0x08192b19u32; }
+        if i == 203u32 { v = 0x08192b2bu32; }
+        if i == 204u32 { v = 0x08192b2bu32; }
+        if i == 205u32 { v = 0x082b0808u32; }
+        if i == 206u32 { v = 0x082b0808u32; }
+        if i == 207u32 { v = 0x082b0808u32; }
+        if i == 208u32 { v = 0x082b0808u32; }
+        if i == 209u32 { v = 0x082b0808u32; }
+        if i == 210u32 { v = 0x082b0808u32; }
+        if i == 211u32 { v = 0x082b0808u32; }
+        if i == 212u32 { v = 0x082b0808u32; }
+        if i == 213u32 { v = 0x082b0808u32; }
+        if i == 214u32 { v = 0x082b0808u32; }
+        if i == 215u32 { v = 0x082b0808u32; }
+        if i == 216u32 { v = 0x082b0808u32; }
+        if i == 217u32 { v = 0x082b0808u32; }
+        if i == 218u32 { v = 0x082b0819u32; }
+        if i == 219u32 { v = 0x082b0819u32; }
+        if i == 220u32 { v = 0x082b0819u32; }
+        if i == 221u32 { v = 0x082b0819u32; }
+        if i == 222u32 { v = 0x082b0819u32; }
+        if i == 223u32 { v = 0x082b0819u32; }
+        if i == 224u32 { v = 0x082b082bu32; }
+        if i == 225u32 { v = 0x082b082bu32; }
+        if i == 226u32 { v = 0x082b082bu32; }
+        if i == 227u32 { v = 0x082b082bu32; }
+        if i == 228u32 { v = 0x082b1908u32; }
+        if i == 229u32 { v = 0x082b1908u32; }
+        if i == 230u32 { v = 0x082b1908u32; }
+        if i == 231u32 { v = 0x082b1908u32; }
+        if i == 232u32 { v = 0x082b1908u32; }
+        if i == 233u32 { v = 0x082b1919u32; }
+        if i == 234u32 { v = 0x082b1919u32; }
+        if i == 235u32 { v = 0x082b1919u32; }
+        if i == 236u32 { v = 0x082b1919u32; }
+        if i == 237u32 { v = 0x082b192bu32; }
+        if i == 238u32 { v = 0x082b192bu32; }
+        if i == 239u32 { v = 0x082b192bu32; }
+        if i == 240u32 { v = 0x082b2b08u32; }
+        if i == 241u32 { v = 0x082b2b08u32; }
+        if i == 242u32 { v = 0x082b2b08u32; }
+        if i == 243u32 { v = 0x082b2b08u32; }
+        if i == 244u32 { v = 0x082b2b08u32; }
+        if i == 245u32 { v = 0x082b2b08u32; }
+        if i == 246u32 { v = 0x082b2b08u32; }
+        if i == 247u32 { v = 0x082b2b19u32; }
+        if i == 248u32 { v = 0x082b2b19u32; }
+        if i == 249u32 { v = 0x082b2b2bu32; }
+        if i == 250u32 { v = 0x082b2b2bu32; }
+        if i == 251u32 { v = 0x082b2b2bu32; }
+        if i == 252u32 { v = 0x082b2b2bu32; }
+        if i == 253u32 { v = 0x082b2b2bu32; }
+        if i == 254u32 { v = 0x19080808u32; }
+        if i == 255u32 { v = 0x19080808u32; }
+        if i == 256u32 { v = 0x19080808u32; }
+        if i == 257u32 { v = 0x19080808u32; }
+        if i == 258u32 { v = 0x19080808u32; }
+        if i == 259u32 { v = 0x19080808u32; }
+        if i == 260u32 { v = 0x19080808u32; }
+        if i == 261u32 { v = 0x19080808u32; }
+        if i == 262u32 { v = 0x19080808u32; }
+        if i == 263u32 { v = 0x19080808u32; }
+        if i == 264u32 { v = 0x19080808u32; }
+        if i == 265u32 { v = 0x19080808u32; }
+        if i == 266u32 { v = 0x19080808u32; }
+        if i == 267u32 { v = 0x19080808u32; }
+        if i == 268u32 { v = 0x19080808u32; }
+        if i == 269u32 { v = 0x19080808u32; }
+        if i == 270u32 { v = 0x19080808u32; }
+        if i == 271u32 { v = 0x19080808u32; }
+        if i == 272u32 { v = 0x19080808u32; }
+        if i == 273u32 { v = 0x19080808u32; }
+        if i == 274u32 { v = 0x19080808u32; }
+        if i == 275u32 { v = 0x19080808u32; }
+        if i == 276u32 { v = 0x19080819u32; }
+        if i == 277u32 { v = 0x19080819u32; }
+        if i == 278u32 { v = 0x19080819u32; }
+        if i == 279u32 { v = 0x19080819u32; }
+        if i == 280u32 { v = 0x19080819u32; }
+        if i == 281u32 { v = 0x19080819u32; }
+        if i == 282u32 { v = 0x19080819u32; }
+        if i == 283u32 { v = 0x19080819u32; }
+        if i == 284u32 { v = 0x19080819u32; }
+        if i == 285u32 { v = 0x19080819u32; }
+        if i == 286u32 { v = 0x19080819u32; }
+        if i == 287u32 { v = 0x19080819u32; }
+        if i == 288u32 { v = 0x19080819u32; }
+        if i == 289u32 { v = 0x1908082bu32; }
+        if i == 290u32 { v = 0x1908082bu32; }
+        if i == 291u32 { v = 0x1908082bu32; }
+        if i == 292u32 { v = 0x1908082bu32; }
+        if i == 293u32 { v = 0x1908082bu32; }
+        if i == 294u32 { v = 0x1908082bu32; }
+        if i == 295u32 { v = 0x19081908u32; }
+        if i == 296u32 { v = 0x19081908u32; }
+        if i == 297u32 { v = 0x19081908u32; }
+        if i == 298u32 { v = 0x19081908u32; }
+        if i == 299u32 { v = 0x19081908u32; }
+        if i == 300u32 { v = 0x19081908u32; }
+        if i == 301u32 { v = 0x19081908u32; }
+        if i == 302u32 { v = 0x19081908u32; }
+        if i == 303u32 { v = 0x19081908u32; }
+        if i == 304u32 { v = 0x19081908u32; }
+        if i == 305u32 { v = 0x19081908u32; }
+        if i == 306u32 { v = 0x19081908u32; }
+        if i == 307u32 { v = 0x19081908u32; }
+        if i == 308u32 { v = 0x19081919u32; }
+        if i == 309u32 { v = 0x19081919u32; }
+        if i == 310u32 { v = 0x19081919u32; }
+        if i == 311u32 { v = 0x19081919u32; }
+        if i == 312u32 { v = 0x19081919u32; }
+        if i == 313u32 { v = 0x19081919u32; }
+        if i == 314u32 { v = 0x1908192bu32; }
+        if i == 315u32 { v = 0x1908192bu32; }
+        if i == 316u32 { v = 0x1908192bu32; }
+        if i == 317u32 { v = 0x1908192bu32; }
+        if i == 318u32 { v = 0x19082b08u32; }
+        if i == 319u32 { v = 0x19082b08u32; }
+        if i == 320u32 { v = 0x19082b08u32; }
+        if i == 321u32 { v = 0x19082b08u32; }
+        if i == 322u32 { v = 0x19082b08u32; }
+        if i == 323u32 { v = 0x19082b08u32; }
+        if i == 324u32 { v = 0x19082b08u32; }
+        if i == 325u32 { v = 0x19082b19u32; }
+        if i == 326u32 { v = 0x19082b19u32; }
+        if i == 327u32 { v = 0x19082b19u32; }
+        if i == 328u32 { v = 0x19082b19u32; }
+        if i == 329u32 { v = 0x19082b19u32; }
+        if i == 330u32 { v = 0x19082b2bu32; }
+        if i == 331u32 { v = 0x19190808u32; }
+        if i == 332u32 { v = 0x19190808u32; }
+        if i == 333u32 { v = 0x19190808u32; }
+        if i == 334u32 { v = 0x19190808u32; }
+        if i == 335u32 { v = 0x19190808u32; }
+        if i == 336u32 { v = 0x19190808u32; }
+        if i == 337u32 { v = 0x19190808u32; }
+        if i == 338u32 { v = 0x19190808u32; }
+        if i == 339u32 { v = 0x19190808u32; }
+        if i == 340u32 { v = 0x19190808u32; }
+        if i == 341u32 { v = 0x19190808u32; }
+        if i == 342u32 { v = 0x19190808u32; }
+        if i == 343u32 { v = 0x19190819u32; }
+        if i == 344u32 { v = 0x19190819u32; }
+        if i == 345u32 { v = 0x19190819u32; }
+        if i == 346u32 { v = 0x19190819u32; }
+        if i == 347u32 { v = 0x19190819u32; }
+        if i == 348u32 { v = 0x19190819u32; }
+        if i == 349u32 { v = 0x1919082bu32; }
+        if i == 350u32 { v = 0x1919082bu32; }
+        if i == 351u32 { v = 0x1919082bu32; }
+        if i == 352u32 { v = 0x19191908u32; }
+        if i == 353u32 { v = 0x19191908u32; }
+        if i == 354u32 { v = 0x19191908u32; }
+        if i == 355u32 { v = 0x19191908u32; }
+        if i == 356u32 { v = 0x19191908u32; }
+        if i == 357u32 { v = 0x19191908u32; }
+        if i == 358u32 { v = 0x19191908u32; }
+        if i == 359u32 { v = 0x19191908u32; }
+        if i == 360u32 { v = 0x19191919u32; }
+        if i == 361u32 { v = 0x19191919u32; }
+        if i == 362u32 { v = 0x19191919u32; }
+        if i == 363u32 { v = 0x19191919u32; }
+        if i == 364u32 { v = 0x1919192bu32; }
+        if i == 365u32 { v = 0x1919192bu32; }
+        if i == 366u32 { v = 0x1919192bu32; }
+        if i == 367u32 { v = 0x19192b08u32; }
+        if i == 368u32 { v = 0x19192b08u32; }
+        if i == 369u32 { v = 0x19192b08u32; }
+        if i == 370u32 { v = 0x19192b08u32; }
+        if i == 371u32 { v = 0x19192b08u32; }
+        if i == 372u32 { v = 0x19192b19u32; }
+        if i == 373u32 { v = 0x19192b19u32; }
+        if i == 374u32 { v = 0x19192b19u32; }
+        if i == 375u32 { v = 0x19192b2bu32; }
+        if i == 376u32 { v = 0x192b0808u32; }
+        if i == 377u32 { v = 0x192b0808u32; }
+        if i == 378u32 { v = 0x192b0808u32; }
+        if i == 379u32 { v = 0x192b0808u32; }
+        if i == 380u32 { v = 0x192b0808u32; }
+        if i == 381u32 { v = 0x192b0808u32; }
+        if i == 382u32 { v = 0x192b0808u32; }
+        if i == 383u32 { v = 0x192b0808u32; }
+        if i == 384u32 { v = 0x192b0819u32; }
+        if i == 385u32 { v = 0x192b082bu32; }
+        if i == 386u32 { v = 0x192b082bu32; }
+        if i == 387u32 { v = 0x192b082bu32; }
+        if i == 388u32 { v = 0x192b1908u32; }
+        if i == 389u32 { v = 0x192b1908u32; }
+        if i == 390u32 { v = 0x192b1919u32; }
+        if i == 391u32 { v = 0x192b1919u32; }
+        if i == 392u32 { v = 0x192b1919u32; }
+        if i == 393u32 { v = 0x192b1919u32; }
+        if i == 394u32 { v = 0x192b2b08u32; }
+        if i == 395u32 { v = 0x192b2b08u32; }
+        if i == 396u32 { v = 0x192b2b19u32; }
+        if i == 397u32 { v = 0x192b2b2bu32; }
+        if i == 398u32 { v = 0x192b2b2bu32; }
+        if i == 399u32 { v = 0x192b2b2bu32; }
+        if i == 400u32 { v = 0x2b080808u32; }
+        if i == 401u32 { v = 0x2b080808u32; }
+        if i == 402u32 { v = 0x2b080808u32; }
+        if i == 403u32 { v = 0x2b080808u32; }
+        if i == 404u32 { v = 0x2b080808u32; }
+        if i == 405u32 { v = 0x2b080808u32; }
+        if i == 406u32 { v = 0x2b080808u32; }
+        if i == 407u32 { v = 0x2b080808u32; }
+        if i == 408u32 { v = 0x2b080808u32; }
+        if i == 409u32 { v = 0x2b080808u32; }
+        if i == 410u32 { v = 0x2b080808u32; }
+        if i == 411u32 { v = 0x2b080808u32; }
+        if i == 412u32 { v = 0x2b080808u32; }
+        if i == 413u32 { v = 0x2b080808u32; }
+        if i == 414u32 { v = 0x2b080808u32; }
+        if i == 415u32 { v = 0x2b080819u32; }
+        if i == 416u32 { v = 0x2b080819u32; }
+        if i == 417u32 { v = 0x2b080819u32; }
+        if i == 418u32 { v = 0x2b080819u32; }
+        if i == 419u32 { v = 0x2b080819u32; }
+        if i == 420u32 { v = 0x2b080819u32; }
+        if i == 421u32 { v = 0x2b080819u32; }
+        if i == 422u32 { v = 0x2b08082bu32; }
+        if i == 423u32 { v = 0x2b08082bu32; }
+        if i == 424u32 { v = 0x2b08082bu32; }
+        if i == 425u32 { v = 0x2b08082bu32; }
+        if i == 426u32 { v = 0x2b08082bu32; }
+        if i == 427u32 { v = 0x2b08082bu32; }
+        if i == 428u32 { v = 0x2b081908u32; }
+        if i == 429u32 { v = 0x2b081908u32; }
+        if i == 430u32 { v = 0x2b081908u32; }
+        if i == 431u32 { v = 0x2b081908u32; }
+        if i == 432u32 { v = 0x2b081908u32; }
+        if i == 433u32 { v = 0x2b081908u32; }
+        if i == 434u32 { v = 0x2b081908u32; }
+        if i == 435u32 { v = 0x2b081908u32; }
+        if i == 436u32 { v = 0x2b081919u32; }
+        if i == 437u32 { v = 0x2b081919u32; }
+        if i == 438u32 { v = 0x2b081919u32; }
+        if i == 439u32 { v = 0x2b08192bu32; }
+        if i == 440u32 { v = 0x2b08192bu32; }
+        if i == 441u32 { v = 0x2b082b08u32; }
+        if i == 442u32 { v = 0x2b082b08u32; }
+        if i == 443u32 { v = 0x2b082b08u32; }
+        if i == 444u32 { v = 0x2b082b08u32; }
+        if i == 445u32 { v = 0x2b082b08u32; }
+        if i == 446u32 { v = 0x2b082b08u32; }
+        if i == 447u32 { v = 0x2b082b08u32; }
+        if i == 448u32 { v = 0x2b082b19u32; }
+        if i == 449u32 { v = 0x2b082b2bu32; }
+        if i == 450u32 { v = 0x2b082b2bu32; }
+        if i == 451u32 { v = 0x2b082b2bu32; }
+        if i == 452u32 { v = 0x2b082b2bu32; }
+        if i == 453u32 { v = 0x2b082b2bu32; }
+        if i == 454u32 { v = 0x2b190808u32; }
+        if i == 455u32 { v = 0x2b190808u32; }
+        if i == 456u32 { v = 0x2b190808u32; }
+        if i == 457u32 { v = 0x2b190808u32; }
+        if i == 458u32 { v = 0x2b190808u32; }
+        if i == 459u32 { v = 0x2b190808u32; }
+        if i == 460u32 { v = 0x2b190819u32; }
+        if i == 461u32 { v = 0x2b190819u32; }
+        if i == 462u32 { v = 0x2b190819u32; }
+        if i == 463u32 { v = 0x2b19082bu32; }
+        if i == 464u32 { v = 0x2b19082bu32; }
+        if i == 465u32 { v = 0x2b191908u32; }
+        if i == 466u32 { v = 0x2b191908u32; }
+        if i == 467u32 { v = 0x2b191908u32; }
+        if i == 468u32 { v = 0x2b191908u32; }
+        if i == 469u32 { v = 0x2b191908u32; }
+        if i == 470u32 { v = 0x2b191919u32; }
+        if i == 471u32 { v = 0x2b191919u32; }
+        if i == 472u32 { v = 0x2b191919u32; }
+        if i == 473u32 { v = 0x2b19192bu32; }
+        if i == 474u32 { v = 0x2b192b08u32; }
+        if i == 475u32 { v = 0x2b192b08u32; }
+        if i == 476u32 { v = 0x2b192b19u32; }
+        if i == 477u32 { v = 0x2b192b2bu32; }
+        if i == 478u32 { v = 0x2b192b2bu32; }
+        if i == 479u32 { v = 0x2b2b0808u32; }
+        if i == 480u32 { v = 0x2b2b0808u32; }
+        if i == 481u32 { v = 0x2b2b0808u32; }
+        if i == 482u32 { v = 0x2b2b0808u32; }
+        if i == 483u32 { v = 0x2b2b0808u32; }
+        if i == 484u32 { v = 0x2b2b0808u32; }
+        if i == 485u32 { v = 0x2b2b0808u32; }
+        if i == 486u32 { v = 0x2b2b0819u32; }
+        if i == 487u32 { v = 0x2b2b0819u32; }
+        if i == 488u32 { v = 0x2b2b0819u32; }
+        if i == 489u32 { v = 0x2b2b082bu32; }
+        if i == 490u32 { v = 0x2b2b082bu32; }
+        if i == 491u32 { v = 0x2b2b082bu32; }
+        if i == 492u32 { v = 0x2b2b082bu32; }
+        if i == 493u32 { v = 0x2b2b082bu32; }
+        if i == 494u32 { v = 0x2b2b082bu32; }
+        if i == 495u32 { v = 0x2b2b1908u32; }
+        if i == 496u32 { v = 0x2b2b1908u32; }
+        if i == 497u32 { v = 0x2b2b192bu32; }
+        if i == 498u32 { v = 0x2b2b192bu32; }
+        if i == 499u32 { v = 0x2b2b2b08u32; }
+        if i == 500u32 { v = 0x2b2b2b08u32; }
+        if i == 501u32 { v = 0x2b2b2b08u32; }
+        if i == 502u32 { v = 0x2b2b2b08u32; }
+        if i == 503u32 { v = 0x2b2b2b08u32; }
+        if i == 504u32 { v = 0x2b2b2b08u32; }
+        if i == 505u32 { v = 0x2b2b2b19u32; }
+        if i == 506u32 { v = 0x2b2b2b19u32; }
+        if i == 507u32 { v = 0x2b2b2b19u32; }
+        if i == 508u32 { v = 0x2b2b2b2bu32; }
+        if i == 509u32 { v = 0x2b2b2b2bu32; }
+        if i == 510u32 { v = 0x2b2b2b2bu32; }
+        if i == 511u32 { v = 0x2b2b2b2bu32; }
+        v
     }
 
     /// `tmp += vec_dot_<FMT>_q8_1(xb, yb, iqs)` with the reference's contraction of the `+=`.
@@ -1638,6 +5606,177 @@ mod kernels {
     #[inline(always)]
     pub unsafe fn vdot<const FMT: u32, const GROUPED: bool>(tmp: f32, xb: *const u8, yb: *const u8, iqs: usize) -> f32 {
         match FMT {
+            18 => {
+                // vec_dot_iq3_xxs_q8_1; kqs = 4*(tid % (qi/vdr)) => q8 block = kby + iqs/vdr.
+                let qs = xb.add(2);
+                let q3a = get_b4(qs, iqs as i32);
+                let q3b = get_b4(qs, iqs as i32 + 1);
+                let mut q3 = [0u8; 8];
+                q3[0] = q3a as u8; q3[1] = (q3a >> 8) as u8; q3[2] = (q3a >> 16) as u8; q3[3] = (q3a >> 24) as u8;
+                q3[4] = q3b as u8; q3[5] = (q3b >> 8) as u8; q3[6] = (q3b >> 16) as u8; q3[7] = (q3b >> 24) as u8;
+                let aux32 = get_b4(qs.add(64), iqs as i32 / 2);
+                let b8 = yb.add((iqs / 2) * 36);
+                let q8 = b8.add(4) as *const u32;
+                let mut sumi = 0i32;
+                let mut l0 = 0usize;
+                while l0 < 8 {
+                    let g0 = i3_grid(q3[l0] as u32);
+                    let g1 = i3_grid(q3[l0 + 1] as u32);
+                    let signs = unpack_ksigns(aux32 >> (7 * l0 as u32 / 2));
+                    // unpack_ksigns already broadcasts the byte across the word (s * 0x01010101);
+                    // multiplying again here squares the byte and corrupts the sign selectors.
+                    let s0 = vcmpne4_zero(signs & 0x0804_0201);
+                    let g_l = vsub4_wrap(g0 ^ s0, s0);
+                    let s1 = vcmpne4_zero(signs & 0x8040_2010);
+                    let g_h = vsub4_wrap(g1 ^ s1, s1);
+                    sumi = dp4a(g_l, *q8.add(l0), sumi);
+                    sumi = dp4a(g_h, *q8.add(l0 + 1), sumi);
+                    l0 += 2;
+                }
+                let ls = (aux32 >> 28) as i32;
+                let sumi = (ls.wrapping_mul(sumi).wrapping_add(sumi / 2)) / 2;
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(b8, 0)));
+                fmaf(d, sumi as f32, tmp)
+            }
+            20 => {
+                // vec_dot_iq4_nl_q8_1 (vecdotq.cuh): one q8_1 block per iq4_nl block (QK 32);
+                // q8 = bq8_1->qs + iqs, aux = get_int_b2(bq4->qs, iqs + l), v = table16(aux) against q8[l], q8[l + 4].
+                let qs = xb.add(2);
+                let q8 = yb.add(4) as *const u32;
+                let mut sumi = 0i32;
+                let mut l = 0usize;
+                while l < 2 {
+                    let (v0, v1) = i4_table16(get_b2(qs, (iqs + l) as i32));
+                    sumi = dp4a(v0, *q8.add(iqs + l), sumi);
+                    sumi = dp4a(v1, *q8.add(iqs + l + 4), sumi);
+                    l += 1;
+                }
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(yb, 0)));
+                fmaf(d, sumi as f32, tmp)
+            }
+            23 => {
+                // vec_dot_iq4_xs_q8_1; kqs = 4*(tid % (qi/vdr)) => q8 block = kby + iqs/vdr.
+                let qs = xb.add(8) as *const u32;
+                let b8 = yb.add((iqs / 4) * 36);
+                let q8 = b8.add(4) as *const u32;
+                let mut sumi = 0i32;
+                let mut j = 0usize;
+                while j < 4 {
+                    let (v0, v1) = i4_table16(get_b4(xb, iqs as i32 + j as i32 + 2));
+                    sumi = dp4a(v0, *q8.add(j), sumi);
+                    sumi = dp4a(v1, *q8.add(j + 4), sumi);
+                    j += 1;
+                }
+                let ls = i4_group_scale6(xb, iqs / 4) as i32 - 32;
+                let sumi = sumi.wrapping_mul(ls);
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(b8, 0)));
+                fmaf(d, sumi as f32, tmp)
+            }
+
+            17 => {
+                // vec_dot_iq2_xs_q8_1; iqs is 2*(tid % 8) => q8 block iqs/2.
+                let qs = xb.add(2);
+                let q16 = qs.add(4 * iqs) as *const u16;
+                let ls0 = (*xb.add(66 + (iqs / 2)) & 0x0F) as i32;
+                let ls1 = (*xb.add(66 + (iqs / 2)) >> 4) as i32;
+                let b8 = yb.add((iqs / 2) * 36);
+                let q8 = b8.add(4) as *const u32;
+                let mut sumi0 = 0i32;
+                let mut sumi1 = 0i32;
+                let mut l0 = 0usize;
+                while l0 < 8 {
+                    let w = *q16.add(l0 / 2) as u32;
+                    let gl = xs_grid_lo(w & 0x1FF);
+                    let gh = xs_grid_hi(w & 0x1FF);
+                    let signs = unpack_ksigns(w >> 9);
+                    let s0 = vcmpne4_zero(signs & 0x0804_0201);
+                    let s1 = vcmpne4_zero(signs & 0x8040_2010);
+                    let g0 = vsub4_wrap(gl ^ s0, s0);
+                    let g1 = vsub4_wrap(gh ^ s1, s1);
+                    if l0 < 4 {
+                        sumi0 = dp4a(g0, *q8.add(l0), sumi0);
+                        sumi0 = dp4a(g1, *q8.add(l0 + 1), sumi0);
+                    } else {
+                        sumi1 = dp4a(g0, *q8.add(l0), sumi1);
+                        sumi1 = dp4a(g1, *q8.add(l0 + 1), sumi1);
+                    }
+                    l0 += 2;
+                }
+                let sumi = sumi0.wrapping_mul(ls0).wrapping_add(sumi1.wrapping_mul(ls1)).wrapping_add((sumi0 + sumi1) / 2) / 4;
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(b8, 0)));
+                fmaf(d, sumi as f32, tmp)
+            }
+            22 => {
+                // vec_dot_iq2_s_q8_1; iqs is 2*(tid % 8) => q8 block iqs/2.
+                let i2 = iqs as i32 / 2;
+                let qs = xb.add(2);
+                let qp = get_b2(qs, i2);
+                let sp = get_b2(qs.add(32), i2);
+                let mut q8b = [0u8; 4];
+                let mut s8 = [0u8; 4];
+                let mut t = 0usize;
+                while t < 4 { q8b[t] = (qp >> (8 * t)) as u8; s8[t] = (sp >> (8 * t)) as u8; t += 1; }
+                let qh = *xb.add(66 + i2 as usize) as u32;
+                let ls0 = (*xb.add(74 + i2 as usize) & 0x0F) as i32;
+                let ls1 = (*xb.add(74 + i2 as usize) >> 4) as i32;
+                let b8 = yb.add((iqs / 2) * 36);
+                let q8 = b8.add(4) as *const u32;
+                let mut sumi0 = 0i32;
+                let mut sumi1 = 0i32;
+                let mut l0 = 0usize;
+                while l0 < 8 {
+                    let gidx = q8b[l0 / 2] as u32 | ((qh << (8 - l0 as u32)) & 0x300);
+                    let gl = s_grid_lo(gidx);
+                    let gh = s_grid_hi(gidx);
+                    let sb = s8[l0 / 2] as u32;
+                    let s0 = vcmpne4_zero(((sb & 0x03) << 7) | ((sb & 0x0C) << 21));
+                    let s1 = vcmpne4_zero(((sb & 0x30) << 3) | ((sb & 0xC0) << 17));
+                    let g_l = vsub4_wrap(gl ^ s0, s0);
+                    let g_h = vsub4_wrap(gh ^ s1, s1);
+                    if l0 < 4 {
+                        sumi0 = dp4a(g_l, *q8.add(l0), sumi0);
+                        sumi0 = dp4a(g_h, *q8.add(l0 + 1), sumi0);
+                    } else {
+                        sumi1 = dp4a(g_l, *q8.add(l0), sumi1);
+                        sumi1 = dp4a(g_h, *q8.add(l0 + 1), sumi1);
+                    }
+                    l0 += 2;
+                }
+                let sumi = (sumi0.wrapping_mul(ls0).wrapping_add(sumi1.wrapping_mul(ls1)).wrapping_add((sumi0 + sumi1) / 2)) / 4;
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(b8, 0)));
+                fmaf(d, sumi as f32, tmp)
+            }
+
+            11 => {
+                // vec_dot_iq2_xxs_q8_1. iqs is already 2*(tid % 8) => q8 word base iqs/2.
+                // block_iq2_xxs starts with `half d`, so qs sits at byte 2: the reference
+                // reads get_int_b2(bq2->qs, ...) = byte 2 + 4*k, not 4*k.
+                let qs2 = xb.add(2);
+                let q2 = get_b2(qs2, iqs as i32);
+                let aux8 = q2.to_le_bytes();
+                let aux32 = get_b2(qs2, iqs as i32 + 1);
+                let mut sumi = 0i32;
+                let mut k0 = 0usize;
+                while k0 < 8 {
+                    let idx = aux8[k0 / 2] as usize;
+                    let gl = grid_lo(idx as u32);
+                    let gh = grid_hi(idx as u32);
+                    let signs = unpack_ksigns(aux32 >> (7 * k0 as u32 / 2));
+                    let s0 = vcmpne4_zero(signs & 0x0804_0201);
+                    let s1 = vcmpne4_zero(signs & 0x8040_2010);
+                    let g0 = vsub4_wrap(gl ^ s0, s0);
+                    let g1 = vsub4_wrap(gh ^ s1, s1);
+                    let b8 = yb.add((iqs / 2) * 36);
+                    sumi = dp4a(g0, yq(b8, k0), sumi);
+                    sumi = dp4a(g1, yq(b8, k0 + 1), sumi);
+                    k0 += 2;
+                }
+                let ls = (aux32 >> 27 | 1) as i32;
+                let sumi2 = sumi.wrapping_mul(ls) / 8;
+                let b8 = yb.add((iqs / 2) * 36);
+                let d = mulf(h2f32(ld16(xb, 0)), h2f32(ld16(b8, 0)));
+                fmaf(d, sumi2 as f32, tmp)
+            }
             0 | 1 | 2 | 3 => {
                 let mut sumi = 0i32;
                 let mut i = 0;
@@ -2007,8 +6146,11 @@ mod kernels {
         }
     }
 
-    /// moe_gemv_down_aggregate: grid (ceil(n / 16), topk, batch), block (32, 4); each warp 4 rows;
-    /// out[batch, row] += tmp * topk_weight through a float atomic (red.add.f32 is .ftz).
+    /// moe_gemv_down_aggregate: grid (ceil(n / 4), 1, batch), block (32, 4); each warp one row and every
+    /// top-k slot of its token in slot order: out[batch, row] = ((out + p_0) + p_1) + ... with
+    /// p_s = dot_s * topk_weight_s and .ftz adds, i.e. the sum the reference's float atomics
+    /// (red.add.f32 is .ftz) form when they arrive in slot order. The atomics' arrival order was the
+    /// hardware's, so the reference's result varied run to run; this one is fixed (redcell).
     #[inline(always)]
     unsafe fn down_aggregate<const FMT: u32>(
         all_w: *const u8, all_x: *const u8, indices: *const u32, topk_weights: *const f32, all_out: *mut f32, n: i32, k: i32,
@@ -2017,26 +6159,25 @@ mod kernels {
         let (qk, qi, vdr, bs) = fmt_params::<FMT>();
         let warp_id = thread::threadIdx_y() as i32;
         let tx = thread::threadIdx_x() as i32;
-        let row0 = (16 * thread::blockIdx_x() as i32).wrapping_add(warp_id * 4);
-        let cur_topk = thread::blockIdx_y() as i32;
+        let row = (4 * thread::blockIdx_x() as i32).wrapping_add(warp_id);
         let cur_batch = thread::blockIdx_z() as i32;
-        if row0 >= n {
+        if row >= n {
             return;
         }
-        let task_id = cur_batch.wrapping_mul(topk).wrapping_add(cur_topk);
-        let expert_id = *indices.offset(task_id as isize);
-        let tw = *topk_weights.offset(task_id as isize);
         let bpr = (k as i64 as u64).wrapping_add(qk as u64 - 1) / qk as u64;
         let w_stride = (n as i64 as u64).wrapping_mul(bpr).wrapping_mul(bs as u64);
         let x_stride = (k_padded as i64 as u64) / 32 * 36;
-        let x = all_x.wrapping_add((task_id as i64 as u64).wrapping_mul(x_stride) as usize);
-        let w = all_w.wrapping_add((expert_id as u64).wrapping_mul(w_stride) as usize);
         let bpi = vdr * 32 / qi;
         let bpr_x = bpr as i32;
         let out = all_out.wrapping_add((cur_batch as i64 as u64).wrapping_mul(n as i64 as u64) as usize);
-        let mut r = 0;
-        while r < 4 && row0 + r < n {
-            let row = row0 + r;
+        let mut acc = *out.offset(row as isize);
+        let mut slot = 0;
+        while slot < topk {
+            let task_id = cur_batch.wrapping_mul(topk).wrapping_add(slot);
+            let expert_id = *indices.offset(task_id as isize);
+            let tw = *topk_weights.offset(task_id as isize);
+            let x = all_x.wrapping_add((task_id as i64 as u64).wrapping_mul(x_stride) as usize);
+            let w = all_w.wrapping_add((expert_id as u64).wrapping_mul(w_stride) as usize);
             let mut tmp = 0.0f32;
             let mut kbx = tx / (qi / vdr);
             while kbx < bpr_x {
@@ -2047,10 +6188,11 @@ mod kernels {
                 kbx += bpi;
             }
             tmp = warp_xor_sum(tmp);
-            if tx == 0 {
-                DeviceAtomicF32::from_ptr(out.offset(row as isize)).fetch_add(mulf(tmp, tw), AtomicOrdering::Relaxed);
-            }
-            r += 1;
+            acc = addf(acc, mulf(tmp, tw));
+            slot += 1;
+        }
+        if tx == 0 {
+            *out.offset(row as isize) = acc;
         }
     }
     // GENERATED MOE KERNELS BEGIN
@@ -2069,6 +6211,11 @@ mod kernels {
     #[kernel] pub unsafe fn indexed_moe_forward_q8_0_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<4>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn moe_gemv_fused_gate_up_q8_0_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<4>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
     #[kernel] pub unsafe fn moe_gemv_down_aggregate_q8_0_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<4>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq3_xxs_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<18>(w, x, ids, out, n, k, batch, topk, kp, d1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq4_xs_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<23>(w, x, ids, out, n, k, batch, topk, kp, d1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq4_nl_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<20>(w, x, ids, out, n, k, batch, topk, kp, d1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq2_xs_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<17>(w, x, ids, out, n, k, batch, topk, kp, d1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq2_s_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<22>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn indexed_moe_forward_q2k_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<5>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn moe_gemv_fused_gate_up_q2k_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<5>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
     #[kernel] pub unsafe fn moe_gemv_down_aggregate_q2k_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<5>(w, x, ids, tw, out, n, k, batch, topk, kp) }
@@ -2084,6 +6231,19 @@ mod kernels {
     #[kernel] pub unsafe fn indexed_moe_forward_q6k_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<9>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn moe_gemv_fused_gate_up_q6k_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<9>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
     #[kernel] pub unsafe fn moe_gemv_down_aggregate_q6k_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<9>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq3_xxs_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<18>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq4_xs_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<23>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq4_nl_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<20>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq2_xs_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<17>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq3_xxs_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<18>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq4_xs_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<23>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq4_nl_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<20>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq2_xs_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<17>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq2_s_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<22>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq2_s_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<22>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn moe_gemv_fused_gate_up_iq2_xxs_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<11>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
+    #[kernel] pub unsafe fn moe_gemv_down_aggregate_iq2_xxs_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<11>(w, x, ids, tw, out, n, k, batch, topk, kp) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq2_xxs_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<11>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn indexed_moe_forward_q8_1_q8_1(w: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, d1: i32) { indexed_moe_forward::<10>(w, x, ids, out, n, k, batch, topk, kp, d1) }
     #[kernel] pub unsafe fn moe_gemv_fused_gate_up_q8_1_q8_1(gw: *const u8, uw: *const u8, x: *const u8, ids: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32, act: i32) { fused_gate_up::<10>(gw, uw, x, ids, out, n, k, batch, topk, kp, act) }
     #[kernel] pub unsafe fn moe_gemv_down_aggregate_q8_1_q8_1(w: *const u8, x: *const u8, ids: *const u32, tw: *const f32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, kp: i32) { down_aggregate::<10>(w, x, ids, tw, out, n, k, batch, topk, kp) }
@@ -2289,6 +6449,45 @@ mod kernels {
             if !sorted_source_ids.is_null() {
                 *sorted_source_ids.offset(pos as isize) = idx.wrapping_div(topk);
             }
+        }
+    }
+
+    /// Stable twin of moe_dispatch_scatter_kernel (redcell): grid (num_experts), block (32). The warp of
+    /// expert e walks the assignments in index order and hands out positions cursors[e].. in that order
+    /// (a warp prefix sum of the matches), so sorted_token_ids is ascending within every expert. The
+    /// atomic scatter's order changed from run to run, and with it which MMQ tile (and stream-k split)
+    /// a token landed in, i.e. the bits of the grouped prefill.
+    #[kernel]
+    pub unsafe fn moe_dispatch_scatter_stable_kernel(topk_ids: *const i32, cursors: *mut i32, sorted_token_ids: *mut i32, sorted_source_ids: *mut i32, total: i32, topk: i32) {
+        let e = thread::blockIdx_x() as i32;
+        let lane = thread::threadIdx_x() as i32;
+        let mut pos = *cursors.offset(e as isize);
+        let mut base = 0i32;
+        while base < total {
+            let idx = base.wrapping_add(lane);
+            let hit = if idx < total && *topk_ids.offset(idx as isize) == e { 1i32 } else { 0i32 };
+            let mut inc = hit;
+            let mut d = 1u32;
+            while d < 32 {
+                let o = warp::shuffle_up_sync(0xffff_ffff, inc as u32, d) as i32;
+                if lane as u32 >= d {
+                    inc = inc.wrapping_add(o);
+                }
+                d <<= 1;
+            }
+            if hit != 0 {
+                let p = pos.wrapping_add(inc).wrapping_sub(1);
+                *sorted_token_ids.offset(p as isize) = idx;
+                if !sorted_source_ids.is_null() {
+                    *sorted_source_ids.offset(p as isize) = idx.wrapping_div(topk);
+                }
+            }
+            pos = pos.wrapping_add(warp::shuffle_sync(0xffff_ffff, inc as u32, 31) as i32);
+            base = base.wrapping_add(32);
+        }
+        // leave the cursor where the atomic scatter leaves it (expert_bounds[e + 1])
+        if lane == 0 {
+            *cursors.offset(e as isize) = pos;
         }
     }
 

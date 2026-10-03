@@ -1,0 +1,3 @@
+out/committed-*.ptx
+out/nvcc_cubin_only.sh
+*.nohup

@@ -163,8 +163,7 @@ pub(crate) fn resolve_lora_adapter_model(
 
     let models = list_lora_adapter_models(state)
         .map_err(|error| ApiError::from_error(&error, ApiErrorKind::Internal))?;
-    resolve_lora_adapter_model_from_models(&models, model, adapter)
-        .map_err(ApiError::invalid_request)
+    resolve_lora_adapter_model_from_models(&models, model, adapter).map_err(ApiError::invalid_request)
 }
 
 /// Controls exposure and filesystem access for runtime LoRA management routes.

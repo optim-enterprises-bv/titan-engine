@@ -106,6 +106,7 @@ impl GgufDType {
             39 => "MXFP4",
             40 => "NVFP4",
             41 => "Q1_0",
+            143 => "PTQ1_0",
             _ => "UNKNOWN",
         }
     }
@@ -115,7 +116,7 @@ impl GgufDType {
             0 | 1 | 24..=28 | 30 => Some(1),
             2 | 3 | 6..=9 | 20 | 39 => Some(32),
             40 => Some(64),
-            41 => Some(128),
+            41 | 143 => Some(128),
             10..=19 | 21..=23 | 29 | 34 | 35 => Some(256),
             _ => None,
         }
@@ -155,6 +156,7 @@ impl GgufDType {
             39 => Some(17),
             40 => Some(36),
             41 => Some(18),
+            143 => Some(28),
             _ => None,
         }
     }
@@ -175,7 +177,15 @@ impl GgufDType {
             13 => GgmlDType::Q5K,
             14 => GgmlDType::Q6K,
             15 => GgmlDType::Q8K,
+            16 => GgmlDType::IQ2XXS,
+            17 => GgmlDType::IQ2XS,
+            18 => GgmlDType::IQ3XXS,
+            20 => GgmlDType::IQ4NL,
+            22 => GgmlDType::IQ2S,
+            21 => GgmlDType::IQ3S,
+            23 => GgmlDType::IQ4XS,
             30 => GgmlDType::BF16,
+            143 => GgmlDType::PTQ1_0,
             raw => candle_core::bail!("GGUF dtype {raw} is not supported by Candle"),
         };
         Ok(dtype)
@@ -628,7 +638,14 @@ const fn ggml_dtype_alignment(dtype: GgmlDType) -> usize {
         GgmlDType::Q8K => align_of::<BlockQ8K>(),
         GgmlDType::BF16 => align_of::<bf16>(),
         // titan block types (u8 / f16 fields); over-aligning is harmless here
-        GgmlDType::Q1_0 | GgmlDType::IQ4NL | GgmlDType::MXFP4 | GgmlDType::NVFP4 => align_of::<f16>(),
+        GgmlDType::Q1_0 | GgmlDType::IQ4NL | GgmlDType::MXFP4 | GgmlDType::NVFP4 | GgmlDType::PTQ1_0 => align_of::<f16>(),
+        // i-quant lookup-table families: f16 scale + byte arrays, so f16 alignment is enough
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ4XS
+        | GgmlDType::IQ3S => align_of::<f16>(),
     }
 }
 

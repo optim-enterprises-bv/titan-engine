@@ -22,6 +22,13 @@ pub const Q3_K: QType = QType { name: "q3_K", bs: 110, qk: 256, f16s: &[108], f3
 pub const Q4_K: QType = QType { name: "q4_K", bs: 144, qk: 256, f16s: &[0, 2], f32s: &[] };
 pub const Q5_K: QType = QType { name: "q5_K", bs: 176, qk: 256, f16s: &[0, 2], f32s: &[] };
 pub const Q6_K: QType = QType { name: "q6_K", bs: 210, qk: 256, f16s: &[208], f32s: &[] };
+pub const IQ2_XXS: QType = QType { name: "iq2_xxs", bs: 66,  qk: 256, f16s: &[0], f32s: &[] };
+pub const IQ2_XS:  QType = QType { name: "iq2_xs",  bs: 74,  qk: 256, f16s: &[0], f32s: &[] };
+pub const IQ2_S:   QType = QType { name: "iq2_s",   bs: 82,  qk: 256, f16s: &[0], f32s: &[] };
+pub const IQ3_XXS: QType = QType { name: "iq3_xxs", bs: 98,  qk: 256, f16s: &[0], f32s: &[] };
+pub const IQ4_XS:  QType = QType { name: "iq4_xs",  bs: 136, qk: 256, f16s: &[0], f32s: &[] };
+pub const IQ4_NL:  QType = QType { name: "iq4_nl",  bs: 18,  qk: 32,  f16s: &[0], f32s: &[] };
+
 pub const Q8_K: QType = QType { name: "q8_K", bs: 292, qk: 256, f16s: &[], f32s: &[0] };
 
 pub struct G {
@@ -88,6 +95,11 @@ impl G {
     /// (to check that a test's outputs are mostly finite and non-zero, i.e. meaningful).
     #[allow(clippy::too_many_arguments)]
     pub fn probe(&self, name: &str, grid: (u32, u32, u32), block: (u32, u32, u32), args: &[Arg], bufs: &[Vec<u8>], out: usize) -> Vec<f32> {
+        self.probe_mod(false, name, grid, block, args, bufs, out)
+    }
+
+    /// Same as `probe` but selectable module (false = nvcc reference, true = oxide port).
+    pub fn probe_mod(&self, oxide: bool, name: &str, grid: (u32, u32, u32), block: (u32, u32, u32), args: &[Arg], bufs: &[Vec<u8>], out: usize) -> Vec<f32> {
         use kdiff::cuda_core::DeviceBuffer;
         let st = &self.h.stream;
         let d: Vec<DeviceBuffer<u8>> = bufs.iter().map(|b| DeviceBuffer::from_host(st, b).unwrap()).collect();
@@ -97,7 +109,7 @@ impl G {
             _ => panic!("probe: unsupported arg"),
         }).collect();
         let mut ptrs: Vec<*mut std::ffi::c_void> = vals.iter_mut().map(|v| v.as_mut_ptr() as *mut std::ffi::c_void).collect();
-        let f = self.h.reference.load_function(name).unwrap();
+        let f = if oxide { self.h.oxide.load_function(name).unwrap() } else { self.h.reference.load_function(name).unwrap() };
         unsafe { kdiff::cuda_core::simt::launch_kernel_on_stream(&f, grid, block, 0, st, &mut ptrs).unwrap(); }
         st.synchronize().unwrap();
         let b = d[out].to_host_vec(st).unwrap();
@@ -290,6 +302,136 @@ fn moe(g: &mut G) {
     }
 }
 
+// Family 4b: fused MoE for the i-quant lookup-table families.
+// Reference = reference/iq_moe/iq_moe_ref.ptx (candle's indexed_moe_forward template with
+// llama.cpp's vec_dot_iq*_q8_1). Same case matrix as `moe` above so a failure is comparable.
+pub const IQ_MOE_TYPES: [(&QType, &str); 6] = [
+    (&IQ2_XXS, "iq2_xxs"), (&IQ2_XS, "iq2_xs"), (&IQ2_S, "iq2_s"),
+    (&IQ3_XXS, "iq3_xxs"), (&IQ4_XS, "iq4_xs"), (&IQ4_NL, "iq4_nl"),
+];
+
+fn iq_moe(g: &mut G) {
+    for (q, qn) in IQ_MOE_TYPES {
+        let name = format!("indexed_moe_forward_{qn}_q8_1");
+        // QK-32 formats (iq4_nl) also run REDCELL's expert down shapes, K = 704 (22 blocks, not a multiple of 256).
+        let shapes: &[(usize, usize)] = if q.qk == 32 { &[(1, 256), (5, 768), (64, 2048), (3, 512), (64, 704), (2816, 704)] }
+                                        else { &[(1, 256), (5, 768), (64, 2048), (3, 512)] };
+        for &(n, k) in shapes {
+            let experts = 4usize;
+            let stride = (n * k) / q.qk * q.bs;
+            let wlen = (experts - 1) * stride + n * (k / q.qk) * q.bs;
+            let w = g.blocks(q, wlen.div_ceil(q.bs), 256);
+            let k_padded = k.div_ceil(512) * 512;
+            for &(batch, topk, dim1_is_one) in &[(1usize, 4usize, true), (3, 2, true), (2, 3, false), (1, 1, false)] {
+                let rows = if dim1_is_one { batch } else { batch * topk };
+                let xin = g.blocks(&Q8_1, rows * k_padded / 32, 64);
+                let ids: Vec<u32> = (0..batch * topk).map(|_| (g.rng.next() % experts as u64) as u32).collect();
+                let out = g.rng.bytes(batch * topk * n * 4 + 32);
+                g.run(&name, &format!("n={n} k={k} batch={batch} topk={topk} dim1_one={dim1_is_one}"),
+                      (n as u32, batch as u32, topk as u32), (32, 4, 1), 0,
+                      &[Arg::Buf(0), Arg::Buf(1), Arg::Buf(2), Arg::Buf(3), Arg::I32(n as i32), Arg::I32(k as i32),
+                        Arg::I32(batch as i32), Arg::I32(topk as i32), Arg::I32(k_padded as i32),
+                        Arg::I32(if dim1_is_one { 1 } else { topk as i32 })],
+                      &[w.clone(), xin, as_bytes(&ids), out], &[3]);
+            }
+        }
+    }
+}
+
+/// Field-by-field IQ2_XXS probe: runs the reference and port probe kernels on the SAME buffers
+/// and prints both outputs side by side so the diverging component is visible.
+pub fn run_iq_probe() -> bool {
+    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    let refp = format!("{root}/reference/iq_moe/iq_moe_ref.ptx");
+    let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));
+    let mut g = G { h, t: Tally::default(), rng: Rng(0x1234), per_entry: Default::default(), srate: 4096, fails: Default::default() };
+    let q = &IQ2_XXS;
+    let (kbx, iqs) = (0i32, 0i32);
+    let w = g.blocks(q, 4 * 4, 256);
+    let x = g.blocks(&Q8_1, 4 * 8, 64);
+    let out = g.rng.bytes(8 * 4 + 32);
+    let args = [Arg::Buf(0), Arg::Buf(1), Arg::Buf(2), Arg::I32(kbx), Arg::I32(iqs)];
+    let bufs = vec![w, x, out];
+    let a = g.probe_mod(false, "iq_probe_iq2_xxs", (1, 1, 1), (32, 1, 1), &args, &bufs, 2);
+    let b = g.probe_mod(true, "iq_probe_iq2_xxs", (1, 1, 1), (32, 1, 1), &args, &bufs, 2);
+    let labels = ["d*sumi*ls/8 (OUTPUT)", "sumi", "d", "aux32", "aux8[0] (grid index)",
+                  "grid_lo[aux8[0]]", "q8.qs[0]", "q8.qs[4]",
+                  "w.d raw bits", "q8.d raw bits", "w.d as float", "q8.d as float",
+                  "grid_hi", "signs", "vcmpne4", "grid^signs", "dp4a#0"];
+    println!("iq_probe_iq2_xxs kbx={kbx} iqs={iqs}");
+    for i in 0..labels.len() {
+        let (x, y) = (a.get(i).copied().unwrap_or(f32::NAN), b.get(i).copied().unwrap_or(f32::NAN));
+        println!("  {:<22} ref {:<18.6} port {:<18.6} {}", labels[i], x, y,
+                 if x.to_bits() == y.to_bits() { "ok" } else { "<<< DIFFERS" });
+    }
+    true
+}
+
+/// Per-block isolation: diff ONE vec_dot value per (kbx, iqs) so an index bug can be localized
+/// to a specific sub-block instead of showing up as "whole output differs".
+pub fn run_iq_block() -> bool {
+    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    let refp = format!("{root}/reference/iq_moe/iq_moe_ref.ptx");
+    let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));
+    let mut g = G { h, t: Tally::default(), rng: Rng(0x5EED), per_entry: Default::default(), srate: 1024, fails: Default::default() };
+    for (q, qn) in IQ_MOE_TYPES {
+        let name = format!("iq_dbg_vdot_{qn}_q8_1");
+        // 4 weight blocks (kbx 0..3) x the real iqs domain 0,2,4,6
+        for kbx in 0..4i32 {
+            for iqs in [0i32, 2, 4, 6] {
+                let w = g.blocks(q, 4 * 4, 256);
+                let x = g.blocks(&Q8_1, 4 * 8, 64);
+                let out = g.rng.bytes(4 + 32);
+                g.run(&name, &format!("kbx={kbx} iqs={iqs}"), (1, 1, 1), (32, 1, 1), 0,
+                      &[Arg::Buf(0), Arg::Buf(1), Arg::Buf(2), Arg::I32(kbx), Arg::I32(iqs)],
+                      &[w, x, out], &[2]);
+            }
+        }
+    }
+    let ok = g.t.finish("iq_block");
+    ok
+}
+
+/// Gate entry point for the i-quant MoE families only (separate reference module).
+pub fn run_iq_moe() -> bool {
+    // OXIDE_ROOT: a worktree of oxide-kernels (default ~/titan-engine/oxide-kernels).
+    let root = std::env::var("OXIDE_ROOT").unwrap_or_else(|_| format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap()));
+    let refp = format!("{root}/reference/iq_moe/iq_moe_ref.ptx");
+    // OXIDE_PTX: gate another crate's indexed_moe_forward_* entries (e.g. mistralrs-quant-a) against the same oracle.
+    let oxp = std::env::var("OXIDE_PTX").unwrap_or_else(|_| format!("{root}/candle-quantized/candle_quantized.ptx"));
+    println!("iq-moe gate: port {oxp}");
+    let h = Harness::new(&refp, &oxp);
+    let mut g = G { h, t: Tally::default(), rng: Rng(0x9A17), per_entry: Default::default(), srate: 16, fails: Default::default() };
+    println!("iq-moe gate: reference {refp}");
+    for r in [1024u64, 8] { g.srate = r; iq_moe(&mut g); }
+    let entries = reference_entries(&refp);
+    // `iq_dbg_vdot_*` / `iq_probe_*` are instrumentation used to localize a failure, not real
+    // coverage targets. Leaving them in the coverage lists makes a clean `0 failing -> PASS` run
+    // still return false ("ported but not gated this run"), which reads like a gate failure.
+    let real: Vec<String> = entries.iter()
+        .filter(|e| !e.starts_with("iq_dbg_") && !e.starts_with("iq_probe_"))
+        .cloned().collect();
+    let mut missing = vec![];
+    let mut untested = vec![];
+    for e in &real {
+        if !g.h.has(true, e) { missing.push(e.clone()); }
+        else if !g.per_entry.contains_key(e) { untested.push(e.clone()); }
+    }
+    for (e, n) in &g.fails {
+        if real.contains(e) { println!("  failing entry {e}: {n} of {} launches", g.per_entry[e]); }
+    }
+    for e in &real {
+        println!("  {e}: {} launches, {}", g.per_entry.get(e).copied().unwrap_or(0),
+                 if g.fails.contains_key(e) { "FAIL" } else { "pass" });
+    }
+    let ok = g.t.finish("iq_moe");
+    println!("entries: {} in reference ({} real), {} ported, {} gated this run",
+             entries.len(), real.len(), real.len() - missing.len(), g.per_entry.len());
+    if !missing.is_empty() { println!("  not ported ({}): {}", missing.len(), missing.join(" ")); }
+    if !untested.is_empty() { println!("  not gated this run ({}): {}", untested.len(), untested.join(" ")); }
+    ok && missing.is_empty() && untested.is_empty()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Family 5: mul_mat_q*.
 fn mmq(g: &mut G) {
@@ -375,6 +517,15 @@ fn bench(g: &mut G) {
 }
 
 pub fn run(args: Vec<String>) -> bool {
+    if args.iter().any(|a| a == "iqmoe") {
+        return run_iq_moe();
+    }
+    if args.iter().any(|a| a == "iqblock") {
+        return run_iq_block();
+    }
+    if args.iter().any(|a| a == "iqprobe") {
+        return run_iq_probe();
+    }
     let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
     let refp = format!("{root}/reference/candle/quantized.ptx");
     let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));

@@ -37,6 +37,54 @@ pub struct ServeConfig {
     pub models: Vec<ModelEntry>,
     #[serde(default)]
     pub default_model_id: Option<String>,
+    /// titan swap mode: models load on demand in this process (see `mistralrs_core::TitanSwapPolicy`).
+    #[serde(default)]
+    pub titan_swap: Option<TitanSwapToml>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+pub struct TitanSwapToml {
+    /// Models resident at once (default 1): a request for another evicts the least recently used.
+    #[serde(default)]
+    pub max_resident: Option<usize>,
+}
+
+/// `[models.titan]`: the model's TITAN_* settings (applied while it is loaded; the process env stays the default,
+/// an empty string unsets one), an optional idle TTL after which it is unloaded, and optional prefix cache bounds:
+/// `prefix_cache_n` sequences (absent: `[runtime] prefix_cache_n`; 0 turns the prefix cache off for this model) and
+/// `prefix_cache_max_mib` MiB of KV kept on the GPU by the sequence-level prefix cache (absent: no byte bound; it is
+/// `TITAN_PREFIX_CACHE_DEVICE_MIB` in the model's env).
+#[derive(Deserialize, Default, Clone)]
+pub struct TitanEntryToml {
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub idle_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub prefix_cache_n: Option<usize>,
+    #[serde(default)]
+    pub prefix_cache_max_mib: Option<usize>,
+}
+
+impl TitanEntryToml {
+    pub fn env_strings(&self) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = self
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    toml::Value::String(s) => s.clone(),
+                    toml::Value::Boolean(b) => (if *b { "1" } else { "0" }).to_string(),
+                    other => other.to_string(),
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        if let Some(mib) = self.prefix_cache_max_mib {
+            env.insert("TITAN_PREFIX_CACHE_DEVICE_MIB".to_string(), mib.to_string());
+        }
+        env
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -86,6 +134,11 @@ pub struct ModelEntry {
     #[serde(default)]
     pub kind: ModelKind,
     pub model_id: String,
+    /// API model name (the `model` field requests send); defaults to `model_id`.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub titan: Option<TitanEntryToml>,
     #[serde(default)]
     pub tokenizer: Option<PathBuf>,
     #[serde(default)]
@@ -171,7 +224,9 @@ fn validate_config(config: &CliConfig) -> Result<()> {
     }
 
     if let Some(default_id) = default_model_id {
-        let has_model = models.iter().any(|model| model.model_id == *default_id);
+        let has_model = models
+            .iter()
+            .any(|model| model.model_id == *default_id || model.name.as_deref() == Some(default_id.as_str()));
         if !has_model {
             anyhow::bail!(
                 "default_model_id '{}' does not match any model_id in [[models]]",
@@ -232,14 +287,14 @@ impl GlobalOptionsToml {
 
 impl DeviceOptionsToml {
     pub fn to_device_options(&self, cpu: bool) -> DeviceOptions {
-        let defaults = DeviceOptions::default();
         DeviceOptions {
             cpu,
             device_layers: self.device_layers.clone(),
             topology: self.topology.clone(),
             hf_cache: self.hf_cache.clone(),
-            max_seq_len: self.max_seq_len.unwrap_or(defaults.max_seq_len),
-            max_batch_size: self.max_batch_size.unwrap_or(defaults.max_batch_size),
+            // DeviceOptions::default() is derived (0 / 0), not the CLI defaults; a 0 batch sizes the KV plans to nothing
+            max_seq_len: self.max_seq_len.unwrap_or(mistralrs_core::AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN),
+            max_batch_size: self.max_batch_size.unwrap_or(mistralrs_core::AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE),
         }
     }
 }
@@ -428,6 +483,110 @@ legacy_lora_order = "order.json"
             .unwrap_err()
             .to_string()
             .contains("not legacy LoRA or X-LoRA"));
+    }
+
+    fn serve(toml_src: &str) -> ServeConfig {
+        match toml::from_str::<CliConfig>(toml_src).unwrap() {
+            CliConfig::Serve(cfg) => cfg,
+            CliConfig::Run(_) => panic!("expected serve config"),
+        }
+    }
+
+    #[test]
+    fn titan_prefix_cache_settings_are_per_model() {
+        let cfg = serve(
+            r#"
+command = "serve"
+
+[runtime]
+prefix_cache_n = 8
+
+[[models]]
+name = "big"
+model_id = "/m/big"
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_MTP = "2"
+
+[[models]]
+name = "gemma"
+model_id = "/m/gemma"
+[models.titan]
+prefix_cache_n = 0
+prefix_cache_max_mib = 1024
+
+[[models]]
+name = "plain"
+model_id = "/m/plain"
+"#,
+        );
+        assert_eq!(cfg.runtime.prefix_cache_n, 8);
+        let big = cfg.models[0].titan.clone().unwrap();
+        assert_eq!(big.prefix_cache_n, None);
+        assert_eq!(big.prefix_cache_max_mib, None);
+        assert_eq!(
+            big.env_strings(),
+            std::collections::HashMap::from([("TITAN_MTP".to_string(), "2".to_string())])
+        );
+        let gemma = cfg.models[1].titan.clone().unwrap();
+        assert_eq!(gemma.prefix_cache_n, Some(0));
+        assert_eq!(gemma.prefix_cache_max_mib, Some(1024));
+        assert_eq!(
+            gemma.env_strings().get("TITAN_PREFIX_CACHE_DEVICE_MIB").map(String::as_str),
+            Some("1024")
+        );
+        assert!(cfg.models[2].titan.is_none());
+    }
+
+    #[test]
+    fn titan_prefix_cache_n_absent_is_the_global_default() {
+        let cfg = serve(
+            r#"
+command = "serve"
+
+[[models]]
+model_id = "/m/a"
+[models.titan]
+idle_ttl_secs = 60
+"#,
+        );
+        // no [runtime]: the CLI default (16), which every model without its own value gets
+        assert_eq!(cfg.runtime.prefix_cache_n, 16);
+        let t = cfg.models[0].titan.clone().unwrap();
+        assert_eq!(t.prefix_cache_n, None);
+        assert!(t.env_strings().is_empty());
+        let policy = mistralrs_core::TitanSwapPolicy {
+            default_model: "/m/a".to_string(),
+            max_resident: 1,
+            models: std::collections::HashMap::from([
+                (
+                    "/m/a".to_string(),
+                    mistralrs_core::TitanModelSettings { prefix_cache_n: t.prefix_cache_n, ..Default::default() },
+                ),
+                (
+                    "/m/b".to_string(),
+                    mistralrs_core::TitanModelSettings { prefix_cache_n: Some(0), ..Default::default() },
+                ),
+            ]),
+        };
+        assert_eq!(policy.prefix_cache_n("/m/a", cfg.runtime.prefix_cache_n), 16);
+        assert_eq!(policy.prefix_cache_n("/m/b", cfg.runtime.prefix_cache_n), 0);
+        assert_eq!(policy.prefix_cache_n("/m/unknown", 16), 16);
+    }
+
+    #[test]
+    fn titan_prefix_cache_n_rejects_bad_values() {
+        assert!(toml::from_str::<CliConfig>(
+            r#"
+command = "serve"
+[[models]]
+model_id = "/m/a"
+[models.titan]
+prefix_cache_n = -1
+"#
+        )
+        .is_err());
     }
 
     #[test]

@@ -44,6 +44,34 @@ macro_rules! sliding_window {
 
 serde_default_fn!(bool, tie_word_embeddings, false);
 
+/// Query rows per launch of the flash-prefill prompt attention (bounds the zero-padded q copy and the f32 output).
+const FLASH_ROWS: usize = 4096;
+/// Tokens per MLP pass of a long prompt (gate, up and their product are `rows x intermediate` each).
+const MLP_ROWS: usize = 4096;
+
+/// titan: qwen3 prompt passes on the cuda-oxide flash-prefill kernels (head dim 128, query heads zero-padded to 8 per
+/// KV head): no `rows x kv` mask and no eager score chunks. `TITAN_QWEN3_FLASH=0` keeps the eager path; the kernels
+/// also follow `TITAN_ATTN_FLASH_PREFILL` / `_MIN` (prompts under 1024 keys stay eager, exact as before).
+fn flash_on() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_QWEN3_FLASH").map(|v| v != "0").unwrap_or(true))
+}
+
+/// The additive causal prompt mask (rows, past + rows) built on `device` (key j of row i visible iff j <= past + i,
+/// and j > past + i - window when `window` is set): CausalMasker's values without its host loop.
+fn causal_mask(rows: usize, past: usize, window: Option<usize>, dtype: DType, device: &Device) -> Result<Tensor> {
+    let kv = past + rows;
+    let pos = Tensor::arange(past as f32, kv as f32, device)?.reshape((rows, 1))?;
+    let key = Tensor::arange(0f32, kv as f32, device)?.reshape((1, kv))?;
+    let mut hidden = key.broadcast_gt(&pos)?;
+    if let Some(w) = window {
+        hidden = hidden.maximum(&(key + w as f64)?.broadcast_le(&pos)?)?;
+    }
+    let ninf = Tensor::new(f32::NEG_INFINITY, device)?.to_dtype(dtype)?.broadcast_as((rows, kv))?;
+    let zero = Tensor::zeros((), dtype, device)?.broadcast_as((rows, kv))?;
+    hidden.where_cond(&ninf, &zero)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub(crate) vocab_size: usize,
@@ -257,15 +285,18 @@ impl Attention {
             },
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(ctx.flash_params()),
-                    &self.sdpa_params,
-                )?
+                if q_len > 1 && matches!(attention_mask, AttentionMask::CausalFlash) {
+                    self.prompt_attention(&q, &k, &v, ctx)?
+                } else {
+                    Sdpa.run_attention(
+                        &q,
+                        &k,
+                        &v,
+                        attention_mask,
+                        Some(ctx.flash_params()),
+                        &self.sdpa_params,
+                    )?
+                }
             }
         };
 
@@ -276,6 +307,46 @@ impl Attention {
         };
         let res = self.o_proj.forward(&attn_output)?;
         Ok(res)
+    }
+}
+
+impl Attention {
+    /// Prompt attention under `AttentionMask::CausalFlash` (set by `Model::forward_embeds` for CUDA layers when the
+    /// prompt takes the flash-prefill kernels): q (1, h, rows, d) over the cache's k / v (1, kvh, past + rows, d), in
+    /// launches of `FLASH_ROWS` query rows; the eager path with a device-built mask if the kernels do not take the
+    /// shapes. Returns (1, h, rows, d) in q's dtype.
+    fn prompt_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        let rows = q.dim(2)?;
+        let kv = k.dim(2)?;
+        let past = kv - rows;
+        if q.device().is_cuda() && crate::attention::flash_prefill_any_supported(q, k, v) {
+            let win = self.sdpa_params.sliding_window.unwrap_or(0);
+            let f16 = q.dtype() == DType::F16;
+            let mut out = Vec::with_capacity(rows.div_ceil(FLASH_ROWS));
+            for c0 in (0..rows).step_by(FLASH_ROWS) {
+                let len = FLASH_ROWS.min(rows - c0);
+                let end = past + c0 + len;
+                let o = crate::attention::flash_prefill_any(
+                    &q.narrow(2, c0, len)?,
+                    &k.narrow(2, 0, end)?,
+                    &v.narrow(2, 0, end)?,
+                    self.sdpa_params.softmax_scale,
+                    win,
+                    f16,
+                )?;
+                out.push(o.to_dtype(q.dtype())?);
+            }
+            return if out.len() == 1 { Ok(out.pop().expect("one launch")) } else { Tensor::cat(&out, 2) };
+        }
+        let mask = causal_mask(rows, past, self.sdpa_params.sliding_window, q.dtype(), q.device())?;
+        Sdpa.run_attention(
+            q,
+            k,
+            v,
+            &AttentionMask::Custom(mask),
+            Some(ctx.flash_params()),
+            &self.sdpa_params,
+        )
     }
 }
 
@@ -349,9 +420,19 @@ impl DecoderLayer {
             .forward(&xs, attention_mask, kv_cache, ctx, layer_idx)?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self
-            .mlp
-            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
+        let normed = xs.apply(&self.post_attention_layernorm)?;
+        let rows = normed.dim(1)?;
+        // titan: a long prompt's MLP in passes of MLP_ROWS tokens (the gate / up / product transients are
+        // rows x intermediate each); under that, one pass as before
+        let xs = if rows > MLP_ROWS && flash_on() {
+            let mut out = Vec::with_capacity(rows.div_ceil(MLP_ROWS));
+            for c0 in (0..rows).step_by(MLP_ROWS) {
+                out.push(self.mlp.forward(&normed.narrow(1, c0, MLP_ROWS.min(rows - c0))?)?);
+            }
+            Tensor::cat(&out, 1)?
+        } else {
+            self.mlp.forward(&normed)?
+        };
         residual + xs
     }
 }
@@ -541,15 +622,41 @@ impl Model {
         let mut xs = input_embeds;
         let cache = &mut self.cache.normal().0;
         let mask_cache = ctx.mask_cache(cache);
-        let attention_mask = CausalMasker.make_causal_mask(
-            input_ids,
-            &mask_cache,
-            xs.dtype(),
-            &CausalMaskConfig {
-                sliding_window: self.sliding_window,
-                ..Default::default()
-            },
-        )?;
+        let rows = input_ids.dim(1)?;
+        // titan: a prompt that takes the flash-prefill kernels builds no rows x kv mask; CUDA layers get CausalFlash
+        // (their attention runs the kernels), any other layer a mask built once on its device
+        let flash = rows > 1
+            && flash_on()
+            && !crate::using_flash_attn()
+            && self.layers.iter().all(|l| l.self_attn.paged_attn.is_none())
+            && matches!(xs.dtype(), DType::F16 | DType::BF16)
+            && crate::attention::flash_prefill_wanted(
+                rows,
+                {
+                    use crate::layers_masker::PastKvLenCache;
+                    mask_cache.get_past_kv_len()?
+                } + rows,
+            );
+        let attention_mask = if flash {
+            AttentionMask::CausalFlash
+        } else {
+            CausalMasker.make_causal_mask(
+                input_ids,
+                &mask_cache,
+                xs.dtype(),
+                &CausalMaskConfig {
+                    sliding_window: self.sliding_window,
+                    ..Default::default()
+                },
+            )?
+        };
+        let past = if flash {
+            use crate::layers_masker::PastKvLenCache;
+            mask_cache.get_past_kv_len()?
+        } else {
+            0
+        };
+        let mut host_masks: HashMap<candle_core::DeviceLocation, AttentionMask> = HashMap::new();
         // PagedAttention prompt chunking
         let attention_mask = if ctx.is_first_prompt_chunk() {
             attention_mask
@@ -559,7 +666,24 @@ impl Model {
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
-            xs = layer.forward(&xs, &attention_mask.get(xs.device()), &mut cache[i], ctx, i)?;
+            let mask = if flash && !xs.device().is_cuda() {
+                let dev = xs.device().clone();
+                match host_masks.entry(dev.location()) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => e
+                        .insert(AttentionMask::Custom(causal_mask(
+                            rows,
+                            past,
+                            self.sliding_window,
+                            xs.dtype(),
+                            &dev,
+                        )?))
+                        .clone(),
+                }
+            } else {
+                attention_mask.get(xs.device())
+            };
+            xs = layer.forward(&xs, &mask, &mut cache[i], ctx, i)?;
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;

@@ -1,0 +1,75 @@
+--- a/deploy/models.toml	2026-10-02 21:24:08.255502070 +0700
++++ b/deploy/models.toml	2026-10-02 21:24:08.270100829 +0700
+@@ -179,3 +179,72 @@
+ TITAN_MTP = "2"
+ TITAN_CUDA_GRAPHS = "1"
+ TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
++
++# Ternary Bonsai 2 27B (PrismML PTQ1_0 + prism Hadamard, dense qwen35 + dense MTP head; integ-20261002). All on the GPU.
++# MTP 1 (80% acceptance, 8/8 greedy identical to MTP off); the template's own default effort (xhigh) runs long.
++[[models]]
++name = "bonsai2-27b"
++kind = "text"
++model_id = "~/ai/models/bonsai2-27b"
++[models.format]
++format = "gguf"
++quantized_file = "Ternary-Bonsai-2-27B-PTQ1_0-mtp.gguf"
++[models.device]
++max_seq_len = 65536
++[models.titan]
++idle_ttl_secs = 1800
++[models.titan.env]
++TITAN_MTP = "1"
++TITAN_REASONING_EFFORT = "medium"
++
++# Spark-X2.5 4B Q4_K_M (spark2_5, dense; banded/windowed flash-prefill on the sliding layers). 16k context.
++[[models]]
++name = "spark-x2.5"
++kind = "text"
++model_id = "~/ai/models/spark-x2.5"
++max_model_len = 16384
++[models.format]
++format = "gguf"
++quantized_file = "Spark-X2.5-4B-Q4_K_M.gguf"
++[models.device]
++max_seq_len = 16384
++[models.titan]
++idle_ttl_secs = 1800
++
++# Gemma 4 12B QAT Q4_0, text only. BF16 activations, all 48 layers on the GPU, 12k context. Prefix cache off for this
++# model only (m4/pcache/README.md): each kept ~4k sequence pins ~0.4 GB of KV and the 6th ~4k prompt OOMs with the
++# global 16; with 0, 6/6 pass at <= 10.2 GB and the outputs equal --prefix-cache-n 0's. The 35B keeps the global 16.
++[[models]]
++name = "gemma4-12b"
++kind = "text"
++model_id = "~/ai/models/gemma4-12b-qat"
++dtype = "bf16"
++max_model_len = 12288
++[models.format]
++format = "gguf"
++quantized_file = "gemma-4-12b-it-qat-q4_0.gguf"
++[models.device]
++device_layers = ["0:48"]
++max_seq_len = 12288
++[models.titan]
++idle_ttl_secs = 1800
++prefix_cache_n = 0
++
++# REDCELL 26B-A4B (gemma4 MoE; IQ4_NL expert down projections, unaligned-K prompts on the fused decode kernels).
++# BF16, all 30 layers on the GPU, 8k context. Prefix cache off for this model only (m4/pcache/README.md): ~4k prompts
++# peak at ~15.5 GB, so any kept KV (even a 1024 MiB byte cap) OOMs 3 of 7; with 0, 6/6 pass.
++[[models]]
++name = "redcell-26b"
++kind = "text"
++model_id = "~/ai/models/redcell-26b"
++dtype = "bf16"
++max_model_len = 8192
++[models.format]
++format = "gguf"
++quantized_file = "REDCELL-26B-A4B-OSINT-Cyber-APEX-Mini.gguf"
++[models.device]
++device_layers = ["0:30"]
++max_seq_len = 8192
++[models.titan]
++idle_ttl_secs = 1800
++prefix_cache_n = 0

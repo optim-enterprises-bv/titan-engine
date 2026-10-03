@@ -30,8 +30,18 @@ use mistralrs_core::{initialize_mistralrs_logging, LogVerbosity};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+extern "C" {
+    // libmimalloc-sys links it in with the allocator
+    fn mi_collect(force: bool);
+}
+
+fn heap_collect() {
+    unsafe { mi_collect(true) };
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = mistralrs_core::TITAN_HEAP_COLLECT.set(heap_collect);
     candle_core::utils::init_global_threadpool();
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);

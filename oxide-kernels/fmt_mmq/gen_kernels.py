@@ -21,13 +21,16 @@ FIX_A = ("ids_dst, expert_bounds, dst, tmp_last_tile, Fd { mp: bpn_mp, l: bpn_l,
 
 # (J, fallback) instances of mmq-config-ampere.cuh (IQ4_NL) / mmq-config-blackwell.cuh (MXFP4, NVFP4)
 MMQ = [(j, False) for j in (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128)] + [(j, True) for j in (8, 16, 32, 64, 128)]
-FMTS = [("iq4_nl", "Iq4Nl"), ("mxfp4", "Mxfp4"), ("nvfp4", "Nvfp4")]
+FMTS = [("iq4_nl", "Iq4Nl"), ("mxfp4", "Mxfp4"), ("nvfp4", "Nvfp4"), ("iq4_xs", "Iq4Xs")]
+# gate mutants of the IQ4_XS loader (one J / fallback instance each; export_ptx.py leaves them out)
+MUTS = [("iq4_xs_mut1", "Iq4XsMut1"), ("iq4_xs_mut2", "Iq4XsMut2")]
 
 out = []
-for (name, ty) in FMTS:
-    for (j, fb) in MMQ:
+for (name, ty) in FMTS + MUTS:
+    MMQ_I = MMQ if (name, ty) in FMTS else [(32, False)]
+    for (j, fb) in MMQ_I:
         out.append(f"    #[kernel] #[launch_bounds(256, 1)] pub unsafe fn {name}_mmq_j{j}_f{int(fb)}({MMQ_P}) {{ mul_mat_q::<{ty}, {j}, {'true' if fb else 'false'}>({MMQ_A}) }}")
-    for (j, fb) in MMQ:
+    for (j, fb) in MMQ_I:
         out.append(f"    #[kernel] #[launch_bounds(128, 1)] pub unsafe fn {name}_mmq_fixup_j{j}_f{int(fb)}({FIX_P}) {{ stream_k_fixup::<{ty}, {j}, {'true' if fb else 'false'}>({FIX_A}) }}")
 
 s = open(P).read()

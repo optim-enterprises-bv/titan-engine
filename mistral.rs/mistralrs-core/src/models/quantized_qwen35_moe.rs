@@ -3,11 +3,12 @@
 //! GGUF `qwen35` (dense), `qwen35moe` (Qwen3.5/3.6) and `qwen3next` (Qwen3-Next), after llama.cpp
 //! `src/models/{qwen35,qwen35moe,qwen3next}.cpp` and `conversion/qwen.py`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
+use mistralrs_quant::ptq1_0::PrismRot;
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfig};
 
 use super::quantized_qwen3_moe::{load_experts, Experts};
@@ -291,48 +292,147 @@ fn gguf_linear(q: QTensor) -> Result<Arc<dyn QuantMethod>> {
     })?))
 }
 
+/// GGUF `prism.hadamard.*` (Ternary Bonsai 2): the weights folded with a rotated input, the lookup tables
+/// storing rotated rows, and one rotation per input width (llama.cpp `llama_model_base::load_hparams`).
+#[derive(Default)]
+struct Prism {
+    folded: HashSet<String>,
+    inverse: HashSet<String>,
+    rots: HashMap<usize, Arc<PrismRot>>,
+    gdn_v_grouped: bool,
+}
+
+fn gguf_int(v: &candle_core::quantized::gguf_file::Value) -> Result<i64> {
+    use candle_core::quantized::gguf_file::Value as V;
+    Ok(match v {
+        V::U8(x) => *x as i64,
+        V::I8(x) => *x as i64,
+        V::U16(x) => *x as i64,
+        V::I16(x) => *x as i64,
+        V::U32(x) => *x as i64,
+        V::I32(x) => *x as i64,
+        V::U64(x) => *x as i64,
+        V::I64(x) => *x,
+        other => candle_core::bail!("prism.hadamard: expected an integer, got {other:?}"),
+    })
+}
+
+impl Prism {
+    fn load(md: &HashMap<String, candle_core::quantized::gguf_file::Value>, device: &Device) -> Result<Self> {
+        let Some(version) = md.get("prism.hadamard.version") else {
+            return Ok(Self::default());
+        };
+        let version = gguf_int(version)?;
+        let tied = md.get("prism.hadamard.tied_output").map(|v| v.to_bool()).transpose()?.unwrap_or(false);
+        if version != 1 || tied {
+            candle_core::bail!("prism.hadamard version {version} (tied output {tied}): only version 1 is supported");
+        }
+        let get = |k: &str| md.get(&format!("prism.hadamard.{k}")).ok_or_else(|| candle_core::Error::msg(format!("prism.hadamard.{k} missing")));
+        let block = gguf_int(get("block_size")?)?;
+        let transform = get("transform")?.to_string()?.clone();
+        let axis = get("axis")?.to_string()?.clone();
+        let sign_mode = get("sign_mode")?.to_string()?.clone();
+        if block != 1024 || transform != "normalized-sylvester-walsh-hadamard" || axis != "input-last-dimension" {
+            candle_core::bail!("prism.hadamard: block {block} / {transform} / {axis} not supported (1024-wide normalized Sylvester WHT on the input)");
+        }
+        let names = |k: &str| -> Result<HashSet<String>> {
+            match md.get(&format!("prism.hadamard.{k}")) {
+                Some(v) => v.to_vec()?.iter().map(|n| Ok(n.to_string()?.clone())).collect(),
+                None => Ok(HashSet::new()),
+            }
+        };
+        let folded = names("weight_names")?;
+        let inverse = names("inverse_weight_names")?;
+        if inverse.iter().any(|n| n != "token_embd.weight") {
+            candle_core::bail!("prism.hadamard: inverse tables {inverse:?} (only token_embd.weight is supported)");
+        }
+        let mut signs: HashMap<usize, Vec<f32>> = HashMap::new();
+        match sign_mode.as_str() {
+            "identity" => {}
+            "explicit" => {
+                let widths = get("sign_widths")?.to_vec()?.iter().map(gguf_int).collect::<Result<Vec<_>>>()?;
+                let values = get("sign_values")?.to_vec()?.iter().map(gguf_int).collect::<Result<Vec<_>>>()?;
+                let mut off = 0usize;
+                for w in widths {
+                    let w = w as usize;
+                    if w == 0 || w % 1024 != 0 || off + w > values.len() {
+                        candle_core::bail!("prism.hadamard: bad sign width {w}");
+                    }
+                    let v = &values[off..off + w];
+                    if v.iter().any(|&x| x != 1 && x != -1) {
+                        candle_core::bail!("prism.hadamard: sign values must be +-1");
+                    }
+                    signs.insert(w, v.iter().map(|&x| x as f32).collect());
+                    off += w;
+                }
+                if off != values.len() {
+                    candle_core::bail!("prism.hadamard: sign_values length mismatch");
+                }
+            }
+            m => candle_core::bail!("prism.hadamard: sign mode {m}"),
+        }
+        let explicit = sign_mode == "explicit";
+        let mut rots = HashMap::new();
+        for w in signs.keys().copied().chain([5120usize]) {
+            if !rots.contains_key(&w) && (!explicit || signs.contains_key(&w)) {
+                rots.insert(w, Arc::new(PrismRot::new(w, signs.get(&w).map(|v| v.as_slice()), device)?));
+            }
+        }
+        let gdn_v_grouped = md.get("prism.hadamard.gdn_v_grouped").map(|v| v.to_bool()).transpose()?.unwrap_or(false);
+        tracing::info!(
+            "prism hadamard: {} folded weights, {} inverse tables, rotations for widths {:?} ({sign_mode} signs)",
+            folded.len(),
+            inverse.len(),
+            { let mut w: Vec<_> = rots.keys().copied().collect(); w.sort(); w }
+        );
+        Ok(Self { folded, inverse, rots, gdn_v_grouped })
+    }
+
+    fn rot(&self, width: usize) -> Result<Arc<PrismRot>> {
+        self.rots.get(&width).cloned().ok_or_else(|| candle_core::Error::msg(format!("prism.hadamard: no rotation for width {width}")))
+    }
+
+    /// `name`'s weight as a linear layer, with its input rotation when it is folded.
+    fn linear(&self, name: &str, q: QTensor) -> Result<Arc<dyn QuantMethod>> {
+        let width = q.shape().dims().last().copied().unwrap_or(0);
+        let m = GgufMatMul::new(QuantMethodConfig::Gguf { q_weight: Arc::new(q), b: None })?;
+        let m = if self.folded.contains(name) { m.with_prism(self.rot(width)?) } else { m };
+        Ok(Arc::new(m))
+    }
+
+    fn load_linear<R: std::io::Seek + std::io::Read>(&self, ct: &mut Content<'_, R>, name: &str, device: &Device) -> Result<Arc<dyn QuantMethod>> {
+        self.linear(name, ct.tensor(name, device)?)
+    }
+}
+
 /// Quantized, in host memory: a dense F32 table would be 2 GB (248320 x 2048) of VRAM.
+/// Lookups go through candle's `QTensor::embedding`, which dequantizes only the looked-up rows.
 pub(crate) struct QEmbedding {
-    data: Vec<u8>,
-    dtype: GgmlDType,
-    row_bytes: usize,
-    vocab: usize,
+    q: QTensor,
     hidden: usize,
+    /// prism Hadamard-latent rows: `S (H z)` after the lookup
+    inverse: Option<Arc<PrismRot>>,
 }
 
 impl QEmbedding {
     pub(crate) fn new(q: QTensor) -> Result<Self> {
-        let (vocab, hidden) = q.shape().dims2()?;
-        let row_bytes = row_bytes(&q)?;
-        Ok(Self {
-            data: q.data()?.into_owned(),
-            dtype: q.dtype(),
-            row_bytes,
-            vocab,
-            hidden,
-        })
+        let (_vocab, hidden) = q.shape().dims2()?;
+        Ok(Self { q, hidden, inverse: None })
+    }
+
+    fn with_inverse(mut self, rot: Arc<PrismRot>) -> Self {
+        self.inverse = Some(rot);
+        self
     }
 
     pub(crate) fn forward(&self, ids: &Tensor, device: &Device) -> Result<Tensor> {
-        let dims = ids.dims().to_vec();
-        let flat: Vec<u32> = ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1()?;
-        let mut rows = Vec::with_capacity(flat.len() * self.row_bytes);
-        for &id in &flat {
-            let id = id as usize;
-            if id >= self.vocab {
-                candle_core::bail!("token id {id} out of range for vocab {}", self.vocab);
-            }
-            rows.extend_from_slice(&self.data[id * self.row_bytes..(id + 1) * self.row_bytes]);
+        let t = self.q.embedding(ids)?.to_device(device)?;
+        match &self.inverse {
+            #[cfg(feature = "cuda")]
+            Some(rot) if device.is_cuda() => mistralrs_quant::ptq1_0::inverse_rows(&t, rot),
+            Some(_) => candle_core::bail!("prism-latent embedding lookups need CUDA"),
+            None => Ok(t),
         }
-        let q = QTensor::new(
-            QStorage::from_data(std::borrow::Cow::Owned(rows), &Device::Cpu, self.dtype)?,
-            (flat.len(), self.hidden),
-        )?;
-        let mut out_dims = dims;
-        out_dims.push(self.hidden);
-        q.dequantize(&Device::Cpu)?
-            .reshape(out_dims)?
-            .to_device(device)
     }
 }
 
@@ -874,6 +974,48 @@ struct DenseFfn {
     gate: Arc<dyn QuantMethod>,
     up: Arc<dyn QuantMethod>,
     down: Arc<dyn QuantMethod>,
+    /// PTQ1_0 gate/up with a folded Hadamard: their shared input rotation (fused GLU mat-vec at 1..=4 rows)
+    prism: Option<Arc<PrismRot>>,
+}
+
+impl DenseFfn {
+    fn load<R: std::io::Seek + std::io::Read>(ct: &mut Content<'_, R>, prefix: &str, prism: &Prism, device: &Device) -> Result<Self> {
+        let gate_name = format!("{prefix}.ffn_gate.weight");
+        let up_name = format!("{prefix}.ffn_up.weight");
+        let gate = prism.load_linear(ct, &gate_name, device)?;
+        let up = prism.load_linear(ct, &up_name, device)?;
+        let fused = [&gate, &up].iter().all(|w| w.get_qtensor().is_some_and(|q| q.dtype() == GgmlDType::PTQ1_0))
+            && prism.folded.contains(&gate_name) == prism.folded.contains(&up_name);
+        let prism_rot = if fused && prism.folded.contains(&gate_name) {
+            Some(prism.rot(gate.get_qtensor().map(|q| q.shape().dims()[1]).unwrap_or(0))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            gate,
+            up,
+            down: prism.load_linear(ct, &format!("{prefix}.ffn_down.weight"), device)?,
+            prism: prism_rot,
+        })
+    }
+
+    fn ptq1_0_pair(&self) -> bool {
+        [&self.gate, &self.up].iter().all(|w| w.get_qtensor().is_some_and(|q| q.dtype() == GgmlDType::PTQ1_0))
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if xs.device().is_cuda() && self.ptq1_0_pair() {
+            if let (Some(g), Some(u)) = (self.gate.get_qtensor(), self.up.get_qtensor()) {
+                if let Some(h) = mistralrs_quant::ptq1_0::glu_forward(&g, &u, xs, self.prism.as_deref())? {
+                    return self.down.forward(&h)?.to_dtype(xs.dtype());
+                }
+            }
+        }
+        let g = self.gate.forward(xs)?;
+        let u = self.up.forward(xs)?;
+        self.down.forward(&crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?)
+    }
 }
 
 enum Ffn {
@@ -885,15 +1027,7 @@ impl Ffn {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Moe(moe) => moe.forward(xs),
-            Self::Dense(ffn) => {
-                let g = ffn.gate.forward(xs)?;
-                let u = ffn.up.forward(xs)?;
-                ffn.down.forward(&crate::ops::mul_and_act(
-                    &g,
-                    &u,
-                    crate::layers::Activation::Silu,
-                )?)
-            }
+            Self::Dense(ffn) => ffn.forward(xs),
         }
     }
 }
@@ -903,6 +1037,8 @@ impl Ffn {
     fn forward_rows(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Moe(moe) => moe.forward_rows(xs),
+            // the PTQ1_0 mat-vec gives every row its single-row bits at 1..=4 rows
+            Self::Dense(ffn) if ffn.ptq1_0_pair() && xs.dim(1)? <= PTQ1_0_ROWS => ffn.forward(xs),
             Self::Dense(_) => {
                 let rows = (0..xs.dim(1)?)
                     .map(|r| self.forward(&xs.narrow(1, r, 1)?))
@@ -952,9 +1088,9 @@ pub struct ModelWeights {
 /// `TITAN_MTP=<n>`: draft `n` tokens per step with the GGUF's nextn (multi-token prediction) block.
 /// Read at load time: the block's VRAM is planned (gguf_metadata) and it is loaded only when set.
 pub(crate) fn mtp_draft_len() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *N.get_or_init(|| {
-        std::env::var("TITAN_MTP")
+        mistralrs_quant::titan_cfg::var("TITAN_MTP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0)
@@ -962,13 +1098,20 @@ pub(crate) fn mtp_draft_len() -> usize {
     })
 }
 
+/// `TITAN_RECURRENT_SLOTS=<n>` (default 2): recurrent state slots the hybrid cache allocates at load (it doubles
+/// when all are taken). Upstream's 9 (its CUDA graph batch range) cost ~1.3 GiB of VRAM on a 48-GDN-layer 27B,
+/// where one sequence needs one slot.
+fn recurrent_slots() -> usize {
+    mistralrs_quant::titan_cfg::var("TITAN_RECURRENT_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).max(1)
+}
+
 /// `TITAN_PREFILL_CHUNK=<tokens>`: unpaged prompt passes longer than this run as consecutive chunks
 /// of this many tokens (0: never chunk). Bounds the prompt pass's activations, which otherwise grow
 /// with the prompt. At least `MIN_PREFILL_CHUNK`.
 pub(crate) fn prefill_chunk_size() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *N.get_or_init(|| {
-        match std::env::var("TITAN_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        match mistralrs_quant::titan_cfg::var("TITAN_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
             Some(0) => 0,
             Some(n) => n.max(MIN_PREFILL_CHUNK),
             None => DEFAULT_PREFILL_CHUNK,
@@ -980,8 +1123,26 @@ pub(crate) fn prefill_chunk_size() -> usize {
 /// the 1 GiB tiered reserve; 1024 was ~3% faster to prefill but failed 13k-token prompts at 16k context
 /// and 30k-token prompts at 32k context once decode steps had fragmented the pool.
 const DEFAULT_PREFILL_CHUNK: usize = 512;
-/// Granularity (tokens) of the KV room a chunked prompt reserves up front (also `titan_admit`'s).
+/// Granularity (tokens) of the KV room a chunked prompt reserves up front (see `kv_reserve_len`; also `titan_admit`'s).
 pub(crate) const KV_RESERVE_STEP: usize = 8192;
+/// Device memory `kv_reserve_len` leaves for the prompt's activations before it takes a whole bucket.
+const KV_BUCKET_MARGIN: usize = 512 << 20;
+
+/// Free bytes on a CUDA device: unallocated device memory plus the stream-ordered pool's reserved, unused bytes.
+fn device_free_bytes(dev: &Device) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        let a = crate::utils::memory_usage::MemoryUsage.query_cuda_allocator(dev).ok()??;
+        let slack = a.async_pool.map_or(0, |p| p.current.reserved.saturating_sub(p.current.used));
+        Some(a.available + slack)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = dev;
+        None
+    }
+}
+
 /// The GDN prefill switches recurrence kernels below 64 rows (gdn::backend
 /// RECURRENCE_CHUNK_THRESHOLD); every chunk stays at or above it so a chunk runs the same
 /// sequential per-token warp kernel as the whole prompt.
@@ -1027,8 +1188,8 @@ fn expert_sum(p: &Tensor) -> Result<Tensor> {
 /// experts (and the MTP block's experts piece by piece), so its MoE temporaries stay at the size of a
 /// `TITAN_PREFILL_CHUNK` chunk while the expert copies are still amortised over the whole chunk.
 fn prefill_moe_piece() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("TITAN_PREFILL_MOE_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(512))
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
+    *N.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_PREFILL_MOE_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(512))
 }
 
 /// Rows from which an MTP pass (a prompt chunk) runs its experts as grouped MMQ (`forward_grouped_stock`); drafts
@@ -1044,10 +1205,10 @@ const MTP_CATCHUP_MAX_ROWS: usize = 8;
 /// the streamed experts once per 2048 tokens instead of per 512; `prefill_moe_piece` keeps their MoE temporaries
 /// at the 512-row size. Passes ending past `TITAN_PREFILL_BIG_MAX_CTX` tokens (0 = no limit) keep small chunks.
 fn prefill_big_chunk() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *N.get_or_init(|| {
         let c = prefill_chunk_size();
-        let b = std::env::var("TITAN_PREFILL_BIG_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_BIG_CHUNK);
+        let b = mistralrs_quant::titan_cfg::var("TITAN_PREFILL_BIG_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_BIG_CHUNK);
         if c == 0 || b <= c {
             0
         } else {
@@ -1061,9 +1222,9 @@ const DEFAULT_BIG_MAX_CTX: usize = 0;
 
 /// `TITAN_PREFILL_BIG_MAX_CTX`: see `prefill_big_chunk`.
 fn prefill_big_max_ctx() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *N.get_or_init(|| {
-        std::env::var("TITAN_PREFILL_BIG_MAX_CTX").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_BIG_MAX_CTX)
+        mistralrs_quant::titan_cfg::var("TITAN_PREFILL_BIG_MAX_CTX").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_BIG_MAX_CTX)
     })
 }
 
@@ -1089,9 +1250,9 @@ fn prefill_grid_bounds(l: usize, c: usize, big: usize) -> Vec<(usize, usize)> {
 /// each `pos` and restarts the chunk grid there, as a chain of prefix-cache resumes at those
 /// positions runs it (the reference for comparing a resumed request with a cold one).
 fn prefill_split_at() -> &'static [usize] {
-    static S: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    static S: mistralrs_quant::titan_cfg::GenCell<Vec<usize>> = mistralrs_quant::titan_cfg::GenCell::new();
     S.get_or_init(|| {
-        let mut v: Vec<usize> = std::env::var("TITAN_PREFILL_SPLIT_AT")
+        let mut v: Vec<usize> = mistralrs_quant::titan_cfg::var("TITAN_PREFILL_SPLIT_AT")
             .unwrap_or_default()
             .split(',')
             .filter_map(|x| x.trim().parse().ok())
@@ -1150,6 +1311,16 @@ fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usi
     Ok(KvCache::Normal { k: single(k)?, v: single(v)? })
 }
 
+/// The batch's recurrent slot indices on a GDN layer's state pool device (a CPU-mapped layer keeps its pool in
+/// host memory; the indices come on the main device).
+fn pool_indices(indices: &Tensor, pool_device: &Device) -> Result<Tensor> {
+    if indices.device().same_device(pool_device) {
+        Ok(indices.clone())
+    } else {
+        indices.to_device(pool_device)
+    }
+}
+
 /// The device's stream-ordered allocation pool around prompt chunks.
 mod cuda_pool {
     use candle_core::{Device, Result};
@@ -1161,7 +1332,7 @@ mod cuda_pool {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = dev {
             use candle_core::cuda_backend::cudarc::driver::sys;
-            if !std::env::var("TITAN_PREFILL_MEMLOG").is_ok_and(|v| v == "1") {
+            if !mistralrs_quant::titan_cfg::var("TITAN_PREFILL_MEMLOG").is_ok_and(|v| v == "1") {
                 return Ok(());
             }
             let stream = d.cuda_stream();
@@ -1194,24 +1365,24 @@ mod cuda_pool {
 
 /// `TITAN_TIERED_LOOKAHEAD=N`: predict the next N layers' routing during decode (P1 prefetch), 0 = off.
 fn lookahead_depth() -> usize {
-    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static D: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *D.get_or_init(|| {
-        std::env::var("TITAN_TIERED_LOOKAHEAD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(4)
+        mistralrs_quant::titan_cfg::var("TITAN_TIERED_LOOKAHEAD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(4)
     })
 }
 
 /// `TITAN_MTP_PROF=1`: device-synchronised phase timings of decode / verification forwards, logged
 /// with the MTP stats (the syncs slow everything down; for relative costs only).
 fn mtp_prof_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_MTP_PROF").is_ok_and(|v| v == "1"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_MTP_PROF").is_ok_and(|v| v == "1"))
 }
 
 /// `TITAN_MTP_PROF=wall`: no syncs; wall time inside forward (`in.*`) and between forwards (`gap.*`,
 /// sampling, verification, drafting and the engine loop), keyed by the forward's row count.
 fn mtp_prof_wall() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_MTP_PROF").is_ok_and(|v| v == "wall"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_MTP_PROF").is_ok_and(|v| v == "wall"))
 }
 
 static LAST_EXIT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -1278,11 +1449,14 @@ fn prof_report() -> String {
 
 const VERIFY_NAMES: [&str; 9] = ["v0", "verify1", "verify2", "verify3", "verify4", "verify5", "verify6", "verify7", "verify8"];
 
+/// Rows the PTQ1_0 mat-vec runs in one launch with each row bit-identical to its single-row result.
+const PTQ1_0_ROWS: usize = 4;
+
 /// `TITAN_MTP_VERIFY=rowwise`: debug, run every verification op (but the routed experts) per row
 /// through the plain decode path instead of the row-exact batched kernels.
 fn mtp_verify_rowwise() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_MTP_VERIFY").is_ok_and(|v| v == "rowwise"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_MTP_VERIFY").is_ok_and(|v| v == "rowwise"))
 }
 
 /// `w @ x` for the rows of a verification, each row bit-identical to the decode step's matmul:
@@ -1292,6 +1466,9 @@ fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
     let k = x.dim(D::Minus1)?;
     let rows = x.elem_count() / k;
     if rows == 1 {
+        return w.forward(x);
+    }
+    if rows <= PTQ1_0_ROWS && w.get_qtensor().is_some_and(|q| q.dtype() == GgmlDType::PTQ1_0) {
         return w.forward(x);
     }
     #[cfg(feature = "cuda")]
@@ -1327,9 +1504,9 @@ fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
 
 /// `TITAN_MTP_ROWWISE_EXPERTS=1`: debug, run the routed experts of a verification one row at a time.
 fn mtp_rowwise_experts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        std::env::var("TITAN_MTP_ROWWISE_EXPERTS").is_ok_and(|v| !v.is_empty() && v != "0")
+        mistralrs_quant::titan_cfg::var("TITAN_MTP_ROWWISE_EXPERTS").is_ok_and(|v| !v.is_empty() && v != "0")
     })
 }
 
@@ -1337,6 +1514,8 @@ fn mtp_rowwise_experts() -> bool {
 /// full-attention MoE block with its own KV cache at the token positions; `head_norm` then the
 /// trunk's LM head give the draft logits, and the head-normed hidden seeds the next draft step.
 struct MtpBlock {
+    /// `nextn.embed_tokens`: the head's own (unrotated) token embedding, else the trunk's
+    embed: Option<QEmbedding>,
     eh_proj: Arc<dyn QuantMethod>,
     enorm: QRmsNorm,
     hnorm: QRmsNorm,
@@ -1396,6 +1575,7 @@ fn host_f32<R: std::io::Seek + std::io::Read>(
 #[allow(clippy::too_many_arguments)]
 fn load_full_attention<R: std::io::Seek + std::io::Read>(
     ct: &mut Content<'_, R>,
+    prism: &Prism,
     prefix: &str,
     device: &Device,
     rotary: Arc<RotaryEmbedding>,
@@ -1405,10 +1585,10 @@ fn load_full_attention<R: std::io::Seek + std::io::Read>(
     dtype: DType,
 ) -> Result<FullAttention> {
     Ok(FullAttention {
-        wq: gguf_linear(ct.tensor(&format!("{prefix}.attn_q.weight"), device)?)?,
-        wk: gguf_linear(ct.tensor(&format!("{prefix}.attn_k.weight"), device)?)?,
-        wv: gguf_linear(ct.tensor(&format!("{prefix}.attn_v.weight"), device)?)?,
-        wo: gguf_linear(ct.tensor(&format!("{prefix}.attn_output.weight"), device)?)?,
+        wq: prism.load_linear(ct, &format!("{prefix}.attn_q.weight"), device)?,
+        wk: prism.load_linear(ct, &format!("{prefix}.attn_k.weight"), device)?,
+        wv: prism.load_linear(ct, &format!("{prefix}.attn_v.weight"), device)?,
+        wo: prism.load_linear(ct, &format!("{prefix}.attn_output.weight"), device)?,
         q_norm: QRmsNorm::new(
             ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
             rms_norm_eps,
@@ -1459,6 +1639,7 @@ fn load_shared_expert<R: std::io::Seek + std::io::Read>(
 #[allow(clippy::too_many_arguments)]
 fn load_gdn<R: std::io::Seek + std::io::Read>(
     ct: &mut Content<'_, R>,
+    prism: &Prism,
     prefix: &str,
     cfg: &GdnCfg,
     perm: &[usize],
@@ -1518,7 +1699,13 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
     // into the tiled order at run time: tiled slot perm[h] holds grouped head h.
     let ssm_out_name = format!("{prefix}.ssm_out.weight");
     let ssm_out_block = ct.tensor_info(&ssm_out_name)?.ggml_dtype.block_size();
-    let (out_proj, out_perm) = if is_identity(perm) {
+    let (out_proj, out_perm) = if prism.folded.contains(&ssm_out_name) {
+        // folded in the grouped V-head basis (our GDN's output order): no column move, no gather
+        if !prism.gdn_v_grouped && !is_identity(perm) {
+            candle_core::bail!("{prefix}: prism-folded ssm_out in the tiled V-head basis is not supported");
+        }
+        (ct.tensor(&ssm_out_name, device)?, None)
+    } else if is_identity(perm) {
         (ct.tensor(&ssm_out_name, device)?, None)
     } else if cfg.head_v_dim % ssm_out_block == 0 {
         let w = load_v_reordered(ct, &ssm_out_name, perm, VReorder::Cols { cols_per_head: cfg.head_v_dim }, device)?;
@@ -1563,15 +1750,15 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
 
     let gdn = GatedDeltaNet::from_parts(
         cfg,
-        gguf_linear(in_proj_qkv)?,
-        gguf_linear(in_proj_z)?,
-        gguf_linear(in_proj_b)?,
-        gguf_linear(in_proj_a)?,
+        prism.linear(&format!("{prefix}.attn_qkv.weight"), in_proj_qkv)?,
+        prism.linear(&format!("{prefix}.attn_gate.weight"), in_proj_z)?,
+        prism.linear(&format!("{prefix}.ssm_beta.weight"), in_proj_b)?,
+        prism.linear(&format!("{prefix}.ssm_alpha.weight"), in_proj_a)?,
         conv1d,
         dt_bias,
         a_log,
         norm_weight,
-        gguf_linear(out_proj)?,
+        prism.linear(&ssm_out_name, out_proj)?,
     );
     Ok(match out_perm {
         Some(index) => gdn.with_out_proj_input_perm(index),
@@ -1593,6 +1780,7 @@ pub(crate) fn nextn_predict_layers(
 #[allow(clippy::too_many_arguments)]
 fn load_mtp_block<R: std::io::Seek + std::io::Read>(
     ct: &mut Content<'_, R>,
+    prism: &Prism,
     prefix: &str,
     device: &Device,
     rotary: Arc<RotaryEmbedding>,
@@ -1604,34 +1792,47 @@ fn load_mtp_block<R: std::io::Seek + std::io::Read>(
     let norm = |ct: &mut Content<'_, R>, name: &str| -> Result<QRmsNorm> {
         QRmsNorm::new(ct.tensor(&format!("{prefix}.{name}"), device)?, rms_norm_eps)
     };
-    if ct.has_tensor(&format!("{prefix}.nextn.embed_tokens.weight"))
-        || ct.has_tensor(&format!("{prefix}.nextn.shared_head_head.weight"))
-    {
-        candle_core::bail!("{prefix}: MTP blocks with their own embed_tokens / shared_head_head are not supported");
+    if ct.has_tensor(&format!("{prefix}.nextn.shared_head_head.weight")) {
+        candle_core::bail!("{prefix}: MTP blocks with their own shared_head_head are not supported");
     }
-    let attn = load_full_attention(ct, prefix, device, rotary, None, heads, rms_norm_eps, dtype)?;
-    // The MTP experts stay stock (fully on the GPU): drafting never waits for a tiered miss.
-    let exps = |ct: &mut Content<'_, R>, n: &str| -> Result<QMatMul> {
-        QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.{n}.weight"), device)?)
+    // llama.cpp qwen35 graph_mtp: the head's own token embedding when the file carries one (unrotated: a
+    // Hadamard-latent trunk table gets the inverse only when the head uses it)
+    let embed_name = format!("{prefix}.nextn.embed_tokens.weight");
+    let embed = if ct.has_tensor(&embed_name) {
+        let e = QEmbedding::new(ct.tensor(&embed_name, &Device::Cpu)?)?;
+        let hidden = e.hidden;
+        Some(if prism.inverse.contains(&embed_name) { e.with_inverse(prism.rot(hidden)?) } else { e })
+    } else {
+        None
     };
-    let experts = Experts::Stock {
-        gate: exps(ct, "ffn_gate_exps")?,
-        up: exps(ct, "ffn_up_exps")?,
-        down: exps(ct, "ffn_down_exps")?,
+    let attn = load_full_attention(ct, prism, prefix, device, rotary, None, heads, rms_norm_eps, dtype)?;
+    let ffn = if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) {
+        // The MTP experts stay stock (fully on the GPU): drafting never waits for a tiered miss.
+        let exps = |ct: &mut Content<'_, R>, n: &str| -> Result<QMatMul> {
+            QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.{n}.weight"), device)?)
+        };
+        let experts = Experts::Stock {
+            gate: exps(ct, "ffn_gate_exps")?,
+            up: exps(ct, "ffn_up_exps")?,
+            down: exps(ct, "ffn_down_exps")?,
+        };
+        Ffn::Moe(MoeBlock {
+            router: QMatMul::Tensor(host_f32(ct, &format!("{prefix}.ffn_gate_inp.weight"), device)?),
+            experts,
+            shared: load_shared_expert(ct, prefix, device)?,
+            top_k,
+        })
+    } else {
+        Ffn::Dense(DenseFfn::load(ct, prefix, prism, device)?)
     };
-    let ffn = Ffn::Moe(MoeBlock {
-        router: QMatMul::Tensor(host_f32(ct, &format!("{prefix}.ffn_gate_inp.weight"), device)?),
-        experts,
-        shared: load_shared_expert(ct, prefix, device)?,
-        top_k,
-    });
     let head_norm = if ct.has_tensor(&format!("{prefix}.nextn.shared_head_norm.weight")) {
         norm(ct, "nextn.shared_head_norm.weight")?
     } else {
         QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?
     };
     let block = MtpBlock {
-        eh_proj: gguf_linear(ct.tensor(&format!("{prefix}.nextn.eh_proj.weight"), device)?)?,
+        embed,
+        eh_proj: prism.load_linear(ct, &format!("{prefix}.nextn.eh_proj.weight"), device)?,
         enorm: norm(ct, "nextn.enorm.weight")?,
         hnorm: norm(ct, "nextn.hnorm.weight")?,
         attn_norm: norm(ct, "attn_norm.weight")?,
@@ -1642,7 +1843,9 @@ fn load_mtp_block<R: std::io::Seek + std::io::Read>(
         n_draft: mtp_draft_len(),
     };
     tracing::info!(
-        "titan mtp: loaded {prefix} as the MTP draft head (stock experts on the GPU), {} draft tokens per step",
+        "titan mtp: loaded {prefix} as the MTP draft head ({}{}), {} draft tokens per step",
+        if matches!(block.ffn, Ffn::Moe(_)) { "stock experts on the GPU" } else { "dense FFN" },
+        if block.embed.is_some() { ", own token embedding" } else { "" },
         block.n_draft
     );
     Ok(block)
@@ -1719,13 +1922,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 .collect(),
         };
 
+        let prism = Prism::load(ct.get_metadata(), device)?;
         let tok_embeddings = QEmbedding::new(ct.tensor("token_embd.weight", &Device::Cpu)?)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
-        let output = if ct.has_tensor("output.weight") {
-            ct.tensor("output.weight", device)?
+        let tok_embeddings = if prism.inverse.contains("token_embd.weight") {
+            tok_embeddings.with_inverse(prism.rot(embedding_length)?)
         } else {
-            ct.tensor("token_embd.weight", device)?
+            tok_embeddings
         };
+        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let output_name = if ct.has_tensor("output.weight") { "output.weight" } else { "token_embd.weight" };
+        let output = prism.linear(output_name, ct.tensor(output_name, device)?)?;
 
         let mut ropes = HashMap::new();
         for layer_idx in (0..block_count).filter(|&i| is_attn[i]) {
@@ -1776,6 +1982,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 };
                 Mixer::Attention(load_full_attention(
                     &mut ct,
+                    &prism,
                     &prefix,
                     device,
                     rotary,
@@ -1786,7 +1993,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 )?)
             } else {
                 Mixer::Linear(load_gdn(
-                    &mut ct, &prefix, &gdn_cfg, &perm, device, gdn_dtype,
+                    &mut ct, &prism, &prefix, &gdn_cfg, &perm, device, gdn_dtype,
                 )?)
             };
 
@@ -1803,11 +2010,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     top_k,
                 })
             } else {
-                Ffn::Dense(DenseFfn {
-                    gate: gguf_linear(ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?)?,
-                    up: gguf_linear(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?)?,
-                    down: gguf_linear(ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?)?,
-                })
+                Ffn::Dense(DenseFfn::load(&mut ct, &prefix, &prism, device)?)
             };
 
             layers.push(DecoderLayer {
@@ -1844,15 +2047,15 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     )
                 })
                 .clone();
-            let Some(top_k) = expert_used_count else {
-                candle_core::bail!("{arch}: MTP needs an MoE (qwen35moe / qwen3next) arch");
-            };
+            // dense qwen35 heads have no experts
+            let top_k = expert_used_count.unwrap_or(0);
             #[cfg(feature = "cuda")]
             if let Device::Cuda(dev) = device {
                 mistralrs_quant::mmvq_rows::warm_up(dev)?;
             }
             Some(load_mtp_block(
                 &mut ct,
+                &prism,
                 &format!("blk.{block_count}"),
                 device,
                 rotary,
@@ -1874,7 +2077,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             block_count - num_attn
         );
 
-        let hybrid_cache = HybridCache::new(
+        // each layer's KV / recurrent state on its own device (CPU-mapped layers keep theirs in host memory)
+        let layer_devices = (0..is_attn.len())
+            .map(|i| mapper.device_for(i, false).unwrap_or(device).clone())
+            .collect::<Vec<_>>();
+        let hybrid_cache = HybridCache::with_slots(
             HybridCacheConfig {
                 layer_types: is_attn
                     .iter()
@@ -1899,15 +2106,15 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 },
             },
             gdn_dtype,
-            // every layer's caches on the main device, as before (tiering keeps all layers on it)
-            &vec![device.clone(); is_attn.len()],
+            &layer_devices,
+            recurrent_slots(),
         )?;
 
         Ok(Self {
             tok_embeddings,
             layers,
             norm,
-            output: gguf_linear(output)?,
+            output,
             device: device.clone(),
             cache: EitherCache::Hybrid(Arc::new(Mutex::new(hybrid_cache))),
             max_seq_len,
@@ -2072,17 +2279,14 @@ impl ModelWeights {
                 self.prefix_points.lock().expect("prefix points poisoned").remove(&slot);
             }
         }
-        // KV room for the whole prompt and the start of its reply, in KV_RESERVE_STEP buckets: the
-        // buffers are allocated once, not regrown per chunk, and bucket-sized buffers freed by one
-        // sequence are reused whole by the next instead of fragmenting the device pool
-        let end = (base.iter().max().copied().unwrap_or(0) + input_ids.dim(1)? + 1)
-            .next_multiple_of(KV_RESERVE_STEP)
-            .min(self.max_seq_len);
+        // KV room for the whole prompt and the start of its reply (`kv_reserve_len`): the buffers are
+        // allocated once, not regrown per chunk
+        let end = self.kv_reserve_len(base.iter().max().copied().unwrap_or(0) + input_ids.dim(1)? + 1);
         self.cache.hybrid().reserve_attention(end)?;
         #[cfg(feature = "cuda")]
         mistralrs_quant::TieredExperts::set_prefill_context(end);
         let mut out = None;
-        let tf_tokens: Option<Vec<u32>> = if std::env::var_os("TITAN_TF_DUMP").is_some() && b == 1 {
+        let tf_tokens: Option<Vec<u32>> = if mistralrs_quant::titan_cfg::var_os("TITAN_TF_DUMP").is_some() && b == 1 {
             Some(input_ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?)
         } else {
             None
@@ -2183,7 +2387,7 @@ impl ModelWeights {
                     attn.forward(&h, &mask.get(h.device()), kv_cache, ctx, i)?
                 }
                 (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
-                    let indices = recurrent_metadata.state_indices();
+                    let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
                     let mut gdn_cache = GdnLayerCache {
                         conv_state: pool.gather_conv_state(indices)?,
                         recurrent_state: pool.gather_recurrent_state(indices)?,
@@ -2319,7 +2523,7 @@ impl ModelWeights {
                         attn.forward_decode_rows(&h, kv_cache, start, Some(flash_params))?
                     }
                     (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
-                        let indices = recurrent_metadata.state_indices();
+                        let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
                         let mut gdn_cache = GdnLayerCache {
                             conv_state: pool.gather_conv_state(indices)?,
                             recurrent_state: pool.gather_recurrent_state(indices)?,
@@ -2382,7 +2586,7 @@ impl ModelWeights {
                     }
                 }
                 (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
-                    let indices = recurrent_metadata.state_indices();
+                    let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
                     let mut gdn_cache = GdnLayerCache {
                         conv_state: pool.gather_conv_state(indices)?,
                         recurrent_state: pool.gather_recurrent_state(indices)?,
@@ -2533,8 +2737,10 @@ impl ModelWeights {
         want_logits: bool,
     ) -> Result<(Option<Tensor>, Tensor)> {
         let m = tokens.dim(1)?;
-        let e = self
-            .tok_embeddings
+        let e = mtp
+            .embed
+            .as_ref()
+            .unwrap_or(&self.tok_embeddings)
             .forward(tokens, &self.device)?
             .to_dtype(DType::F32)?;
         let e = mtp.enorm.forward(&e)?;
@@ -2624,10 +2830,16 @@ impl ModelWeights {
         Ok(self.graph_model_ok())
     }
 
+    /// CUDA OOM recovery: destroy the captured decode segments.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn reset_graphs(&self) {
+        self.graphs.clear();
+    }
+
     /// The step-invariant part of `graphable_decode` (checked once).
     #[cfg(feature = "cuda")]
     fn graph_model_ok(&self) -> bool {
-        static STATIC_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static STATIC_OK: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
         *STATIC_OK.get_or_init(|| {
             let one_device = self.mapper.as_ref().is_none_or(|m| m.get_unique_devices().len() == 1);
             let layers_ok = self.layers.iter().all(|l| {
@@ -2980,7 +3192,7 @@ impl ModelWeights {
         let Some(mtp) = &self.mtp else {
             return Ok(None);
         };
-        if std::env::var("TITAN_MTP_NODRAFT").is_ok_and(|v| v == "1") {
+        if mistralrs_quant::titan_cfg::var("TITAN_MTP_NODRAFT").is_ok_and(|v| v == "1") {
             return Ok(None); // A/B: MTP block loaded (same VRAM plan), plain decoding
         }
         let t0 = std::time::Instant::now();
@@ -3081,6 +3293,40 @@ impl ModelWeights {
                 })
             })
             .collect()
+    }
+
+    /// The device trunk layer `i` (and its caches) lives on.
+    fn layer_device(&self, i: usize) -> &Device {
+        self.mapper.as_ref().and_then(|m| m.device_for(i, false)).unwrap_or(&self.device)
+    }
+
+    /// KV positions to reserve for a prompt needing `need`: the `KV_RESERVE_STEP` bucket (buffers freed by one
+    /// sequence are reused whole by the next instead of fragmenting the device pool) while the bucket's extra
+    /// positions fit in the main device's free memory with `KV_BUCKET_MARGIN` to spare; otherwise `need` rounded
+    /// up to the cache's growth step, so a prompt still fits when the bucket would not.
+    fn kv_reserve_len(&self, need: usize) -> usize {
+        let need = need.min(self.max_seq_len);
+        let bucket = need.next_multiple_of(KV_RESERVE_STEP).min(self.max_seq_len);
+        let exact = need.next_multiple_of(HybridCache::CACHE_GROW_SIZE).min(self.max_seq_len);
+        if bucket <= exact {
+            return bucket;
+        }
+        // K and V of every attention layer on the main device, the MTP block's included
+        let attn = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match &l.mixer {
+                Mixer::Attention(a) if self.layer_device(i).same_device(&self.device) => Some(a),
+                _ => None,
+            })
+            .chain(self.mtp.as_ref().map(|m| &m.attn));
+        let per_pos: usize = attn.map(|a| 2 * a.n_kv_head * a.head_dim * a.dtype.size_in_bytes()).sum();
+        let extra = (bucket - exact).saturating_mul(per_pos);
+        match device_free_bytes(&self.device) {
+            Some(free) if extra.saturating_add(KV_BUCKET_MARGIN) > free => exact,
+            _ => bucket,
+        }
     }
 
     /// Save the recurrent state of `slot` (just after its first `len` tokens) as a resume point.
@@ -3227,13 +3473,13 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::msg("prefix restore: no resume point"))?;
         // the sequence holds the prompt tokens after the resume point
         let total = q + seq.get_toks().len();
-        let cap = (total + 1).next_multiple_of(KV_RESERVE_STEP).min(self.max_seq_len).max(q);
+        let cap = self.kv_reserve_len(total + 1).max(q);
         let mut hybrid = self.cache.hybrid();
         let max_seq_len = hybrid.config().max_seq_len;
         let mut caches = Vec::with_capacity(entry.kv.len());
-        for kv in &entry.kv {
+        for (i, kv) in entry.kv.iter().enumerate() {
             caches.push(match kv {
-                Some((k, v)) => Some(kv_from_host(k, v, q, cap, max_seq_len, &self.device)?),
+                Some((k, v)) => Some(kv_from_host(k, v, q, cap, max_seq_len, self.layer_device(i))?),
                 None => None,
             });
         }
@@ -3340,9 +3586,9 @@ const TF_TOPK: usize = 64;
 /// its positions and appends `u32 first position, u32 rows`, then per position `u32 next token (u32::MAX past the
 /// end), f32 its log-probability, TF_TOPK x (u32 id, f32 log-probability)` (teacher-forced KL / perplexity).
 fn tf_dump(output: &Arc<dyn QuantMethod>, x: &Tensor, tokens: &[u32], start: usize) -> Result<()> {
-    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static FILE: mistralrs_quant::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = mistralrs_quant::titan_cfg::GenCell::new();
     let Some(f) = FILE.get_or_init(|| {
-        let path = std::env::var("TITAN_TF_DUMP").ok()?;
+        let path = mistralrs_quant::titan_cfg::var("TITAN_TF_DUMP").ok()?;
         std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
     }) else {
         return Ok(());
@@ -3384,9 +3630,9 @@ fn tf_dump(output: &Arc<dyn QuantMethod>, x: &Tensor, tokens: &[u32], start: usi
 /// exact: per record `layer, first position, rows, cols` as u32 LE, then the rows as F32 LE. For
 /// diffing a chunked prompt pass against the whole one (see titan-engine m4/chunk/layerbin.py).
 fn layer_dump_bin(layer: usize, start: usize, x: &Tensor) -> Result<()> {
-    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static FILE: mistralrs_quant::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = mistralrs_quant::titan_cfg::GenCell::new();
     let Some(f) = FILE.get_or_init(|| {
-        let path = std::env::var("TITAN_LAYER_DUMP_BIN").ok()?;
+        let path = mistralrs_quant::titan_cfg::var("TITAN_LAYER_DUMP_BIN").ok()?;
         std::fs::File::create(path).ok().map(std::sync::Mutex::new)
     }) else {
         return Ok(());
@@ -3413,9 +3659,9 @@ fn layer_dump_bin(layer: usize, start: usize, x: &Tensor) -> Result<()> {
 /// llama-eval-callback prints `l_out-N` (sum over the tensor, first/last 3 values of each token row),
 /// for a layer-by-layer diff against llama.cpp (see titan-engine m4/layerdiff.py).
 fn layer_dump(layer: usize, x: &Tensor) -> Result<()> {
-    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static FILE: mistralrs_quant::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = mistralrs_quant::titan_cfg::GenCell::new();
     let Some(f) = FILE.get_or_init(|| {
-        let path = std::env::var("TITAN_LAYER_DUMP").ok()?;
+        let path = mistralrs_quant::titan_cfg::var("TITAN_LAYER_DUMP").ok()?;
         std::fs::File::create(path).ok().map(std::sync::Mutex::new)
     }) else {
         return Ok(());

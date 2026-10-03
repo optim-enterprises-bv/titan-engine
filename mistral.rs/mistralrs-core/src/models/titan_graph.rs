@@ -17,7 +17,7 @@
 //! A capture that fails (an op that cannot be captured) falls back to eager for that segment for good.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use candle_core::cuda_backend::cudarc::driver::{result, sys, CudaStream, DevicePtr};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
@@ -28,8 +28,8 @@ use crate::pipeline::cuda_graph::{
 };
 
 pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1"))
 }
 
 /// Identifies one captured segment: what it computes (`tag`, `layer`) plus every value the capture
@@ -287,6 +287,12 @@ impl SegmentGraphs {
                 }
             }
         }
+    }
+
+    /// Destroy every captured segment (after a CUDA OOM): the next steps warm up and capture again.
+    pub(crate) fn clear(&self) {
+        let old = std::mem::take(&mut *self.inner.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(old);
     }
 
     pub(crate) fn report(&self, dev: &Device) -> String {

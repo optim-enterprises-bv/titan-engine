@@ -72,8 +72,8 @@ const ADMIT_MAX_ROWS: usize = 8;
 
 /// Rows per CPU work item (`TITAN_TIERED_CHUNK`, default ROWS_PER_CPU_CHUNK).
 fn rows_per_chunk() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("TITAN_TIERED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(ROWS_PER_CPU_CHUNK))
+    static N: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
+    *N.get_or_init(|| crate::titan_cfg::var("TITAN_TIERED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(ROWS_PER_CPU_CHUNK))
 }
 
 /// `TITAN_MMVQ_MOE`: 1 (default) runs decode (b = 1) and MTP-verify batches (b = 2..8) on the mmvq-moe
@@ -81,16 +81,17 @@ fn rows_per_chunk() -> usize {
 /// grid); 2 uses the MoE grid at every b; 3 the b1 grid (small_k included) at b = 1; 0 keeps the
 /// one-block-per-(row, task) kernels. The output bits are the same in every mode.
 fn mmvq_moe_mode() -> u32 {
-    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("TITAN_MMVQ_MOE").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    static M: crate::titan_cfg::GenCell<u32> = crate::titan_cfg::GenCell::new();
+    *M.get_or_init(|| crate::titan_cfg::var("TITAN_MMVQ_MOE").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
 }
 
 /// The pool that computes CPU misses: spinning workers (see `titan_spin`), or rayon's global pool
 /// with `TITAN_TIERED_SPIN=0`.
+static MISS_POOL: crate::titan_cfg::GenCell<Option<super::titan_spin::SpinPool>> = crate::titan_cfg::GenCell::new();
+
 fn miss_pool() -> Option<&'static super::titan_spin::SpinPool> {
-    static POOL: std::sync::OnceLock<Option<super::titan_spin::SpinPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        if std::env::var("TITAN_TIERED_SPIN").is_ok_and(|v| v == "0") {
+    MISS_POOL.get_or_init(|| {
+        if crate::titan_cfg::var("TITAN_TIERED_SPIN").is_ok_and(|v| v == "0") {
             return None;
         }
         // the calling thread works too; with the doorbell it is not the decode thread, and the memory-bound pass
@@ -112,15 +113,15 @@ enum Policy {
 
 /// `TITAN_TIERED_LFU_DECAY` / `TITAN_TIERED_LFU_MARGIN`.
 fn lfu_params() -> (f32, f32) {
-    static P: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    static P: crate::titan_cfg::GenCell<(f32, f32)> = crate::titan_cfg::GenCell::new();
     *P.get_or_init(|| {
-        let f = |name: &str, default: f32| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let f = |name: &str, default: f32| crate::titan_cfg::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
         (f("TITAN_TIERED_LFU_DECAY", 0.98), f("TITAN_TIERED_LFU_MARGIN", 4.0))
     })
 }
 
 fn async_uploads() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
     *ON.get_or_init(|| env_flag("TITAN_TIERED_ASYNC"))
 }
 
@@ -145,7 +146,11 @@ struct Cache {
     slots_ptr: u64,
 }
 
-static AUTO_FRACTION: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+static AUTO_FRACTION: crate::titan_cfg::GenCell<f64> = crate::titan_cfg::GenCell::new();
+/// Free VRAM the first auto plan of the process saw (see `plan_auto`).
+static FIRST_PLAN_FREE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Largest shortfall against `FIRST_PLAN_FREE` still planned as the first load's figure; more is a real shortage.
+const PLAN_FREE_ADJUST_MAX: usize = 512 << 20;
 /// Bytes the auto plan must leave free on top of the reserve (the KV cache of the requested context).
 static AUTO_EXTRA_RESERVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -177,8 +182,8 @@ const MAJFLT: usize = 9;
 const MINFLT: usize = 10;
 /// TITAN_TIERED_TIMING: 1 = wall time of the miss path, 2 = also sync after each GPU gemv (serializes).
 fn timing_level() -> u32 {
-    static L: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *L.get_or_init(|| std::env::var("TITAN_TIERED_TIMING").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    static L: crate::titan_cfg::GenCell<u32> = crate::titan_cfg::GenCell::new();
+    *L.get_or_init(|| crate::titan_cfg::var("TITAN_TIERED_TIMING").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 fn timing_on() -> bool {
     timing_level() > 0
@@ -201,18 +206,18 @@ fn proc_counters() -> String {
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    crate::titan_cfg::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// `TITAN_TIERED_WILLNEED=0` drops the within-layer MADV_WILLNEED hint on mapped misses.
 fn willneed_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_TIERED_WILLNEED").map_or(true, |v| v != "0"))
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_TIERED_WILLNEED").map_or(true, |v| v != "0"))
 }
 
 /// `TITAN_TIERED_FINGERPRINT=M`: slots per tensor re-seeded from each request's prefill (0 = off).
 fn fingerprint_slots() -> usize {
-    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static M: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
     *M.get_or_init(|| env_usize("TITAN_TIERED_FINGERPRINT", 0))
 }
 
@@ -248,9 +253,11 @@ fn run_prefetch(job: &PrefetchJob, populate: bool) {
 }
 
 /// `TITAN_TIERED_LOOKAHEAD_THREADS` (default 2) workers draining a bounded queue.
-fn prefetcher() -> &'static std::sync::mpsc::SyncSender<PrefetchJob> {
-    static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<PrefetchJob>> = std::sync::OnceLock::new();
-    TX.get_or_init(|| {
+static PREFETCH_TX: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<PrefetchJob>>> = std::sync::Mutex::new(None);
+
+fn prefetcher() -> std::sync::mpsc::SyncSender<PrefetchJob> {
+    let mut g = PREFETCH_TX.lock().unwrap();
+    g.get_or_insert_with(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<PrefetchJob>(PREFETCH_QUEUE);
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let populate = env_flag("TITAN_TIERED_LOOKAHEAD_POPULATE");
@@ -266,6 +273,28 @@ fn prefetcher() -> &'static std::sync::mpsc::SyncSender<PrefetchJob> {
         }
         tx
     })
+    .clone()
+}
+
+/// CUDA OOM recovery: a fresh doorbell for the next forward.
+pub(crate) fn reset_doorbell() {
+    doorbell::release();
+}
+
+/// Model unload: stop the miss pool's workers and the lookahead prefetch workers, forget the auto plan and
+/// zero the counters. The next model's settings start them again.
+pub(crate) fn release_statics() {
+    use std::sync::atomic::Ordering::Relaxed;
+    doorbell::release();
+    if let Some(Some(pool)) = MISS_POOL.get() {
+        pool.shutdown();
+    }
+    PREFETCH_TX.lock().unwrap().take();
+    AUTO_EXTRA_RESERVE.store(0, Relaxed);
+    PENDING.lock().unwrap().clear();
+    for a in STATS.iter().chain(PF_STATS.iter()).chain(TIMING.iter()).chain(PRED_STATS.iter().flatten()) {
+        a.store(0, Relaxed);
+    }
 }
 
 fn pred_report() -> String {
@@ -366,13 +395,13 @@ pub struct TieredExperts {
     fast_ok: std::sync::OnceLock<bool>,
 }
 
-static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+static TRACE: crate::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = crate::titan_cfg::GenCell::new();
 
 /// `TITAN_TIERED_TRACE=<file>`: one line per forward, `layer batch topk id id ...`.
 fn trace_path() -> Option<&'static std::sync::Mutex<std::fs::File>> {
     TRACE
         .get_or_init(|| {
-            let path = std::env::var("TITAN_TIERED_TRACE").ok()?;
+            let path = crate::titan_cfg::var("TITAN_TIERED_TRACE").ok()?;
             std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
         })
         .as_ref()
@@ -392,7 +421,7 @@ fn trace_ids(f: &std::sync::Mutex<std::fs::File>, layer: usize, batch: usize, to
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| v == "1")
+    crate::titan_cfg::var(name).is_ok_and(|v| v == "1")
 }
 
 impl TieredExperts {
@@ -419,7 +448,7 @@ impl TieredExperts {
     }
 
     fn policy() -> Policy {
-        match std::env::var("TITAN_TIERED_POLICY").as_deref() {
+        match crate::titan_cfg::var("TITAN_TIERED_POLICY").as_deref() {
             Ok("lru") => Policy::Lru,
             Ok("lfu") => Policy::Lfu,
             _ => Policy::Static,
@@ -428,7 +457,7 @@ impl TieredExperts {
 
     /// Experts of `layer` ordered hottest first, from `TITAN_TIERED_PROFILE` (`layer expert count` lines).
     fn profile_order(layer: usize, num_experts: usize) -> Option<Vec<usize>> {
-        let path = std::env::var("TITAN_TIERED_PROFILE").ok()?;
+        let path = crate::titan_cfg::var("TITAN_TIERED_PROFILE").ok()?;
         let text = std::fs::read_to_string(&path).ok()?;
         let mut counts = vec![0u64; num_experts];
         for line in text.lines() {
@@ -452,7 +481,7 @@ impl TieredExperts {
     }
 
     fn gpu_fraction() -> f64 {
-        match std::env::var("TITAN_TIERED_GPU_FRACTION").as_deref() {
+        match crate::titan_cfg::var("TITAN_TIERED_GPU_FRACTION").as_deref() {
             Ok("auto") => *AUTO_FRACTION.get().unwrap_or(&1.0),
             Ok(v) => v.parse::<f64>().map_or(1.0, |f| f.clamp(0.0, 1.0)),
             Err(_) => 1.0,
@@ -462,7 +491,7 @@ impl TieredExperts {
     /// Whether `TITAN_TIERED_GPU_FRACTION=auto` still needs a plan (see `plan_auto`).
     pub fn wants_auto_plan() -> bool {
         Self::enabled()
-            && std::env::var("TITAN_TIERED_GPU_FRACTION").as_deref() == Ok("auto")
+            && crate::titan_cfg::var("TITAN_TIERED_GPU_FRACTION").as_deref() == Ok("auto")
             && AUTO_FRACTION.get().is_none()
     }
 
@@ -476,7 +505,25 @@ impl TieredExperts {
     }
 
     pub fn plan_auto(tiered_bytes: usize, other_bytes: usize, free_bytes: usize) -> f64 {
-        let reserve = std::env::var("TITAN_TIERED_RESERVE_MIB")
+        use std::sync::atomic::Ordering::Relaxed;
+        // A model loaded after an unload sees less free VRAM than a fresh process by what the first model left in
+        // the context for good (kernel modules, library workspaces): a fresh process allocates the same during its
+        // first load, after planning. Plan from the fresh-process figure so every load of a model places its experts
+        // alike (a different placement changes which experts the CPU computes).
+        let first = FIRST_PLAN_FREE.load(Relaxed);
+        if first == 0 {
+            FIRST_PLAN_FREE.store(free_bytes, Relaxed);
+        }
+        let measured = free_bytes;
+        let free_bytes = if first > free_bytes && first - free_bytes <= PLAN_FREE_ADJUST_MAX { first } else { free_bytes };
+        if free_bytes != measured {
+            tracing::info!(
+                "titan tiered auto: {} MiB measured free, planning with the first load's {} MiB (context state kept since)",
+                measured >> 20,
+                free_bytes >> 20
+            );
+        }
+        let reserve = crate::titan_cfg::var("TITAN_TIERED_RESERVE_MIB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1024)
@@ -569,7 +616,7 @@ impl TieredExperts {
         let (host, host_index, host_mib, host_kind) = match mapped {
             Some((mm, offset)) => {
                 // TITAN_TIERED_POPULATE=f: page in (and map) the hottest f of the non-resident experts now.
-                let share = std::env::var("TITAN_TIERED_POPULATE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let share = crate::titan_cfg::var("TITAN_TIERED_POPULATE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
                 if share > 0.0 {
                     let take = ((num_experts - num_resident) as f64 * share.clamp(0.0, 1.0)).round() as usize;
                     let ranges = order[num_resident..].iter().take(take).map(|&e| (offset + e * expert_bytes, expert_bytes)).collect();
@@ -1093,7 +1140,7 @@ impl TieredExperts {
         let mut out = out;
         let mut deferred = Vec::new();
         // TITAN_TIERED_DEBUG_SKIP_MISSES=1: timing experiment only, output is WRONG (misses stay zero).
-        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SKIP: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
         let skip = *SKIP.get_or_init(|| env_flag("TITAN_TIERED_DEBUG_SKIP_MISSES"));
         if !all_resident && !skip {
             if defer && self.policy != Policy::Lru {
@@ -1181,7 +1228,7 @@ impl TieredExperts {
             let first = groups.len();
             for &t in tasks.iter() {
                 let e = ids_host[t];
-                static NOGROUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                static NOGROUP: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
                 let nogroup = *NOGROUP.get_or_init(|| env_flag("TITAN_TIERED_NOGROUP"));
                 match groups[first..].iter_mut().find(|(gp, g)| !nogroup && *gp == p && ids_host[g[0]] == e) {
                     Some((_, g)) => g.push(t),

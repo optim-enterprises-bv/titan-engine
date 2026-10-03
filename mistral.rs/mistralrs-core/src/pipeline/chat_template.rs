@@ -18,6 +18,7 @@ const SUPPORTED_ALTERNATE_EOS: &[&str] = &[
     "<|end_of_text|>", // Hermes
     "<|end|>",         // Phi-3, Phi-3.5, Harmony
     "<|eot_id|>",      // Llama 3
+    "<turn|>",         // Gemma 4 (GGUF eos is <eos> in some conversions)
 ];
 
 /// titan (replaces upstream's HARMONY_ALTERNATE_EOS, which made `<|message|>` / `<|start|>` /
@@ -825,6 +826,20 @@ pub fn apply_chat_template_to(
     let date = chrono::Local::now();
     let date_string = date.format("%d, %B, %Y").to_string();
 
+    // titan: a per-model default effort (TITAN_REASONING_EFFORT) for templates whose own default runs long
+    // (Ternary Bonsai 2's template defaults to xhigh); an explicit request field or disabled thinking wins
+    let reasoning_effort = reasoning_effort.or_else(|| {
+        if enable_thinking == Some(false) {
+            return None;
+        }
+        match mistralrs_quant::titan_cfg::var("TITAN_REASONING_EFFORT").ok()?.as_str() {
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::XHigh),
+            _ => None,
+        }
+    });
     let reasoning_controls = resolve_reasoning_controls(enable_thinking, reasoning_effort)?;
     let reasoning_effort_value = reasoning_controls
         .reasoning_effort

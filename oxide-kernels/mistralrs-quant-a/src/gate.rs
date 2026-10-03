@@ -281,6 +281,23 @@ impl G {
         x == y
     }
 
+    /// Run `f` on the Rust side only (fresh device copies of `bufs`) and download every buffer.
+    pub fn rust_only(&mut self, label: &str, bufs: &[Vec<u8>], f: impl Fn(&Side)) -> Vec<Vec<u8>> {
+        let a = self.upload(bufs);
+        self.ctx.synchronize().unwrap();
+        f(&a);
+        self.ctx.synchronize().unwrap_or_else(|e| panic!("{label}: rust side: {e:?}"));
+        a.bufs.iter().map(|x| x.to_host_vec(&self.streams[0]).unwrap()).collect()
+    }
+
+    /// Record a host-side check as one launch (`ok == false` is a failure).
+    pub fn check(&mut self, label: &str, ok: bool) {
+        let d = kdiff::Diff { bytes: 1, differing: (!ok) as usize, first: if ok { None } else { Some((0, 0, 0, 1)) } };
+        self.calls += 1;
+        self.family_calls += 1;
+        self.t.record(label, &d);
+    }
+
     pub fn f32s(&mut self, n: usize) -> Vec<u8> {
         as_bytes(&self.rng.f32s(n))
     }
@@ -1035,11 +1052,29 @@ impl G {
         }
         b
     }
+    /// `blocks` with every f16 scale field a normal magnitude 2^-12..2^3 (no inf / nan / subnormal).
+    pub fn sane_blocks(&mut self, f: &Fmt, n: usize, pad: usize) -> Vec<u8> {
+        let mut b = self.rng.bytes(n * f.bs + pad);
+        for i in 0..n {
+            for &o in f.f16s {
+                let r = self.rng.next();
+                let v = ((((r >> 8) & 1) as u16) << 15) | ((3 + ((r >> 9) % 16) as u16) << 10) | ((r >> 16) & 0x3ff) as u16;
+                b[i * f.bs + o..i * f.bs + o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        b
+    }
     /// `n` random Q8_1 blocks (36 bytes): random int8 quants, `ds` from `f16_scale`.
     pub fn q8_1(&mut self, n: usize) -> Vec<u8> {
         let f = &FMTS[10];
         self.blocks(f, n, 0)
     }
+}
+
+/// `add.rn.ftz.f32` on the host: subnormal inputs and results become zero of the same sign.
+fn ftz_add(a: f32, b: f32) -> f32 {
+    let ftz = |x: f32| if x.is_subnormal() { 0f32.copysign(x) } else { x };
+    ftz(ftz(a) + ftz(b))
 }
 
 fn indexed_moe(g: &mut G) {
@@ -1124,6 +1159,40 @@ fn indexed_moe(g: &mut G) {
                     (if rust { dao } else { dac })(b.p(0), b.p(1), b.p(2) as _, b.p(3) as _, b.p(4) as _, n, kk, batch, topk, kp, s)
                 });
             }
+            // Every slot weighted (redcell): the oxide sum must be the slot-order fold of the one-slot
+            // results, bit for bit (.ftz adds), and the same on a second run. Finite scales only, so
+            // a zero weight never meets an inf/nan dot product.
+            {
+                let wn = g.sane_blocks(f, ne * n as usize * bpr, 64);
+                let xq = g.sane_blocks(&FMTS[10], tasks * xblocks_row, 0);
+                let tw_all: Vec<f32> = (0..tasks).map(|t| [0.5f32, -1.25, 3.0, 1e-3, 0.37, -0.0625, 2.5, 0.8][t % 8]).collect();
+                let init: Vec<f32> = (0..batch as usize * n as usize).map(|i| ((i % 13) as f32 - 6.5) * 0.37).collect();
+                let label = format!("moe_gemv_down_aggregate_{}_q8_1 n={n} k={kk} batch={batch} topk={topk} slot-order", f.name);
+                let run = |g: &mut G, tw: &[f32], init: &[f32]| -> Vec<f32> {
+                    let o = g.rust_only(&label, &[wn.clone(), xq.clone(), as_bytes(&ids), as_bytes(tw), as_bytes(init)], |b| unsafe {
+                        dao(b.p(0), b.p(1), b.p(2) as _, b.p(3) as _, b.p(4) as _, n, kk, batch, topk, kp, s)
+                    });
+                    o[4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                };
+                let full = run(&mut *g, &tw_all, &init);
+                let again = run(&mut *g, &tw_all, &init);
+                let zeros = vec![0f32; init.len()];
+                let mut want = init.clone();
+                for slot in 0..topk {
+                    let tws: Vec<f32> = (0..tasks).map(|t| if t as i32 % topk == slot { tw_all[t] } else { 0.0 }).collect();
+                    let p = run(&mut *g, &tws, &zeros);
+                    for (a, b) in want.iter_mut().zip(&p) {
+                        *a = ftz_add(*a, *b);
+                    }
+                }
+                let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()) || (a == 0.0 && b == 0.0);
+                let bad = full.iter().zip(&want).filter(|(a, b)| !same(**a, **b)).count();
+                if bad > 0 {
+                    eprintln!("{label}: {bad} of {} outputs differ from the slot-order fold", full.len());
+                }
+                g.check(&label, bad == 0);
+                g.check(&format!("{label} rerun"), full.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
         }
     }
     g.family("indexed_moe");
@@ -1182,6 +1251,17 @@ fn moe_grouped(g: &mut G) {
                 v[2][..total * 4].copy_from_slice(&as_bytes(&st));
                 v[3][..total * 4].copy_from_slice(&as_bytes(&ss));
             };
+            {
+                // redcell: the oxide scatter is stable (ascending assignment index within an expert)
+                let o = g.rust_only("moe_dispatch stable", &bufs, |b| unsafe {
+                    let src = if with_src { b.p(3) as *mut i32 } else { std::ptr::null_mut() };
+                    ox::launch_moe_dispatch(b.p(0) as _, b.p(1) as _, b.p(2) as _, src, total as i32, ne as i32, topk as i32, b.p(4) as _, b.p(5) as _, s)
+                });
+                let st = i32s_of(&o[2][..total * 4]);
+                let mut want: Vec<i32> = (0..total as i32).collect();
+                want.sort_by_key(|&i| (ids[i as usize], i));
+                g.check(&format!("moe_dispatch stable tokens={tokens} topk={topk} experts={ne} src={with_src}"), st == want);
+            }
             g.case_canon(&format!("moe_dispatch tokens={tokens} topk={topk} experts={ne} src={with_src}"), bufs, move |rust, b| unsafe {
                 let src = if with_src { b.p(3) as *mut i32 } else { std::ptr::null_mut() };
                 (if rust { ox::launch_moe_dispatch } else { cref::launch_moe_dispatch })(b.p(0) as _, b.p(1) as _, b.p(2) as _, src, total as i32, ne as i32, topk as i32, b.p(4) as _, b.p(5) as _, s)

@@ -392,6 +392,45 @@ mmq_quantize_glu_launcher!(launch_mmq_quantize_glu_q8_1_D4_f32, "d4");
 mmq_quantize_glu_launcher!(launch_mmq_quantize_glu_q8_1_DS4_f32, "ds4");
 mmq_quantize_glu_launcher!(launch_mmq_quantize_glu_q8_1_D2S6_f32, "d2s6");
 
+/// `launch_mmq_quantize_glu_q8_1_typed<layout>`: the void-pointer entry of the C++ (dense GGUF
+/// prefill), dispatching on `type_x` (GGML_TYPE 0 f32, 1 f16, 30 bf16). Same grid and block as the
+/// f32 launcher; an unlisted `type_x` launches nothing, as the C++ `default:` does.
+unsafe fn mmq_quantize_glu_typed(
+    layout: &str, gate: *const c_void, up: *const c_void, ids: *const i32, vy: *mut c_void, type_x: i32, ne00: i64, s01: i64, ne0: i64,
+    ne1: i64, activation: i32, stream: *mut c_void,
+) {
+    let tn = match type_x {
+        0 => "f32",
+        1 => "f16",
+        30 => "bf16",
+        _ => return,
+    };
+    let block_num_y = (ne0 + 4 * 128 - 1) / (4 * 128);
+    let n = format!("quantize_mmq_q8_1_glu_{tn}_{layout}");
+    unsafe {
+        launch(n.clone(), &n, (ne1 as u32, block_num_y as u32, 1), (128, 1, 1), 0, stream, &[
+            A::P(gate), A::P(up), A::P(ids as *const c_void), A::P(vy), A::L(ne00), A::L(s01),
+            A::L(ne0), A::I(ne1 as i32), A::I(activation),
+        ]);
+    }
+}
+
+macro_rules! mmq_quantize_glu_typed_launcher {
+    ($fn:ident, $l:literal) => {
+        #[allow(non_snake_case)]
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $fn(
+            gate: *const c_void, up: *const c_void, ids: *const i32, vy: *mut c_void, type_x: i32, ne00: i64, s01: i64, ne0: i64,
+            ne1: i64, activation: i32, stream: *mut c_void,
+        ) {
+            unsafe { mmq_quantize_glu_typed($l, gate, up, ids, vy, type_x, ne00, s01, ne0, ne1, activation, stream) }
+        }
+    };
+}
+mmq_quantize_glu_typed_launcher!(launch_mmq_quantize_glu_q8_1_D4, "d4");
+mmq_quantize_glu_typed_launcher!(launch_mmq_quantize_glu_q8_1_DS4, "ds4");
+mmq_quantize_glu_typed_launcher!(launch_mmq_quantize_glu_q8_1_D2S6, "d2s6");
+
 // ================================================================================================
 // mmq_instance_*.cu (+ the host helpers of mmq_common.cuh / mmq_gguf.cuh), for the sm_120a build:
 // `__CUDA_ARCH_LIST__` = 1200, so ggml_cuda_highest_compiled_arch(cc) is 1200 for cc >= 1200 and
@@ -657,11 +696,13 @@ unsafe fn mmq_dense(
 /// are y columns expert_bounds[e]..expert_bounds[e+1], written to dst column ids_dst[..]; f32 dst.
 unsafe fn mmq_moe(
     t: Ty, tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, ids_dst: *const i32, expert_bounds: *const i32, dst: *mut c_void,
-    ncols_x: i64, nrows_x: i64, ncols_dst: i64, stride_row_x: i64, num_experts: i64, ncols_max: i64, cc: i32, nsm: i32, smpbo: i64,
-    warp_size: i32, stream: *mut c_void,
+    ncols_x: i64, nrows_x: i64, ncols_dst: i64, stride_row_x: i64, stride_col_dst: i64, num_experts: i64, ncols_max: i64, cc: i32,
+    nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
 ) {
+    // dst column stride = stride_col_dst, as DEFINE_MMQ_MOE_LAUNCHER passes it (nrows_dst); the dense launcher
+    // ignores its stride_col_dst, the MoE one does not (gate/up packed into one buffer use 2 * nrows).
     let a = MmqArgs {
-        x, y, ids_dst, expert_bounds, dst, type_dst: 0, ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y: ncols_dst, nrows_dst: nrows_x,
+        x, y, ids_dst, expert_bounds, dst, type_dst: 0, ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y: ncols_dst, nrows_dst: stride_col_dst,
         nchannels_x: num_experts, nchannels_y: num_experts, stride_channel_x: nrows_x.wrapping_mul(stride_row_x), stride_channel_y: 0,
         stride_channel_dst: 0, nsamples_x: 1, nsamples_y: 1, stride_sample_x: 0, stride_sample_y: 0, stride_sample_dst: 0,
         use_stream_k: volta_plus(cc), ncols_max,
@@ -683,11 +724,11 @@ macro_rules! mmq_launchers {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $moe(
             tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, ids_dst: *const i32, expert_bounds: *const i32, dst: *mut c_void,
-            ncols_x: i64, nrows_x: i64, ncols_dst: i64, stride_row_x: i64, _stride_col_dst: i64, num_experts: i64, ncols_max: i64,
+            ncols_x: i64, nrows_x: i64, ncols_dst: i64, stride_row_x: i64, stride_col_dst: i64, num_experts: i64, ncols_max: i64,
             cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
         ) {
             unsafe {
-                mmq_moe($t, tmp_fixup, x, y, ids_dst, expert_bounds, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, num_experts, ncols_max,
+                mmq_moe($t, tmp_fixup, x, y, ids_dst, expert_bounds, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_dst, num_experts, ncols_max,
                         cc, nsm, smpbo, warp_size, stream)
             }
         }

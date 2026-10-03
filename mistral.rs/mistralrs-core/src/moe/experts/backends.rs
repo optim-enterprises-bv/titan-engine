@@ -21,6 +21,9 @@ use super::forward::{MoEForward, MoEForwardConfig};
 
 #[cfg(feature = "cuda")]
 const GROUPED_PREFILL_MIN_TOKENS: usize = 32;
+/// Grouped unaligned-K prompt forwards whose output was not finite (recomputed on the decode kernels).
+#[cfg(feature = "cuda")]
+static GROUPED_NONFINITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Canonical stacked expert weights, ENK [E, N, K] = [E, out, in]. The raw backends (Fused,
 /// Cutile) hold exactly this; nothing else stores a layout.
@@ -1142,11 +1145,163 @@ impl FastExpertsWeights {
             Some(MoECudaFastPath::Decode) => self
                 .forward_decode(forward, config)
                 .map_err(|err| err.context("moe experts fast decode")),
+            Some(MoECudaFastPath::GroupedPrefill)
+                if self.down_k_unaligned() && self.unaligned_prompt_on_decode() =>
+            {
+                self.forward_decode(forward, config).map_err(|err| {
+                    err.context("moe experts fast decode (prompt, unaligned down K)")
+                })
+            }
+            Some(MoECudaFastPath::GroupedPrefill) if self.down_k_unaligned() => {
+                let grouped = self
+                    .forward_grouped_pieces(forward, config)
+                    .map_err(|err| err.context("moe experts fast grouped (unaligned down K)"))?;
+                if let Some(y) = grouped.as_ref() {
+                    self.xcheck_against_decode(forward, config, y)?;
+                }
+                match grouped {
+                    // TITAN_MOE_NONFINITE_GUARD=1 (debug): a non-finite expert row recomputes this forward on
+                    // the per-token decode kernels instead of reaching the logits; counted in the log
+                    Some(y) if Self::nonfinite_guard() && !Self::all_finite(&y)? => {
+                        let n = GROUPED_NONFINITE
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        tracing::warn!("moe grouped prefill (unaligned down K): non-finite output for {} tokens, recomputed on the decode kernels ({n} so far)", forward.shape.num_tokens);
+                        self.forward_decode(forward, config)
+                    }
+                    other => Ok(other),
+                }
+            }
             Some(MoECudaFastPath::GroupedPrefill) => self
                 .forward_grouped(forward, config)
                 .map_err(|err| err.context("moe experts fast grouped")),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::forward_grouped`] over pieces of at most `TITAN_MOE_PIECE` (default 2048) tokens, for experts
+    /// whose down K is not a multiple of 256 (REDCELL-26B: 704). The grouped kernels' transients grow with the
+    /// prompt (f32 gate/up and down rows for every routed assignment: ~0.55 GB per 2048 tokens at REDCELL's
+    /// shape), so a long prompt runs them piece by piece. `None` (the caller falls back) only if the first
+    /// piece is refused.
+    #[cfg(feature = "cuda")]
+    fn forward_grouped_pieces(
+        &self,
+        forward: &MoEForward,
+        config: MoEForwardConfig,
+    ) -> Result<Option<Tensor>> {
+        let n = forward.shape.num_tokens;
+        let piece = mistralrs_quant::titan_cfg::var("TITAN_MOE_PIECE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&p| p >= GROUPED_PREFILL_MIN_TOKENS)
+            .unwrap_or(2048);
+        if n <= piece {
+            return self.forward_grouped(forward, config);
+        }
+        let mut outs = Vec::with_capacity(n.div_ceil(piece));
+        let mut start = 0;
+        while start < n {
+            // the last piece takes the remainder (>= GROUPED_PREFILL_MIN_TOKENS rows when possible)
+            let len = if n - start <= piece + GROUPED_PREFILL_MIN_TOKENS {
+                n - start
+            } else {
+                piece
+            };
+            // fresh offset-0 copies: the grouped path asserts an offset-0 ids buffer (copy() keeps the narrow offset)
+            let xs_flat = forward.xs_flat.narrow(0, start, len)?.force_contiguous()?;
+            let topk_ids = forward.topk_ids.narrow(0, start, len)?.force_contiguous()?;
+            let topk_weights = forward
+                .topk_weights
+                .narrow(0, start, len)?
+                .force_contiguous()?;
+            let xs = xs_flat.reshape((1, len, forward.shape.hidden_dim))?;
+            let sub = MoEForward {
+                xs: &xs,
+                xs_flat: &xs_flat,
+                topk_weights: &topk_weights,
+                topk_ids: &topk_ids,
+                original_dtype: forward.original_dtype,
+                shape: super::forward::MoEForwardShape::new(1, len, forward.shape.hidden_dim),
+                lora: None,
+            };
+            match self.forward_grouped(&sub, config)? {
+                Some(y) => outs.push(y),
+                None if outs.is_empty() => return Ok(None),
+                None => candle_core::bail!(
+                    "moe grouped pieces: piece at {start} refused after earlier pieces ran"
+                ),
+            }
+            start += len;
+        }
+        Ok(Some(Tensor::cat(&outs, 0)?))
+    }
+
+    /// `TITAN_MOE_XCHECK=1` (debug): also run the per-token decode kernels on the same prompt rows and log
+    /// max |grouped - decode|, max |decode| and the worst row for this layer (the two routes quantize the
+    /// activations differently, so they agree to quantization noise, not bit for bit).
+    #[cfg(feature = "cuda")]
+    fn xcheck_against_decode(
+        &self,
+        forward: &MoEForward,
+        config: MoEForwardConfig,
+        y: &Tensor,
+    ) -> Result<()> {
+        if !mistralrs_quant::titan_cfg::var("TITAN_MOE_XCHECK").is_ok_and(|v| v == "1") {
+            return Ok(());
+        }
+        let Some(r) = self.forward_decode(forward, config)? else {
+            return Ok(());
+        };
+        let (y, r) = (y.to_dtype(DType::F32)?, r.to_dtype(DType::F32)?);
+        let row_diff = (&y - &r)?.abs()?.max(D::Minus1)?;
+        let worst: u32 = row_diff.argmax(0)?.to_scalar()?;
+        let d = row_diff.max(0)?.to_scalar::<f32>()?;
+        let ref_max = r.abs()?.max_all()?.to_scalar::<f32>()?;
+        let nonfinite = !y.sum_all()?.to_scalar::<f32>()?.is_finite();
+        tracing::info!(
+            "moe xcheck: {} tokens, max |grouped - decode| {d} (row {worst}), max |decode| {ref_max}, grouped non-finite {nonfinite}",
+            forward.shape.num_tokens
+        );
+        Ok(())
+    }
+
+    /// `TITAN_MOE_NONFINITE_GUARD=1` (debug, off by default: its F32 sum and sync cost ~19% of a 3.5k prefill).
+    #[cfg(feature = "cuda")]
+    fn nonfinite_guard() -> bool {
+        mistralrs_quant::titan_cfg::var("TITAN_MOE_NONFINITE_GUARD").is_ok_and(|v| v == "1")
+    }
+
+    /// Whether every element of `y` is finite (one F32 sum and a device sync; REDCELL rows are far from overflow).
+    #[cfg(feature = "cuda")]
+    fn all_finite(y: &Tensor) -> Result<bool> {
+        // a sum, not a max: candle's max skips NaN
+        let s = y.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+        Ok(s.is_finite())
+    }
+
+    /// Unaligned-K prompts run the grouped MMQ route ([`Self::forward_grouped_pieces`]) unless
+    /// `TITAN_MOE_UNALIGNED_DECODE` is `1` (every layer on the per-token fused decode kernels, the a7ea678f9
+    /// routing) or `iq4_nl` / `q4_0` (only the layers whose down projection has that format).
+    #[cfg(feature = "cuda")]
+    fn unaligned_prompt_on_decode(&self) -> bool {
+        let dt = self.fused_down_proj.get_qtensor().map(|q| q.dtype());
+        match mistralrs_quant::titan_cfg::var("TITAN_MOE_UNALIGNED_DECODE").as_deref() {
+            Ok("1") => true,
+            Ok("iq4_nl") => dt == Some(candle_core::quantized::GgmlDType::IQ4NL),
+            Ok("q4_0") => dt == Some(candle_core::quantized::GgmlDType::Q4_0),
+            _ => false,
+        }
+    }
+
+    /// Experts whose down projection K (the expert FFN width) is not a multiple of 256 (REDCELL-26B: 704):
+    /// prompts run [`Self::forward_grouped_pieces`] (`TITAN_MOE_UNALIGNED_DECODE=1`: the per-token fused decode
+    /// kernels instead, the a7ea678f9 routing). No effect on other shapes.
+    #[cfg(feature = "cuda")]
+    fn down_k_unaligned(&self) -> bool {
+        self.fused_down_proj
+            .get_qtensor()
+            .is_some_and(|qt| qt.shape().dims().last().is_some_and(|k| k % 256 != 0))
     }
 
     fn uses_flattened_gather(&self, device: &Device) -> bool {
@@ -1495,10 +1650,26 @@ impl FastExpertsWeights {
             Some(qt) => qt,
             None => return Ok(None),
         };
-
         let use_mmq_gate_up =
             gate_qt.dtype() == up_qt.dtype() && mistralrs_quant::supports_mmq(gate_qt.dtype());
         if forward.lora.is_some() && !use_mmq_gate_up {
+            return Ok(None);
+        }
+        // IQ4_NL down projections (REDCELL) run the llama.cpp IQ4_NL MMQ port in its MoE mode on the packed
+        // gate/up rows; without a LoRA, an MMQ gate/up and a GLU activation it has no grouped kernel, so the
+        // prompt takes the gather path before any grouped work is done.
+        let down_iq4_nl = down_qt.dtype() == candle_core::quantized::GgmlDType::IQ4NL;
+        if down_iq4_nl
+            && (forward.lora.is_some()
+                || !use_mmq_gate_up
+                || !matches!(
+                    config.act,
+                    Activation::Silu
+                        | Activation::Swish
+                        | Activation::NewGelu
+                        | Activation::GeluPytorchTanh
+                ))
+        {
             return Ok(None);
         }
 
@@ -1604,7 +1775,46 @@ impl FastExpertsWeights {
             _ => None,
         };
 
-        let down = if let (true, Some(glu_activation)) = (
+        let down = if let (true, Some(glu_activation), GroupedGateUp::Packed(gate_up)) =
+            (down_iq4_nl, glu_activation, &gate_up)
+        {
+            let Some(down_assignments) = mistralrs_quant::grouped_moe_llama_mmq_from_glu_packed(
+                &down_qt,
+                gate_up,
+                &sorted_token_ids,
+                &sorted_token_ids,
+                &expert_bounds,
+                total_assignments,
+                forward.shape.num_tokens,
+                num_experts,
+                glu_activation as i32,
+                dev,
+            )?
+            else {
+                candle_core::bail!("moe grouped: no IQ4_NL MMQ port for the down projection");
+            };
+            if forward.original_dtype == DType::BF16 {
+                unsafe {
+                    mistralrs_quant::moe_weighted_reduce_flat_bf16(
+                        &down_assignments,
+                        tw_ptr,
+                        forward.shape.num_tokens,
+                        topk,
+                        dev,
+                    )?
+                }
+            } else {
+                unsafe {
+                    mistralrs_quant::moe_weighted_reduce_flat(
+                        &down_assignments,
+                        tw_ptr,
+                        forward.shape.num_tokens,
+                        topk,
+                        dev,
+                    )?
+                }
+            }
+        } else if let (true, Some(glu_activation)) = (
             mistralrs_quant::supports_mmq(down_qt.dtype()),
             glu_activation,
         ) {

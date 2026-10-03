@@ -77,7 +77,7 @@ pub use loaders::{
     Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName, QuantizationKind,
     Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader,
     Qwen3NextLoader, Qwen3VLLoader, Qwen3VLMoELoader, Qwen3_5Loader, Qwen3_5MoeLoader,
-    Qwen3_5TextLoader, SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader,
+    Qwen3_5TextLoader, SmolLm3Loader, Spark2_5Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader,
     VoxtralLoader,
 };
 #[allow(clippy::too_many_arguments)]
@@ -1390,6 +1390,8 @@ pub trait MetadataMixin {
     fn reset_non_granular_state(&self);
     /// Destroy decode graphs at teardown, while the engine thread's cuTile modules are still loaded.
     fn cleanup_cuda_graphs(&self) {}
+    /// titan: drop the model's captured segment graphs (CUDA OOM recovery); they are captured again.
+    fn titan_reset_graphs(&self) {}
     /// Evict least-recently-used decode graphs without disturbing recurrent state.
     fn reclaim_cuda_graph_memory(&self, _max_entries: usize) -> usize {
         0
@@ -2000,6 +2002,11 @@ pub trait Pipeline:
         backend_metadata: CacheBackendMetadata,
         logger: &IntervalLogger,
     ) -> Result<Duration, candle_core::Error> {
+        let memlog = is_prompt && crate::utils::memory_usage::devmap_memlog_enabled();
+        let tokens = input_seqs.iter().map(|s| s.len()).sum::<usize>();
+        if memlog {
+            crate::utils::memory_usage::devmap_memlog(&self.device(), &format!("before prompt step ({tokens} tokens)"));
+        }
         let completion = self
             .submit_step(
                 input_seqs,
@@ -2015,6 +2022,9 @@ pub trait Pipeline:
             .await?
             .into_ready()
             .expect("lookahead-disabled pipeline step must complete eagerly");
+        if memlog {
+            crate::utils::memory_usage::devmap_memlog(&self.device(), &format!("after prompt step ({tokens} tokens)"));
+        }
         Ok(completion.duration())
     }
 

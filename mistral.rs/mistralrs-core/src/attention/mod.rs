@@ -76,7 +76,7 @@ pub(crate) fn sliding_window_left(sliding_window: Option<usize>) -> Option<usize
     sliding_window.map(|window| window.saturating_sub(1))
 }
 
-fn eager_attention_mask(
+pub(crate) fn eager_attention_mask(
     query_len: usize,
     key_len: usize,
     causal: bool,
@@ -261,10 +261,10 @@ fn gqa_grouped_sdpa(
 ///   pick for a batch of `n_rep` with stride 0 can differ, e.g. in split-K, and round differently).
 #[cfg(feature = "cuda")]
 fn nocopy_mode() -> (u8, usize) {
-    static M: std::sync::OnceLock<(u8, usize)> = std::sync::OnceLock::new();
+    static M: mistralrs_quant::titan_cfg::GenCell<(u8, usize)> = mistralrs_quant::titan_cfg::GenCell::new();
     *M.get_or_init(|| {
-        let mode = std::env::var("TITAN_ATTN_NOCOPY").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        let max = std::env::var("TITAN_ATTN_NOCOPY_MAX")
+        let mode = mistralrs_quant::titan_cfg::var("TITAN_ATTN_NOCOPY").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let max = mistralrs_quant::titan_cfg::var("TITAN_ATTN_NOCOPY_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(GQA_GROUPED_MIN_KV);
@@ -422,13 +422,52 @@ pub(crate) fn flash_prefill_supported(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_p
 /// Causal attention of the last `s` query positions `q` (1, h, s, d) over `k`, `v` (1, kvh, kv_len, d) with the
 /// flash-prefill kernel: (1, h, s, d).
 pub(crate) fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams) -> Result<Tensor> {
+    flash_prefill_window(q, k, v, sdpa_params, 0)
+}
+
+/// Whether `flash_prefill_any` takes these tensors: bf16 or f16 q / k / v, head dim 256 or 512 (gemma4).
+pub(crate) fn flash_prefill_any_supported(q: &Tensor, k: &Tensor, v: &Tensor) -> bool {
     #[cfg(feature = "cuda")]
     {
-        flash_prefill::attend(q, k, v, sdpa_params)
+        flash_prefill::supported_any(q, k, v)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (q, k, v, sdpa_params);
+        let _ = (q, k, v);
+        false
+    }
+}
+
+/// Causal flash-prefill attention for head dim 256 or 512 on bf16 or f16 q / k / v (1, h, s, d) / (1, kvh, kv_len, d),
+/// scale `softmax_scale`, each query limited to its last `win` keys (`win == 0`: no limit); (1, h, s, d) in f32 when
+/// `out32` (f16 inputs), else bf16.
+pub(crate) fn flash_prefill_any(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32, win: usize, out32: bool) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::attend_any(q, k, v, softmax_scale, win, out32)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, softmax_scale, win, out32);
+        candle_core::bail!("flash-prefill needs CUDA")
+    }
+}
+
+/// `flash_prefill` with each query limited to its last `win` keys (itself included); `win == 0`: no limit.
+pub(crate) fn flash_prefill_window(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sdpa_params: &SdpaParams,
+    win: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::attend(q, k, v, sdpa_params, win)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, sdpa_params, win);
         candle_core::bail!("flash-prefill needs CUDA")
     }
 }
@@ -467,8 +506,8 @@ pub(crate) fn flash_decode_rows(
 
 /// `TITAN_ATTN_F32REF=1`: see `run_attention_noflash` (a debug reference, off by default).
 fn f32_reference_attention() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_ATTN_F32REF").is_ok_and(|v| v == "1"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_ATTN_F32REF").is_ok_and(|v| v == "1"))
 }
 
 fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {

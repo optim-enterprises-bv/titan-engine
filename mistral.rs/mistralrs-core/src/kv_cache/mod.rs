@@ -538,8 +538,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let mut dims_v = first_v.dims().to_vec();
             dims_k[0] *= batch_len;
             dims_v[0] *= batch_len;
-            let batch_k = Tensor::zeros(dims_k.clone(), first_k.dtype(), first_k.device()).unwrap();
-            let batch_v = Tensor::zeros(dims_v.clone(), first_v.dtype(), first_v.device()).unwrap();
+            let batch_k = Tensor::zeros(dims_k.clone(), first_k.dtype(), first_k.device())?;
+            let batch_v = Tensor::zeros(dims_v.clone(), first_v.dtype(), first_v.device())?;
             // Fill each sequence's cache slice
             for (i, seq) in seqs.iter_mut().enumerate() {
                 let src_cache = if modify_draft_cache {
@@ -560,8 +560,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Shared { .. } => continue,
                 };
                 let offset = i * first_k.dims()[0];
-                batch_k.slice_set(&src_k, 0, offset).unwrap();
-                batch_v.slice_set(&src_v, 0, offset).unwrap();
+                batch_k.slice_set(&src_k, 0, offset)?;
+                batch_v.slice_set(&src_v, 0, offset)?;
             }
             new_k_cache.push(Some(batch_k));
             new_v_cache.push(Some(batch_v));
@@ -592,14 +592,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
                     caches.push(KvCache::Normal {
                         k: SingleCache {
-                            all_data: k_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: k_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: template_cache_capsl,
                         },
                         v: SingleCache {
-                            all_data: v_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: v_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
@@ -616,7 +616,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
                     caches.push(KvCache::Rotating {
                         k: RotatingCache {
-                            all_data: k_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: k_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
@@ -625,7 +625,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             last_append_result: None,
                         },
                         v: RotatingCache {
-                            all_data: v_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: v_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
@@ -806,66 +806,62 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::Normal { .. } => {}
             }
 
-            let mut k_caches = Vec::new();
-            let mut v_caches = Vec::new();
-            let mut missing_preallocated = false;
-            for seq in seqs.iter_mut() {
-                let Some((mut k_preallocated_cache, mut v_preallocated_cache)) = seq
+            // The sequences' preallocated caches are shape / dtype templates (add_request allocates them as one
+            // broadcast element): allocate the batch's K and V once, on the layer's device. A CPU layer keeps an f32
+            // model's KV in f16 (KvCache::append converts what it stores there), so its cache is f16 too.
+            let mut templates = Vec::new();
+            for seq in seqs.iter() {
+                match seq
                     .preallocated_cache()
                     .and_then(|cache| cache.get(layer_idx))
                     .cloned()
                     .flatten()
-                else {
-                    missing_preallocated = true;
-                    break;
-                };
-                if let Some(layer_devices) = &layer_devices {
-                    let layer_dev = &layer_devices[layer_idx];
-                    k_preallocated_cache = k_preallocated_cache
-                        .to_device(layer_dev)
-                        .expect("Could not prepare cache");
-                    v_preallocated_cache = v_preallocated_cache
-                        .to_device(layer_dev)
-                        .expect("Could not prepare cache");
+                {
+                    Some(t) => templates.push(t),
+                    None => break,
                 }
-                k_caches.push(k_preallocated_cache);
-                v_caches.push(v_preallocated_cache);
             }
-            if missing_preallocated {
+            if templates.len() < seqs.len() {
                 layer.reset();
                 continue;
             }
-            let k_cache = if k_caches.len() > 1 {
-                Tensor::cat(&k_caches, 0).unwrap()
-            } else {
-                k_caches[0].clone()
+            let device = match &layer_devices {
+                Some(layer_devices) => layer_devices[layer_idx].clone(),
+                None => templates[0].0.device().clone(),
             };
-            let v_cache = if v_caches.len() > 1 {
-                Tensor::cat(&v_caches, 0).unwrap()
-            } else {
-                v_caches[0].clone()
-            };
+            let mut dtype = templates[0].0.dtype();
+            if device.is_cpu() && dtype == candle_core::DType::F32 && cpu_kv_f16() {
+                dtype = candle_core::DType::F16;
+            }
+            let batch = templates.iter().map(|(k, _)| k.dim(0)).sum::<Result<usize>>()?;
+            let mut k_shape = templates[0].0.dims().to_vec();
+            let mut v_shape = templates[0].1.dims().to_vec();
+            k_shape[0] = batch;
+            v_shape[0] = batch;
+            let k_cache = Tensor::zeros(k_shape, dtype, &device)?;
+            let v_cache = Tensor::zeros(v_shape, dtype, &device)?;
 
             // Use this for the various parameters. Assumes all seqs are from one model.
             match &old_caches[layer_idx] {
                 KvCache::Normal { k, .. } => {
                     let template_cache_dim = k.dim;
                     let template_cache_msl = k.max_seq_len;
+                    let capacity_seq_len = k_cache.dims()[template_cache_dim];
 
                     let cache = KvCache::Normal {
                         k: SingleCache {
-                            all_data: Some(k_cache.zeros_like().unwrap()),
+                            all_data: Some(k_cache),
                             dim: template_cache_dim,
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
-                            capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            capacity_seq_len,
                         },
                         v: SingleCache {
-                            all_data: Some(v_cache.zeros_like().unwrap()),
+                            all_data: Some(v_cache),
                             dim: template_cache_dim,
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
-                            capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            capacity_seq_len,
                         },
                     };
                     *layer = cache;
@@ -1017,7 +1013,7 @@ fn clone_in_cache(
     cache: &mut LayerCaches,
     seqs: &mut [&mut crate::sequence::Sequence],
     src: SeqCache,
-) {
+) -> Result<()> {
     let mut new_cache = Vec::new();
     'outer: for layer in 0..num_hidden_layers {
         let mut k_vec = Vec::new();
@@ -1042,18 +1038,19 @@ fn clone_in_cache(
         }
         new_cache.push(Some((
             if k_vec.len() > 1 {
-                Tensor::cat(&k_vec, 0).unwrap()
+                Tensor::cat(&k_vec, 0)?
             } else {
                 k_vec[0].clone()
             },
             if v_vec.len() > 1 {
-                Tensor::cat(&v_vec, 0).unwrap()
+                Tensor::cat(&v_vec, 0)?
             } else {
                 v_vec[0].clone()
             },
         )));
     }
     *cache = new_cache;
+    Ok(())
 }
 
 fn clone_out_cache(
@@ -1104,7 +1101,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
                 &mut pipeline.cache().full().lock(),
                 seqs,
                 SeqCache::Draft,
-            );
+            )?;
             return Ok(());
         }
         clone_in_cache(
@@ -1112,14 +1109,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
             &mut pipeline.cache().full().lock(),
             seqs,
             SeqCache::Normal,
-        );
+        )?;
         if pipeline.get_metadata().is_xlora && !pipeline.get_metadata().no_kv_cache {
             clone_in_cache(
                 pipeline.get_metadata().num_hidden_layers,
                 &mut pipeline.cache().full().xlora_lock(),
                 seqs,
                 SeqCache::XLora,
-            );
+            )?;
         }
         if pipeline.get_metadata().is_xlora {
             pipeline

@@ -113,8 +113,9 @@ fn modality_label(m: &SupportedModality) -> String {
 
 fn build_model_list(mistralrs: &Arc<MistralRs>) -> IndexMap<String, UiModelInfo> {
     let mut models = IndexMap::new();
-    if let Ok(list) = mistralrs.list_models() {
-        for model_id in list {
+    // loaded and unloaded: a model that is not resident loads when the UI sends to it (titan swap mode)
+    if let Ok(list) = mistralrs.list_models_with_status() {
+        for (model_id, _) in list {
             if let Ok(category) = mistralrs.get_model_category(Some(&model_id)) {
                 let kind = match category {
                     ModelCategory::Text => "text",

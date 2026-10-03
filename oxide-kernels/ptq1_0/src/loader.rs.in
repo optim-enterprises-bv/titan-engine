@@ -1,0 +1,63 @@
+    /// ggml_cuda_mmq_load_tiles_ptq1_0 (MMA layout, branch-free unpack): 16 threads per row (8 per block);
+    /// lane l < 4 decodes qs word l (elements 16 t + 4 l + b -> ints l + 4 t), lanes 4, 5 decode qs words 4, 5
+    /// (ints 20 + 2 t + (l - 4)), lane 6 walks qh0 / qh1 (ints 30, 31), lane 7 idles; then the f16 scale into
+    /// the 4 sub-block slots of each block. The tile holds exact integers, so only their placement matters.
+    #[inline(always)]
+    unsafe fn load_tiles<const J: i32, const FB: bool>(x: *const u8, kbx0: i32, i_max: i32, stride: i32) {
+        let x_qs = smem().wrapping_add((J + Jc::<J>::YPAD) as usize);
+        let x_df = x_qs.wrapping_add(2 * TILE_NE_K as usize) as *mut f32;
+        let txi = tx() % 16;
+        let kbx = txi / 8;
+        let lane = txi % 8;
+        let full = lane < 6;
+        let dst_base = if lane < 4 { lane } else { 16 + lane };
+        let dst_stride = if lane < 4 { 4 } else { 2 };
+        let word = if lane < 7 { lane } else { 6 };
+        let mut i0 = 0;
+        while i0 < MMQ_I {
+            unroll!();
+            let mut i = i0 + ty() * 2 + tx() / 16;
+            if FB {
+                i = if i < i_max { i } else { i_max };
+            }
+            let bxi = xblock(x, kbx0, i, stride, kbx);
+            let row = x_qs.wrapping_offset((i * SRAM + kbx * 32) as isize);
+            let packed = ldg_b32(bxi.wrapping_add(4 * word as usize) as *const i32) as u32;
+            let mut v_lo = byte_perm(packed, 0, 0x4140);
+            let mut v_hi = byte_perm(packed, 0, 0x4342);
+            v_hi = if full { v_hi } else { v_lo };
+            let mut q = [0u32; 5];
+            let mut t = 0;
+            while t < 5 {
+                unroll!();
+                let w_lo = v_lo.wrapping_mul(3);
+                let w_hi = v_hi.wrapping_mul(3);
+                v_lo = w_lo & 0x00FF00FF;
+                v_hi = w_hi & 0x00FF00FF;
+                q[t] = byte_perm(w_lo, w_hi, 0x7531).wrapping_add(0x7F7F7F7F) ^ 0x8080_8080;
+                if full {
+                    *row.wrapping_offset((dst_base + t as i32 * dst_stride) as isize) = q[t] as i32;
+                }
+                t += 1;
+            }
+            if lane == 6 {
+                *row.wrapping_add(30) = byte_perm(q[0], q[1], 0x5410) as i32;
+                *row.wrapping_add(31) = byte_perm(q[2], q[3], 0x5410) as i32;
+            }
+            i0 += 2 * NWARPS;
+        }
+        let ksx = tx() % 8;
+        let scale_block = ksx / 4;
+        let mut i0 = 0;
+        while i0 < MMQ_I {
+            unroll!();
+            let mut i = i0 + ty() * 4 + tx() / 8;
+            if FB {
+                i = if i < i_max { i } else { i_max };
+            }
+            let bxi = xblock(x, kbx0, i, stride, scale_block);
+            *x_df.offset((i * SRAM + ksx) as isize) = h2f(ldg_u16(bxi.wrapping_add(26) as *const u16));
+            i0 += 4 * NWARPS;
+        }
+    }
+

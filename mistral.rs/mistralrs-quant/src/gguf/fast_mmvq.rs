@@ -196,6 +196,8 @@ pub(crate) struct Q1Workspace {
     pub(crate) slice: CudaSlice<u8>,
     pub(crate) cap: usize,
     pub(crate) tag: Option<Q1Tag>,
+    /// Outgrown buffers: CUDA graphs captured earlier keep reading them, so they live until the model unloads.
+    pub(crate) retired: Vec<CudaSlice<u8>>,
 }
 
 pub(crate) type Q1WsMap = Mutex<HashMap<candle_core::cuda::DeviceId, &'static Mutex<Q1Workspace>>>;
@@ -210,7 +212,7 @@ pub(crate) fn q1_0_workspace(ws: &'static OnceLock<Q1WsMap>, dev: &CudaDevice, b
             Some(s) => s,
             None => {
                 let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
-                let s = Box::leak(Box::new(Mutex::new(Q1Workspace { slice, cap: bytes.max(1), tag: None })));
+                let s = Box::leak(Box::new(Mutex::new(Q1Workspace { slice, cap: bytes.max(1), tag: None, retired: Vec::new() })));
                 g.insert(dev.id(), s);
                 s
             }
@@ -218,8 +220,8 @@ pub(crate) fn q1_0_workspace(ws: &'static OnceLock<Q1WsMap>, dev: &CudaDevice, b
     };
     let mut g = slot.lock().unwrap();
     if g.cap < bytes {
-        // never freed: CUDA graphs captured earlier keep reading the old address
-        std::mem::forget(std::mem::replace(&mut g.slice, unsafe { dev.alloc::<u8>(bytes)? }));
+        let old = std::mem::replace(&mut g.slice, unsafe { dev.alloc::<u8>(bytes)? });
+        g.retired.push(old);
         g.cap = bytes;
         g.tag = None;
     }
@@ -298,6 +300,12 @@ struct WorkspaceKey {
 type WsMap = Mutex<HashMap<WorkspaceKey, &'static Mutex<WorkspaceSlot>>>;
 
 static WORKSPACE: OnceLock<WsMap> = OnceLock::new();
+
+/// Model unload: free every workspace (no forward, and no graph reading one, is left).
+pub(crate) fn release_workspaces() {
+    super::free_leaked(&WORKSPACE);
+    super::free_leaked(&Q1_0_MMVQ_WS);
+}
 
 fn workspace_ensure<'a>(
     dev: &CudaDevice,

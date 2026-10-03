@@ -497,6 +497,7 @@ struct RecurrentStatePoolConfig<'a> {
     conv_dtype: DType,
     recurrent_dtype: DType,
     device: &'a Device,
+    capacity: usize,
 }
 
 impl RecurrentStatePool {
@@ -513,8 +514,8 @@ impl RecurrentStatePool {
             conv_dtype,
             recurrent_dtype,
             device,
+            capacity,
         } = config;
-        let capacity = INITIAL_POOL_CAPACITY;
         let checkpoint_lanes = 1;
 
         let conv_state = Tensor::zeros((capacity, conv_dim, conv_width), conv_dtype, device)?;
@@ -1086,6 +1087,18 @@ impl HybridCache {
         dtype: candle_core::DType,
         layer_devices: &[Device],
     ) -> Result<Self> {
+        Self::with_slots(config, dtype, layer_devices, INITIAL_POOL_CAPACITY)
+    }
+
+    /// `new` with `slots` recurrent state slots allocated up front instead of `INITIAL_POOL_CAPACITY`
+    /// (the pools still double when every slot is taken). One slot of a 48-layer GDN stack is ~150 MiB.
+    pub fn with_slots(
+        config: HybridCacheConfig,
+        dtype: candle_core::DType,
+        layer_devices: &[Device],
+        slots: usize,
+    ) -> Result<Self> {
+        let slots = slots.max(1);
         if layer_devices.len() != config.layer_types.len() {
             candle_core::bail!(
                 "Hybrid cache has {} layers but {} layer devices",
@@ -1114,6 +1127,7 @@ impl HybridCache {
                             conv_dtype: dtype,
                             recurrent_dtype: config.recurrent.recurrent_dtype.unwrap_or(dtype),
                             device,
+                            capacity: slots,
                         },
                     )?)
                 }
@@ -1130,11 +1144,11 @@ impl HybridCache {
             device_state_indices: Vec::new(),
             checkpoint_lanes: 1,
             speculative_storage: RecurrentSpeculativeStorage::FullCheckpoints,
-            committed_lanes: vec![0; INITIAL_POOL_CAPACITY],
-            slot_owners: vec![None; INITIAL_POOL_CAPACITY],
-            initialized_slots: vec![false; INITIAL_POOL_CAPACITY],
-            pristine_zero_slots: vec![true; INITIAL_POOL_CAPACITY],
-            last_released_sequence_owners: vec![None; INITIAL_POOL_CAPACITY],
+            committed_lanes: vec![0; slots],
+            slot_owners: vec![None; slots],
+            initialized_slots: vec![false; slots],
+            pristine_zero_slots: vec![true; slots],
+            last_released_sequence_owners: vec![None; slots],
             recurrent_storage_generation: 0,
             recurrent_storage_locked: false,
             graph_pad_slot: None,

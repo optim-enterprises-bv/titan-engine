@@ -417,3 +417,69 @@ fn metal_sysctl_floor_bytes() -> Result<usize> {
     };
     Ok(floor_mb * SIZE_IN_MB)
 }
+
+/// `TITAN_DEVMAP_LOG=1` (debug): log the CUDA allocator around every prompt step (`devmap_memlog`).
+pub fn devmap_memlog_enabled() -> bool {
+    mistralrs_quant::titan_cfg::var("TITAN_DEVMAP_LOG").is_ok_and(|v| v == "1")
+}
+
+/// Log free device memory and the stream-ordered pool's used / reserved bytes and their high-water marks, then
+/// reset the high-water marks so the next log shows the peak since this one.
+pub fn devmap_memlog(device: &Device, stage: &str) {
+    #[cfg(feature = "cuda")]
+    {
+        let mib = |b: usize| b >> 20;
+        if let Device::Cuda(d) = device {
+            let _ = d.cuda_stream().synchronize();
+        }
+        match MemoryUsage.query_cuda_allocator(device) {
+            Ok(Some(a)) => {
+                let (used, reserved, used_high, reserved_high) =
+                    a.async_pool.map_or((0, 0, 0, 0), |p| {
+                        (
+                            p.current.used,
+                            p.current.reserved,
+                            p.used_high,
+                            p.reserved_high,
+                        )
+                    });
+                tracing::info!(
+                    "titan devmap {stage}: device {} MiB free of {} MiB; pool used {} MiB (peak {} MiB), reserved {} MiB (peak {} MiB)",
+                    mib(a.available),
+                    mib(a.total),
+                    mib(used),
+                    mib(used_high),
+                    mib(reserved),
+                    mib(reserved_high)
+                );
+                if let Device::Cuda(d) = device {
+                    use candle_core::cuda_backend::cudarc::driver::sys;
+                    let stream = d.cuda_stream();
+                    let ctx = stream.context();
+                    let mut pool = std::ptr::null_mut();
+                    if unsafe { sys::cuDeviceGetMemPool(&mut pool, ctx.cu_device()) }
+                        == sys::CUresult::CUDA_SUCCESS
+                    {
+                        for attr in [
+                            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                        ] {
+                            let mut zero = 0u64;
+                            unsafe {
+                                sys::cuMemPoolSetAttribute(
+                                    pool,
+                                    attr,
+                                    (&mut zero as *mut u64).cast(),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("titan devmap {stage}: memory query failed: {e}"),
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (device, stage);
+}

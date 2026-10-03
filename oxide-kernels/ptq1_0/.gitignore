@@ -1,0 +1,5 @@
+.mut/
+target/
+ref/*.ptx
+ref/*.cubin
+ref/nvcc_ref.log

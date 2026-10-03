@@ -1,0 +1,136 @@
+# m4/pcache test roster (from-config, swap mode). qwen3.6-35b is deploy/models.toml's entry verbatim (global
+# prefix_cache_n, 16); gemma4-12b is m4/integ/models-toml-draft.diff's entry with [models.titan] prefix_cache_n = 0.
+# The -def / -cap / -pc0 entries are test variants of the same files: no per-model value (the global 16), a
+# prefix_cache_max_mib byte bound on top of the global count, and prefix_cache_n = 0.
+command = "serve"
+default_model_id = "qwen3.6-35b"
+
+[server]
+host = "127.0.0.1"
+port = 18630
+
+[paged_attn]
+mode = "off"
+
+[titan_swap]
+max_resident = 1
+
+# The service model: tiered experts with the q35 profile, MTP=2, prefill streaming, doorbell + one-pass CPU misses,
+# piecewise CUDA graphs, 64k context. Preloaded (default).
+[[models]]
+name = "qwen3.6-35b"
+kind = "text"
+model_id = "~/ai/models/Qwen3.6-35B-A3B-MTP"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+[models.device]
+max_seq_len = 65536
+[models.titan.env]
+TITAN_TIERED = "1"
+TITAN_TIERED_GPU_FRACTION = "auto"
+TITAN_TIERED_PROFILE = "~/titan-engine/m4/profile-q35.txt"
+TITAN_TIERED_RESERVE_MIB = "1536"
+TITAN_MTP = "2"
+TITAN_PFS = "1"
+TITAN_PFS_HEADROOM_MIB = "768"
+TITAN_DOORBELL = "1"
+TITAN_CPU_ONEPASS = "1"
+TITAN_CUDA_GRAPHS = "1"
+TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
+
+# gemma4-12b as in m4/integ/models-toml-draft.diff, plus the per-model prefix cache setting under test.
+[[models]]
+name = "gemma4-12b"
+kind = "text"
+model_id = "~/ai/models/gemma4-12b-qat"
+dtype = "bf16"
+max_model_len = 12288
+[models.format]
+format = "gguf"
+quantized_file = "gemma-4-12b-it-qat-q4_0.gguf"
+[models.device]
+device_layers = ["0:48"]
+max_seq_len = 12288
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_n = 0
+
+# test variants
+[[models]]
+name = "gemma4-12b-def"
+kind = "text"
+model_id = "~/ai/models/gemma4-12b-qat"
+dtype = "bf16"
+max_model_len = 12288
+[models.format]
+format = "gguf"
+quantized_file = "gemma-4-12b-it-qat-q4_0.gguf"
+[models.device]
+device_layers = ["0:48"]
+max_seq_len = 12288
+[models.titan]
+idle_ttl_secs = 1800
+
+[[models]]
+name = "gemma4-12b-cap"
+kind = "text"
+model_id = "~/ai/models/gemma4-12b-qat"
+dtype = "bf16"
+max_model_len = 12288
+[models.format]
+format = "gguf"
+quantized_file = "gemma-4-12b-it-qat-q4_0.gguf"
+[models.device]
+device_layers = ["0:48"]
+max_seq_len = 12288
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_max_mib = 1024
+
+[[models]]
+name = "redcell-26b-def"
+kind = "text"
+model_id = "~/ai/models/redcell-26b"
+dtype = "bf16"
+max_model_len = 8192
+[models.format]
+format = "gguf"
+quantized_file = "REDCELL-26B-A4B-OSINT-Cyber-APEX-Mini.gguf"
+[models.device]
+device_layers = ["0:30"]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+
+[[models]]
+name = "redcell-26b-pc0"
+kind = "text"
+model_id = "~/ai/models/redcell-26b"
+dtype = "bf16"
+max_model_len = 8192
+[models.format]
+format = "gguf"
+quantized_file = "REDCELL-26B-A4B-OSINT-Cyber-APEX-Mini.gguf"
+[models.device]
+device_layers = ["0:30"]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_n = 0
+
+[[models]]
+name = "redcell-26b-cap"
+kind = "text"
+model_id = "~/ai/models/redcell-26b"
+dtype = "bf16"
+max_model_len = 8192
+[models.format]
+format = "gguf"
+quantized_file = "REDCELL-26B-A4B-OSINT-Cyber-APEX-Mini.gguf"
+[models.device]
+device_layers = ["0:30"]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_max_mib = 1024

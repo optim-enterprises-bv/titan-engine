@@ -3,7 +3,7 @@
 //! re-waking them costs tens of microseconds per pass. These workers spin (`pause`) for a while after
 //! each pass, then park until the next one.
 
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,8 @@ struct Shared {
     /// Workers inside a job.
     active: AtomicUsize,
     sleepers: AtomicUsize,
+    /// Set by `shutdown`: workers exit.
+    stop: AtomicBool,
     park: Mutex<()>,
     wake: Condvar,
     spin: Duration,
@@ -51,13 +53,14 @@ pub struct SpinPool {
 
 impl SpinPool {
     pub fn new(workers: usize) -> Self {
-        let spin_us = std::env::var("TITAN_TIERED_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SPIN_US);
+        let spin_us = crate::titan_cfg::var("TITAN_TIERED_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SPIN_US);
         let shared = Arc::new(Shared {
             gen: AtomicU64::new(0),
             job: AtomicPtr::new(std::ptr::null_mut()),
             retired: AtomicU64::new(0),
             active: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
             park: Mutex::new(()),
             wake: Condvar::new(),
             spin: Duration::from_micros(spin_us),
@@ -70,6 +73,14 @@ impl SpinPool {
                 .expect("spawn titan miss worker");
         }
         Self { shared, busy: Mutex::new(()) }
+    }
+
+    /// Stop the workers (model unload); `run` must not be called afterwards.
+    pub fn shutdown(&self) {
+        let _one = self.busy.lock().unwrap();
+        self.shared.stop.store(true, SeqCst);
+        let _l = self.shared.park.lock().unwrap();
+        self.shared.wake.notify_all();
     }
 
     /// `f(0..n)` on the workers and the calling thread; returns once every call has finished.
@@ -98,6 +109,9 @@ fn worker(s: &Shared) {
         let t0 = Instant::now();
         let mut spins = 0u32;
         let g = loop {
+            if s.stop.load(SeqCst) {
+                return;
+            }
             let g = s.gen.load(SeqCst);
             if g != seen {
                 break g;
@@ -106,7 +120,7 @@ fn worker(s: &Shared) {
             if spins % 64 == 0 && t0.elapsed() > s.spin {
                 let mut l = s.park.lock().unwrap();
                 s.sleepers.fetch_add(1, SeqCst);
-                while s.gen.load(SeqCst) == seen {
+                while s.gen.load(SeqCst) == seen && !s.stop.load(SeqCst) {
                     l = s.wake.wait(l).unwrap();
                 }
                 s.sleepers.fetch_sub(1, SeqCst);

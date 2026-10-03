@@ -164,9 +164,36 @@ struct LlamaFmt {
     /// vdr * WARP_SIZE / qi: blocks one warp covers per K-loop iteration (should_use_small_k)
     blocks_per_iter_1warp: usize,
     /// dequantize launch: false = `<<<ceil(k / 256), 32>>>(vx, y)` (8 blocks of 32 per CUDA
-    /// block), true = NVFP4's `<<<k / 64, 32>>>(vx, y, k)`
+    /// block; for the 256-value i-quant blocks one block per CUDA block, the same launch),
+    /// true = NVFP4's `<<<k / 64, 32>>>(vx, y, k)`
     deq_per_block: bool,
 }
+
+/// IQ3_S (type 21, titan-engine/oxide-kernels/iq3_s): `dequantize_block_iq3_s` + `mul_mat_vec_q
+/// <IQ3_S, n, false, false>`. `blocks_per_iter_1warp` is 0 because llama.cpp never picks the
+/// small_k instance for IQ3_S on NVIDIA Turing+ (`iq_slow_turing` in `should_use_small_k`).
+const IQ3_S_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq3_s_oxide.ptx"),
+    module: "titan_iq3_s",
+    prefix: "iq3_s",
+    qk: 256,
+    blocks_per_iter_1warp: 0,
+    deq_per_block: false,
+};
+
+/// IQ4_XS (type 23, titan-engine/oxide-kernels/iq4_xs): `dequantize_block_iq4_xs` + `mul_mat_vec_q
+/// <IQ4_XS, n, false, small_k>`. qi 32, vdr 4: `blocks_per_iter_1warp` = 4 * 32 / 32 = 4, and
+/// llama.cpp keeps small_k for IQ4_XS on NVIDIA Turing+ (it is only in `iq_slow_other`). Prefill
+/// (batch > 8) goes to mistral.rs's llama.cpp MMQ port (oxide-kernels/fmt_mmq) where the caller
+/// has one, else dequantize + cuBLAS below.
+const IQ4_XS_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq4_xs_oxide.ptx"),
+    module: "titan_iq4_xs",
+    prefix: "iq4_xs",
+    qk: 256,
+    blocks_per_iter_1warp: 4,
+    deq_per_block: false,
+};
 
 const IQ4_NL_FMT: LlamaFmt = LlamaFmt {
     ptx: include_str!("iq4_nl_oxide.ptx"),
@@ -200,6 +227,8 @@ fn llama_fmt(dtype: GgmlDType) -> Option<&'static LlamaFmt> {
         GgmlDType::IQ4NL => Some(&IQ4_NL_FMT),
         GgmlDType::MXFP4 => Some(&MXFP4_FMT),
         GgmlDType::NVFP4 => Some(&NVFP4_FMT),
+        GgmlDType::IQ3S => Some(&IQ3_S_FMT),
+        GgmlDType::IQ4XS => Some(&IQ4_XS_FMT),
         _ => None,
     }
 }
@@ -732,6 +761,11 @@ fn indexed_moe_forward_fused_q8_1_input(
         GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
         GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_q8_1",
+        GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1",
+        GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1",
+        GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1",
+        GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -786,6 +820,13 @@ impl QCudaStorage {
                 | GgmlDType::Q4K
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
+                // i-quant lookup-table families: the vec_dot is ported from oxide-kernels/<family>
+                // (gated bit-identical) and served by candle-quantized's indexed_moe_forward_*.
+                | GgmlDType::IQ2XXS
+ | GgmlDType::IQ4XS
+ | GgmlDType::IQ3XXS
+ | GgmlDType::IQ2S
+ | GgmlDType::IQ2XS
         ) {
             let input_storage = input.as_cuda_slice::<f32>()?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
@@ -854,6 +895,8 @@ impl QCudaStorage {
                 | GgmlDType::IQ4NL
                 | GgmlDType::MXFP4
                 | GgmlDType::NVFP4
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ4XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -884,7 +927,14 @@ impl QCudaStorage {
             GgmlDType::Q1_0 => deq::<crate::quantized::BlockQ1_0>(&buffer, block_len, &mut out),
             GgmlDType::IQ4NL => deq::<crate::quantized::BlockIQ4nl>(&buffer, block_len, &mut out),
             GgmlDType::MXFP4 => deq::<crate::quantized::BlockMXFP4>(&buffer, block_len, &mut out),
+            GgmlDType::PTQ1_0 => deq::<crate::quantized::BlockPTQ1_0>(&buffer, block_len, &mut out),
             GgmlDType::NVFP4 => deq::<crate::quantized::BlockNVFP4>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2XXS => deq::<crate::quantized::BlockIQ2xxs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ3XXS => deq::<crate::quantized::BlockIQ3xxs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2S => deq::<crate::quantized::BlockIQ2s>(&buffer, block_len, &mut out),
+            GgmlDType::IQ4XS => deq::<crate::quantized::BlockIQ4xs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2XS => deq::<crate::quantized::BlockIQ2xs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ3S => deq::<crate::quantized::BlockIQ3s>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -892,6 +942,30 @@ impl QCudaStorage {
     }
 
     pub fn dequantize_f16(&self, elem_count: usize) -> Result<CudaStorage> {
+        // dtypes with an f16 dequantize kernel (bit-identical to llama.cpp's convert.cu f16
+        // output, m4/deq); every other dtype dequantizes to f32 (on the host for the i-quants,
+        // PTQ1_0 and Q8_1; exact for F32/F16/BF16) and rounds to f16 like convert.cu's
+        // `ggml_cuda_cast<half>`.
+        let f16_kernel = llama_fmt(self.dtype).is_some()
+            || matches!(
+                self.dtype,
+                GgmlDType::Q4_0
+                    | GgmlDType::Q4_1
+                    | GgmlDType::Q5_0
+                    | GgmlDType::Q5_1
+                    | GgmlDType::Q8_0
+                    | GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+                    | GgmlDType::Q8K
+                    | GgmlDType::Q1_0
+            );
+        if !f16_kernel {
+            use crate::backend::BackendStorage;
+            return self.dequantize(elem_count)?.to_dtype(&crate::Layout::contiguous(elem_count), crate::DType::F16);
+        }
         dequantize_f16(&self.data, self.dtype, elem_count, self.device())
     }
 
@@ -1037,6 +1111,56 @@ impl QCudaStorage {
         }
     }
 
+    /// titan: rows `ids` (contiguous u32) of this `[rows, row_bytes]` table as a new storage of
+    /// `ids.len()` rows, gathered on the device with candle's `is_u32_u8` index-select kernel into a
+    /// zero-padded buffer laid out like [`Self::zeros`]. Dequantizing it runs the same per-block
+    /// routine over the same block bytes as dequantizing the whole table, so the rows are the same
+    /// bits (see `QTensor::embedding`). The kernel indexes bytes with 32-bit offsets: `None` when the
+    /// table is 4 GiB or larger.
+    pub fn gather_rows(
+        &self,
+        rows: usize,
+        row_bytes: usize,
+        ids: &CudaStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<Option<Self>> {
+        if rows * row_bytes > u32::MAX as usize {
+            return Ok(None);
+        }
+        let crate::cuda_backend::CudaStorageSlice::U32(ids) = &ids.slice else {
+            crate::bail!("gather_rows: ids must be u32");
+        };
+        let Some((o1, o2)) = ids_l.contiguous_offsets() else {
+            crate::bail!("gather_rows: ids must be contiguous");
+        };
+        let ids = ids.slice(o1..o2);
+        let n = o2 - o1;
+        let dst_el = n * row_bytes;
+        let (bs, ts) = (self.dtype.block_size(), self.dtype.type_size());
+        let el_count = dst_el / ts * bs;
+        let inner = self.device.alloc_zeros::<u8>(ceil_div(el_count + MATRIX_ROW_PADDING, bs) * ts)?;
+        if n > 0 {
+            let func = self.device.get_or_load_func("is_u32_u8", &candle_kernels::INDEXING)?;
+            // one dimension, stride 1: the kernel's contiguous path
+            let info = self.device.clone_htod(&[n, 1usize][..])?;
+            let src = self.data.inner.slice(..rows * row_bytes);
+            let cfg = cudarc::driver::LaunchConfig::for_num_elems(dst_el as u32);
+            let mut builder = func.builder();
+            barg!(builder, dst_el, 1usize);
+            builder.arg(&info);
+            builder.arg(&ids);
+            builder.arg(&src);
+            builder.arg(&inner);
+            barg!(builder, 1usize, rows, n, row_bytes);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        Ok(Some(QCudaStorage {
+            data: PaddedCudaSlice { inner, len: dst_el },
+            dtype: self.dtype,
+            device: self.device.clone(),
+        }))
+    }
+
     pub fn data(&self) -> Result<Vec<u8>> {
         let mut out = vec![0u8; self.data.len];
         self.device
@@ -1119,6 +1243,7 @@ impl QCudaStorage {
         // (bit-identical to llama.cpp's convert.cu) + cuBLAS.
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
             || self.dtype == GgmlDType::Q1_0
+            || self.dtype == GgmlDType::PTQ1_0
             || llama_fmt(self.dtype).is_some()
         {
             let data_f32 = self.dequantize(n * k)?;
@@ -1372,6 +1497,156 @@ mod test {
     fn cuda_nvfp4() -> Result<()> {
         // k = 1024: 16 blocks per row (small_k at m = 1); k = 8256: 129 blocks.
         cuda_llama_fmt(GgmlDType::NVFP4, &[(37, 1024), (19, 8256)])
+    }
+
+    /// IQ3_S (no quantizer in candle: random blocks with finite scales). CPU dequantize equals
+    /// llama.cpp's `dequantize_row_iq3_s` bit for bit (when the oxide-kernels/iq3_s gate has
+    /// written its oracle file), the GPU dequantize equals the CPU one bit for bit, and the MMVQ
+    /// (m <= 8) / dequantize + matmul (m > 8) products agree with the f32 product.
+    #[test]
+    fn cuda_iq3_s() -> Result<()> {
+        use crate::quantized::{GgmlType, QMatMul, QTensor};
+        use crate::{Device, Module, Tensor};
+        let oracle = "~/titan-engine/oxide-iq3s/iq3_s/ref";
+        if let (Ok(blocks), Ok(want)) = (
+            std::fs::read(format!("{oracle}/cpu_blocks.bin")),
+            std::fs::read(format!("{oracle}/cpu_deq.bin")),
+        ) {
+            let xs: &[crate::quantized::BlockIQ3s] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const _, blocks.len() / 110)
+            };
+            let mut ys = vec![0f32; xs.len() * 256];
+            crate::quantized::BlockIQ3s::to_float(xs, &mut ys);
+            let got: Vec<u8> = ys.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(got.len(), want.len());
+            let bad = got.chunks(4).zip(want.chunks(4)).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "IQ3_S CPU dequantize vs llama.cpp dequantize_row_iq3_s");
+            eprintln!("IQ3_S CPU dequantize == llama.cpp dequantize_row_iq3_s on {} blocks", xs.len());
+        } else {
+            eprintln!("IQ3_S: no llama.cpp oracle file in {oracle}, skipping that comparison");
+        }
+        let dev = Device::new_cuda(0)?;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (n, k): k = 1024 (4 blocks per row), 4096 (16), 5120 (20, the 27B hidden size).
+        for &(n, k) in &[(37usize, 1024usize), (19, 4096), (8, 5120)] {
+            let mut bytes = Vec::with_capacity(n * k / 256 * 110);
+            for _ in 0..n * k / 256 {
+                let d = (0x1C00 + (next() % 0x0800) as u16) | (((next() & 1) as u16) << 15);
+                bytes.extend_from_slice(&d.to_le_bytes());
+                for _ in 0..108 {
+                    bytes.push(next() as u8);
+                }
+            }
+            let q_cpu = QTensor::new(
+                crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &Device::Cpu, GgmlDType::IQ3S)?,
+                (n, k),
+            )?;
+            let deq_cpu = q_cpu.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let storage = crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::IQ3S)?;
+            let q_gpu = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+            let deq_gpu = q_gpu.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(deq_cpu.iter().zip(&deq_gpu).all(|(a, b)| a.to_bits() == b.to_bits()), "IQ3_S dequantize f32");
+            let deq_h = q_gpu.dequantize_f16(&dev)?.flatten_all()?.to_vec1::<half::f16>()?;
+            assert!(deq_cpu.iter().zip(&deq_h).all(|(a, b)| half::f16::from_f32(*a) == *b), "IQ3_S dequantize f16");
+            let mm = QMatMul::from_arc(q_gpu)?;
+            let wd = Tensor::from_vec(deq_cpu, (n, k), &Device::Cpu)?;
+            for m in [1usize, 2, 3, 5, 8, 20] {
+                let x: Vec<f32> = (0..m * k).map(|i| ((i * 104729 % 997) as f32 - 498.0) / 250.0).collect();
+                let x = Tensor::from_vec(x, (m, k), &Device::Cpu)?;
+                let scale = x.abs()?.matmul(&wd.abs()?.t()?)?.to_vec2::<f32>()?;
+                let exact = x.matmul(&wd.t()?)?.to_vec2::<f32>()?;
+                let got = mm.forward(&x.to_device(&dev)?)?.to_vec2::<f32>()?;
+                for r in 0..m {
+                    for c in 0..n {
+                        let (g, s, w) = (got[r][c], scale[r][c], exact[r][c]);
+                        let tol = if m <= 8 { 1e-2 * s } else { 1e-5 * s };
+                        assert!((g - w).abs() <= tol, "IQ3_S n={n} k={k} m={m} ({r},{c}): gpu {g} want {w} (scale {s})");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// IQ4_XS (random blocks with finite scales, as the oxide gate's oracle). CPU dequantize equals
+    /// llama.cpp's `dequantize_row_iq4_xs` bit for bit (when the oxide-kernels/iq4_xs gate has
+    /// written its oracle file), the GPU dequantize equals the CPU one bit for bit, and the MMVQ
+    /// (m <= 8) / dequantize + matmul (m > 8) products agree with the f32 product.
+    #[test]
+    fn cuda_iq4_xs() -> Result<()> {
+        use crate::quantized::{GgmlType, QMatMul, QTensor};
+        use crate::{Device, Module, Tensor};
+        let oracle = "~/titan-engine/oxide-iq4xs/iq4_xs/ref";
+        if let (Ok(blocks), Ok(want)) = (
+            std::fs::read(format!("{oracle}/cpu_blocks.bin")),
+            std::fs::read(format!("{oracle}/cpu_deq.bin")),
+        ) {
+            let xs: &[crate::quantized::BlockIQ4xs] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const _, blocks.len() / 136)
+            };
+            let mut ys = vec![0f32; xs.len() * 256];
+            crate::quantized::BlockIQ4xs::to_float(xs, &mut ys);
+            let got: Vec<u8> = ys.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(got.len(), want.len());
+            let bad = got.chunks(4).zip(want.chunks(4)).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "IQ4_XS CPU dequantize vs llama.cpp dequantize_row_iq4_xs");
+            eprintln!("IQ4_XS CPU dequantize == llama.cpp dequantize_row_iq4_xs on {} blocks", xs.len());
+        } else {
+            eprintln!("IQ4_XS: no llama.cpp oracle file in {oracle}, skipping that comparison");
+        }
+        let dev = Device::new_cuda(0)?;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (n, k): k = 1024 (4 blocks per row: small_k at m = 1), 4096 (16), 5120 (20, the 27B hidden size).
+        for &(n, k) in &[(37usize, 1024usize), (19, 4096), (8, 5120)] {
+            let mut bytes = Vec::with_capacity(n * k / 256 * 136);
+            for _ in 0..n * k / 256 {
+                let d = (0x1C00 + (next() % 0x0800) as u16) | (((next() & 1) as u16) << 15);
+                bytes.extend_from_slice(&d.to_le_bytes());
+                for _ in 0..134 {
+                    bytes.push(next() as u8);
+                }
+            }
+            let q_cpu = QTensor::new(
+                crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &Device::Cpu, GgmlDType::IQ4XS)?,
+                (n, k),
+            )?;
+            let deq_cpu = q_cpu.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let storage = crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::IQ4XS)?;
+            let q_gpu = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+            let deq_gpu = q_gpu.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(deq_cpu.iter().zip(&deq_gpu).all(|(a, b)| a.to_bits() == b.to_bits()), "IQ4_XS dequantize f32");
+            let deq_h = q_gpu.dequantize_f16(&dev)?.flatten_all()?.to_vec1::<half::f16>()?;
+            assert!(deq_cpu.iter().zip(&deq_h).all(|(a, b)| half::f16::from_f32(*a) == *b), "IQ4_XS dequantize f16");
+            let mm = QMatMul::from_arc(q_gpu)?;
+            let wd = Tensor::from_vec(deq_cpu, (n, k), &Device::Cpu)?;
+            for m in [1usize, 2, 3, 5, 8, 20] {
+                let x: Vec<f32> = (0..m * k).map(|i| ((i * 104729 % 997) as f32 - 498.0) / 250.0).collect();
+                let x = Tensor::from_vec(x, (m, k), &Device::Cpu)?;
+                let scale = x.abs()?.matmul(&wd.abs()?.t()?)?.to_vec2::<f32>()?;
+                let exact = x.matmul(&wd.t()?)?.to_vec2::<f32>()?;
+                let got = mm.forward(&x.to_device(&dev)?)?.to_vec2::<f32>()?;
+                for r in 0..m {
+                    for c in 0..n {
+                        let (g, s, w) = (got[r][c], scale[r][c], exact[r][c]);
+                        let tol = if m <= 8 { 1e-2 * s } else { 1e-5 * s };
+                        assert!((g - w).abs() <= tol, "IQ4_XS n={n} k={k} m={m} ({r},{c}): gpu {g} want {w} (scale {s})");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // The following test used to fail under compute-sanitizer until #2526.

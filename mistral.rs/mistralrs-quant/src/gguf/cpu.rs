@@ -25,6 +25,12 @@ pub fn qtensor_indexed_moe_forward(
     x: &Tensor,
     ids: &Tensor,
 ) -> Result<Tensor> {
+    // titan: the packed gemv and the dequantized (f32) fallback take f32 rows; a bf16 / f16 model's CPU-offloaded
+    // MoE layers run in f32 and return in their dtype
+    if x.device().is_cpu() && x.dtype() != candle_core::DType::F32 {
+        return qtensor_indexed_moe_forward(qtensor, &x.to_dtype(candle_core::DType::F32)?, ids)?
+            .to_dtype(x.dtype());
+    }
     // Repacked per-expert gemv path; falls back to dequantize-and-gather only for
     // layouts the packed kernels cannot serve. Normalize the metal/cpu 4D/5D input
     // shapes to the (tokens, x_t, hidden) form the kernel expects.

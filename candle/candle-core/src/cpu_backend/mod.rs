@@ -2981,6 +2981,20 @@ impl BackendStorage for CpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // titan: the CPU gemm has no bf16 kernel; a bf16 model's CPU-offloaded layers multiply in f32 (exact
+        // products of the bf16 inputs, f32 accumulation) and round the result back to bf16
+        if self.dtype() == DType::BF16 {
+            let lhs = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs = rhs.to_dtype(rhs_l, DType::F32)?;
+            let out = MatMul(bmnk).map(
+                &lhs,
+                &Layout::contiguous(lhs_l.shape().clone()),
+                &rhs,
+                &Layout::contiguous(rhs_l.shape().clone()),
+            )?;
+            let (b, m, n, _) = bmnk;
+            return out.to_dtype(&Layout::contiguous(b * m * n), DType::BF16);
+        }
         MatMul(bmnk).map(self, lhs_l, rhs, rhs_l)
     }
 

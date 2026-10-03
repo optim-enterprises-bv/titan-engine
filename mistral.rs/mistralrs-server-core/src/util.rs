@@ -97,7 +97,8 @@ pub fn validate_model_name(
     requested_model: &str,
     state: Arc<MistralRs>,
 ) -> Result<(), MistralRsError> {
-    if requested_model == "default" {
+    // titan swap mode: unknown names go to the default model
+    if requested_model == "default" || state.titan_swap_active() {
         return Ok(());
     }
 

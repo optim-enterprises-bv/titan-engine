@@ -62,7 +62,7 @@ const TITAN_CUDA_GRAPHS_RESERVE_MIB: usize = 256;
 /// The titan architecture of a GGUF file (its `general.architecture`), when it loads through the
 /// fork-local models.
 pub(super) fn titan_arch(paths: &dyn ModelPaths) -> Result<Option<String>> {
-    if env::var("TITAN_GGUF_ROUTE").is_ok_and(|v| v == "upstream") {
+    if mistralrs_quant::titan_cfg::var("TITAN_GGUF_ROUTE").is_ok_and(|v| v == "upstream") {
         return Ok(None);
     }
     let Some(first) = paths.get_weight_filenames().first() else {
@@ -143,7 +143,7 @@ pub(super) fn load(
             .map(|f| {
                 let m = unsafe { memmap2::Mmap::map(f)? };
                 // TITAN_TIERED_MADV=hugepage|random: whole-file advice (mmap cost experiments)
-                let _ = match std::env::var("TITAN_TIERED_MADV").as_deref() {
+                let _ = match mistralrs_quant::titan_cfg::var("TITAN_TIERED_MADV").as_deref() {
                     Ok("hugepage") => m.advise(memmap2::Advice::HugePage),
                     Ok("random") => m.advise(memmap2::Advice::Random),
                     _ => Ok(()),
@@ -212,8 +212,8 @@ pub(super) fn load(
                 kv.div_ceil((params.max_batch_size() * params.max_seq_len()).max(1)),
             );
             // TITAN_CUDA_GRAPHS=1: graph memory (captured decode segments) comes from its own pool
-            let graphs = if std::env::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1") {
-                std::env::var("TITAN_CUDA_GRAPHS_RESERVE_MIB")
+            let graphs = if mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1") {
+                mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS_RESERVE_MIB")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(TITAN_CUDA_GRAPHS_RESERVE_MIB)
@@ -479,6 +479,12 @@ impl MetadataMixin for TitanGGUFPipeline {
         self.model_id.clone()
     }
     fn reset_non_granular_state(&self) {}
+    fn titan_reset_graphs(&self) {
+        #[cfg(feature = "cuda")]
+        if let Model::Qwen35MoE(ref model) = self.model {
+            model.reset_graphs();
+        }
+    }
     fn get_metadata(&self) -> Arc<GeneralMetadata> {
         self.metadata.clone()
     }

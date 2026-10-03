@@ -51,7 +51,14 @@ impl AffineFormatSpec {
             GgmlDType::Q5K | GgmlDType::Q8K => (8, 32),
             GgmlDType::Q6K => (8, 16),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => return None,
-            GgmlDType::Q1_0 | GgmlDType::IQ4NL | GgmlDType::MXFP4 | GgmlDType::NVFP4 => return None,
+            GgmlDType::Q1_0 | GgmlDType::IQ4NL | GgmlDType::MXFP4 | GgmlDType::NVFP4 | GgmlDType::PTQ1_0 => return None,
+            // i-quant lookups have no affine (scale+bias) repacking.
+            GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ3S => return None,
         };
         Some(Self {
             source_dtype,

@@ -57,6 +57,13 @@ type F32WsMap = Mutex<HashMap<WorkspaceKey, &'static Mutex<F32WorkspaceSlot>>>;
 static MOE_DECODE_Q8_WORKSPACE: OnceLock<U8WsMap> = OnceLock::new();
 static MOE_DECODE_F32_WORKSPACE: OnceLock<F32WsMap> = OnceLock::new();
 
+/// Model unload: free every workspace.
+pub(crate) fn release_workspaces() {
+    super::free_leaked(&MOE_DISPATCH_WORKSPACE);
+    super::free_leaked(&MOE_DECODE_Q8_WORKSPACE);
+    super::free_leaked(&MOE_DECODE_F32_WORKSPACE);
+}
+
 fn workspace_key(dev: &CudaDevice) -> WorkspaceKey {
     WorkspaceKey {
         device: dev.id(),
@@ -183,6 +190,14 @@ fn indexed_moe_weight_dtype(dtype: GgmlDType) -> bool {
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
+            // i-quant fused MoE: vec_dot ported from the gated oxide-kernels/iq2_xxs crate.
+            | GgmlDType::IQ2XXS
+ | GgmlDType::IQ4XS
+ | GgmlDType::IQ3XXS
+ | GgmlDType::IQ2S
+ | GgmlDType::IQ2XS
+            // IQ4_NL (REDCELL's expert down projections): oxide-kernels mistralrs-quant-a FMT 20.
+            | GgmlDType::IQ4NL
     )
 }
 
@@ -485,6 +500,96 @@ fn indexed_moe_forward_fused_q8_1_input(
             }
             GgmlDType::Q8_0 => {
                 ffi::launch_indexed_moe_forward_q8_0_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ2XXS => {
+                ffi::launch_indexed_moe_forward_iq2_xxs_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ2XS => {
+                ffi::launch_indexed_moe_forward_iq2_xs_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ2S => {
+                ffi::launch_indexed_moe_forward_iq2_s_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ3XXS => {
+                ffi::launch_indexed_moe_forward_iq3_xxs_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ4XS => {
+                ffi::launch_indexed_moe_forward_iq4_xs_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ4NL => {
+                ffi::launch_indexed_moe_forward_iq4_nl_q8_1(
                     weights_ptr,
                     inputs_ptr as *const std::ffi::c_void,
                     indices_ptr as *const u32,
@@ -1625,6 +1730,7 @@ pub unsafe fn indexed_moe_fused_decode(
             GgmlDType::Q4K => ffi::launch_moe_gemv_down_aggregate_q4k_q8_1,
             GgmlDType::Q5K => ffi::launch_moe_gemv_down_aggregate_q5k_q8_1,
             GgmlDType::Q6K => ffi::launch_moe_gemv_down_aggregate_q6k_q8_1,
+            GgmlDType::IQ4NL => ffi::launch_moe_gemv_down_aggregate_iq4_nl_q8_1,
             _ => candle_core::bail!("unsupported dtype for fused MoE decode: {down_dtype:?}"),
         };
 

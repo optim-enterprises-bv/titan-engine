@@ -17,6 +17,7 @@ pub use weight_source::{
 };
 #[cfg(feature = "cuda")]
 pub mod mmvq_rows;
+pub mod ptq1_0;
 #[cfg(any(feature = "cuda", all(test, target_arch = "x86_64")))]
 pub mod titan_cpu;
 #[cfg(any(feature = "cuda", all(test, target_arch = "x86_64")))]
@@ -29,6 +30,45 @@ mod titan_spin;
 pub mod titan_tiered;
 #[cfg(feature = "cuda")]
 mod titan_upload;
+
+/// Free the boxed-and-leaked workspace slots of a lazily built map. The slots are `&'static` so their guards can
+/// outlive the map lock; call only while no guard is held (model unload).
+#[cfg(feature = "cuda")]
+pub(crate) fn free_leaked<K, T>(m: &std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<K, &'static std::sync::Mutex<T>>>>) {
+    if let Some(m) = m.get() {
+        for (_, v) in m.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+            // SAFETY: every value came from Box::leak and nothing else references it any more.
+            unsafe { drop(Box::from_raw(v as *const std::sync::Mutex<T> as *mut std::sync::Mutex<T>)) };
+        }
+    }
+}
+
+/// Model unload: stop every titan thread, free the titan buffers (doorbell and pfs pinned memory, staging ring,
+/// kernel workspaces) and reset the per-model statics, so the next model starts as in a fresh process.
+#[cfg(feature = "cuda")]
+pub fn release_titan_state() {
+    titan_tiered::release_statics();
+    titan_pfs::release_all();
+    fast_mmvq::release_workspaces();
+    fast_mmq::release_workspaces();
+    ptq1_0::release_workspaces();
+    cuda::release_workspaces();
+    crate::titan_monitor::reset_model_stats();
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn release_titan_state() {}
+
+/// CUDA OOM recovery: drop the staging ring and restart the doorbell (a failed step may have left a layer's
+/// publish unanswered); the model stays loaded.
+#[cfg(feature = "cuda")]
+pub fn titan_recover_oom() {
+    titan_tiered::reset_doorbell();
+    titan_pfs::release_all();
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn titan_recover_oom() {}
 
 use candle_core::{
     quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QStorage, QTensor},
@@ -59,6 +99,8 @@ pub struct GgufMatMul {
     pub(crate) w: QMatMul,
     pub(crate) b: Option<Tensor>,
     stats: crate::ImatrixLayerStats,
+    /// PTQ1_0 weights with a folded prism Hadamard: the input rotation.
+    prism: Option<Arc<ptq1_0::PrismRot>>,
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
     packed_affine: OnceLock<Option<Arc<packed_affine::PackedAffine>>>,
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
@@ -86,6 +128,13 @@ fn ggml_dtype_to_uqff_code(dtype: GgmlDType) -> u32 {
         GgmlDType::IQ4NL => 20,
         GgmlDType::MXFP4 => 39,
         GgmlDType::NVFP4 => 40,
+        GgmlDType::IQ2XXS => 16,
+        GgmlDType::IQ2XS => 17,
+        GgmlDType::IQ3XXS => 18,
+        GgmlDType::IQ2S => 22,
+        GgmlDType::IQ4XS => 23,
+        GgmlDType::PTQ1_0 => 143,
+        GgmlDType::IQ3S => 21,
     }
 }
 
@@ -110,6 +159,13 @@ fn ggml_dtype_from_uqff_code(dtype: u32) -> Result<GgmlDType> {
         20 => Ok(GgmlDType::IQ4NL),
         39 => Ok(GgmlDType::MXFP4),
         40 => Ok(GgmlDType::NVFP4),
+        16 => Ok(GgmlDType::IQ2XXS),
+        17 => Ok(GgmlDType::IQ2XS),
+        18 => Ok(GgmlDType::IQ3XXS),
+        22 => Ok(GgmlDType::IQ2S),
+        23 => Ok(GgmlDType::IQ4XS),
+        143 => Ok(GgmlDType::PTQ1_0),
+        21 => Ok(GgmlDType::IQ3S),
         _ => candle_core::bail!("unknown dtype for quantized weight tensor {dtype}"),
     }
 }
@@ -135,6 +191,8 @@ fn gguf_dtype_label(dtype: u32) -> String {
         20 => "iq4_nl",
         39 => "mxfp4",
         40 => "nvfp4",
+        143 => "ptq1_0",
+        21 => "iq3_s",
         _ => "unknown",
     }
     .to_string()
@@ -148,6 +206,7 @@ impl GgufMatMul {
             w,
             b,
             stats,
+            prism: None,
             #[cfg(all(feature = "cuda", has_marlin_kernels))]
             packed_affine: OnceLock::new(),
             #[cfg(all(feature = "cuda", has_marlin_kernels))]
@@ -305,6 +364,16 @@ impl GgufMatMul {
         Self::from_raw_uqff(dtype, weight, dims, bias, device)
     }
 
+    /// Folds the prism Hadamard `rot` into this PTQ1_0 weight's matmuls (its input is rotated first).
+    pub fn with_prism(mut self, rot: Arc<ptq1_0::PrismRot>) -> Self {
+        self.prism = Some(rot);
+        self
+    }
+
+    pub fn prism(&self) -> Option<&Arc<ptq1_0::PrismRot>> {
+        self.prism.as_ref()
+    }
+
     fn add_bias(&self, x: Tensor) -> Result<Tensor> {
         if let Some(ref b) = self.b {
             x.broadcast_add(b)
@@ -323,6 +392,11 @@ impl GgufMatMul {
 
     #[cfg(feature = "cuda")]
     fn try_fast_forward(&self, a: &Tensor) -> Result<Option<Tensor>> {
+        if let QMatMul::QTensor(q) = &self.w {
+            if q.dtype() == GgmlDType::PTQ1_0 && q.device().is_cuda() {
+                return Ok(Some(ptq1_0::forward(q, a, self.prism.as_deref())?));
+            }
+        }
         // IQ4_NL / MXFP4 / NVFP4 prefill: llama.cpp's MMQ (cuda-oxide port). Their decode
         // (batch <= 8) stays on candle's mmvq below.
         if let QMatMul::QTensor(q) = &self.w {
@@ -461,12 +535,12 @@ impl QuantMethod for GgufMatMul {
         }
     }
 
+    /// The weight in f32, dequantized directly (llama.cpp's f32 `to_float` / convert.cu values). It
+    /// used to go through `dequantize_f16`, which rounded every value to f16 first (m4/deq).
     fn dequantize_w(&self) -> Result<Tensor> {
         match &self.w {
-            QMatMul::QTensor(weight) if weight.dtype() == GgmlDType::Q8_1 => {
-                weight.dequantize(&weight.device())
-            }
-            _ => self.w.dequantize_f16()?.to_dtype(DType::F32),
+            QMatMul::QTensor(weight) => weight.dequantize(&weight.device()),
+            QMatMul::Tensor(w) | QMatMul::TensorF16(w) => w.to_dtype(DType::F32),
         }
     }
 
@@ -581,6 +655,10 @@ impl QuantMethod for GgufMatMul {
         #[cfg(feature = "cuda")]
         {
             if self.uses_fast_mmvq() {
+                return None;
+            }
+            // the PTQ1_0 kernels read F32 and BF16 activations directly
+            if matches!(&self.w, QMatMul::QTensor(q) if q.dtype() == GgmlDType::PTQ1_0 && q.device().is_cuda()) {
                 return None;
             }
         }

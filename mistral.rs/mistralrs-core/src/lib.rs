@@ -5,6 +5,7 @@ use titan_oxide_ffi as _;
 use titan_nvcc_only as _;
 use candle_core::Device;
 use engine::Engine;
+pub use mistralrs_quant::titan_cfg;
 pub use mistralrs_quant::titan_monitor;
 pub use engine::{
     agentic_session::{AgenticSessionStore, SerializedSession, SerializedVideo},
@@ -92,6 +93,11 @@ mod titan_faults;
 mod titan_gdn;
 #[cfg(feature = "oxide")]
 mod titan_oxide;
+mod titan_swap;
+pub use titan_swap::{
+    device_free as titan_device_free, host_rss as titan_host_rss, release_device_memory as titan_release_device_memory,
+    TitanModelSettings, TitanSwapPolicy, DEFAULT_MAX_RESIDENT as TITAN_DEFAULT_MAX_RESIDENT, HEAP_COLLECT as TITAN_HEAP_COLLECT,
+};
 mod gguf;
 pub mod layers;
 mod layers_masker;
@@ -460,6 +466,8 @@ pub struct MistralRs {
     id: String,
     creation_time: u64,
     next_request_id: Mutex<RefCell<usize>>,
+    /// titan swap mode (`set_titan_swap`): models loaded on demand, one process.
+    titan_swap: std::sync::OnceLock<Arc<titan_swap::SwapState>>,
 }
 
 #[derive(Clone)]
@@ -1128,9 +1136,14 @@ impl MistralRs {
             Request::Normal(request) => request.model_id.clone(),
             _ => None,
         };
-        self.get_sender(requested_model.as_deref())?;
-
-        let model_id = self.resolve_alias_or_default(requested_model.as_deref())?;
+        let model_id = if let Some(st) = self.titan_swap_state() {
+            let id = self.titan_resolve(st, requested_model.as_deref())?;
+            self.titan_get_sender(st, Some(&id))?;
+            id
+        } else {
+            self.get_sender(requested_model.as_deref())?;
+            self.resolve_alias_or_default(requested_model.as_deref())?
+        };
         let engines = self
             .engines
             .read()
@@ -1728,6 +1741,7 @@ impl MistralRs {
                 .expect("Time travel has occurred!")
                 .as_secs(),
             next_request_id: Mutex::new(RefCell::new(1)),
+            titan_swap: std::sync::OnceLock::new(),
         })
     }
 
@@ -1790,6 +1804,9 @@ impl MistralRs {
     /// Get sender for a specific model. If model_id is None, uses default engine.
     /// If the model is unloaded, it will be automatically reloaded before returning the sender.
     pub fn get_sender(&self, model_id: Option<&str>) -> Result<Sender<Request>, MistralRsError> {
+        if let Some(st) = self.titan_swap_state() {
+            return self.titan_get_sender(st, model_id);
+        }
         let resolved_model_id = self.resolve_alias_or_default(model_id)?;
 
         // Check if model is loaded
@@ -2064,6 +2081,9 @@ impl MistralRs {
     }
 
     fn resolve_alias_or_default(&self, model_id: Option<&str>) -> Result<String, MistralRsError> {
+        if let Some(st) = self.titan_swap_state() {
+            return self.titan_resolve(st, model_id);
+        }
         match model_id {
             Some(id) => self.resolve_alias(id),
             None => {
@@ -2208,6 +2228,13 @@ impl MistralRs {
             .map_err(|_| MistralRsError::EnginePoisoned)?;
         if let Some(engine_instance) = engines.get(&resolved_model_id) {
             Ok(engine_instance.category.clone())
+        } else if let Some(state) = self
+            .unloaded_models
+            .read()
+            .map_err(|_| MistralRsError::EnginePoisoned)?
+            .get(&resolved_model_id)
+        {
+            Ok(state.category.clone())
         } else {
             Err(MistralRsError::EnginePoisoned)
         }
@@ -2226,6 +2253,13 @@ impl MistralRs {
             .map_err(|_| MistralRsError::EnginePoisoned)?;
         if let Some(engine_instance) = engines.get(&resolved_model_id) {
             Ok(engine_instance.config.max_seq_len)
+        } else if let Some(state) = self
+            .unloaded_models
+            .read()
+            .map_err(|_| MistralRsError::EnginePoisoned)?
+            .get(&resolved_model_id)
+        {
+            Ok(state.mistralrs_config.max_seq_len)
         } else {
             Err(MistralRsError::EnginePoisoned)
         }
@@ -2582,6 +2616,13 @@ impl MistralRs {
             .map_err(|_| "Failed to acquire read lock on engines")?;
         if let Some(engine_instance) = engines.get(&resolved_model_id) {
             Ok(engine_instance.config.clone())
+        } else if let Some(state) = self
+            .unloaded_models
+            .read()
+            .map_err(|_| "Failed to acquire read lock on unloaded_models")?
+            .get(&resolved_model_id)
+        {
+            Ok(state.mistralrs_config.clone())
         } else {
             Err(format!("Model {resolved_model_id} not found"))
         }
@@ -2595,6 +2636,9 @@ impl MistralRs {
     /// Models added via `MistralRsBuilder` without explicit loader config cannot be reloaded.
     pub fn unload_model(&self, model_id: &str) -> Result<(), MistralRsError> {
         let resolved_model_id = self.resolve_alias(model_id)?;
+        if let Some(st) = self.titan_swap_state() {
+            return self.titan_unload(st, &resolved_model_id);
+        }
         // Check if already unloaded
         {
             let unloaded = self
@@ -2681,6 +2725,15 @@ impl MistralRs {
     /// Manually reload a previously unloaded model.
     /// This is also called automatically by `get_sender()` when a request targets an unloaded model.
     pub async fn reload_model(&self, model_id: &str) -> Result<(), MistralRsError> {
+        if let Some(st) = self.titan_swap_state() {
+            let id = self.resolve_alias(model_id)?;
+            return self.titan_reload(st, &id);
+        }
+        self.reload_model_raw(model_id).await
+    }
+
+    /// `reload_model` without the swap policy (the swap itself calls this).
+    pub(crate) async fn reload_model_raw(&self, model_id: &str) -> Result<(), MistralRsError> {
         let resolved_model_id = self.resolve_alias(model_id)?;
         // Check if already reloading
         {
@@ -2992,6 +3045,7 @@ mod tests {
             id: "test".to_string(),
             creation_time: 0,
             next_request_id: Mutex::new(RefCell::new(1)),
+            titan_swap: std::sync::OnceLock::new(),
         }
     }
 

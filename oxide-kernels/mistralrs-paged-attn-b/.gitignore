@@ -1,0 +1,7 @@
+target/
+.oxide-artifacts/
+*.ll
+build.log
+*.cubin
+.mut/
+ref/*.ptx

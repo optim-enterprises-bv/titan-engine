@@ -84,9 +84,6 @@ indexed_row_copy_f16	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
 indexed_row_copy_f32	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
 launch_dynamic_lora_bf16	new in v0.9.4	mistralrs_quant_src_lora_dynamic_cuda_ffi_rs
 launch_dynamic_lora_f16	new in v0.9.4	mistralrs_quant_src_lora_dynamic_cuda_ffi_rs
-launch_mmq_quantize_glu_q8_1_D2S6	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs
-launch_mmq_quantize_glu_q8_1_D4	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs
-launch_mmq_quantize_glu_q8_1_DS4	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs
 launch_moe_gemv_gate_up_pair_q2k_q8_1	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs
 launch_moe_gemv_gate_up_pair_q3k_q8_1	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs
 launch_moe_gemv_gate_up_pair_q4_0_q8_1	new in v0.9.4	mistralrs_quant_src_gguf_ffi_rs

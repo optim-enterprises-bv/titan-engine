@@ -34,6 +34,7 @@ mod fp8;
 mod fp8_config;
 pub mod gemv;
 mod gguf;
+pub mod titan_cfg;
 pub mod titan_monitor;
 mod gptq;
 mod hqq;
@@ -86,6 +87,13 @@ pub trait QuantizedWeightSource: Send + Sync {
     fn pack_factor(&self, dtype: DType) -> Result<usize>;
 
     fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>>;
+
+    /// Device bytes the bound weights occupy once loaded at `dtype`: `(per text layer, everything else)`, the
+    /// layers `0..num_layers` (tensors of a layer past that count as everything else). `None` when the source
+    /// cannot say; automatic device mapping then falls back to the loader's size formulas.
+    fn resident_inventory(&self, _num_layers: usize, _dtype: DType) -> Result<Option<(Vec<usize>, usize)>> {
+        Ok(None)
+    }
 }
 
 impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
@@ -116,6 +124,10 @@ impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
 
     fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>> {
         (**self).pack_factor_for(key, dtype)
+    }
+
+    fn resident_inventory(&self, num_layers: usize, dtype: DType) -> Result<Option<(Vec<usize>, usize)>> {
+        (**self).resident_inventory(num_layers, dtype)
     }
 }
 
@@ -183,6 +195,7 @@ pub use gguf::fast_mmq::grouped_from_glu_sorted_pair as grouped_moe_mmq_from_glu
 #[cfg(feature = "cuda")]
 pub use gguf::fast_mmq::{
     grouped as grouped_moe_mmq, grouped_from_glu_packed as grouped_moe_mmq_from_glu_packed,
+    grouped_llama_from_glu_packed as grouped_moe_llama_mmq_from_glu_packed,
     grouped_from_glu_pair as grouped_moe_mmq_from_glu_pair, grouped_pair as grouped_moe_mmq_pair,
     grouped_pair_packed as grouped_moe_mmq_pair_packed, supports as supports_mmq,
 };
@@ -217,11 +230,13 @@ impl TieredExperts {
     pub fn set_auto_extra_reserve(_bytes: usize) {}
 }
 pub use gguf::GgufMatMul;
+pub use gguf::{release_titan_state, titan_recover_oom};
 pub use gguf::{
     GgufBindingMap, GgufBindingResolver, GgufTensorBackend, GgufTensorBinding, GgufWeightSource,
 };
 #[cfg(feature = "cuda")]
 pub use gguf::mmvq_rows;
+pub use gguf::ptq1_0;
 pub use gptq::GptqLayer;
 pub use hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer};
 pub use imatrix::{CollectedImatrixData, ImatrixLayerStats};
@@ -1339,7 +1354,14 @@ impl TryFrom<GgmlDType> for IsqType {
             | GgmlDType::Q1_0
             | GgmlDType::IQ4NL
             | GgmlDType::MXFP4
-            | GgmlDType::NVFP4 => {
+            | GgmlDType::NVFP4
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ4XS
+            | GgmlDType::PTQ1_0 => {
                 candle_core::bail!("Expected valid GGML ISQ type.")
             }
         }

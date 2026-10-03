@@ -267,6 +267,17 @@ type WsMap = Mutex<HashMap<WorkspaceKey, &'static Mutex<WorkspaceSlot>>>;
 static MMQ_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
 static FIXUP_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
 
+/// Model unload: free every workspace (no forward, and no graph reading one, is left).
+pub(crate) fn release_workspaces() {
+    super::free_leaked(&MMQ_WORKSPACE);
+    super::free_leaked(&FIXUP_WORKSPACE);
+    super::free_leaked(&Q1_0_MMQ_WS);
+    super::free_leaked(&IQ4_NL_MMQ_WS);
+    super::free_leaked(&MXFP4_MMQ_WS);
+    super::free_leaked(&NVFP4_MMQ_WS);
+    super::free_leaked(&PTQ1_0_MMQ_WS);
+}
+
 #[derive(Clone, Copy)]
 struct DeviceInfo {
     cc: i32,
@@ -563,6 +574,8 @@ struct LlamaMmq {
 static IQ4_NL_MMQ_WS: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
 static MXFP4_MMQ_WS: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
 static NVFP4_MMQ_WS: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
+static PTQ1_0_MMQ_WS: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
+static IQ4_XS_MMQ_WS: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
 
 static IQ4_NL_MMQ: LlamaMmq = LlamaMmq {
     name: "iq4_nl",
@@ -595,11 +608,41 @@ static NVFP4_MMQ: LlamaMmq = LlamaMmq {
     ws: &NVFP4_MMQ_WS,
 };
 
+// PrismML PTQ1_0 (type 143): oxide-kernels/ptq1_0, bit-identical to sudoingX/llama.cpp bonsai2 v1.1 (the q1_0
+// MMQ core with PTQ1_0's tile loader); its input is the prism-rotated activation (gguf/ptq1_0.rs).
+static PTQ1_0_MMQ: LlamaMmq = LlamaMmq {
+    name: "ptq1_0",
+    ptx: include_str!("ptq1_0_mmq_oxide.ptx"),
+    module: "titan_ptq1_0_mmq",
+    qk: 128,
+    neb: 128,
+    iter_k: 256,
+    fi: 3,
+    ws: &PTQ1_0_MMQ_WS,
+};
+
+// GGML IQ4_XS (type 23, dense): `mul_mat_q<IQ4_XS, J, fallback>` (mmq-config-ampere.cuh, the IQ4_NL
+// configuration: `ggml_cuda_mmq_load_tiles_iq4_xs` + the same s8 MMA vec_dot on D4 activations), so its
+// module carries IQ4_NL's activation quantizer (`iq4_nl_quantize_mmq_d4_*`). One 256-value block per
+// tile iteration (K_vram 256).
+static IQ4_XS_MMQ: LlamaMmq = LlamaMmq {
+    name: "iq4_xs",
+    ptx: include_str!("iq4_xs_mmq_oxide.ptx"),
+    module: "titan_iq4_xs_mmq",
+    qk: 256,
+    neb: 128,
+    iter_k: 256,
+    fi: 4,
+    ws: &IQ4_XS_MMQ_WS,
+};
+
 fn llama_mmq(dtype: GgmlDType) -> Option<&'static LlamaMmq> {
     match dtype {
+        GgmlDType::PTQ1_0 => Some(&PTQ1_0_MMQ),
         GgmlDType::IQ4NL => Some(&IQ4_NL_MMQ),
         GgmlDType::MXFP4 => Some(&MXFP4_MMQ),
         GgmlDType::NVFP4 => Some(&NVFP4_MMQ),
+        GgmlDType::IQ4XS => Some(&IQ4_XS_MMQ),
         _ => None,
     }
 }
@@ -676,7 +719,8 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
         let z64 = 0u64;
         if quantize {
             let quant = super::fast_mmvq::q1_0_func(dev, slot0 + ti, f.module, f.ptx, || match f.fi {
-                0 => format!("iq4_nl_quantize_mmq_d4_{ts}"),
+                0 | 4 => format!("iq4_nl_quantize_mmq_d4_{ts}"),
+                3 => format!("ptq1_0_quantize_mmq_d4_{ts}"),
                 _ => format!("{}_quantize_mmq_{ts}", f.name),
             })?;
             let (ne00, s01, s02, ne0) = (k as i64, k as i64, (k * b_size) as i64, k_padded as i64);
@@ -685,11 +729,18 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
             let cfg = match f.fi {
                 // quantize_mmq_q8_1 / quantize_mmq_mxfp4: x, ids, vy, ne00, s01, s02, s03, ne0,
                 // ne1, ne2, n_expert_used (int)
-                0 | 1 => {
+                0 | 1 | 4 => {
                     b.arg(&x_ptr).arg(&z64).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
                     b.arg(&ne1_32).arg(&ne2_32).arg(&neu);
-                    let block_dim = if f.fi == 0 { (128, 1, 1) } else { (32, 8, 1) };
+                    let block_dim = if f.fi == 1 { (32, 8, 1) } else { (128, 1, 1) };
                     LaunchConfig { grid_dim: (b_size as u32, (k_padded as u32).div_ceil(512), 1), block_dim, shared_mem_bytes: 0 }
+                }
+                // bonsai2's quantize_mmq_q8_1<D4, false, false, false>: the same, plus unused gate /
+                // norm_weight / norm_scale pointers
+                3 => {
+                    b.arg(&x_ptr).arg(&z64).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
+                    b.arg(&ne1_32).arg(&ne2_32).arg(&neu).arg(&z64).arg(&z64).arg(&z64);
+                    LaunchConfig { grid_dim: (b_size as u32, (k_padded as u32).div_ceil(512), 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 }
                 }
                 // quantize_mmq_nvfp4: x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2
                 // (int64), n_expert_used
@@ -754,7 +805,7 @@ pub fn llama_fmt_plain(w: &QTensor, xs: &Tensor) -> Result<Option<Tensor>> {
     let Some(f) = llama_mmq(w.dtype()) else {
         return Ok(None);
     };
-    if std::env::var_os("TITAN_LLAMA_MMQ").is_some_and(|v| v == "0") {
+    if crate::titan_cfg::var_os("TITAN_LLAMA_MMQ").is_some_and(|v| v == "0") {
         return Ok(None);
     }
     let Device::Cuda(dev) = w.device() else {
@@ -1811,6 +1862,141 @@ pub fn grouped_from_glu_packed(
         activation,
         dev,
     })
+}
+
+/// [`grouped_from_glu_packed`] for a format whose MMQ is a llama.cpp port in [`plain`] (IQ4_NL):
+/// `activation(gate) * up` of the packed gate/up rows `ids_src` (dispatch order) quantized once as
+/// block_q8_1_mmq D4 (the layout the port's tiles read), then the port's `mul_mat_q<type, J,
+/// fallback>` in its MoE mode (one channel per expert: columns `expert_bounds[e]..expert_bounds[e + 1]`
+/// of the activations, column j written to dst row `ids_dst[j]`) and the stream-k fixup, with
+/// llama.cpp's `ggml_cuda_mul_mat_q` arguments for MUL_MAT_ID. Out: `[total_assignments, nrows]` f32.
+/// K need not be a whole number of 256-wide tile iterations (REDCELL's expert down K = 704): as in
+/// llama.cpp, the last iteration's tile also reads the next row's first blocks, against activations
+/// that are zero from K to k_padded. `Ok(None)` for formats without such a port.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_llama_from_glu_packed(
+    weight: &QTensor,
+    gate_up: &Tensor,
+    ids_src: &CudaSlice<u32>,
+    ids_dst: &CudaSlice<u32>,
+    expert_bounds: &CudaSlice<u32>,
+    total_assignments: usize,
+    ncols_max: usize,
+    num_experts: usize,
+    activation: i32,
+    dev: &CudaDevice,
+) -> Result<Option<Tensor>> {
+    use candle_core::cuda::cudarc::driver::sys::CUfunction_attribute_enum;
+    use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda::WrapErr;
+    let dtype = weight.dtype();
+    // D4 activations with 128-value blocks: the IQ4_NL port only
+    let Some(f) = llama_mmq(dtype).filter(|f| f.fi == 0) else {
+        return Ok(None);
+    };
+    let (weight_experts, nrows, k) = weight.shape().dims3()?;
+    if weight_experts != num_experts || k % f.qk != 0 || total_assignments == 0 {
+        candle_core::bail!("fast_mmq grouped_llama: weight {:?}, {num_experts} experts, {total_assignments} rows", weight.shape());
+    }
+    let gate_up = gate_up.contiguous()?;
+    if gate_up.dims2()? != (total_assignments, 2 * k) || gate_up.dtype() != DType::F32 {
+        candle_core::bail!("fast_mmq grouped_llama: gate/up {:?} {:?}, want ({total_assignments}, {}) f32", gate_up.shape(), gate_up.dtype(), 2 * k);
+    }
+    let gate = gate_up.narrow(1, 0, k)?;
+    let up = gate_up.narrow(1, k, k)?;
+    let (gate_storage, gate_layout) = gate.storage_and_layout();
+    let Storage::Cuda(gate_cuda) = &*gate_storage else {
+        candle_core::bail!("fast_mmq grouped_llama: gate/up must live on CUDA");
+    };
+    let up_offset = up.layout().start_offset();
+
+    let stream = dev.cuda_stream();
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+    let k_padded = pad(pad(k, MATRIX_ROW_PADDING), 4 * QK8_1);
+    let ws_bytes = total_assignments * (k_padded / (4 * QK8_1)) * BLOCK_Q8_1_MMQ_SIZE + MMQ_X_MAX * BLOCK_Q8_1_MMQ_SIZE;
+    let mut workspace = workspace_ensure(&MMQ_WORKSPACE, dev, ws_bytes, &stream)?;
+    let (y_ptr, _y_guard) = workspace.ptr_mut();
+
+    let fallback = nrows % 128 != 0;
+    let j = q1_0_mmq_pick_j(ncols_max, fallback);
+    let nty = nrows.div_ceil(128) as u32;
+    let ntx = ncols_max.div_ceil(j as usize) as u32;
+    let ntiles = ntx * nty * num_experts as u32;
+    let nsm = get_device_info(dev).nsm.max(1) as u32;
+    let nwaves = ntiles.div_ceil(nsm);
+    let nblocks = if 100 * ntiles / (nsm * nwaves) >= 90 { ntiles } else { nsm };
+    let fixup_needed = ntiles % nblocks != 0;
+    let mut fixup_ws = workspace_ensure(&FIXUP_WORKSPACE, dev, fixup_workspace_bytes(dev), &stream)?;
+    let (fixup_ptr, _fixup_guard) = fixup_ws.ptr_mut();
+
+    let w_ptr = weight.device_ptr()? as u64;
+    let mut out = unsafe { dev.alloc::<f32>(total_assignments * nrows)? };
+    {
+        let gu_slice = gate_cuda.as_cuda_slice::<f32>()?;
+        let (gate_ptr, _gate_guard) = slice_ptr(gu_slice, gate_layout.start_offset());
+        let (up_ptr, _up_guard) = slice_ptr(gu_slice, up_offset);
+        let (ids_src_ptr, _src_guard) = slice_ptr(ids_src, 0);
+        let (ids_dst_ptr, _dst_guard) = slice_ptr(ids_dst, 0);
+        let (bounds_ptr, _bounds_guard) = slice_ptr(expert_bounds, 0);
+        let (dst_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
+        unsafe {
+            quantize_glu_f32_launcher(DsLayout::D4)(
+                gate_ptr as *const f32,
+                up_ptr as *const f32,
+                ids_src_ptr as *const i32,
+                y_ptr as *mut std::ffi::c_void,
+                k as i64,
+                (2 * k) as i64,
+                k_padded as i64,
+                total_assignments as i64,
+                activation,
+                stream_ptr,
+            );
+        }
+
+        let fb = fallback as u32;
+        let bpn = super::fast_mmvq::q1_0_fastdiv((k / f.qk) as u32);
+        let ntx_fd = super::fast_mmvq::q1_0_fastdiv(ntx);
+        let one = super::fast_mmvq::q1_0_fastdiv(1);
+        let ncy = super::fast_mmvq::q1_0_fastdiv(num_experts as u32);
+        let (nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst) =
+            (nrows as i32, total_assignments as i32, (k / f.qk) as i32, total_assignments as i32, nrows as i32);
+        let stride_channel_x = (nrows * (k / f.qk)) as i32;
+        let (z32, z64) = (0i32, 0u64);
+        let smem = q1_0_mmq_smem(j);
+        let slot = (j / 8) as usize * 2 + fb as usize;
+        let slot0 = 1000 + 200 * f.fi;
+        let name = f.name;
+        let mmq = super::fast_mmvq::q1_0_func(dev, slot0 + 10 + slot, f.module, f.ptx, || format!("{name}_mmq_j{j}_f{fb}"))?;
+        mmq.set_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).w()?;
+        let mut b = stream.launch_builder(&mmq);
+        // x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst,
+        // stride_row_x, ncols_y, stride_col_dst, channel_ratio (1), nchannels_y (experts),
+        // stride_channel_{x,y,dst}, sample_ratio, nsamples_y, stride_sample_{x,y,dst}, ntx
+        b.arg(&w_ptr).arg(&y_ptr).arg(&ids_dst_ptr).arg(&bounds_ptr).arg(&dst_ptr).arg(&fixup_ptr).arg(&z64);
+        b.arg(&bpn[0]).arg(&bpn[1]).arg(&bpn[2]);
+        b.arg(&nrows_x).arg(&ncols_dst).arg(&stride_row_x).arg(&ncols_y).arg(&stride_col_dst);
+        b.arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&ncy[0]).arg(&ncy[1]).arg(&ncy[2]).arg(&stride_channel_x).arg(&z32).arg(&z32);
+        b.arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&z32).arg(&z32).arg(&z32);
+        b.arg(&ntx_fd[0]).arg(&ntx_fd[1]).arg(&ntx_fd[2]);
+        let cfg = LaunchConfig { grid_dim: (nblocks, 1, 1), block_dim: (32, 8, 1), shared_mem_bytes: smem };
+        unsafe { b.launch(cfg) }.w()?;
+
+        if fixup_needed {
+            let fix = super::fast_mmvq::q1_0_func(dev, slot0 + 100 + slot, f.module, f.ptx, || format!("{name}_mmq_fixup_j{j}_f{fb}"))?;
+            let mut b = stream.launch_builder(&fix);
+            // ids_dst, expert_bounds, dst, tmp_last_tile, blocks_per_ne00, nrows_x, ncols_dst,
+            // stride_col_dst, nchannels_y, stride_channel_dst, nsamples_y, stride_sample_dst, ntx
+            b.arg(&ids_dst_ptr).arg(&bounds_ptr).arg(&dst_ptr).arg(&fixup_ptr);
+            b.arg(&bpn[0]).arg(&bpn[1]).arg(&bpn[2]);
+            b.arg(&nrows_x).arg(&ncols_dst).arg(&stride_col_dst);
+            b.arg(&ncy[0]).arg(&ncy[1]).arg(&ncy[2]).arg(&z32).arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&z32);
+            b.arg(&ntx_fd[0]).arg(&ntx_fd[1]).arg(&ntx_fd[2]);
+            let cfg = LaunchConfig { grid_dim: (nblocks, 4, 1), block_dim: (32, 4, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.w()?;
+        }
+    }
+    Ok(Some(wrap_cuda_output(out, dev, Shape::from((total_assignments, nrows)))))
 }
 
 /// Run two GGUF-quantized MoE projections with llama.cpp-style grouped MMQ.

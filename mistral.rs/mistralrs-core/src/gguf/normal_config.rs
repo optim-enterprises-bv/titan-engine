@@ -12,6 +12,9 @@ const GPT_OSS_ALPHA: f64 = 1.702;
 const GPT_OSS_SWIGLU_LIMIT: f64 = 7.0;
 const GPT_OSS_SWA_PERIOD: usize = 2;
 const SMOLLM3_NO_ROPE_INTERVAL: usize = 4;
+const SPARK2_5_SWA_ROPE_THETA: f64 = 10_000.0;
+// llama.cpp's spark2_5 FFN is LLM_FFN_GELU (tanh approximation); the HF config says erf "gelu"
+const SPARK2_5_HIDDEN_ACT: &str = "gelu_pytorch_tanh";
 
 type BuilderFn = fn(&MetadataView<'_>) -> SynthesisResult<JsonValue>;
 type SynthesisResult<T> = Result<T, NormalConfigSynthesisError>;
@@ -43,7 +46,7 @@ pub(crate) struct NormalConfigBuilder {
     build: BuilderFn,
 }
 
-pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 26] = &[
+pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 27] = &[
     NormalConfigBuilder {
         loader: NormalLoaderType::Mistral,
         build: build_mistral,
@@ -147,6 +150,10 @@ pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 26] = &[
     NormalConfigBuilder {
         loader: NormalLoaderType::Lfm2Moe,
         build: build_lfm2_moe,
+    },
+    NormalConfigBuilder {
+        loader: NormalLoaderType::Spark2_5,
+        build: build_spark2_5,
     },
 ];
 
@@ -1896,6 +1903,80 @@ fn build_qwen35(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
     Ok(JsonValue::Object(config))
 }
 
+fn build_spark2_5(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
+    reject_unsupported_rope_scaling(metadata, "Spark2.5")?;
+    let fields = StandardFields::read(metadata, None)?;
+    let sliding_window = fields.sliding_window.ok_or_else(|| {
+        NormalConfigSynthesisError::new(format!(
+            "Standalone Spark2.5 config requires `{}`",
+            metadata.key("attention.sliding_window")
+        ))
+    })?;
+    let pattern = metadata
+        .sliding_pattern(fields.num_hidden_layers)?
+        .ok_or_else(|| {
+            NormalConfigSynthesisError::new(format!(
+                "Standalone Spark2.5 config requires `{}`",
+                metadata.key("attention.sliding_window_pattern")
+            ))
+        })?;
+    if let Some(value_length) = metadata.optional_usize("attention.value_length")? {
+        if value_length != fields.head_dim {
+            return Err(NormalConfigSynthesisError::new(format!(
+                "Spark2.5 needs equal key and value head dims, got {} and {value_length}",
+                fields.head_dim
+            )));
+        }
+    }
+    let rope_dims = metadata
+        .optional_usize("rope.dimension_count")?
+        .unwrap_or(fields.head_dim);
+    let rope_dims_swa = metadata
+        .optional_usize("rope.dimension_count_swa")?
+        .unwrap_or(fields.head_dim);
+    let rope_theta_swa = metadata
+        .optional_f64("rope.freq_base_swa")?
+        .unwrap_or(SPARK2_5_SWA_ROPE_THETA);
+    let full_factor = rope_dims as f64 / fields.head_dim as f64;
+    let swa_factor = rope_dims_swa as f64 / fields.head_dim as f64;
+    let mut config = fields.rms_json();
+    config.remove("rope_theta");
+    config.insert("head_dim".into(), json!(fields.head_dim));
+    config.insert("sliding_window".into(), json!(sliding_window));
+    config.insert(
+        "layer_types".into(),
+        json!(pattern
+            .into_iter()
+            .map(|is_sliding| if is_sliding {
+                "sliding_attention"
+            } else {
+                "full_attention"
+            })
+            .collect::<Vec<_>>()),
+    );
+    config.insert(
+        "rope_parameters".into(),
+        json!({
+            "full_attention": {
+                "rope_theta": fields.rope_theta,
+                "partial_rotary_factor": full_factor,
+            },
+            "sliding_attention": {
+                "rope_theta": rope_theta_swa,
+                "partial_rotary_factor": swa_factor,
+            },
+        }),
+    );
+    config.insert("hidden_act".into(), json!(SPARK2_5_HIDDEN_ACT));
+    config.insert(
+        "attention_bias".into(),
+        json!(metadata.has_tensor_marker(".attn_qkv.bias")),
+    );
+    config.insert("headwise_attn_output_gate".into(), json!(true));
+    config.insert("gate_attn_act_mode".into(), json!("sigmoid"));
+    Ok(JsonValue::Object(config))
+}
+
 fn build_lfm2(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
     build_lfm(metadata, false)
 }
@@ -2758,6 +2839,26 @@ mod tests {
             tensors.push("blk.1.ffn_gate_shexp.weight".to_string());
         }
 
+        if matches!(loader, NormalLoaderType::Spark2_5) {
+            insert_u32(&mut metadata, architecture, "attention.sliding_window", 512);
+            metadata.insert(
+                format!("{}.attention.sliding_window_pattern", architecture.as_str()),
+                GgufValue::Array(
+                    (0..LAYER_COUNT)
+                        .map(|layer| GgufValue::Bool(layer % 4 != 3))
+                        .collect(),
+                ),
+            );
+            insert_u32(&mut metadata, architecture, "rope.dimension_count", 16);
+            insert_u32(&mut metadata, architecture, "rope.dimension_count_swa", 64);
+            insert_f32(&mut metadata, architecture, "rope.freq_base_swa", 10_000.0);
+            tensors.extend(
+                ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight"]
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+
         (metadata, tensors)
     }
 
@@ -2842,7 +2943,34 @@ mod tests {
             NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => {
                 assert_deserializes::<models::lfm2::Config>(loader, config)
             }
+            NormalLoaderType::Spark2_5 => {
+                assert_deserializes::<models::spark2_5::Config>(loader, config)
+            }
         }
+    }
+
+    #[test]
+    fn spark2_5_synthesizes_partial_rope_and_layer_types() {
+        let loader = NormalLoaderType::Spark2_5;
+        let (_, metadata, tensors) = default_fixture(&loader);
+        let config = synthesize_normal_config_value(&loader, &metadata, &tensors).unwrap();
+        assert_eq!(
+            config["layer_types"],
+            json!([
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ])
+        );
+        let rope = &config["rope_parameters"];
+        assert_eq!(rope["full_attention"]["partial_rotary_factor"], 0.25);
+        assert_eq!(rope["full_attention"]["rope_theta"], 10_000.0);
+        assert_eq!(rope["sliding_attention"]["partial_rotary_factor"], 1.0);
+        assert_eq!(rope["sliding_attention"]["rope_theta"], 10_000.0);
+        assert_eq!(config["hidden_act"], "gelu_pytorch_tanh");
+        assert_eq!(config["sliding_window"], 512);
+        assert_eq!(config["head_dim"], 64);
     }
 
     #[test]

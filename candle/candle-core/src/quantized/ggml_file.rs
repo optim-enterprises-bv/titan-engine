@@ -193,8 +193,31 @@ pub fn qtensor_from_ggml(
         GgmlDType::MXFP4 => {
             from_raw_data::<super::mxfp4::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::PTQ1_0 => {
+            from_raw_data::<super::ptq1_0::BlockPTQ1_0>(raw_data, size_in_bytes, dims, device)
+        }
         GgmlDType::NVFP4 => {
             from_raw_data::<super::nvfp4::BlockNVFP4>(raw_data, size_in_bytes, dims, device)
+        }
+        // i-quant lookup-table families (ggml types 16/17/18/22/23). The CUDA path uses the
+        // cuda-oxide MMVQ kernels in oxide-kernels/{iq2_xxs,iq2_xs,iq3_xxs,iq2_s,iq4_xs}.
+        GgmlDType::IQ2XXS => {
+            from_raw_data::<super::iquant::BlockIQ2xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2XS => {
+            from_raw_data::<super::iquant::BlockIQ2xs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3XXS => {
+            from_raw_data::<super::iquant::BlockIQ3xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2S => {
+            from_raw_data::<super::iquant::BlockIQ2s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ4XS => {
+            from_raw_data::<super::iquant::BlockIQ4xs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3S => {
+            from_raw_data::<super::iquant::BlockIQ3s>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }

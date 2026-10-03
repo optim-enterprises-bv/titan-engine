@@ -1,0 +1,10 @@
+[package]
+name = "embcheck"
+version = "0.1.0"
+edition = "2021"
+
+# gate (a) for the row-only QTensor::embedding (m4/emb/README.md): candle-core from the emb worktree.
+[dependencies]
+candle-core = { path = "~/titan-engine/top-emb/candle/candle-core", features = ["cuda"] }
+
+[workspace]

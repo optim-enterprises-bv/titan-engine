@@ -261,6 +261,9 @@ macro_rules! handle_pipeline_forward_error {
                     tracing::error!("Failed to reset model cache: {reset_err}");
                 }
                 get_mut_arcmutex!($prefix_cacher).evict_all_caches().unwrap();
+                if $crate::titan_swap::is_oom(&e) {
+                    $crate::titan_swap::recover_from_oom(&*p);
+                }
 
                 continue $label;
             }

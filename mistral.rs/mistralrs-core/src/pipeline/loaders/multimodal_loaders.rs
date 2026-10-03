@@ -8293,9 +8293,26 @@ impl DeviceMappedModelLoader for Gemma4Loader {
         };
         let audio_tokens = if cfg.audio_config.is_some() { 750 } else { 0 };
         let total_seq_len = *max_seq_len + vision_tokens_per_image * max_num_images + audio_tokens;
-        let max_text_attn = max_batch_size * tc.num_attention_heads * total_seq_len * total_seq_len;
-
-        Ok(max_text_attn)
+        // One unchunked prefill of the whole context. Prompt attention runs on the flash-prefill kernels (no
+        // heads x S x S score matrix); the sliding and the full layers each build an S x S mask. The widest MLP
+        // is the dense one plus, with the MoE block, the routed experts' (top-k rows per token).
+        // The MoE block runs beside the dense MLP (their outputs are summed): both are live.
+        let mlp_width = if tc.enable_moe_block {
+            tc.intermediate_size
+                + tc.top_k_experts.unwrap_or(0) * tc.expert_intermediate_size().unwrap_or(0)
+        } else {
+            tc.intermediate_size
+        };
+        let head_dim = tc.head_dim.max(tc.global_head_dim);
+        Ok(super::auto_device_map::prefill_act_elems(
+            total_seq_len,
+            *max_batch_size,
+            tc.hidden_size,
+            mlp_width,
+            (tc.num_attention_heads + 2 * tc.num_key_value_heads) * head_dim,
+            2,
+            0,
+        ))
     }
 
     fn non_mapped_max_act_size_elems(
@@ -8613,6 +8630,34 @@ impl DeviceMappedModelLoader for Gemma4Loader {
 
     fn non_mapped_sub_models(&self) -> Option<Vec<NonMappedSubModel>> {
         Some(vec![NonMappedSubModel::Vision, NonMappedSubModel::Audio])
+    }
+
+    /// The non-paged auto map charges every layer `num_key_value_heads x global_head_dim` (8 x 512 on the 12B).
+    /// Gemma 4's caches are smaller: sliding layers hold `num_key_value_heads x head_dim` (256), full-attention
+    /// layers `num_global_key_value_heads` (1-2) x `global_head_dim`, KV-shared layers nothing. Sliding layers are
+    /// still charged the whole sequence (a prompt chunk is appended before their window is applied).
+    fn kv_cache_layer_fraction(&self, config: &str) -> Result<f64> {
+        let cfg: Gemma4Config = serde_json::from_str(config)?;
+        let tc = &cfg.text_config;
+        let first_shared = tc.num_hidden_layers.saturating_sub(tc.num_kv_shared_layers);
+        let per_layer: usize = (0..tc.num_hidden_layers)
+            .filter(|&i| first_shared == 0 || i < first_shared)
+            .map(|i| {
+                if tc.layer_types[i] == "sliding_attention" {
+                    tc.num_key_value_heads * tc.head_dim
+                } else {
+                    tc.num_global_key_value_heads.unwrap_or(tc.num_key_value_heads) * tc.global_head_dim
+                }
+            })
+            .sum();
+        let generic = tc.num_hidden_layers * tc.num_key_value_heads * tc.global_head_dim;
+        Ok((per_layer as f64 / generic.max(1) as f64).min(1.0))
+    }
+
+    /// Under `--dtype f32` the cache is F16 (`TITAN_G4_KV16`, default on; gemma4/text.rs `kv16`).
+    fn kv_cache_dtype(&self, _config: &str, dtype: DType) -> Result<DType> {
+        let kv16 = mistralrs_quant::titan_cfg::var("TITAN_G4_KV16").map_or(true, |v| v != "0");
+        Ok(if dtype == DType::F32 && kv16 { DType::F16 } else { dtype })
     }
 
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {

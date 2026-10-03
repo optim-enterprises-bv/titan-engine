@@ -14,7 +14,7 @@ use super::{
     HunYuanDenseV1Loader, HunYuanMoEV1Loader, Lfm2Loader, LlamaLoader, MistralLoader,
     MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader, Qwen2Loader,
     Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, Qwen3_5TextLoader, SmolLm3Loader,
-    Starcoder2Loader,
+    Spark2_5Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
 use crate::attention::ATTENTION_CHUNK_SIZE;
@@ -534,6 +534,7 @@ impl NormalLoaderBuilder {
             Some(NormalLoaderType::Qwen3_5) => Box::new(Qwen3_5TextLoader),
             Some(NormalLoaderType::Lfm2) => Box::new(Lfm2Loader),
             Some(NormalLoaderType::Lfm2Moe) => Box::new(Lfm2Loader),
+            Some(NormalLoaderType::Spark2_5) => Box::new(Spark2_5Loader),
             None => Box::new(AutoNormalLoader),
         };
         Ok(NormalLoader {
@@ -749,36 +750,68 @@ impl Loader for NormalLoader {
                         let source = weight_source
                             .as_ref()
                             .expect("selected weight-source sizing requires a weight source");
-                        let quantization =
-                            if matches!(sizing, super::isq_flow::AutoDeviceMapSizing::Uqff) {
-                                AutoDeviceMapQuantization::weight_source(source.as_ref())
-                            } else {
-                                AutoDeviceMapQuantization::weight_source_with_topology(
-                                    source.as_ref(),
-                                    self.config.topology.as_ref(),
-                                )
-                            };
-                        let weight_pack_factor = quantization
-                            .conservative_pack_factor(dtype, source.pack_factor(dtype)?);
-                        let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
-                            &config,
-                            dtype,
-                            weight_pack_factor,
-                            None,
-                        )?;
-                        let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
-                            &config,
-                            dtype,
-                            weight_pack_factor,
-                            Some(&quantization),
-                            None,
-                        )?;
-                        let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
-                        (
-                            layer_sizes_in_bytes,
-                            non_mapped_size_in_bytes,
-                            layer_sizes_sum + non_mapped_size_in_bytes,
-                        )
+                        // A prepared GGUF source knows each tensor's resident size: use it rather than the
+                        // loader's formulas at one integer pack factor for the whole model.
+                        let inventory = if matches!(
+                            sizing,
+                            super::isq_flow::AutoDeviceMapSizing::PreparedWeightSource
+                        ) && self.config.topology.is_none()
+                            && self.lora_adapters.is_none()
+                        {
+                            source.resident_inventory(self.inner.num_layers(&config)?, dtype)?
+                        } else {
+                            None
+                        };
+                        if let Some((layer_sizes_in_bytes, non_mapped_size_in_bytes)) = inventory {
+                            let total = layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
+                            // For comparison: what the loader's formula charges at the source's pack factor.
+                            let pack = source.pack_factor(dtype)?;
+                            let formula_layers = self
+                                .inner
+                                .layer_sizes_in_bytes(&config, dtype, pack, None)?
+                                .iter()
+                                .sum::<usize>();
+                            info!(
+                                model_mib = total / (1024 * 1024),
+                                layers_mib = layer_sizes_in_bytes.iter().sum::<usize>() / (1024 * 1024),
+                                not_mapped_mib = non_mapped_size_in_bytes / (1024 * 1024),
+                                formula_pack_factor = pack,
+                                formula_layers_mib = formula_layers / (1024 * 1024),
+                                "Using weight source tensor inventory for automatic device mapping"
+                            );
+                            (layer_sizes_in_bytes, non_mapped_size_in_bytes, total)
+                        } else {
+                            let quantization =
+                                if matches!(sizing, super::isq_flow::AutoDeviceMapSizing::Uqff) {
+                                    AutoDeviceMapQuantization::weight_source(source.as_ref())
+                                } else {
+                                    AutoDeviceMapQuantization::weight_source_with_topology(
+                                        source.as_ref(),
+                                        self.config.topology.as_ref(),
+                                    )
+                                };
+                            let weight_pack_factor = quantization
+                                .conservative_pack_factor(dtype, source.pack_factor(dtype)?);
+                            let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                                &config,
+                                dtype,
+                                weight_pack_factor,
+                                None,
+                            )?;
+                            let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                                &config,
+                                dtype,
+                                weight_pack_factor,
+                                Some(&quantization),
+                                None,
+                            )?;
+                            let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
+                            (
+                                layer_sizes_in_bytes,
+                                non_mapped_size_in_bytes,
+                                layer_sizes_sum + non_mapped_size_in_bytes,
+                            )
+                        }
                     }
                     super::isq_flow::AutoDeviceMapSizing::Isq(isq) => {
                         let moqe =

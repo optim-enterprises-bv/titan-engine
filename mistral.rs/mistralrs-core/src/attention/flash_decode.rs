@@ -52,17 +52,17 @@ struct Cfg {
 }
 
 fn cfg() -> &'static Cfg {
-    static C: OnceLock<Cfg> = OnceLock::new();
+    static C: mistralrs_quant::titan_cfg::GenCell<Cfg> = mistralrs_quant::titan_cfg::GenCell::new();
     C.get_or_init(|| {
-        let on = std::env::var("TITAN_ATTN_FLASH")
+        let on = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH")
             .map(|v| v != "0")
             .unwrap_or(true);
-        let min_kv = std::env::var("TITAN_ATTN_FLASH_MIN")
+        let min_kv = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_KV)
             .max(1);
-        let chunk = std::env::var("TITAN_ATTN_FLASH_CHUNK")
+        let chunk = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_CHUNK)

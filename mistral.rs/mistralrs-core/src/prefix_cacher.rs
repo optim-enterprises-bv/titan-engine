@@ -29,19 +29,19 @@ const CAPACITY_EVICTION_REASON: &str = "capacity";
 const BLOCK_PRESSURE_EVICTION_REASON: &str = "block_pressure";
 /// `TITAN_PREFIX_CACHE=0`: no prefix reuse for hybrid (recurrent) models.
 pub(crate) fn hybrid_prefix_cache_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("TITAN_PREFIX_CACHE").is_ok_and(|v| v == "0"))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| !mistralrs_quant::titan_cfg::var("TITAN_PREFIX_CACHE").is_ok_and(|v| v == "0"))
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    mistralrs_quant::titan_cfg::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// Bounds of the hybrid prefix cache (host memory): `TITAN_PREFIX_CACHE_ENTRIES` sequences (2),
 /// `TITAN_PREFIX_CACHE_MIB` bytes in all (1280), `TITAN_PREFIX_CACHE_POINTS` recurrent-state resume
 /// points per sequence (4: the two longest, then the longest chunk-boundary points).
 pub(crate) fn hybrid_prefix_limits() -> (usize, usize, usize) {
-    static L: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    static L: mistralrs_quant::titan_cfg::GenCell<(usize, usize, usize)> = mistralrs_quant::titan_cfg::GenCell::new();
     *L.get_or_init(|| {
         (
             env_usize("TITAN_PREFIX_CACHE_ENTRIES", 2).max(1),
@@ -54,7 +54,7 @@ pub(crate) fn hybrid_prefix_limits() -> (usize, usize, usize) {
 /// `TITAN_PREFIX_CACHE_EXACT=<chunk>`: only resume at multiples of `chunk` tokens (the chunked
 /// prefill grid), where a resumed prompt pass runs exactly the chunks a cold one would.
 fn hybrid_exact_grid() -> usize {
-    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static G: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *G.get_or_init(|| env_usize("TITAN_PREFIX_CACHE_EXACT", 0))
 }
 
@@ -215,6 +215,8 @@ pub struct PrefixCacheManagerV2 {
     paged_recurrent_reported: bool,
     paged_block_retention: Option<PrefixBlockRetention>,
     n_on_device: usize,
+    /// `TITAN_PREFIX_CACHE_DEVICE_MIB` / `[models.titan] prefix_cache_max_mib`: KV bytes kept on the device.
+    max_device_bytes: Option<usize>,
     no_prefix_cache: bool,
     has_paged_attention: bool,
 }
@@ -264,6 +266,7 @@ impl PrefixCacheManagerV2 {
             paged_recurrent_reported: false,
             paged_block_retention: None,
             n_on_device,
+            max_device_bytes: None,
             no_prefix_cache,
             has_paged_attention,
         };
@@ -434,62 +437,32 @@ impl PrefixCacheManagerV2 {
     }
 
     /// Evict the caches. This will evict the first k seqs such that the number of sequences on device after the copy is
-    /// the maximum allowed. Returns the number of evicted sequences.
+    /// the maximum allowed and, with a device byte limit set, their KV buffers fit in it. Returns the number of evicted
+    /// sequences.
     pub fn evict_caches(&mut self) -> Result<usize> {
         if self.no_prefix_cache {
             return Ok(0);
         }
         let mut n_on_device = 0;
+        let mut bytes_on_device = 0;
         for cache in self.caches.values() {
-            let first_non_none = cache
-                .cache
-                .iter()
-                .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
-            let Some(Some(first_non_none)) = first_non_none else {
-                continue;
-            };
-
-            let cache_device = match first_non_none {
-                KvCache::Normal { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-                KvCache::Rotating { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-                KvCache::Shared { .. } => continue,
-            };
-
-            if !matches!(cache_device, Device::Cpu) {
+            if let Some(bytes) = Self::device_bytes(cache) {
                 n_on_device += 1;
+                bytes_on_device += bytes;
             }
         }
+        let limit = self.max_device_bytes.unwrap_or(usize::MAX);
         let mut n_evicted = 0;
+        let mut bytes_evicted = 0;
         // Intentionally evict the first ones first, as they are the oldest
         for cache in self.caches.values_mut() {
-            if n_on_device - n_evicted <= self.n_on_device {
+            if n_on_device - n_evicted <= self.n_on_device && bytes_on_device - bytes_evicted <= limit {
                 break;
             }
-            let first_non_none = cache
-                .cache
-                .iter()
-                .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
-            let Some(Some(first_non_none)) = first_non_none else {
-                continue;
-            };
-
-            let cache_device = match first_non_none {
-                KvCache::Normal { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-                KvCache::Rotating { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-                KvCache::Shared { .. } => continue,
-            };
-
-            if !matches!(cache_device, Device::Cpu) {
+            if let Some(bytes) = Self::device_bytes(cache) {
                 cache.cache.clear();
                 n_evicted += 1;
+                bytes_evicted += bytes;
             }
         }
 
@@ -498,7 +471,55 @@ impl PrefixCacheManagerV2 {
         if n_evicted > 0 {
             metrics::counter!("mistralrs_prefix_cache_evictions_total").increment(n_evicted as u64);
         }
+        if let Some(limit) = self.max_device_bytes {
+            info!(
+                "Prefix cache: {} sequences, {} MiB of KV on the device (limit {} MiB); evicted {n_evicted} ({} MiB)",
+                n_on_device - n_evicted,
+                (bytes_on_device - bytes_evicted) >> 20,
+                limit >> 20,
+                bytes_evicted >> 20
+            );
+        }
         Ok(n_evicted)
+    }
+
+    /// Bytes of the KV buffers an entry holds (allocated capacity, not just the cached length), if they are on a
+    /// device; `None` for an entry on the CPU or without data. Buffers shared between entries count for each.
+    fn device_bytes(cache: &CacheElement) -> Option<usize> {
+        let first_non_none = cache
+            .cache
+            .iter()
+            .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
+        let Some(Some(first_non_none)) = first_non_none else {
+            return None;
+        };
+
+        let cache_device = match first_non_none {
+            KvCache::Normal { k, .. } => k.all_data().as_ref().expect("No KV cache data").device(),
+            KvCache::Rotating { k, .. } => k.all_data().as_ref().expect("No KV cache data").device(),
+            KvCache::Shared { .. } => return None,
+        };
+        if matches!(cache_device, Device::Cpu) {
+            return None;
+        }
+        let size = |t: Option<&candle_core::Tensor>| t.map_or(0, |t| t.elem_count() * t.dtype().size_in_bytes());
+        Some(
+            cache
+                .cache
+                .iter()
+                .flatten()
+                .map(|kv| match kv {
+                    KvCache::Normal { k, v } => size(k.all_data()) + size(v.all_data()),
+                    KvCache::Rotating { k, v } => size(k.all_data()) + size(v.all_data()),
+                    KvCache::Shared { .. } => 0,
+                })
+                .sum(),
+        )
+    }
+
+    /// Cap the KV bytes the sequence-level prefix cache keeps on the device (on top of the entry count); `None`: no cap.
+    pub fn set_max_device_bytes(&mut self, max_device_bytes: Option<usize>) {
+        self.max_device_bytes = max_device_bytes;
     }
 
     /// Evict all the caches.
@@ -1551,6 +1572,57 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         drop(checkpoint);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    /// Needs a GPU: only entries on a device count against the bounds.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_byte_limit_evicts_oldest_until_it_fits() -> candle_core::Result<()> {
+        let dev = Device::new_cuda(0)?;
+        // one layer, k and v of 1024 f32 each: 8 KiB per entry
+        let entry = || -> candle_core::Result<CacheElement> {
+            let src = Tensor::zeros((1, 1, 1024, 1), DType::F32, &dev)?;
+            let mut k = SingleCache::new(2, 1024, 1024);
+            let mut v = SingleCache::new(2, 1024, 1024);
+            k.append(&src)?;
+            v.append(&src)?;
+            Ok(CacheElement {
+                cache: vec![Some(KvCache::Normal { k, v })],
+                recurrent_snapshots: None,
+                audio_hashes: None,
+                image_hashes: None,
+                video_hashes: None,
+            })
+        };
+        assert_eq!(PrefixCacheManagerV2::device_bytes(&entry()?), Some(8192));
+        let fill = |pc: &mut PrefixCacheManagerV2| -> candle_core::Result<()> {
+            for i in 0..4u32 {
+                pc.caches.insert(CacheKey::new(vec![i], None), entry()?);
+            }
+            Ok(())
+        };
+        // no byte limit: the count bound alone, as before
+        let mut pc = PrefixCacheManagerV2::new(16, false, false);
+        fill(&mut pc)?;
+        assert_eq!(pc.evict_caches()?, 0);
+        assert_eq!(pc.caches.len(), 4);
+        // 20 KiB holds two 8 KiB entries: the two oldest go
+        pc.set_max_device_bytes(Some(20 << 10));
+        assert_eq!(pc.evict_caches()?, 2);
+        let left: Vec<_> = pc.caches.keys().map(|k| k.tokens.0.clone()).collect();
+        assert_eq!(left, vec![vec![2], vec![3]]);
+        // the count bound still applies under a large byte limit
+        let mut pc = PrefixCacheManagerV2::new(1, false, false);
+        pc.set_max_device_bytes(Some(1 << 30));
+        fill(&mut pc)?;
+        assert_eq!(pc.evict_caches()?, 3);
+        // an entry larger than the limit is not kept
+        let mut pc = PrefixCacheManagerV2::new(16, false, false);
+        pc.set_max_device_bytes(Some(4096));
+        fill(&mut pc)?;
+        assert_eq!(pc.evict_caches()?, 4);
+        assert!(pc.caches.is_empty());
         Ok(())
     }
 

@@ -16,8 +16,8 @@ use crate::utils::slice_ptr;
 
 /// `TITAN_CPU_ONEPASS`: 0 off, 1 row-split passes, 2 one core per missed expert.
 pub(crate) fn mode() -> u32 {
-    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("TITAN_CPU_ONEPASS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    static M: crate::titan_cfg::GenCell<u32> = crate::titan_cfg::GenCell::new();
+    *M.get_or_init(|| crate::titan_cfg::var("TITAN_CPU_ONEPASS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 fn par_for(n: usize, f: &(dyn Fn(usize) + Sync)) {

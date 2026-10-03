@@ -1,0 +1,6 @@
+.mut/
+target/
+ref/*.ptx
+ref/cpu_ref
+ref/nvcc.log
+ref/*.bin

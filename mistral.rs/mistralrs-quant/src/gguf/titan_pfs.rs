@@ -51,36 +51,36 @@ const ENTRY_PAD: usize = 64 << 10;
 const PROJS: [&str; 3] = ["gate", "up", "down"];
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    crate::titan_cfg::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_PFS").is_ok_and(|v| v == "1"))
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_PFS").is_ok_and(|v| v == "1"))
 }
 
 pub(crate) fn min_rows() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
+    static N: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
     *N.get_or_init(|| env_usize("TITAN_PFS_MIN_ROWS", DEFAULT_MIN_ROWS).max(1))
 }
 
 /// `TITAN_PFS_SHARE`: share of each tensor's non-resident experts that streams (default 1).
 pub(crate) fn share() -> f64 {
-    static S: OnceLock<f64> = OnceLock::new();
-    *S.get_or_init(|| std::env::var("TITAN_PFS_SHARE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0))
+    static S: crate::titan_cfg::GenCell<f64> = crate::titan_cfg::GenCell::new();
+    *S.get_or_init(|| crate::titan_cfg::var("TITAN_PFS_SHARE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0))
 }
 
 /// Streamed layers run llama.cpp's grouped MMQ (Q4_K/Q5_K/Q6_K; tensors of other dtypes take the GEMV).
 /// `TITAN_PFS_KERNEL=gemv`: the slot-map GEMV instead, bit-identical to the CPU twin but ~3x slower; MMQ's
 /// int8 tiles round differently from both.
 pub(crate) fn mmq() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_PFS_KERNEL").map_or(true, |v| v != "gemv"))
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_PFS_KERNEL").map_or(true, |v| v != "gemv"))
 }
 
 fn timing_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_PFS_TIMING").is_ok_and(|v| v == "1"))
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_PFS_TIMING").is_ok_and(|v| v == "1"))
 }
 
 /// One tensor's streamed experts: their host bytes in staging order and the device map to their
@@ -93,8 +93,9 @@ pub struct Source {
     bytes: usize,
     /// The ranges lie in page-locked memory (registered in place): DMA straight from them.
     pinned: bool,
-    /// Registered host range to unregister on drop.
+    /// Registered host range to unregister on drop, and the context it was registered in.
     registered: Option<usize>,
+    ctx: Arc<CudaContext>,
     /// expert -> staging index, NOT_RESIDENT for residents and for experts left to the CPU twin.
     pub(crate) stage_map: CudaSlice<u32>,
     /// Host mirror of `stage_map`.
@@ -110,7 +111,12 @@ unsafe impl Sync for Source {}
 impl Drop for Source {
     fn drop(&mut self) {
         if let Some(addr) = self.registered {
-            unsafe { sys::cuMemHostUnregister(addr as *mut std::ffi::c_void) };
+            // the dropping thread (a model unload) may have no current context
+            let _ = self.ctx.bind_to_thread();
+            let r = unsafe { sys::cuMemHostUnregister(addr as *mut std::ffi::c_void) };
+            if r != sys::CUresult::CUDA_SUCCESS {
+                tracing::warn!("titan pfs: cuMemHostUnregister failed ({r:?})");
+            }
         }
     }
 }
@@ -151,7 +157,7 @@ pub(crate) fn register<'a>(
     let bytes = ranges.iter().map(|r| r.1).sum();
     let mut registered = None;
     // `TITAN_PFS_PIN=0`: leave the owned host store pageable (bounce copies).
-    let pin = std::env::var("TITAN_PFS_PIN").map_or(true, |v| v != "0");
+    let pin = crate::titan_cfg::var("TITAN_PFS_PIN").map_or(true, |v| v != "0");
     if let Some(buf) = owned.filter(|_| pin && !staged.is_empty()) {
         // The enclosing pages: a large Vec is its own mapping, so they belong to it.
         let a0 = buf.as_ptr() as usize & !(PAGE - 1);
@@ -173,6 +179,7 @@ pub(crate) fn register<'a>(
         bytes,
         pinned: registered.is_some(),
         registered,
+        ctx: dev.cuda_stream().context().clone(),
         stage_map,
         stage_index,
         staged: order.len(),
@@ -208,26 +215,60 @@ struct Job {
 
 struct Worker {
     tx: mpsc::Sender<Job>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     copy: Arc<CudaStream>,
     /// TITAN_PFS_TIMING=1: (start, end) timing events of each job's copies.
     timed: Arc<Mutex<Vec<(CudaEvent, CudaEvent)>>>,
 }
 
-fn worker(ctx: &Arc<CudaContext>) -> Result<&'static Worker> {
-    static W: OnceLock<Worker> = OnceLock::new();
-    if let Some(w) = W.get() {
-        return Ok(w);
+/// The copy worker; dropped (thread joined, bounce buffers freed) by `release`.
+static WORKER: Mutex<Option<Arc<Worker>>> = Mutex::new(None);
+
+fn worker(ctx: &Arc<CudaContext>) -> Result<Arc<Worker>> {
+    let mut g = WORKER.lock().unwrap();
+    if let Some(w) = g.as_ref() {
+        return Ok(w.clone());
     }
     ctx.bind_to_thread().w()?;
     let copy = ctx.new_stream().w()?;
     let (tx, rx) = mpsc::channel::<Job>();
     let timed = Arc::new(Mutex::new(Vec::new()));
     let (c, s, t) = (ctx.clone(), copy.clone(), timed.clone());
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("titan-pfs".into())
         .spawn(move || run_worker(c, s, rx, t))
         .map_err(candle_core::Error::wrap)?;
-    Ok(W.get_or_init(|| Worker { tx, copy, timed }))
+    let w = Arc::new(Worker { tx, thread: Mutex::new(Some(thread)), copy, timed });
+    *g = Some(w.clone());
+    Ok(w)
+}
+
+/// Model unload: drop the staging ring (its buffers and its references to the host stores) once its copies
+/// are done, and stop the copy worker, which frees its pinned bounce buffers.
+pub(crate) fn release_all() {
+    let ring = RING.lock().unwrap().take();
+    STATE.store(NONE, std::sync::atomic::Ordering::Release);
+    if let Some(ring) = ring {
+        for e in &ring.entries {
+            if let Some(d) = &e.done {
+                let _ = d.wait();
+            }
+        }
+        if let Some(w) = WORKER.lock().unwrap().as_ref() {
+            let _ = w.copy.synchronize();
+        }
+        drop(ring);
+    }
+    let w = WORKER.lock().unwrap().take();
+    if let Some(w) = w {
+        let _ = w.copy.synchronize();
+        let thread = w.thread.lock().unwrap().take();
+        drop(w);
+        if let Some(t) = thread {
+            let _ = t.join();
+        }
+    }
+    CONTEXT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 struct Bounce {
@@ -255,6 +296,14 @@ fn run_worker(ctx: Arc<CudaContext>, copy: Arc<CudaStream>, rx: mpsc::Receiver<J
         };
         *job.done.ev.lock().unwrap() = Some(ev);
         job.done.cv.notify_all();
+    }
+    for b in bounce {
+        if let Some(ev) = b.copied {
+            let _ = ev.synchronize();
+        }
+        unsafe {
+            let _ = result::free_host(b.ptr as _);
+        }
     }
 }
 
@@ -438,7 +487,7 @@ fn allocate(dev: &CudaDevice, tasks: usize) -> Result<Option<Ring>> {
     if bufs.is_empty() {
         return Ok(None);
     }
-    let _ = worker(&ctx)?;
+    worker(&ctx)?;
     // The copy stream may write a buffer only after its stream-ordered allocation.
     let alloc = Arc::new(stream.record_event(None).w()?);
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -530,7 +579,7 @@ pub(crate) fn acquire(dev: &CudaDevice, src: &Arc<Source>, tasks: usize) -> Resu
         ring.cursor = base;
         ring.issued = base;
     }
-    ring.issue_until(ring.cursor + r, w)?;
+    ring.issue_until(ring.cursor + r, &w)?;
     let e = ring.cursor % r;
     let entry = &ring.entries[e];
     debug_assert_eq!(entry.seq, ring.cursor);
@@ -557,7 +606,7 @@ pub(crate) fn release(dev: &CudaDevice, st: Staged, routed: Option<(usize, usize
     }
     let w = worker(stream.context())?;
     let end = ring.cursor + ring.entries.len();
-    ring.issue_until(end, w)
+    ring.issue_until(end, &w)
 }
 
 /// A tiered forward of `rows` tokens that does not stream: free the ring (once its copies are done) so

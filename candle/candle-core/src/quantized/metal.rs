@@ -127,6 +127,10 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockMXFP4> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockMXFP4::to_float(&vec, &mut out);
             }
+            GgmlDType::PTQ1_0 => {
+                let vec: Vec<crate::quantized::BlockPTQ1_0> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockPTQ1_0::to_float(&vec, &mut out);
+            }
             GgmlDType::NVFP4 => {
                 let vec: Vec<crate::quantized::BlockNVFP4> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockNVFP4::to_float(&vec, &mut out);
@@ -458,6 +462,7 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::Q1_0 => panic!("Q1_0 has no metal kernels"),
             GgmlDType::IQ4NL => panic!("IQ4_NL has no metal kernels"),
             GgmlDType::MXFP4 => panic!("MXFP4 has no metal kernels"),
+            GgmlDType::PTQ1_0 => panic!("PTQ1_0 has no metal kernels"),
             GgmlDType::NVFP4 => panic!("NVFP4 has no metal kernels"),
         }
     }

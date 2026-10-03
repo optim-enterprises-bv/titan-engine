@@ -6,6 +6,7 @@
 //! (2) splits: nsplit 1 vs 2 / 3 / 8 on the same data stay within the same bound of each other.
 //! (3) poison: cache rows at and past kv_len are NaN, and query rows past s never read; a read shows as NaN.
 //! (4) mutation: shifting `past` by one (a wrong causal limit) must break the accuracy check.
+//! (7) head dim 512 and the 256 kernels against the base PTX: gate512.rs.
 //! (5) FP_TIME=1: time at the 35B chunk shapes (512 rows, 16 heads, 2 KV heads, 256).
 use kdiff::cuda_core::{CudaFunction, CudaStream, DeviceBuffer};
 use kdiff::Rng;
@@ -69,7 +70,7 @@ struct Fns {
 /// One flash-prefill call; returns bf16 out [head][s][D] and the time per call (us) over `reps`.
 #[allow(clippy::too_many_arguments)]
 fn call(st: &CudaStream, f: &Fns, c: &Case, dq: &DeviceBuffer<u8>, dk: &DeviceBuffer<u8>, dv: &DeviceBuffer<u8>,
-        past: usize, nsplit: usize, reps: usize) -> (Vec<u16>, f64) {
+        past: usize, nsplit: usize, reps: usize, win: usize) -> (Vec<u16>, f64) {
     let s = c.s;
     let kv_len = past + s;
     let out = DeviceBuffer::from_host(st, &vec![0xffu8; H * s * D * 2]).unwrap();
@@ -81,7 +82,7 @@ fn call(st: &CudaStream, f: &Fns, c: &Case, dq: &DeviceBuffer<u8>, dk: &DeviceBu
             b8(dq.cu_deviceptr()), b8(dk.cu_deviceptr()), b8(dv.cu_deviceptr()), b8(out.cu_deviceptr()),
             b8(part.cu_deviceptr()), b8(ml.cu_deviceptr()), b8(scale.to_bits() as u64), b8(s as u64), b8(past as u64),
             b8(kv_len as u64), b8(H as u64), b8(nsplit as u64), b8((s * D) as u64), b8((s * D) as u64),
-            b8((c.cap * D) as u64), b8((c.cap * D) as u64),
+            b8((c.cap * D) as u64), b8((c.cap * D) as u64), b8(win as u64),
         ];
         let mut p: Vec<*mut std::ffi::c_void> = a.iter_mut().map(|v| v.as_mut_ptr() as *mut std::ffi::c_void).collect();
         unsafe {
@@ -119,9 +120,10 @@ fn call(st: &CudaStream, f: &Fns, c: &Case, dq: &DeviceBuffer<u8>, dk: &DeviceBu
 }
 
 /// f64 reference for query position i, all heads: [H][D].
-fn reference(c: &Case, dt: &Data, past: usize, i: usize) -> Vec<f64> {
+fn reference(c: &Case, dt: &Data, past: usize, i: usize, win: usize) -> Vec<f64> {
     let n_rep = H / KVH;
     let len = past + i + 1;
+    let lo = if win > 0 { len.saturating_sub(win) } else { 0 };
     let mut out = vec![0f64; H * D];
     for h in 0..H {
         let kvh = h / n_rep;
@@ -129,6 +131,10 @@ fn reference(c: &Case, dt: &Data, past: usize, i: usize) -> Vec<f64> {
         let mut sc = vec![0f64; len];
         let mut mx = f64::NEG_INFINITY;
         for (t, x) in sc.iter_mut().enumerate() {
+            if t < lo {
+                *x = f64::NEG_INFINITY;
+                continue;
+            }
             let kr = &dt.k[(kvh * c.cap + t) * D..(kvh * c.cap + t + 1) * D];
             *x = (0..D).map(|d| qv[d] * bf(kr[d])).sum();
             mx = mx.max(*x);
@@ -138,7 +144,7 @@ fn reference(c: &Case, dt: &Data, past: usize, i: usize) -> Vec<f64> {
             *x = (*x - mx).exp();
             den += *x;
         }
-        for (t, p) in sc.iter().enumerate() {
+        for (t, p) in sc.iter().enumerate().skip(lo) {
             let vr = &dt.v[(kvh * c.cap + t) * D..(kvh * c.cap + t + 1) * D];
             for d in 0..D {
                 out[h * D + d] += p * bf(vr[d]);
@@ -156,7 +162,7 @@ fn tol(r: f64) -> f64 {
 }
 
 pub fn run() -> bool {
-    let root = format!("{}/titan-engine/oxide-kernels/flash-prefill", std::env::var("HOME").unwrap());
+    let root = env!("CARGO_MANIFEST_DIR");
     let ctx = kdiff::cuda_core::CudaContext::new(0).expect("cuda context");
     let st = ctx.default_stream();
     let m = ctx.load_module_from_file(&format!("{root}/flash_prefill.ptx")).expect("load flash_prefill.ptx");
@@ -203,13 +209,13 @@ pub fn run() -> bool {
             r.dedup();
             r
         };
-        let refs: Vec<Vec<f64>> = rows.iter().map(|&i| reference(&c, &dt, past, i)).collect();
+        let refs: Vec<Vec<f64>> = rows.iter().map(|&i| reference(&c, &dt, past, i, 0)).collect();
         let mut outs = Vec::new();
-        let (o_v1, _) = call(&st, &fns[v1], &c, &dq, &dk, &dv, past, 1, 0);
+        let (o_v1, _) = call(&st, &fns[v1], &c, &dq, &dk, &dv, past, 1, 0, 0);
         for (vi, f) in fns.iter().enumerate() {
         let mut vouts = Vec::new();
         for &ns in &[1usize, 2, 3, 8] {
-            let (o, _) = call(&st, f, &c, &dq, &dk, &dv, past, ns, 0);
+            let (o, _) = call(&st, f, &c, &dq, &dk, &dv, past, ns, 0, 0);
             if ns == 1 && vi != v1 {
                 // (6) against the previous kernel: bit-identical with one split, else within the tolerance
                 for (a, b) in o.iter().zip(o_v1.iter()) {
@@ -267,7 +273,7 @@ pub fn run() -> bool {
         }
         // (4) mutation: the kernel run with past - 1 (keys one short) against the true reference
         if past > 0 {
-            let (o, _) = call(&st, &fns[0], &c, &dq, &dk, &dv, past - 1, 1, 0);
+            let (o, _) = call(&st, &fns[0], &c, &dq, &dk, &dv, past - 1, 1, 0, 0);
             n_mut += 1;
             let mut caught = false;
             for (ri, &i) in rows.iter().enumerate() {
@@ -282,6 +288,63 @@ pub fn run() -> bool {
             }
             n_mut_caught += caught as usize;
         }
+    }
+    // (7) sliding window: row i sees keys in [past + i + 1 - win, past + i]; all non-v1 variants, splits 1/2/3/8,
+    // plus a mutation (win + 1 must break it)
+    let (mut n_win, mut worst_win, mut n_wmut, mut n_wmut_caught) = (0usize, 0f64, 0usize, 0usize);
+    for &(s, past, win) in &[(512usize, 0usize, 512usize), (700, 0, 512), (512, 4608, 512), (64, 1000, 512), (300, 50, 100), (33, 0, 16), (1000, 0, 40)] {
+        let c = Case { s, past, cap: past + s + 40, qmul: 2.0 };
+        let dt = make(&mut rng, &c);
+        let dq = DeviceBuffer::from_host(&st, &kdiff::as_bytes(&dt.q)).unwrap();
+        let dk = DeviceBuffer::from_host(&st, &kdiff::as_bytes(&dt.k)).unwrap();
+        let dv = DeviceBuffer::from_host(&st, &kdiff::as_bytes(&dt.v)).unwrap();
+        let rows: Vec<usize> = if s <= 64 {
+            (0..s).collect()
+        } else {
+            let mut r: Vec<usize> = (0..9).chain(s - 9..s).chain((1..13).map(|j| j * s / 13)).collect();
+            r.sort_unstable();
+            r.dedup();
+            r
+        };
+        let refs: Vec<Vec<f64>> = rows.iter().map(|&i| reference(&c, &dt, past, i, win)).collect();
+        for (vi, f) in fns.iter().enumerate().filter(|(vi, _)| *vi != v1) {
+            for &ns in &[1usize, 2, 3, 8] {
+                let (o, _) = call(&st, f, &c, &dq, &dk, &dv, past, ns, 0, win);
+                let mut case_worst = 0f64;
+                for (ri, &i) in rows.iter().enumerate() {
+                    for j in 0..H * D {
+                        let (h, d) = (j / D, j % D);
+                        let got = bf(o[(h * s + i) * D + d]);
+                        let want = refs[ri][j];
+                        let e = (got - want).abs() / tol(want);
+                        if !(e <= 1.0) {
+                            if ok {
+                                println!("WINDOW FAIL s {s} past {past} win {win} nsplit {ns} row {i} head {h} dim {d}: got {got} ref {want}");
+                            }
+                            ok = false;
+                        }
+                        case_worst = case_worst.max(if e.is_nan() { f64::INFINITY } else { e });
+                        n_win += 1;
+                    }
+                }
+                worst_win = worst_win.max(case_worst);
+                println!("  {} s {s:4} past {past:5} win {win:3} nsplit {ns}: worst err/tol {case_worst:.3}", variants[vi].0);
+            }
+        }
+        if past + s <= win {
+            continue;
+        }
+        let (o, _) = call(&st, &fns[1], &c, &dq, &dk, &dv, past, 1, 0, win + 1);
+        n_wmut += 1;
+        let caught = rows.iter().enumerate().any(|(ri, &i)| {
+            (0..H * D).any(|j| !((bf(o[((j / D) * s + i) * D + j % D]) - refs[ri][j]).abs() <= tol(refs[ri][j]) / 8.0))
+        });
+        n_wmut_caught += caught as usize;
+    }
+    println!("window: {n_win} outputs, worst err/tol {worst_win:.3}; mutation (win + 1): {n_wmut_caught} of {n_wmut} caught");
+    if n_wmut_caught < n_wmut {
+        println!("WINDOW MUTATION CHECK WEAK");
+        ok = false;
     }
     println!("accuracy: {n_acc} outputs, worst err/tol {worst:.3}, mean |err| {:.2e}", sum_err / n_acc.max(1) as f64);
     println!("splits: {n_split} outputs vs nsplit 1, worst {worst_split:.3} of tol");
@@ -300,13 +363,16 @@ pub fn run() -> bool {
             let dv = DeviceBuffer::from_host(&st, &kdiff::as_bytes(&dt.v)).unwrap();
             for (vi, f) in fns.iter().enumerate() {
                 for &ns in &[1usize, 2, 4, 8] {
-                    let (_, us) = call(&st, f, &c, &dq, &dk, &dv, past, ns, 20);
+                    let (_, us) = call(&st, f, &c, &dq, &dk, &dv, past, ns, 20, 0);
                     let flop = 4.0 * (H * s * D) as f64 * (past as f64 + s as f64 / 2.0);
                     println!("  time {:20} s {s} past {past:5} nsplit {ns}: {us:8.1} us ({:.1} TFLOP/s)", variants[vi].0, flop / (us * 1e6));
                 }
             }
         }
     }
+    println!("flash-prefill gate (head dim 256): {}", if ok { "PASS" } else { "FAIL" });
+    let ok512 = crate::gate512::run(&ctx, &m);
+    let ok = ok && ok512;
     println!("flash-prefill gate: {}", if ok { "PASS" } else { "FAIL" });
     ok
 }

@@ -9,3 +9,10 @@ reference/*/lib*.a
 .mut/
 refptx/
 mistralrs-paged-attn-b/ref/
+build*.log
+run.log
+*.out
+b.sh
+*.log
+*.bak
+*.bak-*

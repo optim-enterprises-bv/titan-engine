@@ -1,0 +1,29 @@
+//! PrismML PTQ1_0 (GGML type 143) CUDA kernels in cuda-oxide for titan-mistral, ported from
+//! sudoingX/llama.cpp `bonsai2` v1.1 (ff41412: the PTQ1_0 mat-vec of PrismML-Eng/llama.cpp#218, PrismML's
+//! PTQ1_0 MMQ tile loader, the prism Hadamard FWHT) under the reference's own parameter ABI, bit-identical to
+//! its nvcc build (nvcc 13.3, g++-15, -O3 -use_fast_math, sm_120a; `ref/nvcc_ref.py` rebuilds the reference TUs
+//! from the reference build's compile_commands.json):
+//!
+//! - `ptq1_0_quantize_pt_{f32,bf16}` = `quantize_q8_1<pt = true>` (quantize.cu; bf16 input widened exactly);
+//! - `ptq1_0_fwht_{f32,bf16}_m{0,1,2}` = `fwht_cuda_block<1024, 256, float, has_signs>` (fwht.cu): m0 no signs,
+//!   m1 signs before the transform (the fused MUL + FWHT of a folded weight's activation), m2 signs after it
+//!   (the inverse on a latent embedding row, `ggml_mul(fwht(z), signs)`);
+//! - `ptq1_0_fwht_q8pt_{f32,bf16}_m{0,1}`: fwht_cuda_block + quantize_q8_1<pt> in one launch (same values);
+//! - `ptq1_0_mmvq_pt_c<n>[_bf16]` = `mul_mat_vec_ptq1_0_pt<n, 4, false, false>` (n = 1..4; `_bf16` rounds the
+//!   f32 result once), `ptq1_0_mmvq_pt_glu_c<n>` = `mul_mat_vec_ptq1_0_pt<n, 4, true, true>` (gate + up + GLU);
+//! - `ptq1_0_quantize_mmq_d4_{f32,bf16}` = `quantize_mmq_q8_1<D4, false, false, false>`;
+//! - `ptq1_0_mmq_j<J>_f<fb>` / `ptq1_0_mmq_fixup_j<J>_f<fb>` = `mul_mat_q<PTQ1_0, J, fb>` (mmq-config-ampere.cuh,
+//!   which sm_120 falls back to: 256 threads, I = 128, SRAM layout Q8_0, K_vram 256, stream-k) and
+//!   `mul_mat_q_stream_k_fixup`: the q1_0 crate's MMQ core (acecd56 = bonsai2 off GB10) with PTQ1_0's loader.
+//!
+//! `export_ptx.py` splits ptq1_0.ptx into the modules mistral.rs embeds.
+#![allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
+mod gate;
+
+use cuda_device::{DynamicSharedArray, SharedArray, convert, device, dotprod, kernel, launch_bounds, ptx_asm, thread, warp};
+use cuda_host::cuda_module;
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+

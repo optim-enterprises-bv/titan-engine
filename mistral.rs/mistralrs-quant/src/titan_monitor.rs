@@ -247,6 +247,28 @@ pub fn tiered_placement(
     TIERED_HOST_BYTES.fetch_add(host_bytes as u64, Relaxed);
 }
 
+/// Model unload: the next model's placement, prefix-cache and MTP counters start from zero.
+pub fn reset_model_stats() {
+    for a in [
+        &TIERED_EXPERTS_TOTAL,
+        &TIERED_EXPERTS_GPU,
+        &TIERED_GPU_BYTES,
+        &TIERED_HOST_BYTES,
+        &PC_ENTRIES,
+        &PC_BYTES,
+        &PC_LAST_REUSED,
+        &MISS_NS_PREFILL,
+        &MISS_NS_DECODE,
+        &UPLOAD_BYTES,
+        &MTP_STEPS,
+        &MTP_DRAFTED,
+        &MTP_ACCEPTED,
+        &MAX_SEQ_LEN,
+    ] {
+        a.store(0, Relaxed);
+    }
+}
+
 pub fn tiered_miss_ns(ns: u64) {
     if PREFILL_ACTIVE.load(Relaxed) {
         MISS_NS_PREFILL.fetch_add(ns, Relaxed);

@@ -39,7 +39,8 @@ pub(crate) fn add_delta(
     input: &Tensor,
     base_output: Tensor,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    // titan oxide build: launch_dynamic_lora is nvcc-only, so the reference path runs on the GPU tensors
+    #[cfg(all(feature = "cuda", not(feature = "oxide")))]
     if let Some(output) = super::cuda::try_add_delta_cuda(execution, site, input, &base_output)? {
         return Ok(output);
     }

@@ -760,8 +760,15 @@ impl GgmlType for BlockQ8_1 {
         }
     }
 
-    fn to_float(_xs: &[Self], _ys: &mut [f32]) {
-        unimplemented!("no support for vec-dot on Q8_1")
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        // x = d * q, as dequantize_row_q8_0 (llama.cpp has no Q8_1 to_float; `s` is the
+        // precomputed d * sum(q) used by the dot products only)
+        for (i, x) in xs.iter().enumerate() {
+            let d = x.d.to_f32();
+            for (j, &q) in x.qs.iter().enumerate() {
+                ys[i * QK8_1 + j] = q as f32 * d;
+            }
+        }
     }
 }
 
@@ -2296,17 +2303,15 @@ pub fn matmul<T: GgmlType>(
     dst: &mut [f32],
 ) -> Result<()> {
     debug_assert_eq!(
-        T::BLCK_SIZE,
-        T::VecDotType::BLCK_SIZE,
-        "Mismatched block sizes"
-    );
-    debug_assert_eq!(
         m * k,
         lhs.len(),
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    // rhs (weight) rows are in T blocks, the quantized lhs in T::VecDotType blocks: the i-quants
+    // (256-value blocks) dot against 32-value Q8_1 blocks, so the two counts differ there.
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
+    let k_in_lhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
 
     // Thread-local scratch buffer reused across calls to avoid per-matmul
     // heap allocation of the quantized LHS.
@@ -2318,7 +2323,7 @@ pub fn matmul<T: GgmlType>(
 
     let elem_size = std::mem::size_of::<T::VecDotType>();
     // Required scratch buffer length in u64
-    let required_scratch_len = (m * k_in_blocks * elem_size).div_ceil(8);
+    let required_scratch_len = (m * k_in_lhs_blocks * elem_size).div_ceil(8);
 
     LHS_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
@@ -2330,7 +2335,7 @@ pub fn matmul<T: GgmlType>(
         let lhs_b: &mut [T::VecDotType] = unsafe {
             std::slice::from_raw_parts_mut(
                 scratch.as_mut_ptr() as *mut T::VecDotType,
-                m * k_in_blocks,
+                m * k_in_lhs_blocks,
             )
         };
         // f32, f16, and bf16 support direct copy
@@ -2338,7 +2343,7 @@ pub fn matmul<T: GgmlType>(
             T::VecDotType::direct_copy(lhs, lhs_b);
         } else {
             for row_idx in 0..m {
-                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                let lhs_b_mut = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
                 let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
                 T::VecDotType::from_float(lhs, lhs_b_mut)
             }
@@ -2353,7 +2358,7 @@ pub fn matmul<T: GgmlType>(
         let lhs_b: &[T::VecDotType] = lhs_b;
 
         for row_idx in 0..m {
-            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
             let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
             let (main, tail) = dst_row.split_at_mut(n_quad);
             let main_ptr = main.as_mut_ptr() as usize;
@@ -2419,8 +2424,8 @@ pub fn matmul_f16<T: GgmlType>(
         crate::bail!("unexpected lhs length {} {mkn:?}", lhs.len());
     }
 
-    let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
-    let k_in_rhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
+    let k_in_lhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
+    let k_in_rhs_blocks = k.div_ceil(T::BLCK_SIZE);
     let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_lhs_blocks];
     for row_idx in 0..m {
         let lhs_b = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];

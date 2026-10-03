@@ -43,9 +43,11 @@ for li, lay in enumerate(LAYOUTS):
         out.append(
             f"    #[kernel] pub unsafe fn quantize_mmq_q8_1_{tn}_{lay}(x: *const u8, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, s02: i64, s03: i64, ne0: i64, ne1: i32, ne2: i32) "
             f"{{ quantize_mmq_q8_1::<{it}, {li}>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2) }}\n")
-    out.append(
-        f"    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_f32_{lay}(gate: *const f32, up: *const f32, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) "
-        f"{{ quantize_mmq_q8_1_glu::<{li}>(gate, up, ids, vy, ne00, s01, ne0, ne1, activation) }}\n")
+    for it, tn in enumerate(["f32", "f16", "bf16"]):
+        cty = ["f32", "u16", "u16"][it]
+        out.append(
+            f"    #[kernel] pub unsafe fn quantize_mmq_q8_1_glu_{tn}_{lay}(gate: *const {cty}, up: *const {cty}, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) "
+            f"{{ quantize_mmq_q8_1_glu::<{it}, {li}>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }}\n")
 FD = lambda n: f"{n}_mp: u32, {n}_l: u32, {n}_d: u32"
 FV = lambda n: f"Fd {{ mp: {n}_mp, l: {n}_l, d: {n}_d }}"
 for t in MMQ_TYPES:
