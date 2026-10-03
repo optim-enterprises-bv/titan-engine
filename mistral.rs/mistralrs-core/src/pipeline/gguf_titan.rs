@@ -207,6 +207,10 @@ pub(super) fn load(
                 * (cfg.k_head_dim() + cfg.v_head_dim())
                 * dtype.size_in_bytes();
             let kv = (per_layer as f64 * cfg.num_layers() as f64 * frac).ceil() as usize;
+            // TITAN_ADMIT sizes each request's KV from the same numbers
+            crate::titan_admit::set_kv_bytes_per_token(
+                kv.div_ceil((params.max_batch_size() * params.max_seq_len()).max(1)),
+            );
             // TITAN_CUDA_GRAPHS=1: graph memory (captured decode segments) comes from its own pool
             let graphs = if std::env::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1") {
                 std::env::var("TITAN_CUDA_GRAPHS_RESERVE_MIB")

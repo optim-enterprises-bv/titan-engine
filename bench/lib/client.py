@@ -10,18 +10,21 @@ PLAN
   mtpoff   warm-up; the 8 prompts twice (identity vs h-off); TTFT twice.
   ident    the 8 prompts once, no warm-up (as m3/collect.sh), identity vs ref/q35-prof.first8.json.
   nsys     warm-up; `nsys start`; twice: one ~2.1k-token cold prompt + 32 decode tokens; `nsys stop`.
+  admit    (server under TITAN_ADMIT=1) a ~4k prompt with max_tokens past the context, three times: each must be
+           refused (HTTP 4xx) quickly; then a short request must still answer, and a cold ~28k prompt must run.
 
 Every request is streamed: TTFT = send -> first content chunk; decode tok/s (client) = (completion_tokens - 1) /
 (last chunk - first chunk). The server's usage (last chunk) is kept too. Identity compares the concatenated stream
 text; a mismatch is re-checked with a non-streamed request (reported separately) so a stream artefact is not
 mistaken for an engine change."""
-import json, os, statistics, subprocess, sys, time, urllib.request, uuid
+import json, os, statistics, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 B = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NSYS = "/opt/nvidia/nsight-compute/2026.2.1/host/target-linux-x64/nsys"
 PROMPTS = [l.strip() for l in open(f"{B}/prompts/eval8.txt") if l.strip()][:8]
 CORPUS = open(f"{B}/prompts/corpus-sys28k.txt").read()
-CHARS = {"4k": 15600, "13k": 50800, "2k": 8200}
+CHARS = {"4k": 15600, "13k": 50800, "2k": 8200, "28k": len(CORPUS)}
+MAX_SEQ_LEN = 65536  # the service's --max-seq-len
 
 
 def post(port, body, stream=True, timeout=1800):
@@ -114,6 +117,27 @@ def long_req(port, nonce, key, maxtok=16):
             "wall_s": r["wall"], "decode_tok_s": r["decode_tok_s"]}
 
 
+def admit(port):
+    out = {"refusals": []}
+    for _ in range(3):
+        body = dict(longp(uuid.uuid4().hex[:12], CHARS["4k"]), max_tokens=MAX_SEQ_LEN)
+        t0 = time.time()
+        try:
+            post(port, body, stream=False, timeout=60)
+            out["refusals"].append({"status": 200, "ms": 1e3 * (time.time() - t0)})
+        except urllib.error.HTTPError as e:
+            out["refusals"].append({"status": e.code, "ms": 1e3 * (time.time() - t0),
+                                    "body": e.read().decode("utf-8", "replace")[:300]})
+    r = post(port, dict(chat("Say hi."), max_tokens=16))
+    out["after_ok"] = bool(r["text"])
+    out["long_28k"] = long_req(port, uuid.uuid4().hex[:12], "28k")
+    ms = [x["ms"] for x in out["refusals"]]
+    out["refused_all"] = all(400 <= x["status"] < 500 for x in out["refusals"])
+    out["refuse_ms_max"] = max(ms)
+    out["pass"] = out["refused_all"] and out["refuse_ms_max"] < 100 and out["after_ok"] and bool(out["long_28k"]["prompt_tokens"])
+    return out
+
+
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
@@ -167,6 +191,12 @@ def main():
             log(f"nsys rep{rep}: prompt {r['prompt_tokens']} tok, decode {r['decode_tok_s'] or 0:.1f} tok/s (under nsys)")
         time.sleep(0.5)
         subprocess.run([NSYS, "stop", f"--session={session}"], timeout=600, stdout=subprocess.DEVNULL)
+    if plan == "admit":
+        a = admit(port)
+        res["admit"] = a
+        log(f"admit: refused {a['refused_all']} (max {a['refuse_ms_max']:.0f} ms), next request ok {a['after_ok']}, "
+            f"28k {a['long_28k']['prompt_tokens']} tok at {a['long_28k']['prompt_tok_s'] or 0:.0f} tok/s: "
+            + ("PASS" if a["pass"] else "FAIL"))
     res["client_s"] = time.time() - t0
     json.dump(res, open(outp, "w"), indent=1, ensure_ascii=False)
 

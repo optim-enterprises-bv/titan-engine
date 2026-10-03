@@ -87,6 +87,8 @@ mod diffusion_models;
 pub mod distributed;
 pub mod files;
 mod gdn;
+mod titan_admit;
+mod titan_faults;
 mod titan_gdn;
 #[cfg(feature = "oxide")]
 mod titan_oxide;

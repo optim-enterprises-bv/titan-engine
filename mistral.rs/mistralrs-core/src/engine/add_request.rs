@@ -477,6 +477,29 @@ impl Engine {
         if let Some(defaults) = get_mut_arcmutex!(self.pipeline).generation_defaults() {
             request.sampling_params.fill_model_defaults(&defaults);
         }
+        if matches!(
+            get_mut_arcmutex!(self.pipeline).category(),
+            ModelCategory::Text | ModelCategory::Multimodal { .. }
+        ) {
+            let (max_seq_len, device) = {
+                let pipeline = get_mut_arcmutex!(self.pipeline);
+                (pipeline.get_metadata().max_seq_len, pipeline.device())
+            };
+            if let Some(msg) = crate::titan_admit::check(
+                request.id,
+                prompt_tokens.len(),
+                request.sampling_params.max_len,
+                max_seq_len,
+                &device,
+            ) {
+                request
+                    .response
+                    .send(Response::ValidationError(msg.into()))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
+        }
         let topk = request
             .sampling_params
             .top_k
