@@ -47,6 +47,8 @@ criterion = { workspace = true }
 [features]
 default = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
+# titan noblas: cuBLAS for the float matmul and cuRAND for rand_* (the nvcc build); without it the oxide kernels
+cublas = ["cuda", "cudarc/cublas", "cudarc/cublaslt", "cudarc/curand"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:intel-mkl-src"]

@@ -132,6 +132,8 @@ cuda = [
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
 ]
+# titan noblas: cuBLAS / cuBLASLt / cuRAND (the nvcc build); without it the oxide GEMM / RNG kernels
+cublas = ["cuda", "mistralrs-quant/cublas", "candle-core/cublas"]
 cudnn = ["candle-core/cudnn"]
 cutile = ["cuda", "mistralrs-quant/cutile"]
 metal = [

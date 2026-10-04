@@ -48,6 +48,9 @@ mistralrs-metal-compile = { workspace = true, optional = true, features = ["meta
 
 [features]
 oxide = ["cuda", "dep:titan-oxide-ffi"]
+# titan noblas: cuBLASLt for the unquantized / attention batch matmuls and cuBLAS for GPTQ (the nvcc build); without it
+# the same calls run candle's oxide GEMM (src/cublaslt/oxide.rs)
+cublas = ["cuda", "candle-core/cublas"]
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",

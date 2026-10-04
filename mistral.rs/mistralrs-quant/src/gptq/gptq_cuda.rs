@@ -11,15 +11,14 @@ use std::{
 
 use candle_core::{
     cuda::{
-        cudarc::{
-            cublas::{result::hgemm, sys::cublasOperation_t},
-            driver::{CudaSlice, DevicePtr},
-        },
+        cudarc::driver::{CudaSlice, DevicePtr},
         CudaStorageSlice, WrapErr,
     },
     Context, CudaStorage, DType, Device, Result, Shape, Storage, Tensor, D,
 };
 use half::f16;
+#[cfg(feature = "cublas")]
+use candle_core::cuda::cudarc::cublas::{result::hgemm, sys::cublasOperation_t};
 
 use crate::{
     gptq::marlin_backend::{marlin_matmul, marlin_weight_repack},
@@ -96,6 +95,7 @@ impl GptqLayer {
 
         let dev = get_cuda_device(&a)?;
 
+        #[cfg(feature = "cublas")]
         let cublas_handle = match a.device() {
             Device::Cuda(dev) => dev.cublas_handle(),
             _ => unreachable!(), // invariant enforced earlier
@@ -202,9 +202,24 @@ impl GptqLayer {
                 )
             };
 
+            #[cfg(not(feature = "cublas"))]
+            {
+                // titan noblas: C (m x n) = A (m x k, rows) @ dequantized W (k x n, rows) on the oxide GEMM (f32 accumulate)
+                use candle_core::cuda::oxide_gemm::{gemm, Dt, Problem};
+                let (mm, nn, kk) = (m as i64, n as i64, k as i64);
+                let p = Problem {
+                    dt: Dt::F16, batch: 1, m: mm, n: nn, k: kk, a_s0: kk, a_s1: 1, b_s0: nn, b_s1: 1, d_s0: nn, d_s1: 1,
+                    c_s0: nn, c_s1: 1, bias_s0: 0, bias_s1: 0, sa: 0, sb: 0, sd: 0, sc: 0, alpha: 1.0, beta: 0.0,
+                    has_c: false, has_bias: false, a_addr: a_ptr as u64, b_addr: temp_dq_ptr as u64, d_addr: c_ptr as u64,
+                };
+                gemm(&dev, &p, 0, 0)?;
+            }
+            #[cfg(feature = "cublas")]
             let alpha = f16::from_f32_const(1.0);
+            #[cfg(feature = "cublas")]
             let beta = f16::from_f32_const(0.0);
 
+            #[cfg(feature = "cublas")]
             unsafe {
                 hgemm(
                     *cublas_handle.handle(),

@@ -57,9 +57,11 @@ crossterm = "0.28"
 fuzzy-matcher = "0.3"
 
 [features]
-oxide = ["cuda", "mistralrs-core/oxide", "mistralrs-server-core/oxide"]
+# titan noblas: `oxide` (the nvcc-free build) no longer implies `cuda`, which now also pulls cuBLAS / cuBLASLt / cuRAND
+# (mistralrs-core/cublas): the oxide binary links none of them.
+oxide = ["mistralrs-core/oxide", "mistralrs-server-core/oxide"]
 default = ["code-execution"]
-cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda"]
+cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda", "mistralrs-core/cublas"]
 cutile = ["cuda", "mistralrs-core/cutile"]
 nccl = ["mistralrs-core/nccl", "mistralrs-server-core/nccl"]
 cudnn = ["mistralrs-core/cudnn", "mistralrs-server-core/cudnn"]

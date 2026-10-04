@@ -313,6 +313,9 @@ struct Gemma4Router {
     norm: RmsNorm,
     scale: Tensor,
     proj: candle_nn::Linear,
+    /// F32 norm + projection (ggml's router precision: F32 activations, the GGUF's F32 weight, F32 logits).
+    /// `TITAN_G4_ROUTER_F32=0` keeps the model-dtype router.
+    f32_path: Option<(RmsNorm, candle_nn::Linear)>,
     proj_lora: Option<Arc<mistralrs_quant::LoraSiteHandle>>,
     top_k: usize,
 }
@@ -336,24 +339,39 @@ impl Gemma4Router {
         // Pre-combine: weight = scale * hidden_size^(-0.5)
         let root_size = (hidden_size as f64).powf(-0.5);
         let combined_weight = (&scale * root_size)?;
+        let f32_on = mistralrs_quant::titan_cfg::var("TITAN_G4_ROUTER_F32").map(|v| v != "0").unwrap_or(true);
+        let f32_path = if f32_on && vb.dtype() != DType::F32 {
+            // read the stored tensors again at F32 (a GGUF F32 router stays exact, not rounded via the model dtype)
+            let vb32 = vb.clone().set_dtype(DType::F32);
+            let scale32 = vb32.get(hidden_size, "scale")?;
+            let w32 = vb32.pp("proj").get((num_experts, hidden_size), "weight")?;
+            Some((RmsNorm::from_w((&scale32 * root_size)?, eps)?, candle_nn::Linear::new(w32, None)))
+        } else {
+            None
+        };
         let norm = RmsNorm::from_w(combined_weight, eps)?;
         Ok(Self {
             norm,
             scale,
             proj,
+            f32_path,
             proj_lora,
             top_k,
         })
     }
 
     fn forward(&self, xs: &Tensor, per_expert_scale: &Tensor) -> Result<(Tensor, Tensor)> {
-        let normed = xs.apply(&self.norm)?;
-
-        let router_input = normed.to_dtype(self.proj.weight().dtype())?;
-        let logits = router_input.apply(&self.proj)?;
-        let logits = match &self.proj_lora {
-            Some(site) => mistralrs_quant::apply_dynamic_lora_delta(site, &router_input, logits)?,
-            None => logits,
+        let logits = match (&self.f32_path, &self.proj_lora) {
+            (Some((norm, proj)), None) => xs.to_dtype(DType::F32)?.apply(norm)?.apply(proj)?,
+            _ => {
+                let normed = xs.apply(&self.norm)?;
+                let router_input = normed.to_dtype(self.proj.weight().dtype())?;
+                let logits = router_input.apply(&self.proj)?;
+                match &self.proj_lora {
+                    Some(site) => mistralrs_quant::apply_dynamic_lora_delta(site, &router_input, logits)?,
+                    None => logits,
+                }
+            }
         };
 
         let topk = crate::ops::moe_router_topk(

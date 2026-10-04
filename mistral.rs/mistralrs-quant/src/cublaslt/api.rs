@@ -457,6 +457,23 @@ impl CublasLTBatchMatmul {
             heuristic_batch: self.heuristic_batch,
         };
 
+        if candle_core::cuda::gemmlog_on() {
+            candle_core::cuda::gemmlog(format_args!(
+                "L {} b={batch_size} m={m} n={n} k={k} transa={} lda={lda} ldb={ldb} ldc={ldc} sa={} sb={} sc={stride_c} alpha={} beta={} bias={} c={} act={} heur={:?} a={:?} b={:?}",
+                std::any::type_name::<T>(),
+                self.transa,
+                a_l.stride()[0],
+                b_l.stride()[0],
+                config.alpha,
+                config.beta,
+                bias.is_some(),
+                self.c.is_some(),
+                self.act.is_some(),
+                self.heuristic_batch,
+                a_l.stride(),
+                b_l.stride()
+            ));
+        }
         unsafe {
             self.cublaslt
                 .matmul(config, &a, &b, &mut out, bias.as_ref(), self.act.as_ref())

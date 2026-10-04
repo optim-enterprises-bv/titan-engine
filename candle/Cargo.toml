@@ -47,11 +47,10 @@ candle-transformers = { path = "./candle-transformers", version = "0.10.2" }
 candle-ug = { path = "./candle-ug", version = "0.10.2" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
+# titan noblas: cuBLAS / cuBLASLt / cuRAND come only with candle-core's `cublas` feature (the nvcc build); without it
+# candle's CUDA matmul and RNG run the cuda-oxide kernels of cuda_backend/oxide_gemm.rs and the binary links neither.
 cudarc = { version = "0.19.8", features = [
     "std",
-    "cublas",
-    "cublaslt",
-    "curand",
     "driver",
     "nvrtc",
     "f16",

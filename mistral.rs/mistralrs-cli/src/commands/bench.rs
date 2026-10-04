@@ -23,7 +23,7 @@ use super::serve::{
     extract_paged_attn_settings,
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "oxide"))]
 unsafe extern "C" {
     fn cudaProfilerStart() -> i32;
     fn cudaProfilerStop() -> i32;
@@ -245,9 +245,9 @@ pub async fn run_bench(
         iterations, prompt_lens, gen_len, depths
     );
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "oxide"))]
     let cuda_profiler_range = std::env::var_os("MISTRALRS_BENCH_CUDA_PROFILER_RANGE").is_some();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "oxide"))]
     if cuda_profiler_range {
         unsafe {
             let _ = cudaProfilerStart();
@@ -314,7 +314,7 @@ pub async fn run_bench(
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "oxide"))]
     if cuda_profiler_range {
         unsafe {
             let _ = cudaProfilerStop();

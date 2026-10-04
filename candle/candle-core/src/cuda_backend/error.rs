@@ -9,9 +9,11 @@ pub enum CudaError {
     #[error(transparent)]
     Compiler(#[from] cudarc::nvrtc::CompileError),
 
+    #[cfg(feature = "cublas")]
     #[error(transparent)]
     Cublas(#[from] cudarc::cublas::result::CublasError),
 
+    #[cfg(feature = "cublas")]
     #[error(transparent)]
     Curand(#[from] cudarc::curand::result::CurandError),
 

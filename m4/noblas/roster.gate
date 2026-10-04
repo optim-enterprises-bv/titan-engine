@@ -1,0 +1,14 @@
+# model  G1-prompts  G3-chars (0: skip G3)
+qwen3.6-35b         ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+spark-x2.5          ~/titan-engine/m4/g4s/prompts/spark.json              13500
+qwen3-14b           ~/titan-engine/m4/devmap/prompts/qwen3-14b.json       13500
+gemma4-12b          ~/titan-engine/m4/g4s/prompts/gemma4-12b.json         13500
+redcell-26b         ~/titan-engine/m4/g4s/prompts/redcell.json            13500
+orcasaq2-cyber-27b  ~/titan-engine/m4/orca/orca-g1.json                   13500
+bonsai-27b          ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+bonsai2-27b         ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+qwen3.6-35b-iq2m    ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+qwen3.6-35b-mxfp4   ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+gpt-oss-20b         ~/titan-engine/top-noblas/m4/noblas/plain40.json      6000
+qwen3-next-80b      ~/titan-engine/top-noblas/m4/noblas/plain40.json      13500
+gpt-oss-120b        ~/titan-engine/top-noblas/m4/noblas/plain40.json      0

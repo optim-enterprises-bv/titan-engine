@@ -98,7 +98,7 @@ pub fn run_doctor(json: bool) -> Result<()> {
         }
 
         // CUDA version info
-        if cfg!(feature = "cuda") {
+        if cfg!(any(feature = "cuda", feature = "oxide")) {
             let build_cuda = system
                 .build
                 .cuda_toolkit_version

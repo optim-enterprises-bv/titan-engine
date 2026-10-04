@@ -65,16 +65,22 @@ pub static CUBLASLT_CONTROLLER: LazyLock<CublasLtController> =
         device_location: Mutex::new(None),
     });
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
 mod api;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
+mod matmul;
+/// titan noblas: the same wrapper on candle's oxide GEMM (no cuBLASLt in the build).
+#[cfg(all(feature = "cuda", not(feature = "cublas")))]
+#[path = "oxide.rs"]
 mod matmul;
 #[cfg(test)]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
 mod tests;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
 pub use api::{fused_batch_matmul, fused_batch_matmul_f8, fused_batch_matmul_heur, fused_batch_matmul_nn, CublasLt};
+#[cfg(all(feature = "cuda", not(feature = "cublas")))]
+pub use matmul::{fused_batch_matmul, fused_batch_matmul_f8, fused_batch_matmul_heur, fused_batch_matmul_nn, CublasLt};
 
 pub fn maybe_init_cublas_lt_wrapper(device: Device) {
     #[cfg(feature = "cuda")]
