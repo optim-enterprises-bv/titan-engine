@@ -159,6 +159,98 @@ pub unsafe extern "C" fn cuda_graph_copy_bytes(src: *const c_void, dst: *mut c_v
     }
 }
 
+/// v0.9.4 `cuda_graph_copy_2d_bytes`: `cudaMemcpy2DAsync` device to device (`cuMemcpy2DAsync`).
+pub unsafe extern "C" fn cuda_graph_copy_2d_bytes(
+    src: *const c_void, dst: *mut c_void, width: i64, height: i64, src_pitch: i64, dst_pitch: i64, stream: i64,
+) -> i32 {
+    if width < 0 || height < 0 || src_pitch < width || dst_pitch < width {
+        return 1;
+    }
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    unsafe {
+        let s = cu_stream(stream);
+        stream_context(s);
+        let mut p: sys::CUDA_MEMCPY2D = std::mem::zeroed();
+        p.srcMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+        p.srcDevice = src as sys::CUdeviceptr;
+        p.srcPitch = src_pitch as usize;
+        p.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+        p.dstDevice = dst as sys::CUdeviceptr;
+        p.dstPitch = dst_pitch as usize;
+        p.WidthInBytes = width as usize;
+        p.Height = height as usize;
+        sys::cuMemcpy2DAsync_v2(&p, s) as i32
+    }
+}
+
+// ================================================================================================
+// input_packing.cu (v0.9.4)
+
+/// Launch `name` and return what the runtime's `cudaGetLastError()` would after it (0 = launched).
+unsafe fn launch_status(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, u32), stream: sys::CUstream, args: &mut [*mut c_void]) -> i32 {
+    if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
+        return 9; // cudaErrorInvalidConfiguration
+    }
+    LAUNCHED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock().unwrap().insert(name);
+    unsafe {
+        let f = function(name, stream);
+        sys::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, stream, args.as_mut_ptr(), std::ptr::null_mut()) as i32
+    }
+}
+
+pub unsafe extern "C" fn pad_decode_input_u32(input: *const c_void, output: *mut c_void, input_rows: i32, output_rows: i32, width: i32, stream: i64) -> i32 {
+    if input.is_null() || output.is_null() || input_rows <= 0 || output_rows < input_rows || width <= 0 {
+        return 1; // cudaErrorInvalidValue
+    }
+    const THREADS: i64 = 256;
+    let elements = (output_rows as i64) * (width as i64);
+    let blocks = ((elements + THREADS - 1) / THREADS) as i32;
+    let (mut i, mut o, mut ir, mut or, mut w) = (input, output, input_rows, output_rows, width);
+    unsafe { launch_status("pad_decode_input_kernel", (blocks as u32, 1, 1), (THREADS as u32, 1, 1), cu_stream(stream), &mut args![i, o, ir, or, w]) }
+}
+
+pub unsafe extern "C" fn pack_completion_input_u32(
+    host: *const c_void, staged_rows: *const *const c_void, output: *mut c_void, rows: i32, host_width: i32, staged_width: i32, stream: i64,
+) -> i32 {
+    if host.is_null() || staged_rows.is_null() || output.is_null() || rows <= 0 || host_width <= 0 || staged_width <= 0 {
+        return 1;
+    }
+    const ROWS_PER_LAUNCH: i32 = 64;
+    const THREADS: i64 = 256;
+    let s = cu_stream(stream);
+    let mut row_start = 0i32;
+    while row_start < rows {
+        let chunk_rows = (rows - row_start).min(ROWS_PER_LAUNCH);
+        let mut packed = [0u64; 64];
+        for r in 0..chunk_rows as usize {
+            packed[r] = unsafe { *staged_rows.add(row_start as usize + r) } as u64;
+        }
+        let row_width = (host_width as i64) + (staged_width as i64);
+        let elements = (chunk_rows as i64) * row_width;
+        let blocks = ((elements + THREADS - 1) / THREADS) as i32;
+        let mut h = unsafe { (host as *const u32).offset((row_start as i64 * host_width as i64) as isize) } as u64;
+        let mut o = unsafe { (output as *mut u32).offset((row_start as i64 * row_width) as isize) } as u64;
+        let (mut cr, mut hw, mut sw) = (chunk_rows, host_width, staged_width);
+        let mut a: Vec<*mut c_void> = Vec::with_capacity(68);
+        a.push(&raw mut h as *mut c_void);
+        for p in packed.iter_mut() {
+            a.push(p as *mut u64 as *mut c_void);
+        }
+        a.push(&raw mut o as *mut c_void);
+        a.push(&raw mut cr as *mut c_void);
+        a.push(&raw mut hw as *mut c_void);
+        a.push(&raw mut sw as *mut c_void);
+        let st = unsafe { launch_status("pack_completion_input_kernel", (blocks as u32, 1, 1), (THREADS as u32, 1, 1), s, &mut a) };
+        if st != 0 {
+            return st;
+        }
+        row_start += ROWS_PER_LAUNCH;
+    }
+    0
+}
+
 // ================================================================================================
 // gdn.cu
 

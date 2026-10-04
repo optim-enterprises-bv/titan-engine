@@ -251,9 +251,20 @@ pub fn get_device_layers(
     params: &AutoDeviceMapParams,
     paged_attn_config: Option<&mut PagedAttentionConfig>,
 ) -> Result<DeviceMapMetadata> {
-    let mapped_max = loader.mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
+    // titan: with PagedAttention a prompt is prefilled in scheduler chunks of at most `prefill_rows` rows (and the
+    // attention of a long context runs flash-prefill over the gathered KV), so prefill activations are those of one
+    // chunk, not of a whole max_seq_len prompt; the KV budget below still covers max_seq_len.
+    let prefill_rows = paged_attn_config.as_ref().and_then(|cfg| cfg.prefill_rows);
+    let act_params = match (prefill_rows, params) {
+        (Some(rows), AutoDeviceMapParams::Text { max_seq_len, max_batch_size }) if rows < *max_seq_len => {
+            info!("Sizing prefill activations for {rows}-token PagedAttention prompt chunks (max_seq_len {max_seq_len}).");
+            AutoDeviceMapParams::Text { max_seq_len: rows, max_batch_size: *max_batch_size }
+        }
+        _ => params.clone(),
+    };
+    let mapped_max = loader.mapped_max_act_size_elems(config, &act_params)? * dtype.size_in_bytes();
     let non_mapped_max =
-        loader.non_mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
+        loader.non_mapped_max_act_size_elems(config, &act_params)? * dtype.size_in_bytes();
 
     let mut layer_sizes_backup = if paged_attn_config.is_some() {
         Some(layer_sizes_in_bytes.clone())

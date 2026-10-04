@@ -193,9 +193,7 @@
    "family": "qwen",
    "ctx": 32768,
    "lengths": [
-    "4k",
-    "13k",
-    "28k"
+    "4k"
    ],
    "short": [
     8,
@@ -268,7 +266,9 @@
    "probe_short": [
     4,
     32
-   ]
+   ],
+   "quality_set": "q40",
+   "_lengths_note": "13k/28k dropped (user, 2026-09-29): prompt processing is NVMe/page-cache bound on this 30 GB machine under the 20 GB cap and varies run to run (llama.cpp 80B: 88 vs 22-28 tok/s at 4k)"
   },
   {
    "id": "oss120",
@@ -277,8 +277,7 @@
    "family": "harmony",
    "ctx": 32768,
    "lengths": [
-    "4k",
-    "13k"
+    "4k"
    ],
    "short": [
     4,
@@ -350,7 +349,8 @@
     2,
     32
    ],
-   "quality_set": "q40"
+   "quality_set": "q40",
+   "_lengths_note": "13k/28k dropped (user, 2026-09-29): prompt processing is NVMe/page-cache bound on this 30 GB machine under the 20 GB cap and varies run to run (llama.cpp 80B: 88 vs 22-28 tok/s at 4k)"
   },
   {
    "id": "oss20",

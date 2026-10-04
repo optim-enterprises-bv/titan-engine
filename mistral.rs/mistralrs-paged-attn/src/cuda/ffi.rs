@@ -162,7 +162,6 @@ extern "C" {
         stream: CUstream,
     ) -> c_int;
 
-    #[cfg_attr(feature = "oxide", link_name = "titan_nvcc_only_reshape_and_cache_flashinfer")]
     pub fn reshape_and_cache_flashinfer(
         key: *const c_void,
         value: *const c_void,
@@ -182,7 +181,6 @@ extern "C" {
         stream: CUstream,
     );
 
-    #[cfg_attr(feature = "oxide", link_name = "titan_nvcc_only_flashinfer_decode")]
     pub fn flashinfer_decode(
         q: *const c_void,
         key_cache: *const c_void,
@@ -216,7 +214,6 @@ extern "C" {
         stream: CUstream,
     ) -> c_int;
 
-    #[cfg_attr(feature = "oxide", link_name = "titan_nvcc_only_gather_kv_cache_flashinfer")]
     pub fn gather_kv_cache_flashinfer(
         key_cache: *const c_void,
         value_cache: *const c_void,

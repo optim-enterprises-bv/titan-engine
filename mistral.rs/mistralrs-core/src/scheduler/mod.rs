@@ -67,6 +67,29 @@ pub enum SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    /// titan swap: the scheduler a registered (not yet loaded) model starts with. With PagedAttention
+    /// (`paged_cache_type` set) the cache geometry is a placeholder that `refresh_paged_cache_config` replaces with the
+    /// pool the model's load realizes; without it, the default scheduler running up to `max_num_seqs` sequences.
+    pub fn titan_swap_template(
+        paged_cache_type: Option<crate::PagedCacheType>,
+        max_num_seqs: usize,
+        max_num_batched_tokens: usize,
+        max_prefill_chunk_tokens: usize,
+        max_decode_steps_before_prefill: usize,
+    ) -> anyhow::Result<Self> {
+        let max_seqs = std::num::NonZeroUsize::new(max_num_seqs).ok_or_else(|| anyhow::anyhow!("max_seqs must be nonzero"))?;
+        Ok(match paged_cache_type {
+            Some(cache_type) => Self::PagedAttentionMeta {
+                max_num_seqs,
+                max_num_batched_tokens,
+                max_prefill_chunk_tokens,
+                max_decode_steps_before_prefill,
+                config: CacheConfig { block_size: 0, num_gpu_blocks: 0, cache_type, kv_cache_group_ids: Vec::new() },
+            },
+            None => Self::DefaultScheduler { method: DefaultSchedulerMethod::Fixed(max_seqs) },
+        })
+    }
+
     pub(crate) fn refresh_paged_cache_config(
         &mut self,
         realized_cache_config: Option<CacheConfig>,
@@ -292,5 +315,33 @@ mod tests {
             config: cache_config(128),
         };
         assert!(scheduler.refresh_paged_cache_config(None).is_err());
+    }
+
+    #[test]
+    fn titan_swap_template_paged_takes_the_realized_pool() -> anyhow::Result<()> {
+        let mut scheduler =
+            SchedulerConfig::titan_swap_template(Some(PagedCacheType::F8E4M3), 4, 16384, 512, 8)?;
+        scheduler.refresh_paged_cache_config(Some(cache_config(4668)))?;
+        let SchedulerConfig::PagedAttentionMeta { max_num_seqs, max_num_batched_tokens, config, .. } = scheduler else {
+            panic!("expected PagedAttention scheduler")
+        };
+        assert_eq!((max_num_seqs, max_num_batched_tokens), (4, 16384));
+        assert_eq!((config.block_size, config.num_gpu_blocks), (32, 4668));
+        // a pipeline that came up without a pool does not match a paged template
+        let mut scheduler = SchedulerConfig::titan_swap_template(Some(PagedCacheType::Auto), 4, 4096, 512, 8)?;
+        assert!(scheduler.refresh_paged_cache_config(None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn titan_swap_template_unpaged_is_the_fixed_default_scheduler() -> anyhow::Result<()> {
+        let mut scheduler = SchedulerConfig::titan_swap_template(None, 32, 4096, 512, 8)?;
+        let SchedulerConfig::DefaultScheduler { method: DefaultSchedulerMethod::Fixed(n) } = scheduler.clone() else {
+            panic!("expected the default scheduler")
+        };
+        assert_eq!(n.get(), 32);
+        scheduler.refresh_paged_cache_config(None)?;
+        assert!(SchedulerConfig::titan_swap_template(None, 0, 4096, 512, 8).is_err());
+        Ok(())
     }
 }

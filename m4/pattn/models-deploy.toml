@@ -1,0 +1,280 @@
+# titan-mistral model swap config (mistralrs from-config). One process serves every model below; one is resident at
+# a time. A request naming an unloaded model unloads the resident one (its memory released) and loads it; requests
+# arriving during the swap wait. An absent or unknown model name ("default", "gpt-4", ...) goes to the default model.
+# [models.titan.env] holds each model's TITAN_* settings, applied while it is loaded (process env vars stay the
+# defaults; "" unsets one). idle_ttl_secs unloads a model after that long without requests (0 or absent: never).
+command = "serve"
+default_model_id = "qwen3.6-35b"
+
+[server]
+host = "127.0.0.1"
+port = 1234
+
+[paged_attn]
+mode = "off"
+
+[titan_swap]
+max_resident = 1
+
+# The service model: tiered experts with the q35 profile, MTP=2, prefill streaming, doorbell + one-pass CPU misses,
+# piecewise CUDA graphs, 64k context. Preloaded (default).
+[[models]]
+name = "qwen3.6-35b"
+kind = "text"
+model_id = "~/ai/models/Qwen3.6-35B-A3B-MTP"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+[models.device]
+max_seq_len = 65536
+[models.titan.env]
+TITAN_TIERED = "1"
+TITAN_TIERED_GPU_FRACTION = "auto"
+TITAN_TIERED_PROFILE = "~/titan-engine/m4/profile-q35.txt"
+TITAN_TIERED_RESERVE_MIB = "1536"
+TITAN_MTP = "2"
+TITAN_PFS = "1"
+TITAN_PFS_HEADROOM_MIB = "768"
+TITAN_DOORBELL = "1"
+TITAN_CPU_ONEPASS = "1"
+TITAN_CUDA_GRAPHS = "1"
+TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
+
+# Same model, MXFP4 experts (m4/mxfp4-real-20260928.md: the Q4_K profile transfers, 93.9% hits); the service settings
+# except MTP off: the MTP block's experts run candle's indexed MoE, which has no MXFP4 kernel.
+[[models]]
+name = "qwen3.6-35b-mxfp4"
+kind = "text"
+model_id = "~/ai/models/Qwen3.6-35B-A3B-MTP"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+[models.device]
+max_seq_len = 65536
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_TIERED = "1"
+TITAN_TIERED_GPU_FRACTION = "auto"
+TITAN_TIERED_PROFILE = "~/titan-engine/m4/profile-q35.txt"
+TITAN_TIERED_RESERVE_MIB = "1536"
+TITAN_MTP = "0"
+TITAN_PFS = "1"
+TITAN_PFS_HEADROOM_MIB = "768"
+TITAN_DOORBELL = "1"
+TITAN_CPU_ONEPASS = "1"
+TITAN_CUDA_GRAPHS = "1"
+TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
+
+# Qwen3-Next-80B-A3B Q4_K_M (m4/next/p1-20260928.md final: host experts in the GGUF mmap, profile-next, P1 lookahead
+# L+2 with populate, pageout of the GPU-resident experts) plus the doorbell and one-pass CPU misses. 32k context.
+[[models]]
+name = "qwen3-next-80b"
+kind = "text"
+model_id = "~/ai/models/qwen3-next-80b"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
+[models.device]
+max_seq_len = 32768
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_TIERED = "1"
+TITAN_TIERED_GPU_FRACTION = "auto"
+TITAN_TIERED_MMAP = "1"
+TITAN_TIERED_PROFILE = "~/titan-engine/m4/next/profile-next.txt"
+TITAN_TIERED_LOOKAHEAD = "2"
+TITAN_TIERED_LOOKAHEAD_POPULATE = "1"
+TITAN_TIERED_PAGEOUT = "1"
+TITAN_DOORBELL = "1"
+TITAN_CPU_ONEPASS = "1"
+
+# gpt-oss-120b MXFP4 (m5/oss/results.txt: tiered, auto fraction, host experts in the mmap; 20/20 practice). F16
+# activations as in the gates. 16k context.
+[[models]]
+name = "gpt-oss-120b"
+kind = "text"
+model_id = "~/ai/models/gpt-oss-120b"
+dtype = "f16"
+[models.format]
+format = "gguf"
+quantized_file = "gpt-oss-120b-MXFP4.gguf"
+[models.device]
+max_seq_len = 16384
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_TIERED = "1"
+TITAN_TIERED_GPU_FRACTION = "auto"
+TITAN_TIERED_MMAP = "1"
+
+# gpt-oss-20b F16 (m5/oss/results.txt: fits on the GPU; stock is fastest, 82 vs 33 tok/s tiered). 8k context.
+[[models]]
+name = "gpt-oss-20b"
+kind = "text"
+model_id = "~/ai/models"
+dtype = "f16"
+[models.format]
+format = "gguf"
+quantized_file = "gpt-oss-20b-F16.gguf"
+[models.device]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+
+# Bonsai-27B Q1_0, dense (all on the GPU; fused Q1_0 mmvq decode and MMQ prefill). 32k context.
+[[models]]
+name = "bonsai-27b"
+kind = "text"
+model_id = "~/ai/models/bonsai/Bonsai-27B-gguf"
+[models.format]
+format = "gguf"
+quantized_file = "Bonsai-27B-Q1_0.gguf"
+[models.device]
+max_seq_len = 32768
+[models.titan]
+idle_ttl_secs = 1800
+
+# Qwen3-14B Q5_K_M, dense, no device_layers pin: the auto map keeps 40/40 on the GPU at 16384 (devmap2: GGUF tensor
+# inventory, flash-prefill prompt attention, 13.5 x hidden activations per token; m4/devmap/README.md). NOTE: this model's VRAM cost is dominated by the KV cache, not the
+# weights: 40 layers x 2 x 8 kv_heads x 128 dim x 2 B = ~0.164 MB/token, so
+#   64k ctx = 10.7 GB KV + 10.5 GB weights = 21.2 GB  -> does NOT fit -> auto_device_map
+#             offloads layers to CPU and decode collapses to ~5 tok/s (not a model limit)
+#   16k ctx =  2.7 GB KV + 10.5 GB weights = 13.2 GB  -> fits fully on the card
+[[models]]
+name = "qwen3-14b"
+kind = "text"
+model_id = "~/ai/models/qwen3-14b"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3-14B-vanilla-Q5_K_M.gguf"
+[models.device]
+max_seq_len = 16384
+[models.titan]
+prefix_cache_n = 0   # devmap2: a kept prompt's KV stays in the prefix cache while the next copy runs (2 x 2.5 GB at 16k); without it 16k prompts fit (m4/devmap/README.md)
+idle_ttl_secs = 1800
+# PagedAttention (m4/pattn/README.md, pattn2): ~16k prompts fit in the default pool (3352 MB, 21408 tokens), decode
+# 50 vs 39.5 tok/s, G1 identical to paged off; 4 concurrent sequences x1.72.
+paged_attn = "on"
+max_seqs = 4
+[models.titan.env]
+TITAN_CUDA_GRAPHS = "1"
+TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
+
+# Qwen3.6-35B-A3B UD-IQ2_M (11.52 GB) - the i-quant path, PLAIN residency: no TITAN_TIERED, so no
+# expert staging, no CPU twin, no prefill staging buffer. Every expert is GPU-resident (fraction 1.0)
+# with ~4 GB of the 16 GB card left for KV + activations, which is what the tiered Q4_K_XL default
+# cannot do (it packs ~14.1 GB and then fails prefill with CUDA_ERROR_OUT_OF_MEMORY).
+# Requires the oxide i-quant fused-MoE arms (oxide-kernels @ 12c7422, gated bit-identical).
+[[models]]
+name = "qwen3.6-35b-iq2m"
+kind = "text"
+model_id = "~/ai/models/q35-lowbit"
+[models.format]
+format = "gguf"
+quantized_file = "Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
+[models.device]
+max_seq_len = 65536
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+# Non-tiering wins only: MTP speculative decode, piecewise CUDA graphs. Deliberately NO
+# TITAN_TIERED / TITAN_PFS / TITAN_DOORBELL / TITAN_CPU_ONEPASS (those exist to stage experts
+# off-GPU, which this model does not need) and no TITAN_PFS staging buffer.
+TITAN_MTP = "2"
+TITAN_CUDA_GRAPHS = "1"
+TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
+
+# Ternary Bonsai 2 27B (PrismML PTQ1_0 + prism Hadamard, dense qwen35 + dense MTP head; integ-20261002). All on the GPU.
+# MTP 1 (80% acceptance, 8/8 greedy identical to MTP off); the template's own default effort (xhigh) runs long.
+[[models]]
+name = "bonsai2-27b"
+kind = "text"
+model_id = "~/ai/models/bonsai2-27b"
+[models.format]
+format = "gguf"
+quantized_file = "Ternary-Bonsai-2-27B-PTQ1_0-mtp.gguf"
+[models.device]
+max_seq_len = 65536
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_MTP = "1"
+TITAN_REASONING_EFFORT = "medium"
+
+# Spark-X2.5 4B Q4_K_M (spark2_5, dense; banded/windowed flash-prefill on the sliding layers). 16k context.
+[[models]]
+name = "spark-x2.5"
+kind = "text"
+model_id = "~/ai/models/spark-x2.5"
+max_model_len = 16384
+[models.format]
+format = "gguf"
+quantized_file = "Spark-X2.5-4B-Q4_K_M.gguf"
+[models.device]
+max_seq_len = 16384
+[models.titan]
+idle_ttl_secs = 1800
+# PagedAttention (m4/pattn/README.md, pattn2): 16384-token prompt steps, so prompts up to 16k are one chunk and
+# bit-identical to paged off; decode 139 vs 121 tok/s; 4 concurrent sequences x1.97.
+paged_attn = "on"
+max_seqs = 4
+max_num_batched_tokens = 16384
+
+# Gemma 4 12B QAT Q4_0, text only. F32 activations (dtype f32, 2026-10-03), all 48 layers on the GPU, 12k context. Prefix cache off for this
+# model only (m4/pcache/README.md): each kept ~4k sequence pins ~0.4 GB of KV and the 6th ~4k prompt OOMs with the
+# global 16; with 0, 6/6 pass at <= 10.2 GB and the outputs equal --prefix-cache-n 0's. The 35B keeps the global 16.
+[[models]]
+name = "gemma4-12b"
+kind = "text"
+model_id = "~/ai/models/gemma4-12b-qat"
+dtype = "f32"   # llama.cpp precision layout: F32 activations, F16 KV + attention; passes G3 (spread rule) at 4k and 8k
+max_model_len = 11264   # f32: 11388-token prompt fits, ~11.6k OOMs (2026-10-03)
+[models.format]
+format = "gguf"
+quantized_file = "gemma-4-12b-it-qat-q4_0.gguf"
+[models.device]
+max_seq_len = 11264
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_n = 0
+
+# REDCELL 26B-A4B (gemma4 MoE; IQ4_NL expert down projections, unaligned-K prompts on the fused decode kernels).
+# BF16, all 30 layers on the GPU, 8k context. Prefix cache off for this model only (m4/pcache/README.md): ~4k prompts
+# peak at ~15.5 GB, so any kept KV (even a 1024 MiB byte cap) OOMs 3 of 7; with 0, 6/6 pass.
+[[models]]
+name = "redcell-26b"
+kind = "text"
+model_id = "~/ai/models/redcell-26b"
+dtype = "bf16"
+max_model_len = 8192
+[models.format]
+format = "gguf"
+quantized_file = "REDCELL-26B-A4B-OSINT-Cyber-APEX-Mini.gguf"
+[models.device]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+prefix_cache_n = 0
+
+# OrcaSAQ-2 27B Cyber Uncensored (qwen35 dense, IQ4_XS 75% / Q5_K / Q6_K; needs a binary with IQ4_XS dense = orca).
+# All 64 layers on the GPU (auto map at 8192, no pin): 14.6 GB after load (2 recurrent state slots, token_embd on the
+# host), 8k prompts served (two in a row, prefix cache on); ~10k+ OOM (recovered). 512-row prompt chunks: the default
+# 2048-row big chunks (an expert-streaming optimisation) OOM at ~4k on this dense 27B. MTP off: MTP=1 (89.5% acceptance)
+# gains ~3% decode (29.8 vs 28.8 tok/s) but leaves ~0 MiB at 8k. m4/orca/README.md.
+[[models]]
+name = "orcasaq2-cyber-27b"
+kind = "text"
+model_id = "~/ai/models/orcasaq2-cyber-27b"
+max_model_len = 8192
+[models.format]
+format = "gguf"
+quantized_file = "OrcaSAQ-2-27B-Uncensored.gguf"
+[models.device]
+max_seq_len = 8192
+[models.titan]
+idle_ttl_secs = 1800
+[models.titan.env]
+TITAN_MTP = "0"
+TITAN_PREFILL_BIG_CHUNK = "0"

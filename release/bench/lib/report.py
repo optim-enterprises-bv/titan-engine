@@ -72,7 +72,8 @@ def main(root=B):
             continue
         mo = {"id": mid, "name": m["name"], "ctx": m["ctx"], "rows": [], "headline": {}}
         md += [f"## {m['name']}", "", f"GGUF `{os.path.basename(m['gguf'])}`, context {m['ctx']}; short decode = "
-               f"{m['short'][0]} prompts x {m['short'][1]} tokens; long prompts decode {m['long_decode']} tokens.", ""]
+               f"{m['short'][0]} prompts x {m['short'][1]} tokens; long prompts decode {m['long_decode']} tokens."
+               + (f" Note: {m['_lengths_note']}." if m.get("_lengths_note") else ""), ""]
         lens = [k for k in ("4k", "13k", "28k") if any("L" + k in r for r in rows.values())]
         hdr = ["engine", "config", "decode tok/s", "TTFT short ms"]
         for k in lens:

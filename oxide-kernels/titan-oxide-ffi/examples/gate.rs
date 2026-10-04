@@ -102,7 +102,7 @@ mod rc {
     }
 }
 
-/// libmistralrspagedattention.a
+/// libmistralrspagedattention.a (v0.9.4: reference/mistralrs-paged-attn-094)
 mod rp {
     use super::P;
     use std::ffi::c_void;
@@ -111,8 +111,8 @@ mod rp {
         fn paged_attention_v1_f16(out: *mut c_void, q: *mut c_void, kc: *mut c_void, vc: *mut c_void, alibi: *mut c_void, nkv: i32, scale: f32, softcap: f32, bt: *mut u32, cl: *mut u32, bs: i32, max_ctx: i32, nseq: i32, nh: i32, hs: i32, mbps: i32, qs: i32, kvbs: i32, kvhs: i32, stream: *mut c_void, cache_dtype: u32, ks: *mut f32, vs: *mut f32, sinks: *const f32);
         fn paged_attention_v2_bf16(out: *mut c_void, es: *mut f32, ml: *mut f32, tmp: *mut c_void, q: *mut c_void, kc: *mut c_void, vc: *mut c_void, alibi: *mut c_void, nkv: i32, scale: f32, softcap: f32, bt: *mut u32, cl: *mut u32, bs: i32, max_ctx: i32, nseq: i32, nh: i32, hs: i32, mbps: i32, qs: i32, kvbs: i32, kvhs: i32, stream: *mut c_void, cache_dtype: u32, ks: *mut f32, vs: *mut f32, sinks: *const f32);
         fn flash_attn_sinks_f16(q: P, k: P, v: P, o: *mut c_void, sinks: *const f32, scale: f32, b: i32, ql: i32, kl: i32, nh: i32, nkv: i32, hd: i32, w: i32, s: *mut c_void);
-        fn flashinfer_decode(q: *mut c_void, kc: *mut c_void, vc: *mut c_void, indptr: *const i32, indices: *const i32, last: *const i32, req: *const i32, tiles: *const i32, o_indptr: *const i32, chunk: *const i32, mask: *const u8, o: *mut c_void, tmp_v: *mut c_void, tmp_s: *mut c_void, b: i32, padded: i32, nqo: i32, nkv: i32, hd: i32, ps: i32, qsn: i32, qsh: i32, sm: f32, wl: i32, cap: f32, dtype: u32, s: *mut c_void) -> i32;
-        fn reshape_and_cache_flashinfer(key: *mut c_void, value: *mut c_void, kc: *mut c_void, vc: *mut c_void, slots: *mut i64, nt: i32, nh: i32, hs: i32, bs: i32, ks: i32, vs: i32, dtype: u32, s: *mut c_void);
+        fn flashinfer_decode(q: *mut c_void, kc: *mut c_void, vc: *mut c_void, indptr: *const i32, indices: *const i32, last: *const i32, req: *const i32, tiles: *const i32, o_indptr: *const i32, chunk: *const i32, mask: *const u8, o: *mut c_void, tmp_v: *mut c_void, tmp_s: *mut c_void, b: i32, padded: i32, nqo: i32, nkv: i32, hd: i32, ps: i32, qsn: i32, qsh: i32, sm: f32, wl: i32, cap: f32, k_scale: f32, v_scale: f32, dtype: u32, cache_dtype: u32, s: *mut c_void) -> i32;
+        fn reshape_and_cache_flashinfer(key: *mut c_void, value: *mut c_void, kc: *mut c_void, vc: *mut c_void, slots: *mut i64, nt: i32, nh: i32, hs: i32, bs: i32, ks: i32, vs: i32, k_scale: f32, v_scale: f32, dtype: u32, cache_dtype: u32, s: *mut c_void);
     }
 }
 
@@ -954,7 +954,7 @@ fn paged_attn(g: &mut G) {
             let (tvp, tsp) = if use_tmp { (p[12] as M, p[13] as M) } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
             (if r { fb::flashinfer_decode } else { rp::flashinfer_decode })(p[0] as M, p[1] as M, p[2] as M, p[3] as _, p[4] as _, p[5] as _,
                 p[6] as _, p[7] as _, p[8] as _, p[9] as _, p[10] as _, p[11] as M, tvp, tsp, b as i32, padded as i32, nqo as i32, nkv as i32,
-                hd as i32, ps as i32, (nqo * hd) as i32, hd as i32, sm, -1, 0.0, dtype, s) as i64
+                hd as i32, ps as i32, (nqo * hd) as i32, hd as i32, sm, -1, 0.0, 1.0, 1.0, dtype, dtype, s) as i64
         });
     }
     {
@@ -968,7 +968,7 @@ fn paged_attn(g: &mut G) {
         let s = g.s();
         g.case("reshape_and_cache_flashinfer nt=9 nh=2 hs=128 bs=16 bf16", vec![key, val, kc, vc, bytes_of(&slots)], &[], |r, p| unsafe {
             (if r { fb::reshape_and_cache_flashinfer } else { rp::reshape_and_cache_flashinfer })(p[0] as M, p[1] as M, p[2] as M, p[3] as M, p[4] as _,
-                nt as i32, nh as i32, hs as i32, bs as i32, (nh * hs) as i32, (nh * hs) as i32, 1, s);
+                nt as i32, nh as i32, hs as i32, bs as i32, (nh * hs) as i32, (nh * hs) as i32, 1.0, 1.0, 1, 1, s);
             0
         });
     }

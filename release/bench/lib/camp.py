@@ -190,7 +190,7 @@ def est_item(it):
         # cold prefills (reps) + the fixed decode prompt: prefilled once, then prefix/slot-cached (llama.cpp slot
         # cache; ours hybrid prefix cache for qwen35/qwen3next; gpt-oss on ours has none: one more prefill per rep)
         nopc = eng == "ours" and m["family"] == "harmony"
-        return 1.15 * ((reps + 1 + (reps - 1 if nopc else 0)) * tk / pre + reps * (m["long_decode"] / (0.8 * dec) + 3))
+        return 1.15 * ((reps + (reps if nopc else 0)) * tk / pre + reps * (m["long_decode"] / (0.8 * dec) + 3))
     if it["kind"] == "quality":
         per_q = m["est"].get("quality_tokens_per_q", 10)
         nq = 40 if quality_set(m) == "q40" else 100
@@ -573,7 +573,8 @@ def measure_long(m, s, k):
     and draft acceptance); its prefill may be prefix-cached, which does not enter the decode rate (measured from the
     first token). 2 reps each, a third when the pair's spread exceeds the gate."""
     cold = adaptive(lambda: C.long_prompt(PORT, k, 1), "prompt_tok_s")
-    dec = adaptive(lambda: C.long_prompt(PORT, k, m["long_decode"], nonce=f"decode-{k}"), "decode_tok_s")
+    last = cold[-1]["nonce"]  # the engine's prefix/slot cache holds the last prompt: no extra long prefill
+    dec = adaptive(lambda: C.long_prompt(PORT, k, m["long_decode"], nonce=last), "decode_tok_s")
     return {"reps": cold, "decode_reps": dec,
             "metrics": {"prompt_tok_s": [r["prompt_tok_s"] for r in cold], "ttft_s": [r["ttft_s"] for r in cold],
                         "decode_tok_s": [r["decode_tok_s"] for r in dec],

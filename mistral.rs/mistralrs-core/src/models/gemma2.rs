@@ -240,13 +240,14 @@ impl Attention {
             attention_mask
         };
 
+        // titan: sliding layers hand PagedAttention their sliding mask (a whole first prompt chunk applies it as given)
         let mut attn_output = match &self.paged_attn {
             Some(paged_attn) => match metadata {
                 Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
                     &q,
                     &k,
                     &v,
-                    attention_mask,
+                    mask,
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
@@ -258,12 +259,12 @@ impl Attention {
                     // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
                     // Sanity check.
-                    assert!(!matches!(attention_mask, AttentionMask::None));
+                    assert!(!matches!(mask, AttentionMask::None));
                     paged_attn.forward(
                         &q,
                         &k,
                         &v,
-                        attention_mask,
+                        mask,
                         None,
                         None,
                         &input_metadata,

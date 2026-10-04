@@ -41,6 +41,30 @@ pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: CUde
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: CUdevice_attribute = 75;
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: CUdevice_attribute = 97;
 
+pub type CUmemorytype = c_uint;
+pub const CUmemorytype_enum_CU_MEMORYTYPE_DEVICE: CUmemorytype = 2;
+/// `CUDA_MEMCPY2D` (cuda.h, 64-bit layout).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUDA_MEMCPY2D {
+    pub srcXInBytes: usize,
+    pub srcY: usize,
+    pub srcMemoryType: CUmemorytype,
+    pub srcHost: *const c_void,
+    pub srcDevice: CUdeviceptr,
+    pub srcArray: *mut c_void,
+    pub srcPitch: usize,
+    pub dstXInBytes: usize,
+    pub dstY: usize,
+    pub dstMemoryType: CUmemorytype,
+    pub dstHost: *mut c_void,
+    pub dstDevice: CUdeviceptr,
+    pub dstArray: *mut c_void,
+    pub dstPitch: usize,
+    pub WidthInBytes: usize,
+    pub Height: usize,
+}
+
 /// `CU_STREAM_PER_THREAD`.
 pub const STREAM_PER_THREAD: usize = 0x2;
 
@@ -71,6 +95,8 @@ mod raw {
         pub fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
         pub fn cuModuleGetFunction(f: *mut CUfunction, m: CUmodule, name: *const c_char) -> CUresult;
         pub fn cuFuncSetAttribute(f: CUfunction, attrib: CUfunction_attribute, value: c_int) -> CUresult;
+        pub fn cuFuncGetAttribute(pi: *mut c_int, attrib: CUfunction_attribute, f: CUfunction) -> CUresult;
+        pub fn cuMemcpy2DAsync_v2(p: *const CUDA_MEMCPY2D, s: CUstream) -> CUresult;
         pub fn cuOccupancyMaxActiveBlocksPerMultiprocessor(n: *mut c_int, f: CUfunction, block: c_int, smem: usize) -> CUresult;
         pub fn cuLaunchKernel(
             f: CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, smem: c_uint, s: CUstream,
@@ -89,7 +115,7 @@ mod raw {
 
 pub use raw::{
     cuCtxGetCurrent, cuCtxGetDevice, cuCtxPopCurrent_v2, cuCtxPushCurrent_v2, cuCtxSetCurrent, cuCtxSynchronize, cuDeviceGet,
-    cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuFuncSetAttribute, cuGetErrorString, cuInit, cuModuleGetFunction,
+    cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuFuncGetAttribute, cuFuncSetAttribute, cuGetErrorString, cuInit, cuModuleGetFunction,
     cuModuleLoadData, cuOccupancyMaxActiveBlocksPerMultiprocessor, cuStreamGetCtx,
 };
 
@@ -122,6 +148,9 @@ pub unsafe fn cuMemcpyDtoDAsync_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usize,
 }
 pub unsafe fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: CUdeviceptr, n: usize, s: CUstream) -> CUresult {
     unsafe { raw::cuMemcpyDtoHAsync_v2(dst, src, n, ptsz(s)) }
+}
+pub unsafe fn cuMemcpy2DAsync_v2(p: *const CUDA_MEMCPY2D, s: CUstream) -> CUresult {
+    unsafe { raw::cuMemcpy2DAsync_v2(p, ptsz(s)) }
 }
 pub unsafe fn cuMemcpyHtoDAsync_v2(dst: CUdeviceptr, src: *const c_void, n: usize, s: CUstream) -> CUresult {
     unsafe { raw::cuMemcpyHtoDAsync_v2(dst, src, n, ptsz(s)) }

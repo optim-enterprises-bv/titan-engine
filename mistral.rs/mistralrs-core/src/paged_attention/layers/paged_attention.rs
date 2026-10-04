@@ -34,6 +34,13 @@ use crate::{
 
 static UNCALIBRATED_FP8_ATTENTION_WARNING: Once = Once::new();
 
+/// `TITAN_PATTN_TRACE=1`: one stderr line per prompt pass of every paged layer (dims, mask kind, window, chunk metadata)
+/// and the path it took.
+fn pattn_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_PATTN_TRACE").is_ok_and(|v| v == "1"))
+}
+
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 #[derive(Clone, Copy)]
 struct Fa3DecodeCandidate {
@@ -2120,6 +2127,40 @@ impl PagedAttention {
             }
         }
 
+        let trace = ctx.dims.seq_len > 1 && pattn_trace_on();
+        if trace {
+            let mask = match attention_mask {
+                AttentionMask::None => "None".to_string(),
+                AttentionMask::CausalFlash => "CausalFlash".to_string(),
+                AttentionMask::Custom(t) => format!("Custom{:?}", t.dims()),
+            };
+            eprintln!(
+                "pattn: rows {} batch {} heads {}/{} hd {} mask {mask} window {:?} first_chunk {} query_lens {:?} cached {:?} use_full {}",
+                ctx.dims.seq_len,
+                ctx.dims.batch_size,
+                ctx.dims.attention_heads,
+                ctx.dims.key_value_heads,
+                ctx.dims.head_size,
+                ctx.sdpa_params.sliding_window,
+                ctx.input_metadata.is_first_prompt_chunk,
+                ctx.input_metadata.query_lens,
+                ctx.input_metadata.num_cached_tokens,
+                ctx.use_full,
+            );
+        }
+        #[cfg(all(feature = "cuda", target_family = "unix"))]
+        if let Some(out) = self.try_titan_flash_prefill(
+            &ctx,
+            tensors,
+            &mut key_cache,
+            &mut value_cache,
+            write_cache,
+        )? {
+            if trace {
+                eprintln!("pattn:   -> titan flash-prefill");
+            }
+            return Ok(out);
+        }
         if let Some(out) = self.try_prefix_gather_prefill(
             &ctx,
             tensors,
@@ -2127,14 +2168,159 @@ impl PagedAttention {
             &mut value_cache,
             write_cache,
         )? {
+            if trace {
+                eprintln!("pattn:   -> gather + SDPA");
+            }
             return Ok(out);
         }
         if let Some(out) =
             self.try_regular_prompt(&ctx, tensors, &mut key_cache, &mut value_cache, write_cache)?
         {
+            if trace {
+                eprintln!("pattn:   -> regular prompt (chunk K/V, model mask)");
+            }
             return Ok(out);
         }
+        if trace {
+            eprintln!("pattn:   -> decode path");
+        }
         self.run_decode(&ctx, tensors, &mut key_cache, &mut value_cache, write_cache)
+    }
+
+    /// titan: a causal prompt chunk runs the flash-prefill kernels (`crate::attention::flash_prefill_any`, the kernels the
+    /// unpaged titan path uses) over the sequence's KV gathered from the paged cache: the chunk's K/V are written first,
+    /// then each sequence's keys (a sliding-window layer: only the blocks its window can reach) are gathered into one
+    /// contiguous (1, kv_heads, keys, head_dim) tensor. The layer's sliding window comes from `SdpaParams` (the kernel's
+    /// key window), not from the mask, which for a text prompt is the same causal / sliding mask. Anything the kernels
+    /// or this gather cannot take (alibi, sinks, softcap, non-causal multimodal context, windowed block-table views,
+    /// ragged batches, f32, short contexts below `TITAN_ATTN_FLASH_PREFILL_MIN`) returns None: the generic paths.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    fn try_titan_flash_prefill(
+        &self,
+        ctx: &PagedForwardCtx<'_>,
+        tensors: PagedForwardTensors<'_>,
+        key_cache: &mut Option<Tensor>,
+        value_cache: &mut Option<Tensor>,
+        write_cache: bool,
+    ) -> Result<Option<Tensor>> {
+        let (batch, seq_len) = (ctx.dims.batch_size, ctx.dims.seq_len);
+        if !write_cache
+            || seq_len < 2
+            || key_cache.is_none()
+            || value_cache.is_none()
+            || ctx.alibi_slopes.is_some()
+            || ctx.has_noncausal_mm_context()
+            || !(ctx.use_full || ctx.input_metadata.full_block_tables.is_none())
+            || !tensors.query.device().is_cuda()
+        {
+            return Ok(None);
+        }
+        let query_lens = match ctx.input_metadata.query_lens.clone() {
+            Some(lens) => lens,
+            None if batch == 1 => vec![seq_len],
+            None => return Ok(None),
+        };
+        if query_lens.len() != batch || query_lens.iter().any(|&len| len != seq_len) {
+            return Ok(None);
+        }
+        let kv_lens: Vec<usize> = if let Some(lens) = ctx
+            .input_metadata
+            .full_paged_context_lens_cpu
+            .as_deref()
+            .filter(|lens| lens.len() == batch)
+        {
+            lens.to_vec()
+        } else if let Some(cached) = ctx.input_metadata.num_cached_tokens.as_ref() {
+            if cached.len() != batch {
+                return Ok(None);
+            }
+            cached.iter().map(|&c| c + seq_len).collect()
+        } else {
+            query_lens.clone()
+        };
+        let declared_causal = ctx.flash_params.map_or(
+            ctx.input_metadata.prompt_chunk_attention_policy
+                == crate::paged_attention::block_hash::MultimodalAttentionPolicy::Causal,
+            |params| params.causal,
+        );
+        let (_, q_heads, _, head_size) = tensors.query.dims4()?;
+        let kv_heads = ctx.dims.key_value_heads;
+        let plan_input = PrefixPrefillPlanInput {
+            device_is_cuda: true,
+            dtype: tensors.query.dtype(),
+            cache_dtype: key_cache.as_ref().unwrap().dtype(),
+            has_alibi: false,
+            has_sinks: ctx.sdpa_params.sinks.is_some(),
+            has_custom_mask: false,
+            causality_known: true,
+            head_size,
+            has_softcap: ctx.sdpa_params.softcap.is_some(),
+            has_sliding_window: ctx.sdpa_params.sliding_window.is_some(),
+            query_layout_is_dense: true,
+            query_len: seq_len,
+            q_heads,
+            kv_heads,
+            writes_cache: true,
+            is_causal: declared_causal,
+            has_noncausal_mm_context: false,
+            fa3_supported: false,
+            block_size: 0,
+            attention_backend: AttentionBackendKind::from_cache(
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+            ),
+        };
+        if tensors.value.dim(3)? != head_size
+            || !kv_lens
+                .iter()
+                .all(|&kv| kv >= seq_len && crate::paged_attention::plan::titan_flash_prefill_planned(&plan_input, seq_len, kv))
+        {
+            return Ok(None);
+        }
+        let dev = tensors.query.device().location();
+        let Some(block_tables) = ctx.block_tables(&dev) else {
+            return Ok(None);
+        };
+        // the chunk's K/V into the cache, then attention over the gathered keys
+        {
+            let key_cache = key_cache.as_mut().unwrap();
+            let value_cache = value_cache.as_mut().unwrap();
+            let scales = self.cache_scales(key_cache);
+            write_kv_cache(
+                &tensors.key.transpose(1, 2)?,
+                &tensors.value.transpose(1, 2)?,
+                scales,
+                key_cache,
+                value_cache,
+                &ctx.slot_mapping,
+            )?;
+        }
+        let key_cache = key_cache.as_ref().unwrap();
+        let value_cache = value_cache.as_ref().unwrap();
+        let block_size = cache_block_size(key_cache, value_cache)?;
+        let scales = self.cache_scales(key_cache);
+        let window = ctx.sdpa_params.sliding_window.unwrap_or(0);
+        let dtype = tensors.query.dtype();
+        let out32 = dtype == DType::F16;
+        let device = tensors.query.device();
+        let mut outs = Vec::with_capacity(batch);
+        for (b, &kv_len) in kv_lens.iter().enumerate() {
+            // keys the chunk's first row can see: (pos - window, pos]; whole blocks from there
+            let first = if window > 0 { (kv_len - seq_len + 1).saturating_sub(window) } else { 0 };
+            let start_block = first / block_size;
+            let blocks = kv_len.div_ceil(block_size) - start_block;
+            let keys = kv_len - start_block * block_size;
+            let table = block_tables.narrow(0, b, 1)?.narrow(1, start_block, blocks)?.contiguous()?;
+            let cu = Tensor::new(&[0u32, keys as u32], device)?;
+            let (k, v) = gather_kv_cache_for_layout(key_cache, value_cache, scales, &table, &cu, keys, dtype)?;
+            let k = k.transpose(0, 1)?.contiguous()?.unsqueeze(0)?;
+            let v = v.transpose(0, 1)?.contiguous()?.unsqueeze(0)?;
+            let q = tensors.query.narrow(0, b, 1)?;
+            let o = crate::attention::flash_prefill_any(&q, &k, &v, ctx.sdpa_params.softmax_scale, window, out32)?;
+            outs.push(if o.dtype() != dtype { o.to_dtype(dtype)? } else { o });
+        }
+        let out = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
+        prefix_attention_output_layout(out, tensors.attention_mask).map(Some)
     }
 
     /// Standard paged attention forward: writes key/value to cache, then

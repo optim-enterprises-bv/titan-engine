@@ -64,9 +64,54 @@ pub struct TitanEntryToml {
     pub prefix_cache_n: Option<usize>,
     #[serde(default)]
     pub prefix_cache_max_mib: Option<usize>,
+    /// PagedAttention for this model: "on", "off" or "auto" (absent: `[paged_attn] mode`).
+    #[serde(default)]
+    pub paged_attn: Option<crate::args::PagedAttnMode>,
+    /// Paged KV cache type: "auto" (the activation dtype) or "f8e4m3" (absent: `[paged_attn] cache_type`).
+    #[serde(default)]
+    pub pa_cache_type: Option<String>,
+    /// Paged KV pool by context length or by MiB; either replaces the global pool sizing for this model.
+    #[serde(default)]
+    pub pa_context_len: Option<usize>,
+    #[serde(default)]
+    pub pa_memory_mb: Option<usize>,
+    /// Prompt tokens per scheduler step (absent: `[runtime] max_num_batched_tokens`).
+    #[serde(default)]
+    pub max_num_batched_tokens: Option<std::num::NonZeroUsize>,
+    /// Concurrent sequences for this model (absent: `[runtime] max_seqs`). Scheduler only: the auto device map still
+    /// sizes for `[models.device] max_batch_size`.
+    #[serde(default)]
+    pub max_seqs: Option<std::num::NonZeroUsize>,
 }
 
 impl TitanEntryToml {
+    pub fn pa_cache_type(&self) -> Result<Option<mistralrs_core::PagedCacheType>> {
+        self.pa_cache_type
+            .as_deref()
+            .map(|s| s.parse().map_err(|e: String| anyhow::anyhow!("pa_cache_type: {e}")))
+            .transpose()
+    }
+
+    /// The core swap settings of this entry.
+    pub fn settings(&self) -> Result<mistralrs_core::TitanModelSettings> {
+        use crate::args::PagedAttnMode;
+        Ok(mistralrs_core::TitanModelSettings {
+            env: self.env_strings(),
+            idle_ttl: self.idle_ttl_secs.filter(|s| *s > 0).map(std::time::Duration::from_secs),
+            prefix_cache_n: self.prefix_cache_n,
+            paged_attn: self.paged_attn.map(|m| match m {
+                PagedAttnMode::Auto => None,
+                PagedAttnMode::On => Some(true),
+                PagedAttnMode::Off => Some(false),
+            }),
+            pa_cache_type: self.pa_cache_type()?,
+            pa_context_len: self.pa_context_len,
+            pa_memory_mb: self.pa_memory_mb,
+            max_num_batched_tokens: self.max_num_batched_tokens.map(std::num::NonZeroUsize::get),
+            max_seqs: self.max_seqs.map(std::num::NonZeroUsize::get),
+        })
+    }
+
     pub fn env_strings(&self) -> std::collections::HashMap<String, String> {
         let mut env: std::collections::HashMap<String, String> = self
             .env
@@ -250,6 +295,12 @@ fn validate_config(config: &CliConfig) -> Result<()> {
             anyhow::bail!(
                 "multimodal models support dynamic language-model LoRA, but not legacy LoRA or X-LoRA"
             );
+        }
+        if let Some(titan) = &model.titan {
+            titan.pa_cache_type().with_context(|| format!("[models.titan] of {}", model.model_id))?;
+            if titan.pa_context_len.is_some() && titan.pa_memory_mb.is_some() {
+                anyhow::bail!("[models.titan] of {}: set pa_context_len or pa_memory_mb, not both", model.model_id);
+            }
         }
         if let Some(cpu) = model.device.cpu {
             match cpu_setting {
@@ -573,6 +624,81 @@ idle_ttl_secs = 60
         assert_eq!(policy.prefix_cache_n("/m/a", cfg.runtime.prefix_cache_n), 16);
         assert_eq!(policy.prefix_cache_n("/m/b", cfg.runtime.prefix_cache_n), 0);
         assert_eq!(policy.prefix_cache_n("/m/unknown", 16), 16);
+    }
+
+    #[test]
+    fn titan_serving_settings_are_per_model() {
+        let cfg = serve(
+            r#"
+command = "serve"
+
+[paged_attn]
+mode = "off"
+
+[[models]]
+name = "big"
+model_id = "/m/big"
+[models.titan.env]
+TITAN_MTP = "2"
+
+[[models]]
+name = "spark"
+model_id = "/m/spark"
+[models.titan]
+paged_attn = "on"
+max_seqs = 4
+max_num_batched_tokens = 16384
+pa_cache_type = "f8e4m3"
+
+[[models]]
+name = "qwen"
+model_id = "/m/qwen"
+[models.titan]
+paged_attn = "auto"
+pa_context_len = 16384
+
+[[models]]
+name = "gemma"
+model_id = "/m/gemma"
+[models.titan]
+paged_attn = "off"
+pa_memory_mb = 2048
+"#,
+        );
+        let s: Vec<_> = cfg.models.iter().map(|m| m.titan.clone().unwrap_or_default().settings().unwrap()).collect();
+        // absent: every serving setting falls back to the global one (None), the TITAN_* env untouched
+        assert_eq!(
+            (s[0].paged_attn, s[0].pa_cache_type, s[0].pa_context_len, s[0].pa_memory_mb),
+            (None, None, None, None)
+        );
+        assert_eq!((s[0].max_seqs, s[0].max_num_batched_tokens), (None, None));
+        assert_eq!(s[0].env.get("TITAN_MTP").map(String::as_str), Some("2"));
+        assert_eq!(s[1].paged_attn, Some(Some(true)));
+        assert_eq!(s[1].pa_cache_type, Some(mistralrs_core::PagedCacheType::F8E4M3));
+        assert_eq!((s[1].max_seqs, s[1].max_num_batched_tokens), (Some(4), Some(16384)));
+        assert_eq!((s[2].paged_attn, s[2].pa_context_len), (Some(None), Some(16384)));
+        assert_eq!((s[3].paged_attn, s[3].pa_memory_mb), (Some(Some(false)), Some(2048)));
+        // a model without [models.titan] gets the defaults
+        let plain = TitanEntryToml::default().settings().unwrap();
+        assert_eq!((plain.paged_attn, plain.max_seqs, plain.max_num_batched_tokens), (None, None, None));
+        assert!(plain.env.is_empty());
+    }
+
+    #[test]
+    fn titan_serving_settings_reject_bad_values() {
+        let bad = |titan: &str| {
+            let src = format!("command = \"serve\"\n[[models]]\nmodel_id = \"/m/a\"\n[models.titan]\n{titan}\n");
+            match toml::from_str::<CliConfig>(&src) {
+                Err(_) => true,
+                Ok(cfg) => validate_config(&cfg).is_err(),
+            }
+        };
+        assert!(bad("paged_attn = \"yes\""));
+        assert!(bad("pa_cache_type = \"f8e5m2\""));
+        assert!(bad("max_seqs = 0"));
+        assert!(bad("max_num_batched_tokens = 0"));
+        assert!(bad("pa_context_len = 8192\npa_memory_mb = 1024"));
+        assert!(!bad("pa_cache_type = \"auto\"\nmax_seqs = 1"));
     }
 
     #[test]

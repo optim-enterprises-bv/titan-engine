@@ -206,6 +206,9 @@ pub struct PagedAttentionConfig {
     pub(crate) recurrent_checkpoint_lanes_auto: bool,
     pub(crate) recurrent_prefix_capacity: usize,
     pub(crate) resolve_memory_utilization_after_load: bool,
+    /// titan: rows of the largest prompt chunk the paged scheduler runs (max_num_batched_tokens); the automatic
+    /// device map sizes prefill activations for that many rows instead of a whole max_seq_len prompt.
+    pub(crate) prefill_rows: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -232,7 +235,13 @@ impl PagedAttentionConfig {
             recurrent_checkpoint_lanes_auto: false,
             recurrent_prefix_capacity: 0,
             resolve_memory_utilization_after_load: true,
+            prefill_rows: None,
         })
+    }
+
+    /// The KV cache type the pool is allocated with.
+    pub fn cache_type(&self) -> PagedCacheType {
+        self.cache_type
     }
 
     pub fn with_serving_capacity(mut self, serving_capacity: usize) -> anyhow::Result<Self> {
@@ -259,6 +268,13 @@ impl PagedAttentionConfig {
         self.recurrent_checkpoint_lanes = lanes;
         self.recurrent_checkpoint_lanes_auto = false;
         Ok(self)
+    }
+
+    /// titan: the paged scheduler's prompt chunk (`--max-num-batched-tokens`): prompts are prefilled in chunks of at
+    /// most this many rows, so the device map reserves activations for one chunk, not a whole max_seq_len prompt.
+    pub fn with_prefill_rows(mut self, rows: usize) -> Self {
+        self.prefill_rows = Some(rows.max(1));
+        self
     }
 
     pub fn with_recurrent_prefix_capacity(mut self, capacity: usize) -> Self {

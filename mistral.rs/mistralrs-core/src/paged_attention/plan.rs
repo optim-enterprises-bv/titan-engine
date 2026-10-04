@@ -527,6 +527,24 @@ pub(crate) fn prompt_prefill_workspace(
             max_layer_transient = max_layer_transient.max(fa3_workspace.transient_bytes());
             continue;
         }
+        if let Some(pi) = plan_input.filter(|pi| {
+            matches!(plan, PrefixPrefillPlan::GatherSdpa)
+                && !input.has_sliding_window
+                && input.query_lens.iter().zip(input.full_context_lens).all(|(&q, &kv)| titan_flash_prefill_planned(pi, q, kv))
+        }) {
+            // titan flash-prefill over the gathered KV (PagedAttention::try_titan_flash_prefill): one sequence at a time
+            let v_head_dim = model.v_head_dim_for_layer(layer_idx);
+            let es = input.activation_dtype.size_in_bytes();
+            let mut peak = 0usize;
+            for (&q, &kv) in input.query_lens.iter().zip(input.full_context_lens) {
+                let kv_bytes = kv * pi.kv_heads * (pi.head_size + v_head_dim) * es;
+                let attend = crate::attention::flash_prefill_any_workspace_bytes(pi.dtype, pi.head_size, pi.q_heads, pi.kv_heads, q, kv, 0);
+                peak = peak.max(kv_bytes * 2 + attend);
+            }
+            gather_workspace_bytes = gather_workspace_bytes.max(peak);
+            max_layer_transient = max_layer_transient.max(peak);
+            continue;
+        }
         if !matches!(plan, PrefixPrefillPlan::GatherSdpa) {
             let output = checked_tensor_bytes(
                 &[
@@ -589,6 +607,24 @@ pub(crate) fn prompt_prefill_workspace(
         bytes,
         gather_workspace_bytes,
     })
+}
+
+/// Whether a causal prompt chunk of `query_len` rows over `kv_len` keys runs titan's flash-prefill kernels on the gathered
+/// paged KV instead of the gather + eager SDPA fallback (`TITAN_PAGED_FLASH_PREFILL=0` turns it off): CUDA, bf16 / f16,
+/// no alibi, sinks or softcap, text causality, a head layout `flash_prefill_any` takes, and as many keys as the unpaged
+/// path needs to take the kernel (`TITAN_ATTN_FLASH_PREFILL_MIN`).
+pub(crate) fn titan_flash_prefill_planned(input: &PrefixPrefillPlanInput, query_len: usize, kv_len: usize) -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    let on = *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_PAGED_FLASH_PREFILL").map(|v| v != "0").unwrap_or(true));
+    on && input.device_is_cuda
+        && !input.has_alibi
+        && !input.has_sinks
+        && !input.has_softcap
+        && !input.has_noncausal_mm_context
+        && input.is_causal
+        && query_len > 1
+        && crate::attention::flash_prefill_any_shape_supported(input.dtype, input.head_size, input.q_heads, input.kv_heads)
+        && crate::attention::flash_prefill_wanted(query_len, kv_len)
 }
 
 #[allow(dead_code)]

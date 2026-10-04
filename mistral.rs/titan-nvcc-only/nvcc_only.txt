@@ -48,8 +48,6 @@ afq_embedding_8bit_gs64_bf16	new in v0.9.4	mistralrs_quant_src_afq_ffi_rs
 afq_embedding_8bit_gs64_f16	new in v0.9.4	mistralrs_quant_src_afq_ffi_rs
 afq_embedding_8bit_gs64_f32	new in v0.9.4	mistralrs_quant_src_afq_ffi_rs
 categorical_large_f32_packed_batched	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
-copy_blocks_u8	new in v0.9.4	mistralrs_paged_attn_src_cuda_ffi_rs
-cuda_graph_copy_2d_bytes	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
 dflash_context_keys_bf16	new in v0.9.4	mistralrs_core_src_cuda_dflash_context_rs
 dflash_context_keys_f16	new in v0.9.4	mistralrs_core_src_cuda_dflash_context_rs
 dflash_context_keys_f32	new in v0.9.4	mistralrs_core_src_cuda_dflash_context_rs
@@ -149,8 +147,6 @@ mistralrs_nvfp4_swizzle_cuda	new in v0.9.4	mistralrs_quant_src_nvfp4_cutlass_rs
 mistralrs_nvfp4_workspace_size	new in v0.9.4	mistralrs_quant_src_nvfp4_cutlass_rs
 mrs_gguf_affine_repack_bf16	new in v0.9.4	mistralrs_quant_src_gguf_packed_affine_rs
 mrs_gguf_affine_repack_f16	new in v0.9.4	mistralrs_quant_src_gguf_packed_affine_rs
-pack_completion_input_u32	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
-pad_decode_input_u32	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
 rope_sincos_positions	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
 routed_lora_metadata_workspace_size	new in v0.9.4	mistralrs_quant_src_lora_dynamic_moe_cuda_ffi_rs
 sample_ranked_topk	new in v0.9.4	mistralrs_core_src_cuda_ffi_rs
@@ -180,9 +176,6 @@ titan_nvcc_only_gdn_prepare_recurrence	ABI changed in v0.9.4 (the plain name is 
 titan_nvcc_only_gdn_rmsnorm_gated	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
 titan_nvcc_only_warp_gated_delta_rule_recurrence	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
 titan_nvcc_only_top1_large_f32_packed	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
-titan_nvcc_only_flashinfer_decode	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
-titan_nvcc_only_gather_kv_cache_flashinfer	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
-titan_nvcc_only_reshape_and_cache_flashinfer	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
 titan_nvcc_only_marlin_gptq_4bit_f16	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
 titan_nvcc_only_marlin_gptq_4bit_bf16	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	
 titan_nvcc_only_marlin_awq_4bit_f16	ABI changed in v0.9.4 (the plain name is the 84b53bf twin)	

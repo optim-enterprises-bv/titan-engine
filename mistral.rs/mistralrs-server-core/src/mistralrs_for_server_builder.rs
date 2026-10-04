@@ -858,7 +858,8 @@ impl MistralRsForServerBuilder {
             )?
             .map(|config| config.with_serving_capacity(self.max_seqs))
             .transpose()?
-            .map(|config| config.with_recurrent_prefix_capacity(self.prefix_cache_n)),
+            .map(|config| config.with_recurrent_prefix_capacity(self.prefix_cache_n))
+            .map(|config| config.with_prefill_rows(self.max_num_batched_tokens.get())),
             self.mtp_config.as_ref(),
             mtp_runtime,
             &dtype,
@@ -994,17 +995,32 @@ impl MistralRsForServerBuilder {
             mistralrs_core::titan_device_free(&device) >> 20,
             mistralrs_core::titan_host_rss() >> 20
         );
-        let paged_attn = configure_paged_attn(&device, self.paged_attn);
-        let cache_config = init_cache_config(
-            self.paged_attn_block_size,
-            self.paged_attn_gpu_mem,
-            self.paged_attn_gpu_mem_usage,
-            self.paged_ctxt_len,
-            self.paged_cache_type,
-            !paged_attn,
-        )?
-        .map(|config| config.with_serving_capacity(self.max_seqs))
-        .transpose()?;
+        // per model ([models.titan]; absent: the global settings): PagedAttention mode, pool and KV type, prompt
+        // tokens per step and concurrent sequences. max_seqs is the scheduler's limit only; the auto device map keeps
+        // sizing for the model's own max_batch_size.
+        let serving = |id: &str| -> Result<(Option<PagedAttentionConfig>, usize, usize)> {
+            let m = policy.models.get(id).cloned().unwrap_or_default();
+            let max_seqs = m.max_seqs.unwrap_or(self.max_seqs);
+            let batched_tokens = m.max_num_batched_tokens.unwrap_or(self.max_num_batched_tokens.get());
+            let paged_attn = configure_paged_attn(&device, m.paged_attn.unwrap_or(self.paged_attn));
+            let (gpu_mem, gpu_mem_usage, ctxt_len) = if m.pa_context_len.is_some() || m.pa_memory_mb.is_some() {
+                (m.pa_memory_mb, None, m.pa_context_len)
+            } else {
+                (self.paged_attn_gpu_mem, self.paged_attn_gpu_mem_usage, self.paged_ctxt_len)
+            };
+            let cache_config = init_cache_config(
+                self.paged_attn_block_size,
+                gpu_mem,
+                gpu_mem_usage,
+                ctxt_len,
+                m.pa_cache_type.unwrap_or(self.paged_cache_type),
+                !paged_attn,
+            )?
+            .map(|config| config.with_serving_capacity(max_seqs))
+            .transpose()?
+            .map(|config| config.with_prefill_rows(batched_tokens));
+            Ok((cache_config, max_seqs, batched_tokens))
+        };
 
         let mut default = None;
         let mut rest = Vec::new();
@@ -1023,6 +1039,13 @@ impl MistralRsForServerBuilder {
                 .or(self.in_situ_quant.as_ref())
                 .map(|isq| parse_isq_value(isq, Some(&device)).map_err(|e| anyhow::anyhow!("{e}")))
                 .transpose()?;
+            let (cache_config, max_seqs, batched_tokens) = serving(&id)?;
+            if cache_config.is_some() || max_seqs != self.max_seqs || batched_tokens != self.max_num_batched_tokens.get() {
+                info!(
+                    "titan swap: {id}: PagedAttention {}, max_seqs {max_seqs}, max_num_batched_tokens {batched_tokens}",
+                    cache_config.map_or("off".to_string(), |c| format!("on ({:?} KV)", c.cache_type()))
+                );
+            }
             let lc = ModelLoaderConfig {
                 model_selected: mc.model.clone(),
                 token_source: self.token_source.clone(),
@@ -1044,12 +1067,12 @@ impl MistralRsForServerBuilder {
                     .or(self.encoder_cache_memory_bytes),
             };
             if id == policy.default_model {
-                default = Some((id, lc));
+                default = Some((id, lc, cache_config, max_seqs, batched_tokens));
             } else {
-                rest.push((id, lc, params.max_seq_len()));
+                rest.push((id, lc, params.max_seq_len(), cache_config, max_seqs, batched_tokens));
             }
         }
-        let (default_id, lc) = default.with_context(|| format!("titan swap: default model `{}` is not in [[models]]", policy.default_model))?;
+        let (default_id, lc, cache_config, max_seqs, batched_tokens) = default.with_context(|| format!("titan swap: default model `{}` is not in [[models]]", policy.default_model))?;
 
         let t0 = std::time::Instant::now();
         mistralrs_core::titan_cfg::begin_model(policy.settings(&default_id));
@@ -1082,14 +1105,14 @@ impl MistralRsForServerBuilder {
         let scheduler_config = init_scheduler_config(
             &cache_config,
             &pipeline,
-            self.max_seqs,
-            self.max_num_batched_tokens.get(),
+            max_seqs,
+            batched_tokens,
             self.max_prefill_chunk_tokens.get(),
             self.max_decode_steps_before_prefill.get(),
         )
         .await;
         let search_embedding_model = get_search_embedding_model(self.enable_search, self.search_embedding_model);
-        let mut builder = MistralRsBuilder::new(pipeline, scheduler_config.clone(), !self.interactive_mode, search_embedding_model)
+        let mut builder = MistralRsBuilder::new(pipeline, scheduler_config, !self.interactive_mode, search_embedding_model)
             .with_opt_log(self.log.clone())
             .with_no_kv_cache(self.no_kv_cache)
             .with_prefix_cache_n(policy.prefix_cache_n(&default_id, self.prefix_cache_n))
@@ -1108,9 +1131,15 @@ impl MistralRsForServerBuilder {
         let mistralrs = builder.build().await;
 
         let text = || vec![SupportedModality::Text];
-        for (id, lc, max_seq_len) in rest {
+        for (id, lc, max_seq_len, cache_config, max_seqs, batched_tokens) in rest {
             let state = UnloadedModelState {
-                scheduler_config: scheduler_config.clone(),
+                scheduler_config: SchedulerConfig::titan_swap_template(
+                    cache_config.map(|c| c.cache_type()),
+                    max_seqs,
+                    batched_tokens,
+                    self.max_prefill_chunk_tokens.get(),
+                    self.max_decode_steps_before_prefill.get(),
+                )?,
                 engine_config: EngineConfig {
                     no_kv_cache: self.no_kv_cache,
                     no_prefix_cache: false,
@@ -1218,7 +1247,8 @@ impl MistralRsForServerBuilder {
         )?
         .map(|config| config.with_serving_capacity(self.max_seqs))
         .transpose()?
-        .map(|config| config.with_recurrent_prefix_capacity(self.prefix_cache_n));
+        .map(|config| config.with_recurrent_prefix_capacity(self.prefix_cache_n))
+        .map(|config| config.with_prefill_rows(self.max_num_batched_tokens.get()));
         let mut paged_kv_plan = plan_paged_kv(
             &self
                 .models

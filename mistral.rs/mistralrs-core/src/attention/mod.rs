@@ -219,6 +219,13 @@ fn gqa_grouped_sdpa(
     let (_, kv_heads, kv_len, _) = k.dims4()?;
     let n_rep = h / kv_heads;
     let v_d = v.dim(3)?;
+    // The att x V matmul rejects V rows that are unit-stride but not packed (row stride != v_d): a
+    // PagedAttention gather ((tokens, kv_heads, d) transposed to (1, kv_heads, tokens, d), row stride
+    // kv_heads * d) is such a layout and is copied once here. Every other layout (the unpaged caches)
+    // is passed through untouched.
+    let v_rows_gapped = v.stride()[3] == 1 && v.stride()[2] != v_d && kv_len > 1;
+    let v = if v_rows_gapped { v.contiguous()? } else { v.clone() };
+    let v = &v;
     let chunk = attention_chunk_size(q, k)?;
     let k_t = k.t()?;
     let mut out = Vec::with_capacity(seq_len.div_ceil(chunk));
@@ -392,6 +399,44 @@ pub(crate) fn flash_decode_first_row(
     }
 }
 
+/// Debug dumps (`TITAN_PATTN_DUMP=<dir>`, `TITAN_PATTN_DUMP_LAYERS=0,3`, default 0): a model appends each prompt pass's
+/// attention output rows of the listed layers, `(b, rows, ..)` with `b == 1` and `rows > 1`, to `<dir>/L<layer>.bin` as
+/// `[u32 rows][u32 width][rows * width f32]` records, so a prompt's rows in position order. Off (one env read) unless set.
+pub(crate) fn titan_dump_rows(layer: usize, t: &Tensor) -> Result<()> {
+    static CFG: std::sync::OnceLock<Option<(std::path::PathBuf, Vec<usize>)>> = std::sync::OnceLock::new();
+    let cfg = CFG.get_or_init(|| {
+        let dir = mistralrs_quant::titan_cfg::var("TITAN_PATTN_DUMP").ok()?;
+        let layers = mistralrs_quant::titan_cfg::var("TITAN_PATTN_DUMP_LAYERS")
+            .unwrap_or_else(|_| "0".into())
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        Some((std::path::PathBuf::from(dir), layers))
+    });
+    let Some((dir, layers)) = cfg else { return Ok(()) };
+    let dims = t.dims();
+    if !layers.contains(&layer) || dims.len() < 2 || dims[0] != 1 || dims[1] < 2 {
+        return Ok(());
+    }
+    let rows = dims[1];
+    let v = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let width = v.len() / rows;
+    let mut buf = Vec::with_capacity(8 + v.len() * 4);
+    buf.extend((rows as u32).to_le_bytes());
+    buf.extend((width as u32).to_le_bytes());
+    for x in v {
+        buf.extend(x.to_le_bytes());
+    }
+    use std::io::Write;
+    std::fs::create_dir_all(dir).map_err(candle_core::Error::wrap)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("L{layer}.bin")))
+        .and_then(|mut f| f.write_all(&buf))
+        .map_err(candle_core::Error::wrap)
+}
+
 /// Whether a CUDA prompt chunk of `rows` query rows ending at `kv_len` keys runs the flash-prefill kernel
 /// (`TITAN_ATTN_FLASH_PREFILL`); the model's shapes must also pass `flash_prefill_supported`.
 pub(crate) fn flash_prefill_wanted(rows: usize, kv_len: usize) -> bool {
@@ -423,6 +468,32 @@ pub(crate) fn flash_prefill_supported(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_p
 /// flash-prefill kernel: (1, h, s, d).
 pub(crate) fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams) -> Result<Tensor> {
     flash_prefill_window(q, k, v, sdpa_params, 0)
+}
+
+/// `flash_prefill_any`'s shape / dtype support without tensors (PagedAttention's planner).
+pub(crate) fn flash_prefill_any_shape_supported(dtype: DType, head_dim: usize, q_heads: usize, kv_heads: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::supported_any_shape(dtype, head_dim, q_heads, kv_heads)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (dtype, head_dim, q_heads, kv_heads);
+        false
+    }
+}
+
+/// Transient device bytes of one `flash_prefill_any` call (PagedAttention's prompt admission).
+pub(crate) fn flash_prefill_any_workspace_bytes(dtype: DType, head_dim: usize, q_heads: usize, kv_heads: usize, s: usize, kv_len: usize, win: usize) -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::attend_any_workspace_bytes(dtype, head_dim, q_heads, kv_heads, s, kv_len, win)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (dtype, head_dim, q_heads, kv_heads, s, kv_len, win);
+        0
+    }
 }
 
 /// Whether `flash_prefill_any` takes these tensors: bf16 or f16 q / k / v, head dim 256 or 512 (gemma4).

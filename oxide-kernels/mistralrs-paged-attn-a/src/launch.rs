@@ -160,6 +160,24 @@ unsafe fn launch(stream: *mut c_void, name: &'static str, grid: (u32, u32, u32),
     }
 }
 
+/// v0.9.4 `VLLM_EnsureMaxDynamicSharedMemorySize` (cuda_compat.h): `cudaFuncGetAttributes`, and
+/// `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)` only when the function's current
+/// maximum is below `bytes` (never lowers it).
+unsafe fn ensure_max_dynamic_smem(stream: *mut c_void, name: &'static str, bytes: i32) -> i32 {
+    unsafe {
+        let f = function(cu_stream(stream), name);
+        let mut cur: i32 = 0;
+        let r = cu::cuFuncGetAttribute(&mut cur, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f);
+        if r != cu::cudaError_enum_CUDA_SUCCESS {
+            return r as i32;
+        }
+        if cur >= bytes {
+            return 0;
+        }
+        set_max_dynamic_smem(stream, name, bytes)
+    }
+}
+
 /// `cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)`.
 unsafe fn set_max_dynamic_smem(stream: *mut c_void, name: &'static str, bytes: i32) -> i32 {
     unsafe {
@@ -206,7 +224,8 @@ pub unsafe extern "C" fn reshape_and_cache(
             .p(v_scale);
         err = unsafe { launch(stream, name, grid, block, 0, a) };
     }
-    cuda_check(err, "src/cuda/reshape_and_cache_kernel.cu", 140);
+    // v0.9.4: the CUDA_CHECK(cudaGetLastError()) is on line 139 (a reformatted scaled_convert call above it)
+    cuda_check(err, "src/cuda/reshape_and_cache_kernel.cu", 139);
 }
 
 // ================================================================================================
@@ -305,6 +324,10 @@ pub unsafe extern "C" fn copy_blocks_f16(k: *mut i64, v: *mut i64, m: *const i64
 }
 pub unsafe extern "C" fn copy_blocks_bf16(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64) {
     unsafe { copy_blocks("copy_blocks_kernel_bf16", k, v, m, nl, np, nk, nv, stream) }
+}
+/// v0.9.4 (FP8 E4M3 caches are copied as bytes).
+pub unsafe extern "C" fn copy_blocks_u8(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64) {
+    unsafe { copy_blocks("copy_blocks_kernel_u8", k, v, m, nl, np, nk, nv, stream) }
 }
 
 // ================================================================================================
@@ -417,7 +440,10 @@ unsafe fn pa_v1(
         let outputs_size = (NUM_WARPS / 2) * head_size * 4;
         let shared_mem_size = logits_size.max(outputs_size);
         let name = pa_name(1, dt, fp8, head_size, block_size);
-        err = unsafe { set_max_dynamic_smem(stream, name, shared_mem_size) };
+        // v0.9.4 LAUNCH_PAGED_ATTENTION_V1: CUDA_CHECK(VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(..)) exits before
+        // the launch; __LINE__ is the macro's line in pagedattention.cuh's head-size switch
+        let line = match head_size { 64 => 719, 80 => 722, 96 => 725, 112 => 728, 128 => 731, 192 => 734, 256 => 737, _ => 740 };
+        cuda_check(unsafe { ensure_max_dynamic_smem(stream, name, shared_mem_size) }, "src/cuda/pagedattention.cuh", line);
         let a = Args::new()
             .p(out)
             .p(query)
@@ -436,10 +462,7 @@ unsafe fn pa_v1(
             .p(k_scale)
             .p(v_scale)
             .p(sinks);
-        let e = unsafe { launch(stream, name, (num_heads as u32, num_seqs as u32, 1), (128, 1, 1), shared_mem_size as u32, a) };
-        if err == 0 {
-            err = e;
-        }
+        err = unsafe { launch(stream, name, (num_heads as u32, num_seqs as u32, 1), (128, 1, 1), shared_mem_size as u32, a) };
     }
     cuda_check(err, file, line);
 }

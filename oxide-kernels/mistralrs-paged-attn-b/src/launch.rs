@@ -119,7 +119,7 @@ unsafe fn function(stream: cu::CUstream, name: &'static str) -> cu::CUfunction {
 pub fn available(name: &str) -> bool {
     unsafe {
         let s = CU_STREAM_PER_THREAD as cu::CUstream;
-        let _ = function(s, INSTANCES.iter().find(|i| i.kind == Kind::Mla && i.stages == 2).unwrap().name);
+        let _ = function(s, INSTANCES.iter().find(|i| i.kind == Kind::Mla && i.stages == 2).unwrap().ox);
         let guard = MODULES.lock().unwrap();
         let ctx = stream_ctx(s);
         let m = &guard.as_ref().unwrap()[&(ctx as usize)];
@@ -130,16 +130,17 @@ pub fn available(name: &str) -> bool {
 }
 
 /// The decode kernel `flashinfer_decode` would pick (for the gate's partial-build skip).
-pub fn decode_kernel_name(dtype: u32, head_dim: u32, group: u32, sw: bool, sc: bool) -> Option<&'static str> {
-    let sz = dtype_size(dtype);
+pub fn decode_kernel_name(dtype: u32, cache_dtype: u32, head_dim: u32, group: u32, sw: bool, sc: bool) -> Option<&'static str> {
+    let sz = if cache_dtype == 3 { 1 } else { dtype_size(dtype) };
     let vec = (16 / sz).max(head_dim / 32);
     let bdx = head_dim / vec;
     let bdz = 128u32.max(bdx * group) / (bdx * group);
-    let tile = if group == 1 { 4 } else { 1 };
+    let tile = if group == 1 { if sz == 1 { 2 } else { 4 } } else { 1 };
+    let kind = if cache_dtype == 3 { Kind::DecodeFp8 } else { Kind::Decode };
     INSTANCES
         .iter()
-        .find(|i| i.kind == Kind::Decode && i.stages == 2 && i.dtype == dtype && i.vec == vec && i.bdx == bdx && i.bdy == group && i.bdz == bdz && i.tile == tile && i.sw == sw && i.sc == sc)
-        .map(|i| i.name)
+        .find(|i| i.kind == kind && i.stages == 2 && i.dtype == dtype && i.vec == vec && i.bdx == bdx && i.bdy == group && i.bdz == bdz && i.tile == tile && i.sw == sw && i.sc == sc)
+        .map(|i| i.ox)
 }
 
 /// Device of the stream's context.
@@ -199,6 +200,7 @@ fn cuda_error_string(e: i32) -> &'static str {
         9 => "invalid configuration argument",
         400 => "invalid resource handle",
         701 => "too many resources requested for launch",
+        801 => "operation not supported",
         999 => "unknown error",
         _ => "unrecognized error code",
     }
@@ -319,7 +321,7 @@ fn find(kind: Kind, pred: impl Fn(&crate::instances::Inst) -> bool) -> &'static 
         .iter()
         .find(|i| i.kind == kind && pred(i))
         .unwrap_or_else(|| panic!("mistralrs-paged-attn-b: no {kind:?} instance for this configuration"))
-        .name
+        .ox
 }
 
 // ================================================================================================
@@ -372,11 +374,11 @@ unsafe fn variable_length_merge_states(
 /// BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, kNone, DefaultAttention<false, SW, SC, false>, ...>
 /// (through run_flashinfer_decode). Err(msg) = a thrown flashinfer::Error.
 unsafe fn run_flashinfer_decode(
-    dtype: u32, head_dim: u32, sw: bool, sc: bool, q: *mut c_void, key_cache: *mut c_void, value_cache: *mut c_void, kv_indptr: *const i32,
+    dtype: u32, cache_dtype: u32, head_dim: u32, sw: bool, sc: bool, q: *mut c_void, key_cache: *mut c_void, value_cache: *mut c_void, kv_indptr: *const i32,
     kv_indices: *const i32, kv_last_page_len: *const i32, request_indices: *const i32, kv_tile_indices: *const i32, o_indptr: *const i32,
     kv_chunk_size_ptr: *const i32, block_valid_mask: *const u8, o: *mut c_void, tmp_v: *mut c_void, tmp_s: *mut c_void, batch_size: i32,
     padded_batch_size: i32, num_qo_heads: i32, num_kv_heads: i32, page_size: i32, q_stride_n: i32, q_stride_h: i32, sm_scale: f32,
-    window_left: i32, logits_soft_cap: f32, stream: *mut c_void,
+    window_left: i32, logits_soft_cap: f32, v_scale: f32, stream: *mut c_void,
 ) -> Result<i32, String> {
     unsafe {
         let (fd, fm, fs, fa) = fastdiv(page_size as u32);
@@ -387,11 +389,13 @@ unsafe fn run_flashinfer_decode(
         let stride_h = ps.wrapping_mul(head_dim);
         let nqo = num_qo_heads as u32;
         let padded = padded_batch_size as u32;
-        let sz = dtype_size(dtype);
+        // sizeof(DTypeKV): the activation dtype, or 1 for the FP8 E4M3 cache
+        let sz = if cache_dtype == 3 { 1 } else { dtype_size(dtype) };
         let vec = (16 / sz).max(head_dim / 32);
         let bdx = head_dim / vec;
         let group = nqo / nkv;
-        if ![1, 2, 3, 4, 8, 16].contains(&group) {
+        // v0.9.4 DISPATCH_GQA_GROUP_SIZE: 1, 2, 3, 4, 5, 6, 7, 8, 16
+        if ![1, 2, 3, 4, 5, 6, 7, 8, 16].contains(&group) {
             return Err(format!(
                 "Error in function 'BatchDecodeWithPagedKVCacheDispatched' at {}:{}: Unsupported group_size: {group}",
                 "src/cuda/flashinfer/attention/decode.cuh", 755
@@ -400,10 +404,10 @@ unsafe fn run_flashinfer_decode(
         let bdy = group;
         let num_threads = 128u32.max(bdx * bdy);
         let bdz = num_threads / (bdx * bdy);
-        let tile = if group == 1 { 4 } else { 1 };
+        let tile = if group == 1 { if sz == 1 { 2 } else { 4 } } else { 1 };
         let stages = num_stages_smem(cu_stream(stream));
         let smem_size = 2 * stages * tile * bdy * bdz * head_dim * sz + (tile * num_threads * 8).max(2 * bdy * bdz * 4);
-        let name = find(Kind::Decode, |i| {
+        let name = find(if cache_dtype == 3 { Kind::DecodeFp8 } else { Kind::Decode }, |i| {
             i.dtype == dtype && i.stages == stages && i.tile == tile && i.vec == vec && i.bdx == bdx && i.bdy == bdy && i.bdz == bdz && i.sw == sw && i.sc == sc
         });
         let r = set_max_dynamic_smem(stream, name, smem_size);
@@ -434,6 +438,7 @@ unsafe fn run_flashinfer_decode(
             .i(window_left)
             .f(logits_soft_cap)
             .f(sm_scale)
+            .f(v_scale)
             .u(partition as u32)
             .u(fd)
             .u(fm)
@@ -470,15 +475,19 @@ unsafe fn run_flashinfer_decode(
     }
 }
 
+/// v0.9.4 ABI: `k_scale` folds into the softmax scale (`sm_scale * k_scale`, host float multiply), `v_scale` is
+/// BatchDecodeParams::v_scale (OutputTransform), `cache_dtype` selects the KV element type (3 = FP8 E4M3).
 pub unsafe extern "C" fn flashinfer_decode(
     q: *mut c_void, key_cache: *mut c_void, value_cache: *mut c_void, kv_indptr: *const i32, kv_indices: *const i32,
     kv_last_page_len: *const i32, request_indices: *const i32, kv_tile_indices: *const i32, o_indptr: *const i32,
     kv_chunk_size_ptr: *const i32, block_valid_mask: *const u8, o: *mut c_void, tmp_v: *mut c_void, tmp_s: *mut c_void, batch_size: i32,
     padded_batch_size: i32, num_qo_heads: i32, num_kv_heads: i32, head_size: i32, page_size: i32, q_stride_n: i32, q_stride_h: i32,
-    sm_scale: f32, window_left: i32, logits_soft_cap: f32, dtype: u32, stream: *mut c_void,
+    sm_scale: f32, window_left: i32, logits_soft_cap: f32, k_scale: f32, v_scale: f32, dtype: u32, cache_dtype: u32,
+    stream: *mut c_void,
 ) -> i32 {
-    if dtype > 2 {
-        eprintln!("FlashInfer decode received unsupported dtype {dtype}");
+    // (dtype, cache_dtype) pairs of the reference: (0,0) (1,1) (2,2) and the FP8 E4M3 caches (0,3) (1,3) (2,3)
+    if dtype > 2 || (cache_dtype != dtype && cache_dtype != 3) {
+        eprintln!("FlashInfer decode received unsupported dtype pair {dtype}/{cache_dtype}");
         return CUDA_ERROR_INVALID_VALUE;
     }
     if ![64, 128, 256, 512].contains(&head_size) {
@@ -490,6 +499,7 @@ pub unsafe extern "C" fn flashinfer_decode(
     let r = unsafe {
         run_flashinfer_decode(
             dtype,
+            cache_dtype,
             head_size as u32,
             sw,
             sc,
@@ -514,9 +524,10 @@ pub unsafe extern "C" fn flashinfer_decode(
             page_size,
             q_stride_n,
             q_stride_h,
-            sm_scale,
+            sm_scale * k_scale,
             window_left,
             logits_soft_cap,
+            v_scale,
             stream,
         )
     };
@@ -533,17 +544,19 @@ pub unsafe extern "C" fn flashinfer_decode(
     }
 }
 
+/// v0.9.4 ABI: `k_scale` / `v_scale` divide the values written to an FP8 E4M3 cache (`cache_dtype` 3).
 pub unsafe extern "C" fn reshape_and_cache_flashinfer(
     key: *mut c_void, value: *mut c_void, key_cache: *mut c_void, value_cache: *mut c_void, slot_mapping: *mut i64, num_tokens: i32,
-    num_heads: i32, head_size: i32, block_size: i32, key_stride: i32, value_stride: i32, dtype: u32, stream: *mut c_void,
+    num_heads: i32, head_size: i32, block_size: i32, key_stride: i32, value_stride: i32, k_scale: f32, v_scale: f32, dtype: u32,
+    cache_dtype: u32, stream: *mut c_void,
 ) {
-    if dtype > 2 {
-        eprintln!("reshape_and_cache_flashinfer received unsupported dtype {dtype}");
+    if dtype > 2 || (cache_dtype != dtype && cache_dtype != 3) {
+        eprintln!("reshape_and_cache_flashinfer received unsupported dtype pair {dtype}/{cache_dtype}");
         return;
     }
     let grid = (num_tokens as u32, 1, 1);
     let block = (num_heads.wrapping_mul(head_size).min(512) as u32, 1, 1);
-    let name = find(Kind::Reshape, |i| i.dtype == dtype);
+    let name = find(Kind::Reshape, |i| i.dtype == dtype && i.cache == cache_dtype);
     let args = Args::new()
         .p(key)
         .p(value)
@@ -554,22 +567,26 @@ pub unsafe extern "C" fn reshape_and_cache_flashinfer(
         .i(head_size)
         .i(block_size)
         .i(key_stride)
-        .i(value_stride);
+        .i(value_stride)
+        .f(k_scale)
+        .f(v_scale);
     unsafe { launch(stream, name, grid, block, 0, args) };
 }
 
+/// v0.9.4 ABI: `out_dtype` / `cache_dtype` pairs (an FP8 E4M3 cache is dequantised with `k_scale` / `v_scale`);
+/// tokens at or past `cu_seq_lens[num_seqs]` are zero-filled.
 pub unsafe extern "C" fn gather_kv_cache_flashinfer(
     key_cache: *mut c_void, value_cache: *mut c_void, k_out: *mut c_void, v_out: *mut c_void, block_table: *const i32,
-    cu_seq_lens: *const i32, num_tokens: i32, _num_seqs: i32, block_size: i32, block_table_stride: i32, num_kv_heads: i32, head_size: i32,
-    dtype: u32, stream: *mut c_void,
+    cu_seq_lens: *const i32, num_tokens: i32, num_seqs: i32, block_size: i32, block_table_stride: i32, num_kv_heads: i32, head_size: i32,
+    out_dtype: u32, cache_dtype: u32, k_scale: f32, v_scale: f32, stream: *mut c_void,
 ) {
-    if dtype > 2 {
-        eprintln!("gather_kv_cache_flashinfer received unsupported dtype {dtype}");
+    if out_dtype > 2 || (cache_dtype != out_dtype && cache_dtype != 3) {
+        eprintln!("gather_kv_cache_flashinfer received unsupported dtype pair {out_dtype}/{cache_dtype}");
         return;
     }
     let grid = (num_tokens as u32, 1, 1);
     let block = (num_kv_heads.wrapping_mul(head_size).min(512) as u32, 1, 1);
-    let name = find(Kind::Gather, |i| i.dtype == dtype);
+    let name = find(Kind::Gather, |i| i.dtype == out_dtype && i.cache == cache_dtype);
     let args = Args::new()
         .p(key_cache)
         .p(value_cache)
@@ -578,10 +595,13 @@ pub unsafe extern "C" fn gather_kv_cache_flashinfer(
         .p(block_table)
         .p(cu_seq_lens)
         .i(num_tokens)
+        .i(num_seqs)
         .i(block_size)
         .i(block_table_stride)
         .i(num_kv_heads)
-        .i(head_size);
+        .i(head_size)
+        .f(k_scale)
+        .f(v_scale);
     unsafe { launch(stream, name, grid, block, 0, args) };
 }
 

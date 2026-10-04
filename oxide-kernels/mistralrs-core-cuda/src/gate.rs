@@ -16,6 +16,9 @@ mod c {
     use super::{M, P};
     unsafe extern "C" {
         pub fn cuda_graph_copy_bytes(src: P, dst: M, n: i64, stream: i64) -> i32;
+        pub fn v094_cuda_graph_copy_2d_bytes(src: P, dst: M, width: i64, height: i64, src_pitch: i64, dst_pitch: i64, stream: i64) -> i32;
+        pub fn v094_pad_decode_input_u32(input: P, output: M, input_rows: i32, output_rows: i32, width: i32, stream: i64) -> i32;
+        pub fn v094_pack_completion_input_u32(host: P, staged_rows: *const P, output: M, rows: i32, host_width: i32, staged_width: i32, stream: i64) -> i32;
         pub fn gated_delta_rule_recurrence(q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32, state: *mut f32, output: *mut f32, bh: i32, seq_len: i32, k_dim: i32, v_dim: i32, stream: i64);
         pub fn warp_gated_delta_rule_recurrence(q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32, state: *mut f32, output: *mut f32, bh: i32, seq_len: i32, k_dim: i32, v_dim: i32, stream: i64);
         pub fn chunked_gated_delta_rule_recurrence(q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32, state: *mut f32, output: *mut f32, bh: i32, seq_len: i32, k_dim: i32, v_dim: i32, stream: i64);
@@ -317,6 +320,74 @@ fn graph(g: &mut Gate) {
                 launch::cuda_graph_copy_bytes(p[0] as P, p[1] as M, n, st)
             } else {
                 c::cuda_graph_copy_bytes(p[0] as P, p[1] as M, n, st)
+            };
+            let mut v = rc.get();
+            if rust { v.1 = r } else { v.0 = r }
+            rc.set(v);
+        });
+        let (a, b) = rc.get();
+        g.check_eq(&label, "return", a, b);
+    }
+}
+
+/// v0.9.4 CUDA-graph helpers: cuda_graph_copy_2d_bytes (cuMemcpy2DAsync), pad_decode_input_u32,
+/// pack_completion_input_u32 (64-row chunks, the row-pointer table by value).
+fn graph094(g: &mut Gate) {
+    g.family("graph094");
+    for &(w, h, sp, dp, use_null) in &[(-1i64, 1i64, 4i64, 4i64, false), (4, 3, 2, 8, false), (0, 5, 8, 8, true), (7, 0, 8, 8, false),
+                                       (1, 1, 1, 1, false), (13, 9, 16, 32, true), (256, 31, 260, 512, false), (4096, 4, 4096, 8192, true)] {
+        let src = g.bytes((sp.max(1) * h.max(1)) as usize + 64);
+        let dst = g.bytes((dp.max(1) * h.max(1)) as usize + 64);
+        let rc = std::cell::Cell::new((0, 0));
+        let label = format!("cuda_graph_copy_2d_bytes w={w} h={h} sp={sp} dp={dp} null_stream={use_null}");
+        g.case(label.clone(), vec![Arg::In(src), Arg::Out("dst", dst)], use_null, w > 0 && h > 0 && sp >= w && dp >= w, |rust, p, st| unsafe {
+            let r = if rust {
+                launch::cuda_graph_copy_2d_bytes(p[0] as P, p[1] as M, w, h, sp, dp, st)
+            } else {
+                c::v094_cuda_graph_copy_2d_bytes(p[0] as P, p[1] as M, w, h, sp, dp, st)
+            };
+            let mut v = rc.get();
+            if rust { v.1 = r } else { v.0 = r }
+            rc.set(v);
+        });
+        let (a, b) = rc.get();
+        g.check_eq(&label, "return", a, b);
+    }
+    for &(ir, or, w, use_null) in &[(1i32, 1i32, 1i32, false), (1, 4, 1, true), (3, 8, 2, false), (5, 5, 7, false), (2, 64, 3, true), (31, 37, 11, false),
+                                    (0, 4, 1, false), (4, 3, 1, false), (2, 4, 0, false)] {
+        let input = g.bytes((ir.max(1) * w.max(1)) as usize * 4);
+        let output = g.bytes((or.max(1) * w.max(1)) as usize * 4 + 16);
+        let rc = std::cell::Cell::new((0, 0));
+        let label = format!("pad_decode_input_u32 in={ir} out={or} w={w} null_stream={use_null}");
+        g.case(label.clone(), vec![Arg::In(input), Arg::Out("out", output)], use_null, ir > 0 && or >= ir && w > 0, |rust, p, st| unsafe {
+            let r = if rust {
+                launch::pad_decode_input_u32(p[0] as P, p[1] as M, ir, or, w, st)
+            } else {
+                c::v094_pad_decode_input_u32(p[0] as P, p[1] as M, ir, or, w, st)
+            };
+            let mut v = rc.get();
+            if rust { v.1 = r } else { v.0 = r }
+            rc.set(v);
+        });
+        let (a, b) = rc.get();
+        g.check_eq(&label, "return", a, b);
+    }
+    // rows spanning 1, 2 and 3 launches (64 rows each); staged rows are separate device buffers
+    for &(rows, hw, sw, use_null) in &[(1i32, 1i32, 1i32, false), (3, 5, 2, true), (64, 7, 1, false), (65, 3, 4, false), (130, 1, 9, true), (0, 1, 1, false), (2, 0, 1, false)] {
+        let host = g.bytes((rows.max(1) * hw.max(1)) as usize * 4);
+        let out = g.bytes((rows.max(1) as usize) * ((hw.max(0) + sw.max(0)) as usize) * 4 + 16);
+        let mut args = vec![Arg::In(host), Arg::Out("out", out)];
+        for _ in 0..rows.max(0) {
+            args.push(Arg::In(g.bytes(sw.max(1) as usize * 4)));
+        }
+        let rc = std::cell::Cell::new((0, 0));
+        let label = format!("pack_completion_input_u32 rows={rows} host_width={hw} staged_width={sw} null_stream={use_null}");
+        g.case(label.clone(), args, use_null, rows > 0 && hw > 0 && sw > 0, |rust, p, st| unsafe {
+            let staged: Vec<P> = p[2..].iter().map(|&x| x as P).collect();
+            let r = if rust {
+                launch::pack_completion_input_u32(p[0] as P, staged.as_ptr() as *const *const c_void, p[1] as M, rows, hw, sw, st)
+            } else {
+                c::v094_pack_completion_input_u32(p[0] as P, staged.as_ptr(), p[1] as M, rows, hw, sw, st)
             };
             let mut v = rc.get();
             if rust { v.1 = r } else { v.0 = r }
@@ -1236,6 +1307,7 @@ pub fn run() -> bool {
         }
         if want("graph") {
             graph(&mut g);
+            graph094(&mut g);
         }
     }
     g.close_family();

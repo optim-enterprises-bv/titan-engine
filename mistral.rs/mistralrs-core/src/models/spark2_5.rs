@@ -384,13 +384,16 @@ impl Attention {
             attention_mask
         };
 
+        // The paged path takes this layer's mask too: a sliding layer gets the sliding-window mask. (It used to
+        // get the full causal mask, which PagedAttention applies as given to a whole first prompt chunk, up to
+        // max_num_batched_tokens = 4096 rows, so sliding layers attended past their 512-token window.)
         let attn_output = match &self.paged_attn {
             Some(paged_attn) => match metadata {
                 Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
                     &q,
                     &k,
                     &v,
-                    attention_mask,
+                    mask,
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
@@ -399,12 +402,12 @@ impl Attention {
                 )?,
                 None => {
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(!matches!(attention_mask, AttentionMask::None));
+                    assert!(!matches!(mask, AttentionMask::None));
                     paged_attn.forward(
                         &q,
                         &k,
                         &v,
-                        attention_mask,
+                        mask,
                         None,
                         None,
                         &input_metadata,
@@ -424,6 +427,7 @@ impl Attention {
             attn_output
         };
         let attn_output = attn_output.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        crate::attention::titan_dump_rows(layer_idx, &attn_output)?;
 
         let gate = self.g_proj.forward(xs)?;
         let gate = match self.gate_act {
@@ -769,6 +773,15 @@ impl NormalModel for Model {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+    // titan: every layer has a paged KV cache and plain causal attention (no alibi, sinks or softcap), so the paged
+    // prompt admission plans titan's flash-prefill over the gathered KV (paged_attention::plan) instead of the eager
+    // gather fallback's whole-prompt score workspace.
+    fn model_config(&self) -> std::sync::Arc<dyn crate::paged_attention::ModelConfigLike + Send + Sync> {
+        std::sync::Arc::new(
+            crate::paged_attention::HybridPagedKvCacheConfig::new(self.cfg.clone(), vec![true; self.cfg.num_layers])
+                .with_uniform_prefix_prefill_attention_features(Default::default()),
+        )
     }
 }
 

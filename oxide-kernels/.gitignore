@@ -16,3 +16,11 @@ b.sh
 *.log
 *.bak
 *.bak-*
+/tools
+reference/mistralrs-paged-attn-094
+reference/mistralrs-paged-attn
+mistralrs-paged-attn-b/ref094/out/
+mistralrs-paged-attn-b/ref094/reduced/*.ptx
+mistralrs-paged-attn-b/ref094/reduced/*.cu
+reference/mistralrs-core-094
+mistralrs-core-cuda/ref094/out/

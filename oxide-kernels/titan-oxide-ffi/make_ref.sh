@@ -18,4 +18,4 @@ one() { # <src .a> <prefix> <out name>
 one "$ref/candle-ffi/libmoe.a" rm_ ref_moe
 one "$ref/mistralrs-quant/libmistralrsquant.a" rq_ ref_quant
 one "$ref/mistralrs-core/libmistralrscuda.a" rc_ ref_core
-one "$ref/mistralrs-paged-attn/libmistralrspagedattention.a" rp_ ref_pa
+one "$ref/mistralrs-paged-attn-094/libmistralrspagedattention.a" rp_ ref_pa

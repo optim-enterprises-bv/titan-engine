@@ -2379,6 +2379,39 @@ mod kernels {
         let p = logits.add(tok as usize);
         *p = addf(*p, *off(biases, idx));
     }
+    // ------------------------------------------------------------------ input_packing.cu (v0.9.4)
+    /// `pad_decode_input_kernel`: output row r = input row r (r < input_rows) or row 0 (CUDA-graph padding rows).
+    #[kernel]
+    pub unsafe fn pad_decode_input_kernel(input: *const u32, output: *mut u32, input_rows: i32, output_rows: i32, width: i32) {
+        let index = (bid_x() as u32 as i64).wrapping_mul(bdim_x() as u32 as i64).wrapping_add(tid_x() as u32 as i64);
+        let elements = (output_rows as i64).wrapping_mul(width as i64);
+        if index >= elements {
+            return;
+        }
+        let row = (index / width as i64) as i32;
+        let column = index.wrapping_sub((row as i64).wrapping_mul(width as i64)) as i32;
+        let source_row = if row < input_rows { row } else { 0 };
+        *output.offset(index as isize) = *input.offset((source_row as i64).wrapping_mul(width as i64).wrapping_add(column as i64) as isize);
+    }
+    /// `pack_completion_input_kernel`: each output row is the host row's `host_width` tokens then the staged row's
+    /// `staged_width`; `PackedInputRows` (64 row pointers by value) is passed as 64 u64 parameters at the same offsets.
+    #[kernel]
+    pub unsafe fn pack_completion_input_kernel(host: *const u32, s0: u64, s1: u64, s2: u64, s3: u64, s4: u64, s5: u64, s6: u64, s7: u64, s8: u64, s9: u64, s10: u64, s11: u64, s12: u64, s13: u64, s14: u64, s15: u64, s16: u64, s17: u64, s18: u64, s19: u64, s20: u64, s21: u64, s22: u64, s23: u64, s24: u64, s25: u64, s26: u64, s27: u64, s28: u64, s29: u64, s30: u64, s31: u64, s32: u64, s33: u64, s34: u64, s35: u64, s36: u64, s37: u64, s38: u64, s39: u64, s40: u64, s41: u64, s42: u64, s43: u64, s44: u64, s45: u64, s46: u64, s47: u64, s48: u64, s49: u64, s50: u64, s51: u64, s52: u64, s53: u64, s54: u64, s55: u64, s56: u64, s57: u64, s58: u64, s59: u64, s60: u64, s61: u64, s62: u64, s63: u64, output: *mut u32, rows: i32, host_width: i32, staged_width: i32) {
+        let row_width = (host_width as i64).wrapping_add(staged_width as i64);
+        let index = (bid_x() as u32 as i64).wrapping_mul(bdim_x() as u32 as i64).wrapping_add(tid_x() as u32 as i64);
+        let elements = (rows as i64).wrapping_mul(row_width);
+        if index >= elements {
+            return;
+        }
+        let row = (index / row_width) as i32;
+        let column = index.wrapping_sub((row as i64).wrapping_mul(row_width)) as i32;
+        *output.offset(index as isize) = if column < host_width {
+            *host.offset((row as i64).wrapping_mul(host_width as i64).wrapping_add(column as i64) as isize)
+        } else {
+            let staged: [u64; 64] = [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31, s32, s33, s34, s35, s36, s37, s38, s39, s40, s41, s42, s43, s44, s45, s46, s47, s48, s49, s50, s51, s52, s53, s54, s55, s56, s57, s58, s59, s60, s61, s62, s63];
+            *(staged[row as usize] as *const u32).offset(column.wrapping_sub(host_width) as isize)
+        };
+    }
     #[kernel]
     pub unsafe fn _Z28apply_causal_mask_f32_kernelPfiiiii(scores: *mut f32, batch_heads: i32, q_len: i32, kv_len: i32, q_offset: i32, prefix_len: i32) {
         let idx = bid_x().wrapping_mul(bdim_x()).wrapping_add(tid_x());

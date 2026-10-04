@@ -404,6 +404,10 @@ mod kernels {
             }
         }
         let batch_id = lo;
+        // v0.9.4: a token past cu_seq_lens[num_seqs] writes nothing
+        if batch_id >= num_seqs {
+            return;
+        }
         let batch_offset = token_id.wrapping_sub(*cu_seq_lens.add(batch_id as u32 as usize));
         let block_table_id = sdiv(batch_offset, block_size);
         let slot = batch_offset.wrapping_sub(block_table_id.wrapping_mul(block_size));
@@ -551,6 +555,8 @@ mod kernels {
     #[kernel] pub unsafe fn copy_blocks_kernel_f32(k: *const i64, v: *const i64, m: *const i64, nk: i32, nv: i32) { copy_blocks::<f32>(k, v, m, nk, nv) }
     #[kernel] pub unsafe fn copy_blocks_kernel_f16(k: *const i64, v: *const i64, m: *const i64, nk: i32, nv: i32) { copy_blocks::<i16>(k, v, m, nk, nv) }
     #[kernel] pub unsafe fn copy_blocks_kernel_bf16(k: *const i64, v: *const i64, m: *const i64, nk: i32, nv: i32) { copy_blocks::<i16>(k, v, m, nk, nv) }
+    // v0.9.4: copy_blocks_kernel_u8 (byte-wise; the FP8 E4M3 cache)
+    #[kernel] pub unsafe fn copy_blocks_kernel_u8(k: *const i64, v: *const i64, m: *const i64, nk: i32, nv: i32) { copy_blocks::<u8>(k, v, m, nk, nv) }
 
     // ------------------------------------------------------------------------------------------
     // concat_and_cache_mla_kernel.cu: grid (num_tokens), block min(max(rank, kpe), 512).

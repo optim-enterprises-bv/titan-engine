@@ -16,7 +16,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 ref=$here/../reference
 libs=("$ref/candle-ffi/libmoe.a" "$ref/mistralrs-quant/libmistralrsquant.a" "$ref/mistralrs-core/libmistralrscuda.a"
-      "$ref/mistralrs-paged-attn/libmistralrspagedattention.a")
+      "$ref/mistralrs-paged-attn-094/libmistralrspagedattention.a")
 tmp=$(mktemp -d -p "$here/.mut" chk.XXXX)
 trap 'rm -rf "$tmp"' EXIT
 for l in "${libs[@]}"; do

@@ -760,6 +760,15 @@ impl NormalModel for Model {
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
     }
+    // titan: every layer has a paged KV cache and plain causal attention (no alibi, sinks or softcap), so the paged
+    // prompt admission plans titan's flash-prefill over the gathered KV (paged_attention::plan) instead of the eager
+    // gather fallback's whole-prompt score workspace.
+    fn model_config(&self) -> std::sync::Arc<dyn crate::paged_attention::ModelConfigLike + Send + Sync> {
+        std::sync::Arc::new(
+            crate::paged_attention::HybridPagedKvCacheConfig::new(self.cfg.clone(), vec![true; self.cfg.num_layers])
+                .with_uniform_prefix_prefill_attention_features(Default::default()),
+        )
+    }
     fn supports_packed_prefill(&self) -> bool {
         true
     }

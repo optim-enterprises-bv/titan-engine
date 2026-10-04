@@ -1,4 +1,5 @@
-//! Links the REAL mistralrs-paged-attn host launchers + nvcc kernels (libmistralrspagedattention.a,
+//! Links the REAL mistralrs-paged-attn v0.9.4 host launchers + nvcc kernels (reference/mistralrs-paged-attn-094/
+//! libmistralrspagedattention.a: the nvcc objects of titan model-swap / titan-094, see ../mistralrs-paged-attn-b/ref094/README;
 //! -O3 --use_fast_math -DENABLE_FP8, sm_120a, `--default-stream per-thread`) for group 1 so the gate
 //! can call each extern "C" launcher from C and from Rust on identical inputs. Only the objects of
 //! group 1 are extracted into OUT_DIR and re-archived (flashinfer_* never enter the link).
@@ -22,7 +23,7 @@ const OBJECTS: [&str; 13] = [
 
 fn main() {
     let home = std::env::var("HOME").unwrap();
-    let archive = format!("{home}/titan-engine/oxide-kernels/reference/mistralrs-paged-attn/libmistralrspagedattention.a");
+    let archive = format!("{home}/titan-engine/oxide-kernels/reference/mistralrs-paged-attn-094/libmistralrspagedattention.a");
     let out = std::env::var("OUT_DIR").unwrap();
     let list = Command::new("ar").arg("t").arg(&archive).output().expect("ar t");
     let members: Vec<String> = String::from_utf8(list.stdout).unwrap().lines().map(|s| s.to_string()).collect();

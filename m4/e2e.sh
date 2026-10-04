@@ -1,7 +1,7 @@
 #!/bin/bash
 # M4 end-to-end: Qwen3.6-35B-A3B greedy raw completions, llama.cpp (--n-cpu-moe 18) vs mistral.rs tiered.
 set -u; cd "$(dirname "$0")"; mkdir -p out
-M=$HOME/ai/models; F=Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+M=${M:-$HOME/ai/models}; F=${F:-Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}
 export LD_LIBRARY_PATH=$HOME/titan-engine/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 serve_wait() { for i in $(seq 1 300); do curl -sf -m 2 -o /dev/null localhost:$1${3:-/v1/models} && return 0; kill -0 $2 2>/dev/null || return 1; sleep 2; done; return 1; }
 if [ "${SKIP_LLAMA:-0}" != 1 ]; then

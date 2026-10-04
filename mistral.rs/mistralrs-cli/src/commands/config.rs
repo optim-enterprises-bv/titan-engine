@@ -111,16 +111,8 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
             max_resident: swap.max_resident.unwrap_or(mistralrs_core::TITAN_DEFAULT_MAX_RESIDENT),
             models: models
                 .iter()
-                .map(|m| {
-                    let t = m.titan.clone().unwrap_or_default();
-                    let settings = mistralrs_core::TitanModelSettings {
-                        env: t.env_strings(),
-                        idle_ttl: t.idle_ttl_secs.filter(|s| *s > 0).map(std::time::Duration::from_secs),
-                        prefix_cache_n: t.prefix_cache_n,
-                    };
-                    (name(m), settings)
-                })
-                .collect(),
+                .map(|m| Ok::<_, anyhow::Error>((name(m), m.titan.clone().unwrap_or_default().settings()?)))
+                .collect::<Result<_>>()?,
         };
         info!("titan swap mode: {} models, default {}, at most {} resident", models.len(), policy.default_model, policy.max_resident);
         builder = builder.with_titan_swap(policy);

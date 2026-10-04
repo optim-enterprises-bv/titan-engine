@@ -31,13 +31,24 @@ const TTL_POLL: Duration = Duration::from_secs(5);
 /// Polls (IDLE_POLL apart) for the pipeline's last reference to go after its engine stopped.
 const PIPELINE_DROP_POLLS: usize = 50;
 
-/// One model's titan settings: env-style TITAN_* values applied while it is loaded, its idle TTL, and its prefix
-/// cache size (sequences; `None`: the global `prefix_cache_n`), which the model keeps across swaps.
+/// One model's titan settings: env-style TITAN_* values applied while it is loaded, its idle TTL, its prefix
+/// cache size (sequences; `None`: the global `prefix_cache_n`), and its serving settings: PagedAttention mode, KV
+/// cache type and pool size, prompt tokens per scheduler step and concurrent sequences. `None` means the global
+/// value; the server builds the model's loader and scheduler configs from them, which the model keeps across swaps.
 #[derive(Clone, Debug, Default)]
 pub struct TitanModelSettings {
     pub env: HashMap<String, String>,
     pub idle_ttl: Option<Duration>,
     pub prefix_cache_n: Option<usize>,
+    /// PagedAttention for this model: `Some(None)` auto (on CUDA), `Some(Some(on))` forced; `None`: the global mode.
+    pub paged_attn: Option<Option<bool>>,
+    pub pa_cache_type: Option<crate::PagedCacheType>,
+    /// Pool size by context length or by MiB; either one replaces the global pool sizing for this model.
+    pub pa_context_len: Option<usize>,
+    pub pa_memory_mb: Option<usize>,
+    pub max_num_batched_tokens: Option<usize>,
+    /// Sequences scheduled together (the PagedAttention `max_num_seqs`, or the default scheduler's fixed batch).
+    pub max_seqs: Option<usize>,
 }
 
 #[derive(Clone, Debug)]

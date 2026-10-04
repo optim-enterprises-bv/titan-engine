@@ -243,6 +243,39 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
     )))
 }
 
+/// Shapes `attend_any` takes, without tensors: head dim 128 / 256 (at most 8 query heads per KV head) or 512 (a multiple
+/// of 8), bf16 or f16 (the planner's twin of `supported_any`).
+pub(crate) fn supported_any_shape(dtype: DType, head_dim: usize, q_heads: usize, kv_heads: usize) -> bool {
+    let rep = if kv_heads > 0 && q_heads.is_multiple_of(kv_heads) { q_heads / kv_heads } else { 0 };
+    matches!(dtype, DType::BF16 | DType::F16)
+        && rep > 0
+        && match head_dim {
+            128 | HEAD_DIM => rep <= N_REP,
+            512 => rep.is_multiple_of(N_REP),
+            _ => false,
+        }
+        && !mistralrs_quant::distributed::use_nccl()
+}
+
+/// Peak device bytes `attend_any` allocates for `s` query rows over `kv_len` keys (`win` as in `attend_any`): the
+/// zero-padded query, the output, and the split-KV partials (the same split count the launch picks; an upper bound for
+/// the head-dim-256 bf16 `attend` path, which packs 2 positions per warp like the 8-warp kernels).
+pub(crate) fn attend_any_workspace_bytes(dtype: DType, head_dim: usize, q_heads: usize, kv_heads: usize, s: usize, kv_len: usize, win: usize) -> usize {
+    let d = head_dim;
+    let rep = (q_heads / kv_heads.max(1)).max(1);
+    let hp = if d == 512 { q_heads } else { kv_heads * N_REP.max(rep) };
+    let es = dtype.size_in_bytes();
+    let q_pad = if hp > q_heads { hp * s * d * es * 2 } else { 0 };
+    let out = hp * s * d * 4;
+    let (groups, halves) = if d == 512 { (q_heads / N_REP, 2) } else { (kv_heads, 1) };
+    let ppb = 16;
+    let npb = s.div_ceil(ppb);
+    let tiles = (if win > 0 { kv_len.min(win + ppb) } else { kv_len }).div_ceil(TILE);
+    let nsplit = cfg().units.div_ceil((npb * groups * halves).max(1)).min(tiles.div_ceil(MIN_SPLIT_TILES)).clamp(1, MAX_SPLITS);
+    let part = if nsplit > 1 { nsplit * hp * s * (d + 2) * 4 } else { 0 };
+    q_pad + out * 2 + part
+}
+
 /// Head dims, dtypes and GQA layouts `attend_any` takes: CUDA, batch 1, q / k / v all bf16 or all f16, head dim
 /// 256 (at most 8 query heads per KV head, fewer padded with zero heads) or 512 (a multiple of 8 query heads per KV
 /// head), K/V rows contiguous and 16-byte aligned, no tensor parallelism.

@@ -31,6 +31,7 @@ pub mod cref {
         pub fn copy_blocks_f32(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64);
         pub fn copy_blocks_f16(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64);
         pub fn copy_blocks_bf16(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64);
+        pub fn copy_blocks_u8(k: *mut i64, v: *mut i64, m: *const i64, nl: i32, np: i32, nk: i32, nv: i32, stream: i64);
         pub fn concat_and_cache_mla(
             ckv: *mut c_void, k_pe: *mut c_void, ckv_cache: *mut c_void, kpe_cache: *mut c_void, slot_mapping: *mut i64, num_tokens: i32,
             kv_lora_rank: i32, kpe_head_dim: i32, block_size: i32, ckv_stride: i32, kpe_stride: i32, stream: *mut c_void, dtype: u32,
@@ -346,7 +347,8 @@ fn gather_kv_cache(g: &mut G) {
                 for l in lens {
                     cu.push(cu.last().unwrap() + *l as i32);
                 }
-                let nt = *cu.last().unwrap() as usize;
+                // v0.9.4: tokens past cu_seq_lens[num_seqs] (num_tokens > the total) are left untouched
+                let nt = *cu.last().unwrap() as usize + [0usize, 1, 3][si % 3];
                 let kc = if fp8 { g.fp8s(num_blocks * nkv * hs * bs) } else { g.vals(dtype, num_blocks * nkv * hs * bs) };
                 let vc = if fp8 { g.fp8s(num_blocks * nkv * hs * bs) } else { g.vals(dtype, num_blocks * nkv * hs * bs) };
                 let es = esize(dtype);
@@ -396,13 +398,14 @@ fn update_kvscales(g: &mut G) {
 
 fn copy_blocks(g: &mut G) {
     type F = unsafe extern "C" fn(*mut i64, *mut i64, *const i64, i32, i32, i32, i32, i64);
-    let fns: [(&str, usize, F, F); 3] = [
+    let fns: [(&str, usize, F, F); 4] = [
         ("f32", 4, cref::copy_blocks_f32, ox::copy_blocks_f32),
         ("f16", 2, cref::copy_blocks_f16, ox::copy_blocks_f16),
         ("bf16", 2, cref::copy_blocks_bf16, ox::copy_blocks_bf16),
+        ("u8", 1, cref::copy_blocks_u8, ox::copy_blocks_u8),
     ];
     // (num_layers, num_pairs, numel_per_block_key, numel_per_block_value)
-    for (ci, &(nl, np, nk, nv)) in [(1usize, 1usize, 16usize, 16usize), (2, 3, 1024, 1024), (3, 2, 2048, 1000), (1, 4, 300, 5000), (2, 1, 1, 1)].iter().enumerate() {
+    for (ci, &(nl, np, nk, nv)) in [(1usize, 1usize, 16usize, 16usize), (2, 3, 1024, 1024), (3, 2, 2048, 1000), (1, 4, 300, 5000), (2, 1, 1, 1), (2, 3, 4097, 4099), (1, 2, 3, 7)].iter().enumerate() {
         for &(name, es, cf, of) in &fns {
             let nblocks = 2 * np + 2;
             let perm = g.perm(nblocks);

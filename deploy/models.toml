@@ -154,6 +154,10 @@ max_seq_len = 16384
 [models.titan]
 prefix_cache_n = 0   # devmap2: a kept prompt's KV stays in the prefix cache while the next copy runs (2 x 2.5 GB at 16k); without it 16k prompts fit (m4/devmap/README.md)
 idle_ttl_secs = 1800
+# PagedAttention (m4/pattn/README.md, pattn2): ~16k prompts fit in the default pool (3352 MB, 21408 tokens), decode
+# 50 vs 39.5 tok/s, G1 identical to paged off; 4 concurrent sequences x1.72.
+paged_attn = "on"
+max_seqs = 4
 [models.titan.env]
 TITAN_CUDA_GRAPHS = "1"
 TITAN_CUDA_GRAPHS_RESERVE_MIB = "64"
@@ -212,6 +216,12 @@ quantized_file = "Spark-X2.5-4B-Q4_K_M.gguf"
 max_seq_len = 16384
 [models.titan]
 idle_ttl_secs = 1800
+# PagedAttention (m4/pattn/README.md, pattn2): 16384-token prompt steps, so prompts up to 16k are one chunk and
+# bit-identical to paged off; decode 139 vs 121 tok/s; 4 concurrent sequences x1.97.
+paged_attn = "on"
+max_seqs = 4
+max_num_batched_tokens = 16384
+prefix_cache_n = 0   # 2026-10-04: with the cache on, a ~8k prompt reusing KV from a concurrent burst lands outside llama.cpp's spread (dlp 0.095); with 0 it is bit-identical to paged off
 
 # Gemma 4 12B QAT Q4_0, text only. F32 activations (dtype f32, 2026-10-03), all 48 layers on the GPU, 12k context. Prefix cache off for this
 # model only (m4/pcache/README.md): each kept ~4k sequence pins ~0.4 GB of KV and the 6th ~4k prompt OOMs with the
