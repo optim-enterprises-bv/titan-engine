@@ -1,0 +1,786 @@
+From ab330a597316e323d8f3572d263e8b9e99b8dec4 Mon Sep 17 00:00:00 2001
+From: dingo <outbackdingo@gmail.com>
+Date: Mon, 12 Oct 2026 06:18:55 +0700
+Subject: [PATCH] kernels: move cuda-oxide pins to NVIDIA/cuda-rust tip
+ d141118c (was b9847e9, 301 commits behind)
+
+Migrate off cuda-oxide rev b9847e9 to the current tip of NVlabs/cuda-oxide
+(now redirecting to NVIDIA/cuda-rust), rev
+d141118c05f705fcf932a8e9077dc714477edc4d:
+
+  * 80 cuda-device/cuda-host pins bumped b9847e9 -> d141118c (40 manifests)
+  * 41 "cuda-core = 0.3.1" (crates.io) requirements replaced with the git
+    dep at the same tip rev. kdiff is a second consumer, so a 0.3.1
+    crates.io requirement plus a git 0.4.0 both land in the graph and
+    cuda_core::simt::context::CudaContext stops unifying. Moving the
+    requirement itself (not [patch.crates-io]) yields exactly one
+    cuda-core 0.4.0.
+
+Requires nightly-2026-10-11: the tip's cuda-host uses the reflection
+intrinsic and fails on nightly-2026-08-28 with
+error[E0433]: cannot find `reflection` in `intrinsics`.
+
+Buys the sparse-FP8 metadata fix (#1483 preserves rustc reference
+attributes) and toolchain alignment. Kernel sources untouched; the
+measured API drift is zero once the version skew is fixed.
+
+Verified: all 39 crate modules codegen at sm_120; engine rebuilt and
+generates; littlebit gate 9/9 worst rel 5.878e-7 (unchanged).
+---
+ candle-affine/Cargo.toml                    | 11 ++++++++---
+ candle-binary/Cargo.toml                    | 11 ++++++++---
+ candle-cast/Cargo.toml                      | 11 ++++++++---
+ candle-conv/Cargo.toml                      | 11 ++++++++---
+ candle-fill/Cargo.toml                      |  6 +++---
+ candle-indexing/Cargo.toml                  | 11 ++++++++---
+ candle-lb-sign/Cargo.toml                   | 12 ++++++++++++
+ candle-mmq/Cargo.toml                       |  6 +++---
+ candle-mmvq/Cargo.toml                      |  6 +++---
+ candle-moe/Cargo.toml                       |  6 +++---
+ candle-quantized/Cargo.toml                 |  6 +++---
+ candle-reduce/Cargo.toml                    | 11 ++++++++---
+ candle-sort/Cargo.toml                      |  6 +++---
+ candle-ternary/Cargo.toml                   |  6 +++---
+ candle-unary/Cargo.toml                     | 11 ++++++++---
+ flash-decode/Cargo.toml                     | 11 ++++++++---
+ flash-prefill/Cargo.toml                    |  6 +++---
+ fmt_mmq/Cargo.toml                          |  6 +++---
+ gemm/Cargo.toml                             |  6 +++---
+ iq2_s/Cargo.toml                            |  6 +++---
+ iq2_xs/Cargo.toml                           |  6 +++---
+ iq2_xxs/Cargo.toml                          |  6 +++---
+ iq3_s/Cargo.toml                            |  6 +++---
+ iq3_xxs/Cargo.toml                          |  6 +++---
+ iq4_nl/Cargo.toml                           |  6 +++---
+ iq4_xs/Cargo.toml                           |  6 +++---
+ kdiff/Cargo.toml                            |  2 +-
+ mistralrs-core-cuda/Cargo.toml              | 13 ++++++++++---
+ mistralrs-paged-attn-a/Cargo.toml           | 15 ++++++++++++---
+ mistralrs-paged-attn-b/Cargo.toml           | 15 ++++++++++++---
+ mistralrs-quant-a/Cargo.toml                | 13 ++++++++++---
+ mistralrs-quant-b/Cargo.toml                | 15 ++++++++++++---
+ mistralrs-quant-b/marlin-kernels/Cargo.toml | 13 ++++++++++---
+ mistralrs-quant-c/Cargo.toml                | 13 ++++++++++---
+ mmvq-moe/Cargo.toml                         |  6 +++---
+ mmvq-rows/Cargo.toml                        |  6 +++---
+ mxfp4/Cargo.toml                            |  6 +++---
+ nvfp4/Cargo.toml                            | 11 ++++++++---
+ ptq1_0/Cargo.toml                           |  6 +++---
+ q1_0/Cargo.toml                             |  6 +++---
+ titan-doorbell/Cargo.toml                   |  6 +++---
+ 41 files changed, 230 insertions(+), 118 deletions(-)
+ create mode 100644 candle-lb-sign/Cargo.toml
+
+diff --git a/candle-affine/Cargo.toml b/candle-affine/Cargo.toml
+index 4fd1b01..787fbd7 100644
+--- a/candle-affine/Cargo.toml
++++ b/candle-affine/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16x2 results without the
++# instructions the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-binary/Cargo.toml b/candle-binary/Cargo.toml
+index fd2ee0b..58de2d0 100644
+--- a/candle-binary/Cargo.toml
++++ b/candle-binary/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16x2 results without the
++# instructions the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-cast/Cargo.toml b/candle-cast/Cargo.toml
+index d203b46..b99bb1a 100644
+--- a/candle-cast/Cargo.toml
++++ b/candle-cast/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16 results without the instructions
++# the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-conv/Cargo.toml b/candle-conv/Cargo.toml
+index 77229be..a5ebe92 100644
+--- a/candle-conv/Cargo.toml
++++ b/candle-conv/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16 results without the instructions
++# the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-fill/Cargo.toml b/candle-fill/Cargo.toml
+index ad0cfb0..578564f 100644
+--- a/candle-fill/Cargo.toml
++++ b/candle-fill/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-indexing/Cargo.toml b/candle-indexing/Cargo.toml
+index bd77f1b..b9852bc 100644
+--- a/candle-indexing/Cargo.toml
++++ b/candle-indexing/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16 results without the instructions
++# the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-lb-sign/Cargo.toml b/candle-lb-sign/Cargo.toml
+new file mode 100644
+index 0000000..7bc8f01
+--- /dev/null
++++ b/candle-lb-sign/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "candle-lb-sign"
++version = "0.1.0"
++edition = "2024"
++
++[workspace]
++
++[dependencies]
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++kdiff = { path = "../kdiff" }
+diff --git a/candle-mmq/Cargo.toml b/candle-mmq/Cargo.toml
+index f9e6e9e..c88ef7c 100644
+--- a/candle-mmq/Cargo.toml
++++ b/candle-mmq/Cargo.toml
+@@ -7,6 +7,6 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+diff --git a/candle-mmvq/Cargo.toml b/candle-mmvq/Cargo.toml
+index dc91038..b7b9f93 100644
+--- a/candle-mmvq/Cargo.toml
++++ b/candle-mmvq/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-moe/Cargo.toml b/candle-moe/Cargo.toml
+index 0b91fd4..6f493bd 100644
+--- a/candle-moe/Cargo.toml
++++ b/candle-moe/Cargo.toml
+@@ -7,7 +7,7 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-quantized/Cargo.toml b/candle-quantized/Cargo.toml
+index f840b29..3f13636 100644
+--- a/candle-quantized/Cargo.toml
++++ b/candle-quantized/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-reduce/Cargo.toml b/candle-reduce/Cargo.toml
+index 1c001eb..72dcca9 100644
+--- a/candle-reduce/Cargo.toml
++++ b/candle-reduce/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16x2 results without the
++# instructions the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/candle-sort/Cargo.toml b/candle-sort/Cargo.toml
+index fd1ca1e..e6461d9 100644
+--- a/candle-sort/Cargo.toml
++++ b/candle-sort/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-ternary/Cargo.toml b/candle-ternary/Cargo.toml
+index 447d4cc..ff0ceed 100644
+--- a/candle-ternary/Cargo.toml
++++ b/candle-ternary/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/candle-unary/Cargo.toml b/candle-unary/Cargo.toml
+index cbcda05..254c96f 100644
+--- a/candle-unary/Cargo.toml
++++ b/candle-unary/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16x2 results without the
++# instructions the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/flash-decode/Cargo.toml b/flash-decode/Cargo.toml
+index ae9b608..dfe0439 100644
+--- a/flash-decode/Cargo.toml
++++ b/flash-decode/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16 results without the instructions
++# the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/flash-prefill/Cargo.toml b/flash-prefill/Cargo.toml
+index 8be3387..cf2ec21 100644
+--- a/flash-prefill/Cargo.toml
++++ b/flash-prefill/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/fmt_mmq/Cargo.toml b/fmt_mmq/Cargo.toml
+index 15d14b5..e9a9f1d 100644
+--- a/fmt_mmq/Cargo.toml
++++ b/fmt_mmq/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/gemm/Cargo.toml b/gemm/Cargo.toml
+index 95858dd..51fbb11 100644
+--- a/gemm/Cargo.toml
++++ b/gemm/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq2_s/Cargo.toml b/iq2_s/Cargo.toml
+index 2f09534..8e1c642 100644
+--- a/iq2_s/Cargo.toml
++++ b/iq2_s/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq2_xs/Cargo.toml b/iq2_xs/Cargo.toml
+index 56ed455..a02d82f 100644
+--- a/iq2_xs/Cargo.toml
++++ b/iq2_xs/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq2_xxs/Cargo.toml b/iq2_xxs/Cargo.toml
+index 037df3b..68f3084 100644
+--- a/iq2_xxs/Cargo.toml
++++ b/iq2_xxs/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq3_s/Cargo.toml b/iq3_s/Cargo.toml
+index 3fef481..ffe153a 100644
+--- a/iq3_s/Cargo.toml
++++ b/iq3_s/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq3_xxs/Cargo.toml b/iq3_xxs/Cargo.toml
+index f963235..e1d3f02 100644
+--- a/iq3_xxs/Cargo.toml
++++ b/iq3_xxs/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq4_nl/Cargo.toml b/iq4_nl/Cargo.toml
+index b5ac4ce..1c0809d 100644
+--- a/iq4_nl/Cargo.toml
++++ b/iq4_nl/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/iq4_xs/Cargo.toml b/iq4_xs/Cargo.toml
+index c1bccfc..00ac3c3 100644
+--- a/iq4_xs/Cargo.toml
++++ b/iq4_xs/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/kdiff/Cargo.toml b/kdiff/Cargo.toml
+index aa6ee28..c7876c5 100644
+--- a/kdiff/Cargo.toml
++++ b/kdiff/Cargo.toml
+@@ -4,4 +4,4 @@ version = "0.1.0"
+ edition = "2024"
+ 
+ [dependencies]
+-cuda-core = "0.3.1"
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+diff --git a/mistralrs-core-cuda/Cargo.toml b/mistralrs-core-cuda/Cargo.toml
+index ce49a26..dbfe6c3 100644
+--- a/mistralrs-core-cuda/Cargo.toml
++++ b/mistralrs-core-cuda/Cargo.toml
+@@ -7,7 +7,14 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# Emulate the packed-bf16 ops that PTX restricts to sm_90+ (the non-fused add / sub / mul forms)
++# with the sm_80 fma, so this module can be built for sm_86 (RTX 30-series) and sm_89
++# (RTX 40-series). Off for sm_90+ builds, where the native forms exist and the kdiff gates are
++# byte-exact. See the arch-portability section of PORTING.md.
++sm80_compat = []
+diff --git a/mistralrs-paged-attn-a/Cargo.toml b/mistralrs-paged-attn-a/Cargo.toml
+index 70cad3a..b7b19ea 100644
+--- a/mistralrs-paged-attn-a/Cargo.toml
++++ b/mistralrs-paged-attn-a/Cargo.toml
+@@ -7,7 +7,16 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++
++[features]
++# Emulate the instructions PTX restricts to sm_90+ with sm_80 forms, so this module can be built
++# for sm_86 (RTX 30-series) and sm_89 (RTX 40-series). Off for sm_90+ builds, where the native forms
++# exist and the kdiff gates are byte-exact. Each emulation is gated bit-for-bit against the native
++# instruction on silicon; see the arch-portability section of PORTING.md.
++sm80_compat = []
++
+diff --git a/mistralrs-paged-attn-b/Cargo.toml b/mistralrs-paged-attn-b/Cargo.toml
+index e541d7c..bba5c00 100644
+--- a/mistralrs-paged-attn-b/Cargo.toml
++++ b/mistralrs-paged-attn-b/Cargo.toml
+@@ -7,7 +7,16 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++
++[features]
++# Emulate the instructions PTX restricts to sm_90+ with sm_80 forms, so this module can be built
++# for sm_86 (RTX 30-series) and sm_89 (RTX 40-series). Off for sm_90+ builds, where the native forms
++# exist and the kdiff gates are byte-exact. Each emulation is gated bit-for-bit against the native
++# instruction on silicon; see the arch-portability section of PORTING.md.
++sm80_compat = []
++
+diff --git a/mistralrs-quant-a/Cargo.toml b/mistralrs-quant-a/Cargo.toml
+index 4df7c2e..d055341 100644
+--- a/mistralrs-quant-a/Cargo.toml
++++ b/mistralrs-quant-a/Cargo.toml
+@@ -7,7 +7,14 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# Emulate the packed-bf16 ops that PTX restricts to sm_90+ (the non-fused add / sub / mul forms)
++# with the sm_80 fma, so this module can be built for sm_86 (RTX 30-series) and sm_89
++# (RTX 40-series). Off for sm_90+ builds, where the native forms exist and the kdiff gates are
++# byte-exact. See the arch-portability section of PORTING.md.
++sm80_compat = []
+diff --git a/mistralrs-quant-b/Cargo.toml b/mistralrs-quant-b/Cargo.toml
+index cb379b0..456e7d5 100644
+--- a/mistralrs-quant-b/Cargo.toml
++++ b/mistralrs-quant-b/Cargo.toml
+@@ -7,7 +7,16 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++
++[features]
++# Emulate the instructions PTX restricts to sm_90+ with sm_80 forms, so this module can be built
++# for sm_86 (RTX 30-series) and sm_89 (RTX 40-series). Off for sm_90+ builds, where the native forms
++# exist and the kdiff gates are byte-exact. Each emulation is gated bit-for-bit against the native
++# instruction on silicon; see the arch-portability section of PORTING.md.
++sm80_compat = []
++
+diff --git a/mistralrs-quant-b/marlin-kernels/Cargo.toml b/mistralrs-quant-b/marlin-kernels/Cargo.toml
+index bbc023f..faf0acc 100644
+--- a/mistralrs-quant-b/marlin-kernels/Cargo.toml
++++ b/mistralrs-quant-b/marlin-kernels/Cargo.toml
+@@ -6,6 +6,13 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++
++[features]
++# Emulate the packed-bf16 ops that PTX restricts to sm_90+ (the non-fused add / sub / mul forms)
++# with the sm_80 fma, so this module can be built for sm_86 (RTX 30-series) and sm_89
++# (RTX 40-series). Off for sm_90+ builds, where the native forms exist and the kdiff gates are
++# byte-exact. See the arch-portability section of PORTING.md.
++sm80_compat = []
+diff --git a/mistralrs-quant-c/Cargo.toml b/mistralrs-quant-c/Cargo.toml
+index 4c0b4f9..e6a19a7 100644
+--- a/mistralrs-quant-c/Cargo.toml
++++ b/mistralrs-quant-c/Cargo.toml
+@@ -7,6 +7,13 @@ build = "build.rs"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++
++[features]
++# Emulate the packed-bf16 ops that PTX restricts to sm_90+ (the non-fused add / sub / mul forms)
++# with the sm_80 fma, so this module can be built for sm_86 (RTX 30-series) and sm_89
++# (RTX 40-series). Off for sm_90+ builds, where the native forms exist and the kdiff gates are
++# byte-exact. See the arch-portability section of PORTING.md.
++sm80_compat = []
+diff --git a/mmvq-moe/Cargo.toml b/mmvq-moe/Cargo.toml
+index d2f532b..b953cfd 100644
+--- a/mmvq-moe/Cargo.toml
++++ b/mmvq-moe/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/mmvq-rows/Cargo.toml b/mmvq-rows/Cargo.toml
+index a90eeac..9571c4c 100644
+--- a/mmvq-rows/Cargo.toml
++++ b/mmvq-rows/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/mxfp4/Cargo.toml b/mxfp4/Cargo.toml
+index b64bbc7..57e15db 100644
+--- a/mxfp4/Cargo.toml
++++ b/mxfp4/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/nvfp4/Cargo.toml b/nvfp4/Cargo.toml
+index 30c089b..b23032b 100644
+--- a/nvfp4/Cargo.toml
++++ b/nvfp4/Cargo.toml
+@@ -6,7 +6,12 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
++
++[features]
++# sm_86 / sm_89: compute the fp8 and bf16 results without the instructions
++# the backend only lowers from sm_89 (see the emulations in src/main.rs).
++sm80_compat = []
+diff --git a/ptq1_0/Cargo.toml b/ptq1_0/Cargo.toml
+index 4cb0732..a0f20f8 100644
+--- a/ptq1_0/Cargo.toml
++++ b/ptq1_0/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/q1_0/Cargo.toml b/q1_0/Cargo.toml
+index 8c4b6a4..a91f81e 100644
+--- a/q1_0/Cargo.toml
++++ b/q1_0/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+diff --git a/titan-doorbell/Cargo.toml b/titan-doorbell/Cargo.toml
+index 556bced..58b7d23 100644
+--- a/titan-doorbell/Cargo.toml
++++ b/titan-doorbell/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2024"
+ [workspace]
+ 
+ [dependencies]
+-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9" }
+-cuda-core = "0.3.1"
++cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
++cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "d141118c05f705fcf932a8e9077dc714477edc4d" }
+ kdiff = { path = "../kdiff" }
+-- 
+2.56.0
+
