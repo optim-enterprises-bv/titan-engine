@@ -109,7 +109,11 @@ on this box (they are an nvcc artifact; this fork's path is nvcc-free). `ab330a5
   nowhere else).
 - `oxide-kernels/check-artifact-freshness.sh` — presence / non-empty / freshness gate over
   every embedded artifact, the 11 candle ports and the gemm copy; `--strict` fails on stale.
-- `oxide-kernels/PTX-PROVENANCE.md` — the affected crates, the mechanism, the restore recipe.
+- `oxide-kernels/PTX-PROVENANCE.md` — the affected crates, the mechanism, the restore recipe,
+  including the trap that `cargo oxide build` deletes artifacts no build here can recreate
+  (tracked `.cubin`/`.ptx` of the unbuildable crates, and the gitignored native cubins
+  `flash-prefill/flash_prefill.cubin` / `flash-decode/flash_decode.cubin`, which must be
+  re-assembled with `ptxas` from the crate's own `.ptx`).
 
 `candle-kernels/build.rs` already panics on a missing candle port
 (`TITAN_OXIDE_DIR is set but these ports are missing`), which is what caught the deleted

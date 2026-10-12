@@ -1,7 +1,7 @@
 From ab330a597316e323d8f3572d263e8b9e99b8dec4 Mon Sep 17 00:00:00 2001
 From: dingo <outbackdingo@gmail.com>
 Date: Mon, 12 Oct 2026 06:18:55 +0700
-Subject: [PATCH 1/2] kernels: move cuda-oxide pins to NVIDIA/cuda-rust tip
+Subject: [PATCH 1/3] kernels: move cuda-oxide pins to NVIDIA/cuda-rust tip
  d141118c (was b9847e9, 301 commits behind)
 
 Migrate off cuda-oxide rev b9847e9 to the current tip of NVlabs/cuda-oxide
@@ -788,7 +788,7 @@ index 556bced..58b7d23 100644
 From 2c99c4641695a57583a8cbfb043fba49696cd433 Mon Sep 17 00:00:00 2001
 From: dingo <outbackdingo@gmail.com>
 Date: Mon, 12 Oct 2026 07:26:08 +0700
-Subject: [PATCH 2/2] harden: presence+non-empty+freshness checks for embedded
+Subject: [PATCH 2/3] harden: presence+non-empty+freshness checks for embedded
  kernel artifacts
 
 The migration's silent risk was a kernel artifact that is deleted or stale and
@@ -1062,6 +1062,93 @@ index 069e7d1..e502946 100644
      println!("cargo:rerun-if-changed=src/image.rs");
      println!("cargo:rerun-if-changed=build.rs");
  }
+-- 
+2.56.0
+
+
+From 1dd52c3fe84dd47c2be5715b425be33f9f0287eb Mon Sep 17 00:00:00 2001
+From: dingo <outbackdingo@gmail.com>
+Date: Mon, 12 Oct 2026 07:48:02 +0700
+Subject: [PATCH 3/3] docs+gate: record the batch-delete trap and print the
+ restore recipe
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A full `cargo oxide build` batch (39 crates) left 12 tracked artifacts deleted —
+the six crates that cannot build here delete their committed .cubin/.ptx and put
+nothing back — and also removed two gitignored native cubins
+(flash-prefill/flash_prefill.cubin, flash-decode/flash_decode.cubin) that cannot
+be `git checkout`ed. check-artifact-freshness.sh caught all of it as MISSING.
+
+Documents both in PTX-PROVENANCE.md §4 with the exact restore commands, and makes
+the gate print those commands on failure.
+---
+ PTX-PROVENANCE.md           | 24 ++++++++++++++++++++++++
+ check-artifact-freshness.sh | 18 +++++++++++++++++-
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/PTX-PROVENANCE.md b/PTX-PROVENANCE.md
+index 3f0ea28..b60fbe5 100644
+--- a/PTX-PROVENANCE.md
++++ b/PTX-PROVENANCE.md
+@@ -76,3 +76,27 @@ migration regression** — they did not build before the pin move either.
+ `./check-artifact-freshness.sh` verifies that every artifact embedded by `titan-oxide-ffi`
+ and by `candle-kernels` exists, is non-empty, and is not older than the crate source that
+ produces it. Run it before publishing an engine build.
++
++## 4. A batch build deletes artifacts, and some cannot be restored from git
++
++`cargo oxide build` calls `clean_generated_files` first, so **every** `<stem>.ptx`, `.ll`,
++`.cubin`, `.target`, `.options` goes away and is only re-created if the build succeeds. Two
++consequences seen in practice:
++
++- Building a crate that *cannot* build here (§2) deletes its committed `.cubin`/`.ptx` and
++  puts nothing back. After a batch this repo can be left with a dozen tracked deletions —
++  `git status --short | grep '^ D'`. Restore them with
++  `git checkout -- $(git diff --name-only --diff-filter=D)`.
++- Some native cubins are **not** in git (`*.cubin` is ignored): `flash-prefill/flash_prefill.cubin`
++  and `flash-decode/flash_decode.cubin` in particular. A batch build removes them and they
++  cannot be `git checkout`ed back. Re-assemble them with the crate's own `.target`:
++
++  ```sh
++  for p in flash-prefill/flash_prefill flash-decode/flash_decode; do
++    t=$(grep -m1 '^\.target' $p.ptx | awk '{print $2}')
++    "$CUDA_OXIDE_PTXAS" -arch="$t" -O3 $p.ptx -o $p.cubin
++  done
++  ```
++
++`check-artifact-freshness.sh` reports both situations as `MISSING`; run it (and the restore
++steps) after any batch build, before rebuilding the engine.
+diff --git a/check-artifact-freshness.sh b/check-artifact-freshness.sh
+index aece98f..8f84d97 100755
+--- a/check-artifact-freshness.sh
++++ b/check-artifact-freshness.sh
+@@ -71,7 +71,23 @@ for c in candle-reduce candle-unary gemm; do
+ done
+ 
+ echo
+-if [ "$fail" = 1 ]; then echo "RESULT: FAIL (missing or empty artifact)"; exit 1; fi
++if [ "$fail" = 1 ]; then
++  cat <<'FIX'
++RESULT: FAIL (missing or empty artifact)
++
++To restore what a batch build removed:
++  # tracked artifacts (a crate that cannot build here deletes its committed ones):
++  git checkout -- $(git diff --name-only --diff-filter=D)
++  # gitignored native cubins (cannot be checked out; re-assemble with the crate's .target):
++  for p in flash-prefill/flash_prefill flash-decode/flash_decode; do
++    t=$(grep -m1 '^\.target' "$p".ptx | awk '{print $2}')
++    "$CUDA_OXIDE_PTXAS" -arch="$t" -O3 "$p".ptx -o "$p".cubin
++  done
++  # the pinned libdevice-module PTX:
++  git checkout -- candle-reduce/candle_reduce.ptx candle-unary/candle_unary.ptx gemm/gemm.ptx
++FIX
++  exit 1
++fi
+ if [ "$warn" = 1 ] && [ "$STRICT" = 1 ]; then echo "RESULT: FAIL (stale artifact, --strict)"; exit 1; fi
+ if [ "$warn" = 1 ]; then echo "RESULT: OK (with stale warnings)"; exit 0; fi
+ echo "RESULT: OK"; exit 0
 -- 
 2.56.0
 
