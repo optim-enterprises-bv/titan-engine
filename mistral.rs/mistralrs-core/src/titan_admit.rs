@@ -44,10 +44,16 @@ pub(crate) fn mode() -> Mode {
 }
 
 fn parse_mode(v: Option<&str>) -> Mode {
+    // Accept the words as well as the digits: `TITAN_ADMIT=enforce` used to fall through to Off
+    // silently, which is why enforcement "worked" in log mode and did nothing in enforce mode -
+    // the request was admitted and then OOM'd in the prompt step with no admit line at all.
     match v {
-        Some("1") => Mode::Enforce,
-        Some("log") => Mode::Log,
-        _ => Mode::Off,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "enforce" | "on" | "true" | "yes" => Mode::Enforce,
+            "log" => Mode::Log,
+            _ => Mode::Off,
+        },
+        None => Mode::Off,
     }
 }
 

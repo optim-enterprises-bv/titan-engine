@@ -464,6 +464,19 @@ pub(crate) fn flash_prefill_supported(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_p
     }
 }
 
+/// `flash_prefill::attend_host_tiles`: a CUDA prompt chunk over a host F8E4M3 KV cache, streamed in `tile`-key tiles.
+pub(crate) fn flash_prefill_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams, tile: usize) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::attend_host_tiles(q, k, v, sdpa_params, tile)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, sdpa_params, tile);
+        candle_core::bail!("host-tiled flash-prefill needs CUDA")
+    }
+}
+
 /// Causal attention of the last `s` query positions `q` (1, h, s, d) over `k`, `v` (1, kvh, kv_len, d) with the
 /// flash-prefill kernel: (1, h, s, d).
 pub(crate) fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams) -> Result<Tensor> {
@@ -672,6 +685,10 @@ impl Sdpa {
         flash_params: Option<&FlashParams>,
         sdpa_params: &SdpaParams,
     ) -> Result<Tensor> {
+        // TITAN_KV_HOST: a CUDA query over a host-RAM cache; causality is positional (the last rows of the cache)
+        if q.device().is_cuda() && k.device().is_cpu() {
+            return crate::titan_hostkv::attend(q, k, v, sdpa_params);
+        }
         if flash_params.is_some_and(|params| params.packed)
             && (!matches!(mask, AttentionMask::CausalFlash)
                 || !flash_params.is_some_and(|params| params.causal)

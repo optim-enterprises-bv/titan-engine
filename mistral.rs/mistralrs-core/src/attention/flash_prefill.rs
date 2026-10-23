@@ -50,6 +50,7 @@ const DEFAULT_UNITS: usize = 480;
 /// Fewest key tiles a split gets.
 const MIN_SPLIT_TILES: usize = 8;
 const MAX_SPLITS: usize = 16;
+const HOST_TILE_SPLITS: usize = 2;
 
 struct Cfg {
     on: bool,
@@ -132,6 +133,15 @@ pub(crate) fn supported(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> b
         && rows_ok(k)
         && rows_ok(v)
         && !mistralrs_quant::distributed::use_nccl()
+}
+
+fn dptr_f32(t: &Tensor, stream: &std::sync::Arc<candle_core::cuda::cudarc::driver::CudaStream>) -> Result<u64> {
+    let (st, l) = t.storage_and_layout();
+    let Storage::Cuda(c) = &*st else {
+        candle_core::bail!("flash-prefill: tensor must live on CUDA");
+    };
+    let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(stream);
+    Ok(p + (l.start_offset() * 4) as u64)
 }
 
 fn dptr(t: &Tensor, stream: &std::sync::Arc<candle_core::cuda::cudarc::driver::CudaStream>) -> Result<u64> {
@@ -241,6 +251,129 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
         Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
         Shape::from((1, h, s, HEAD_DIM)),
     )))
+}
+
+/// Keys `a .. a + len` of a host F8E4M3 cache `t` (1, kvh, >= a + len, 256) into the device F8E4M3 buffer `dst`
+/// (1, kvh, cap, 256), head `g` at row 0 of its `cap` rows.
+fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice) -> Result<()> {
+    let (_, kvh, cap, _) = dst.dims4()?;
+    let (st, l) = t.storage_and_layout();
+    let Storage::Cpu(c) = &*st else {
+        candle_core::bail!("flash-prefill host tiles: K/V must live on the CPU");
+    };
+    let src = c.as_slice::<float8::F8E4M3>()?;
+    let hs = t.stride()[1];
+    let stream = dev.cuda_stream();
+    let (dst_st, _) = dst.storage_and_layout();
+    let Storage::Cuda(dc) = &*dst_st else {
+        candle_core::bail!("flash-prefill host tiles: staging buffer must live on CUDA");
+    };
+    let (base, _g) = dc.as_cuda_slice::<float8::F8E4M3>()?.device_ptr(&stream);
+    for g in 0..kvh {
+        let off = l.start_offset() + g * hs + a * HEAD_DIM;
+        // pageable source: the driver stages it before returning, ordered on the stream
+        unsafe {
+            candle_core::cuda::cudarc::driver::result::memcpy_htod_async(
+                base + (g * cap * HEAD_DIM) as u64,
+                &src[off..off + len * HEAD_DIM],
+                stream.cu_stream(),
+            )
+        }
+        .w()?;
+    }
+    Ok(())
+}
+
+/// Causal attention of the last `s` positions of `q` (1, h, s, 256) bf16 over a host F8E4M3 cache `k`, `v`
+/// (1, kvh, kv_len, 256): the cached keys stream to the device `tile` at a time and each tile's split partials
+/// merge into running f32 (o, max, sum) as they come, so device memory stays one tile plus the chunk.
+pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, tile: usize) -> Result<Tensor> {
+    let Device::Cuda(dev) = q.device() else {
+        candle_core::bail!("flash-prefill host tiles: q must live on CUDA");
+    };
+    let q = q.contiguous()?;
+    let (_, h0, s, d) = q.dims4()?;
+    let (_, kvh, kv_len, kd) = k.dims4()?;
+    if d != HEAD_DIM || kd != HEAD_DIM || h0 % kvh != 0 || h0 / kvh > N_REP || kv_len < s || k.dtype() != DType::F8E4M3 {
+        candle_core::bail!("flash-prefill host tiles: unsupported q {:?} k {:?} {:?}", q.shape(), k.shape(), k.dtype());
+    }
+    let n_rep = h0 / kvh;
+    let q = if n_rep < N_REP {
+        let pad = Tensor::zeros((kvh, N_REP - n_rep, s, HEAD_DIM), q.dtype(), q.device())?;
+        Tensor::cat(&[&q.reshape((kvh, n_rep, s, HEAD_DIM))?, &pad], 1)?.reshape((1, kvh * N_REP, s, HEAD_DIM))?
+    } else {
+        q
+    };
+    let h = kvh * N_REP;
+    let past = kv_len - s;
+    // cached keys in whole tiles (every row sees all of them), then the chunk's own keys (causal)
+    let mut ranges: Vec<(usize, usize)> = (0..past).step_by(tile.max(TILE)).map(|a| (a, (a + tile.max(TILE)).min(past))).collect();
+    ranges.push((past, kv_len));
+
+    let stream = dev.cuda_stream();
+    let kernel = cfg().kernel;
+    let nw = KERNELS[kernel].2;
+    let npb = s.div_ceil(2 * nw);
+    let main = func(dev, kernel)?;
+    let q_ptr = dptr(&q, &stream)?;
+    let scale_log2 = p.softmax_scale * std::f32::consts::LOG2_E;
+    let (s_i, h_i, q_hs, o_hs, win_i) = (s as i32, h as i32, (s * HEAD_DIM) as i32, (s * HEAD_DIM) as i32, 0i32);
+    let ln2 = std::f64::consts::LN_2;
+    // every buffer of the loop has one size for the whole call: varying tile lengths fragmented the device pool
+    // until a 248k-token prompt ran out of memory
+    let cap = tile.max(TILE).max(s);
+    let (kf8, vf8) = (
+        Tensor::zeros((1, kvh, cap, HEAD_DIM), DType::F8E4M3, q.device())?,
+        Tensor::zeros((1, kvh, cap, HEAD_DIM), DType::F8E4M3, q.device())?,
+    );
+    let hs = (cap * HEAD_DIM) as u64;
+    // 2 splits: the kernel writes partials rather than normalised output, and each split's f32 partial is
+    // h x s x 256 floats (16 MiB at a 512-row chunk), the largest buffer next to the weights
+    let ns = HOST_TILE_SPLITS;
+    let part = Tensor::zeros((ns, h, s, HEAD_DIM), DType::F32, q.device())?;
+    let ml = Tensor::zeros((ns, h, s, 2), DType::F32, q.device())?;
+    let (part_ptr, ml_ptr) = (dptr_f32(&part, &stream)?, dptr_f32(&ml, &stream)?);
+    let mut run: Option<(Tensor, Tensor, Tensor)> = None;
+    for (a, b) in ranges {
+        let len = b - a;
+        upload_keys(k, a, len, &kf8, dev)?;
+        upload_keys(v, a, len, &vf8, dev)?;
+        let (kt, vt) = (kf8.to_dtype(DType::BF16)?, vf8.to_dtype(DType::BF16)?);
+        let (k_ptr, v_ptr) = (dptr(&kt, &stream)?, dptr(&vt, &stream)?);
+        let (past_i, kv_i, ns_i) = ((past - a) as i32, len as i32, ns as i32);
+        let mut lb = stream.launch_builder(&main);
+        lb.arg(&q_ptr).arg(&k_ptr).arg(&v_ptr).arg(&part_ptr).arg(&part_ptr).arg(&ml_ptr);
+        lb.arg(&scale_log2).arg(&s_i).arg(&past_i).arg(&kv_i).arg(&h_i).arg(&ns_i);
+        lb.arg(&q_hs).arg(&o_hs).arg(&hs).arg(&hs).arg(&win_i);
+        let lc = LaunchConfig { grid_dim: (npb as u32, kvh as u32, ns as u32), block_dim: ((32 * nw) as u32, 1, 1), shared_mem_bytes: 0 };
+        unsafe { lb.launch(lc) }.w()?;
+        // elementwise over the splits: a reduction over the leading dim runs ~100x slower than these
+        let split = |t: &Tensor, i: usize| t.narrow(0, i, 1).and_then(|t| t.squeeze(0));
+        let (m0, m1) = (split(&ml, 0)?.narrow(2, 0, 1)?, split(&ml, 1)?.narrow(2, 0, 1)?);
+        let (l0, l1) = (split(&ml, 0)?.narrow(2, 1, 1)?, split(&ml, 1)?.narrow(2, 1, 1)?);
+        let (p0, p1) = (split(&part, 0)?, split(&part, 1)?);
+        let mx = match &run {
+            None => m0.maximum(&m1)?,
+            Some((_, mr, _)) => mr.maximum(&m0)?.maximum(&m1)?,
+        };
+        // the kernel's (max, sum) are in base 2: weights are 2^(m - M); an empty split has m = -inf, weight 0
+        let w = |m: &Tensor| (m - &mx).and_then(|d| d * ln2).and_then(|d| d.exp());
+        let (w0, w1) = (w(&m0)?, w(&m1)?);
+        let mut o = (p0.broadcast_mul(&w0)? + p1.broadcast_mul(&w1)?)?;
+        let mut l = ((l0 * &w0)? + (l1 * &w1)?)?;
+        if let Some((or, mr, lr)) = &run {
+            let wr = w(mr)?;
+            o = (o + or.broadcast_mul(&wr)?)?;
+            l = (l + (lr * &wr)?)?;
+        }
+        run = Some((o, mx, l));
+    }
+    let (o, _, l) = run.expect("at least the chunk's own tile");
+    let o = o.broadcast_div(&l)?.to_dtype(DType::BF16)?.reshape((1, h, s, HEAD_DIM))?;
+    if n_rep < N_REP {
+        return o.reshape((kvh, N_REP, s, HEAD_DIM))?.narrow(1, 0, n_rep)?.reshape((1, h0, s, HEAD_DIM))?.contiguous();
+    }
+    Ok(o)
 }
 
 /// Shapes `attend_any` takes, without tensors: head dim 128 / 256 (at most 8 query heads per KV head) or 512 (a multiple

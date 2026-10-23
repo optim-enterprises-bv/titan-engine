@@ -316,6 +316,7 @@ pub struct ToolCall {
 /// };
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(from = "MessageWire")]
 pub struct Message {
     /// The message content
     pub content: Option<MessageContent>,
@@ -328,8 +329,36 @@ pub struct Message {
     /// Tool call ID this message is responding to (for tool messages)
     pub tool_call_id: Option<String>,
     /// Reasoning emitted with an assistant message (`reasoning` is the OpenAI-compatible alias).
-    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+}
+
+/// `Message` as clients send it: some (hermes) echo an assistant turn's reasoning under both `reasoning_content`
+/// and `reasoning`, which a serde alias rejects as a duplicate field.
+#[derive(Deserialize)]
+struct MessageWire {
+    content: Option<MessageContent>,
+    role: String,
+    name: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+impl From<MessageWire> for Message {
+    fn from(w: MessageWire) -> Self {
+        Self {
+            content: w.content,
+            role: w.role,
+            name: w.name,
+            tool_calls: w.tool_calls,
+            tool_call_id: w.tool_call_id,
+            reasoning_content: w.reasoning_content.or(w.reasoning),
+        }
+    }
 }
 
 /// Stop token configuration for generation
@@ -2111,6 +2140,19 @@ pub struct ResponsesDeltaContent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn message_accepts_reasoning_under_both_names() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "reasoning": "r1", "reasoning_content": "r2"},
+            {"role": "assistant", "content": "x", "reasoning": "only"},
+        ]}))
+        .unwrap();
+        let Either::Left(msgs) = chat.messages else { panic!("expected a message list") };
+        assert_eq!(msgs[1].reasoning_content.as_deref(), Some("r2"));
+        assert_eq!(msgs[2].reasoning_content.as_deref(), Some("only"));
+    }
 
     #[test]
     fn ignore_eos_defaults_false_and_accepts_true() {

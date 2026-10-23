@@ -58,6 +58,20 @@ static FNS: OnceLock<FnCache> = OnceLock::new();
 
 /// `mmvq_gguf_<fmt>_<dst>_rows<n>`, resolved once per device (a `get_or_load_custom_func` per
 /// launch costs a module-map lock, a CString and a cuModuleGetFunction).
+/// `TITAN_Q3K_WARPS=4|16`: use the alternate warp geometry for the single-row Q3_K kernel.
+fn q3k_warps() -> usize {
+    crate::titan_cfg::var("TITAN_Q3K_WARPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n == 4 || *n == 16)
+        .unwrap_or(0)
+}
+
+fn rows_func_w(dev: &CudaDevice, fmt: (usize, &str), dst: (usize, &str), n: usize, w: usize) -> Result<CudaFunction> {
+    let name = format!("mmvq_gguf_{}_{}_rows{n}w{w}", fmt.1, dst.1);
+    Ok(dev.get_or_load_custom_func(&name, MODULE, PTX)?.into_cuda_function())
+}
+
 fn rows_func(dev: &CudaDevice, fmt: (usize, &str), dst: (usize, &str), n: usize) -> Result<CudaFunction> {
     let key = (dev.id(), (fmt.0 * 3 + dst.0) * MAX_ROWS + n - 1);
     let mut map = FNS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -98,7 +112,9 @@ pub fn plain_rows(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
             DType::F32 => ((2, "f32"), ffi::launch_mmvq_gguf_quantize_q8_1_f32),
             d => candle_core::bail!("mmvq_rows: input dtype {d:?}"),
         };
-    let func = rows_func(&dev, fmt, dst, rows)?;
+    // Issue-bound single-row Q3_K: allow a different warp geometry (same dot, same order per warp).
+    let nw = if rows == 1 && w.dtype() == GgmlDType::Q3K { q3k_warps() } else { 0 };
+    let func = if nw > 0 { rows_func_w(&dev, fmt, dst, rows, nw)? } else { rows_func(&dev, fmt, dst, rows)? };
 
     let stream = dev.cuda_stream();
     let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
@@ -117,7 +133,8 @@ pub fn plain_rows(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
         Shape::from(d)
     };
     let (ncols_x, nrows_x, stride_col_y, stride_col_dst) = (k as i32, nrows as i32, blocks_per_row as i32, nrows as i32);
-    let cfg = LaunchConfig { grid_dim: (nrows.div_ceil(2) as u32, 1, 1), block_dim: (32, 8, 1), shared_mem_bytes: 0 };
+    let block_warps = if nw > 0 { nw as u32 } else { 8 };
+    let cfg = LaunchConfig { grid_dim: (nrows.div_ceil(2) as u32, 1, 1), block_dim: (32, block_warps, 1), shared_mem_bytes: 0 };
 
     macro_rules! run {
         ($t:ty) => {{

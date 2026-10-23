@@ -2,6 +2,8 @@ use candle_core::{Result, Tensor};
 
 use super::NormalCache;
 
+const HOST_GROW_DIV: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct SingleCacheSnapshot {
     pub current_seq_len: usize,
@@ -135,8 +137,18 @@ impl SingleCache {
         // Expand kv cache
         if self.current_seq_len + seq_len > self.capacity_seq_len {
             let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
-            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
-            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
+            // a host-RAM cache can reach GiBs: grow by a quarter so the copies stay amortised O(len)
+            let step = if src.device().is_cpu() {
+                (self.capacity_seq_len / HOST_GROW_DIV)
+                    .next_multiple_of(NormalCache::CACHE_GROW_SIZE)
+                    .max(NormalCache::CACHE_GROW_SIZE)
+            } else {
+                NormalCache::CACHE_GROW_SIZE
+            };
+            let n_blocks_needed = diff.div_ceil(step);
+            self.capacity_seq_len = (self.capacity_seq_len + n_blocks_needed * step)
+                .min(self.max_seq_len)
+                .max(self.current_seq_len + seq_len);
             if self.capacity_seq_len > self.max_seq_len {
                 candle_core::bail!(
                     "kv-cache: requested capacity ({}) above max seq len ({})",

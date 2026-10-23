@@ -2007,6 +2007,7 @@ pub trait Pipeline:
         if memlog {
             crate::utils::memory_usage::devmap_memlog(&self.device(), &format!("before prompt step ({tokens} tokens)"));
         }
+        let titan_t_step = std::time::Instant::now();
         let completion = self
             .submit_step(
                 input_seqs,
@@ -2022,6 +2023,10 @@ pub trait Pipeline:
             .await?
             .into_ready()
             .expect("lookahead-disabled pipeline step must complete eagerly");
+        if !is_prompt && titan_prof_on() {
+            titan_prof_add(&TITAN_STEP, titan_t_step.elapsed());
+            titan_prof_report_decode();
+        }
         if memlog {
             crate::utils::memory_usage::devmap_memlog(&self.device(), &format!("after prompt step ({tokens} tokens)"));
         }
@@ -2048,8 +2053,8 @@ pub trait Pipeline:
                     crate::speculative::driver::clear_staged_speculative_tokens(input_seqs);
                 }
 
-                let inputs_iter =
-                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                let titan_t_prep = std::time::Instant::now();
+                let titan_prep_out = self.get_processor().inputs_processor().process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -2062,7 +2067,11 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
-                    ));
+                    );
+                if titan_prof_on() {
+                    titan_prof_add(&TITAN_PREP, titan_t_prep.elapsed());
+                }
+                let inputs_iter = std::iter::once(titan_prep_out);
 
                 let mut logits = vec![None; input_seqs.len()];
                 let len_inputs = 1;
@@ -3806,3 +3815,61 @@ mod tests {
         test_with_inputs(&templates, &expected_outputs, inputs);
     }
 }
+
+/// `TITAN_STEP_PROF=1`: split a decode step's non-forward time into input preparation
+/// (`process_inputs`: positions, mask, recurrent metadata) and the rest of the engine step
+/// (sampling, detokenizing, response). The model-side profiler in `quantized_qwen35_moe` gives
+/// `in`/`gap`; this says where the gap goes.
+pub(crate) static TITAN_PREP: std::sync::Mutex<(std::time::Duration, u64)> =
+    std::sync::Mutex::new((std::time::Duration::ZERO, 0));
+pub(crate) static TITAN_STEP: std::sync::Mutex<(std::time::Duration, u64)> =
+    std::sync::Mutex::new((std::time::Duration::ZERO, 0));
+
+fn titan_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+pub(crate) fn titan_prof_add(slot: &'static std::sync::Mutex<(std::time::Duration, u64)>, d: std::time::Duration) {
+    if let Ok(mut g) = slot.lock() {
+        g.0 += d;
+        g.1 += 1;
+    }
+}
+
+pub(crate) static TITAN_SAMPLE: std::sync::Mutex<(std::time::Duration, u64)> =
+    std::sync::Mutex::new((std::time::Duration::ZERO, 0));
+
+fn titan_prof_report_decode() {
+    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % 64 != 0 {
+        return;
+    }
+    let (pd, pc) = *TITAN_PREP.lock().unwrap();
+    let (sd, sc) = *TITAN_STEP.lock().unwrap();
+    let (md, mc) = *TITAN_SAMPLE.lock().unwrap();
+    let per = |d: std::time::Duration, c: u64| if c == 0 { 0.0 } else { d.as_secs_f64() * 1000.0 / c as f64 };
+    tracing::info!(
+        "titan engine prof (last {} decode steps, avg): prep={:.2}ms sample={:.2}ms step_total={:.2}ms",
+        n,
+        per(pd, pc),
+        per(md, mc),
+        per(sd, sc)
+    );
+    if let Ok(mut g) = TITAN_PREP.lock() {
+        g.0 = std::time::Duration::ZERO;
+        g.1 = 0;
+    }
+    if let Ok(mut g) = TITAN_STEP.lock() {
+        g.0 = std::time::Duration::ZERO;
+        g.1 = 0;
+    }
+    if let Ok(mut g) = TITAN_SAMPLE.lock() {
+        g.0 = std::time::Duration::ZERO;
+        g.1 = 0;
+    }
+}
+

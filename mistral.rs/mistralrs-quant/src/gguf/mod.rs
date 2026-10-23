@@ -382,6 +382,7 @@ impl GgufMatMul {
         }
     }
 
+
     #[cfg(feature = "cuda")]
     fn uses_fast_mmvq(&self) -> bool {
         matches!(
@@ -402,7 +403,7 @@ impl GgufMatMul {
         if let QMatMul::QTensor(q) = &self.w {
             if q.device().is_cuda() && fast_mmq::supports_llama_mmq(q.dtype()) {
                 let flat_batch = a.dims()[..a.dims().len().saturating_sub(1)].iter().product::<usize>();
-                if flat_batch > fast_mmvq::MMVQ_MAX_BATCH {
+                if flat_batch > mmvq_max_batch() {
                     return fast_mmq::llama_fmt_plain(q, a);
                 }
                 return Ok(None);
@@ -420,13 +421,19 @@ impl GgufMatMul {
             unreachable!("uses_fast_mmvq() requires QTensor weights")
         };
 
-        // Batch 1-8: use MMVQ (decode kernel)
-        if (1..=fast_mmvq::MMVQ_MAX_BATCH).contains(&flat_batch) {
+        // Tall-skinny matrices (ncols small, nrows large) starve the matrix-vector kernel: its
+        // block is (32, nwarps) and one block handles one row, so with ncols=5120 there is only
+        // 20 quant-blocks of work for 128 threads and most of them idle. Those measured ~220 GB/s
+        // against ~620 GB/s for the wide FFN matrices. Send them to the GEMM kernel instead.
+        let ncols_w = q.shape().dims2()?.1;
+        let tall_skinny = ncols_w <= mmq_small_cols();
+
+        // Small batches: MMVQ (decode kernel). Larger: MMQ (the GEMM kernel).
+        let ceiling = mmvq_max_batch();
+        if flat_batch <= ceiling && !tall_skinny {
             return Ok(Some(fast_mmvq::plain(q, a)?));
         }
-
-        // Batch > 8: use MMQ (prompt kernel)
-        if flat_batch > fast_mmvq::MMVQ_MAX_BATCH {
+        if flat_batch > ceiling {
             return Ok(Some(fast_mmq::plain(q, a)?));
         }
 
@@ -1265,4 +1272,38 @@ mod tests {
         }
         Ok(())
     }
+}
+
+
+/// One or two rows use the matrix-vector kernel; from 3 rows up the GEMM is cheaper per token
+/// (mmvq walks the rows, so a batch of 8 cost 7x a batch of 1 and gave 1.2x the tokens).
+#[cfg(feature = "cuda")]
+const DEFAULT_MMVQ_MAX_BATCH: usize = 2;
+
+/// Decode batch ceiling for the matrix-vector (mmvq) kernel. Above it the matrix-matrix kernel
+/// (mmq, llama.cpp's GEMM port) is used. mmvq has no real batching - it walks the rows - so with
+/// several concurrent sequences a GEMM is cheaper per token. `TITAN_MMVQ_MAX_BATCH` overrides.
+#[cfg(feature = "cuda")]
+fn mmvq_max_batch() -> usize {
+    static N: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
+    *N.get_or_init(|| {
+        crate::titan_cfg::var("TITAN_MMVQ_MAX_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MMVQ_MAX_BATCH)
+    })
+}
+
+/// `TITAN_MMQ_SMALL_COLS` (default 0 = off): matvecs whose contraction length is at most this are
+/// sent to the GEMM kernel (mmq) even at batch 1, because the matrix-vector kernel idles most of its
+/// 128 threads on tall-skinny shapes.
+#[cfg(feature = "cuda")]
+fn mmq_small_cols() -> usize {
+    static N: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
+    *N.get_or_init(|| {
+        crate::titan_cfg::var("TITAN_MMQ_SMALL_COLS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
 }

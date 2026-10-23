@@ -254,13 +254,22 @@ pub mod kernels {
     // ------------------------------------------------------------------------------------------
     // mmvq_gguf.cu
 
+    // Weights and activations are read-only for the whole launch, so every global load takes the
+    // non-coherent path (`ld.global.nc`, what nvcc emits for the reference's `const __restrict__`
+    // operands as LDG.E.CONSTANT). Plain dereferences compiled to coherent LDG.E.
+    // `register_only` is sound because nothing writes this memory during the launch, and needed:
+    // a side-effecting asm load kept the accumulator array `tmp` in local memory (a stack frame).
     #[inline(always)]
     pub unsafe fn ld8(p: *const u8, off: usize) -> u32 {
-        *p.add(off) as u32
+        let r: u32;
+        ptx_asm!("ld.global.nc.u8 %0, [%1];", out("=r") r, in("l") p.add(off) as u64, options(register_only));
+        r
     }
     #[inline(always)]
     pub unsafe fn ld16(p: *const u8, off: usize) -> u32 {
-        *(p.add(off) as *const u16) as u32
+        let r: u16;
+        ptx_asm!("ld.global.nc.u16 %0, [%1];", out("=h") r, in("l") p.add(off) as u64, options(register_only));
+        r as u32
     }
     /// `get_int_from_uint8`: a 32-bit word from two 16-bit loads (2-byte aligned blocks).
     #[inline(always)]
@@ -270,7 +279,9 @@ pub mod kernels {
     /// `get_int_from_uint8_aligned`.
     #[inline(always)]
     pub unsafe fn ld32a(p: *const u8, off: usize) -> u32 {
-        *(p.add(off) as *const u32)
+        let r: u32;
+        ptx_asm!("ld.global.nc.u32 %0, [%1];", out("=r") r, in("l") p.add(off) as u64, options(register_only));
+        r
     }
     /// Q8_1 block: quant word `i`.
     #[inline(always)]
@@ -302,6 +313,31 @@ pub mod kernels {
             k += 1;
         }
         r
+    }
+
+    /// Per-byte subtract with no cross-byte borrow, branchless. This is what the Q3_K path needs:
+    /// its low nibbles are 0..3 and the high bits add at most 4, so the range is -4..3 and the
+    /// saturating form of `vsubss4u` can never clamp. Compiles to one subtract plus masks, where the
+    /// loop form above expands to four scalar subtracts and a clamp chain per call.
+    #[inline(always)]
+    pub fn sub4s(a: u32, b: u32) -> u32 {
+        const H: u32 = 0x8080_8080;
+        ((a | H) - (b & !H)) ^ ((a ^ !b) & H)
+    }
+
+    /// One 6-bit Q3_K scale, `isc` in 0..16: low nibble from `scales[isc % 8]` shifted by
+    /// `4 * (isc / 8)`, high two bits from `scales[8 + isc % 4]` shifted by `2 * (isc / 4)`.
+    #[inline(always)]
+    pub unsafe fn q3_scale(xb: *const u8, isc: usize) -> i32 {
+        let sc_low = (ld8(xb, 96 + isc % 8) >> (4 * (isc / 8))) & 0xF;
+        let sc_high = ((ld8(xb, 96 + 8 + isc % 4) >> (2 * (isc / 4))) & 3) << 4;
+        (sc_low | sc_high) as i32 - 32
+    }
+
+    /// `((sar(vh, i) << 2) & 0x04040404)`, the Q3_K high bits for sub-block `i`.
+    #[inline(always)]
+    pub fn vih_i(vh: u32, i: usize) -> u32 {
+        (sar(vh, i) << 2) & 0x04040404
     }
 
     /// Output element of the GEMVs (`dst_t`).
@@ -470,22 +506,41 @@ pub mod kernels {
                 let scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
                 let vl = ld32u(xb, 32 + 4 * iqs);
                 let vh = sar(!ld32u(xb, 4 * (iqs % 8)), bq8_offset);
+                // Unrolled over the four 8-element sub-blocks, with the scale bytes and the
+                // activation words hoisted: the loop form reloaded eight single bytes per block
+                // and ptxas kept them inside the loop, which is why Q3_K ran at ~370 GB/s where
+                // the unrolled Q4_K path runs at ~660 on the same launcher. Same operations in the
+                // same order, so the result is bit-identical.
+                let isc0 = scale_offset;
+                let isc1 = scale_offset + 2;
+                let isc2 = scale_offset + 4;
+                let isc3 = scale_offset + 6;
+                let sc0 = q3_scale(xb, isc0);
+                let sc1 = q3_scale(xb, isc1);
+                let sc2 = q3_scale(xb, isc2);
+                let sc3 = q3_scale(xb, isc3);
+                let sc = [sc0, sc1, sc2, sc3];
+                // Fully unrolled: the toolchain warns "not unrolled" for bounded loops it cannot
+                // flatten, and a `[i32; 4]` indexed by a loop counter would spill to local memory.
+                let u0 = yq(yb.add(bq8_offset * 36), iqs % 8);
+                let u1 = yq(yb.add((bq8_offset + 1) * 36), iqs % 8);
+                let u2 = yq(yb.add((bq8_offset + 2) * 36), iqs % 8);
+                let u3 = yq(yb.add((bq8_offset + 3) * 36), iqs % 8);
+                let d0 = h2f(ld16(yb.add(bq8_offset * 36), 0));
+                let d1 = h2f(ld16(yb.add((bq8_offset + 1) * 36), 0));
+                let d2 = h2f(ld16(yb.add((bq8_offset + 2) * 36), 0));
+                let d3 = h2f(ld16(yb.add((bq8_offset + 3) * 36), 0));
                 let mut sumf = 0f32;
-                let mut i = 0;
-                while i < 4 {
-                    let b8 = yb.add((bq8_offset + i) * 36);
-                    let u = yq(b8, iqs % 8);
-                    let d8 = h2f(ld16(b8, 0));
-                    let isc = scale_offset + 2 * i;
-                    let sc_low = (ld8(xb, 96 + isc % 8) >> (4 * (isc / 8))) & 0xF;
-                    let sc_high = ((ld8(xb, 96 + 8 + isc % 4) >> (2 * (isc / 4))) & 3) << 4;
-                    let sc = (sc_low | sc_high) as i32 - 32;
-                    let vil = (vl >> (2 * i)) & 0x03030303;
-                    let vih = (sar(vh, i) << 2) & 0x04040404;
-                    let vi = vsubss4u(vil, vih);
-                    sumf = fma(d8, dp4a(vi, u, 0).wrapping_mul(sc) as f32, sumf);
-                    i += 1;
-                }
+                // llama.cpp's trick (vecdotq.cuh: vec_dot_q3_K_q8_1_impl_mmvq): instead of
+                // subtracting the high bits per byte (a SWAR subtract, ~6 ALU ops each), dot the
+                // low nibbles and the high-bit mask separately and subtract the two integer sums.
+                // dp4a is one instruction, so this trades ~24 ALU ops per block for 4 more dp4a.
+                // The counter data says this kernel is issue-bound (SM 57-62%, DRAM 23-27%), so
+                // instruction count is exactly what to cut.
+                sumf = fma(d0, (dp4a(vl & 0x03030303, u0, 0) - dp4a(vih_i(vh, 0), u0, 0)).wrapping_mul(sc[0]) as f32, sumf);
+                sumf = fma(d1, (dp4a((vl >> 2) & 0x03030303, u1, 0) - dp4a(vih_i(vh, 1), u1, 0)).wrapping_mul(sc[1]) as f32, sumf);
+                sumf = fma(d2, (dp4a((vl >> 4) & 0x03030303, u2, 0) - dp4a(vih_i(vh, 2), u2, 0)).wrapping_mul(sc[2]) as f32, sumf);
+                sumf = fma(d3, (dp4a((vl >> 6) & 0x03030303, u3, 0) - dp4a(vih_i(vh, 3), u3, 0)).wrapping_mul(sc[3]) as f32, sumf);
                 fma(h2f(ld16(xb, 108)), sumf, tmp)
             }
             7 | 8 => {
@@ -550,7 +605,7 @@ pub mod kernels {
                     let b8 = yb.add((bq8_offset + 2 * i) * 36);
                     let u = yq(b8, iqs % 8);
                     let d8 = h2f(ld16(b8, 0));
-                    let sc = *xb.add(192 + scale_offset + 4 * i) as i8 as i32;
+                    let sc = ld8(xb, 192 + scale_offset + 4 * i) as u8 as i8 as i32;
                     let vil = sar(vl, 4 * i) & 0x0F0F0F0F;
                     let vih = (sar(vh, 4 * i) << 4) & 0x30303030;
                     let vi = vsubss4u(vil | vih, 0x20202020);
@@ -559,6 +614,223 @@ pub mod kernels {
                 }
                 fma(h2f(ld16(xb, 208)), sumf, tmp)
             }
+        }
+    }
+
+    /// The weight half of `vdot`, decoded once per (block, row) and reused for every activation
+    /// column. The K-quant decode (bit extraction, 6-bit scales, Q6_K's per-byte subtract) is the
+    /// bulk of the instructions and the kernel is issue-bound, so redoing it per column made a
+    /// rows<b> launch cost ~b times a rows1 launch (Q3_K 17408x5120: 105 us at b=1, 200 us at b=2).
+    /// Pure loads and integer ops only: `wdot` performs exactly `vdot`'s float operations in the
+    /// same order, so the result is bit-identical. Field use per FMT is documented in `wdec`.
+    #[derive(Clone, Copy)]
+    pub struct Wq {
+        pub xb: *const u8,
+        pub a: [u32; 4],
+        pub h: [u32; 4],
+        pub s: [u32; 4],
+        pub f0: f32,
+        pub f1: f32,
+    }
+
+    #[inline(always)]
+    pub unsafe fn wdec<const FMT: u32>(xb: *const u8, iqs: usize) -> Wq {
+        let mut w = Wq { xb, a: [0; 4], h: [0; 4], s: [0; 4], f0: 0.0, f1: 0.0 };
+        match FMT {
+            // a: the four 2-bit planes, h: low-nibble scales, s: min nibbles, f0/f1: d, dmin
+            5 => {
+                let scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+                let v = ld32a(xb, 16 + 4 * iqs);
+                w.a = [v & 0x03030303, (v >> 2) & 0x03030303, (v >> 4) & 0x03030303, (v >> 6) & 0x03030303];
+                let (c0, c1, c2, c3) = (
+                    ld8(xb, scale_offset),
+                    ld8(xb, scale_offset + 2),
+                    ld8(xb, scale_offset + 4),
+                    ld8(xb, scale_offset + 6),
+                );
+                w.h = [c0 & 0xF, c1 & 0xF, c2 & 0xF, c3 & 0xF];
+                w.s = [c0 >> 4, c1 >> 4, c2 >> 4, c3 >> 4];
+                let dm = ld32a(xb, 80);
+                w.f0 = h2f(dm);
+                w.f1 = h2f(dm >> 16);
+            }
+            // a: low 2-bit planes, h: high-bit masks, s: 6-bit scales, f0: d
+            6 => {
+                let bq8_offset = 4 * (iqs / 8);
+                let scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+                let vl = ld32u(xb, 32 + 4 * iqs);
+                let vh = sar(!ld32u(xb, 4 * (iqs % 8)), bq8_offset);
+                w.a = [vl & 0x03030303, (vl >> 2) & 0x03030303, (vl >> 4) & 0x03030303, (vl >> 6) & 0x03030303];
+                w.h = [vih_i(vh, 0), vih_i(vh, 1), vih_i(vh, 2), vih_i(vh, 3)];
+                w.s = [
+                    q3_scale(xb, scale_offset) as u32,
+                    q3_scale(xb, scale_offset + 2) as u32,
+                    q3_scale(xb, scale_offset + 4) as u32,
+                    q3_scale(xb, scale_offset + 6) as u32,
+                ];
+                w.f0 = h2f(ld16(xb, 108));
+            }
+            // a: v[0][0], v[0][1], v[1][0], v[1][1], s: sc[0], sc[1], m[0], m[1], f0/f1: dm halves
+            7 | 8 => {
+                let bq8_offset = 2 * ((iqs / 2) / 4);
+                let (v0, v1) = if FMT == 7 {
+                    let q4 = 16 + 16 * bq8_offset + 4 * ((iqs / 2) % 4);
+                    let (a, b) = (ld32a(xb, q4), ld32a(xb, q4 + 16));
+                    ([a & 0x0F0F0F0F, b & 0x0F0F0F0F], [sar(a, 4) & 0x0F0F0F0F, sar(b, 4) & 0x0F0F0F0F])
+                } else {
+                    let ql = 48 + 16 * bq8_offset + 4 * ((iqs / 2) % 4);
+                    let qh = 16 + 4 * ((iqs / 2) % 4);
+                    let (l0, l1) = (ld32a(xb, ql), ld32a(xb, ql + 16));
+                    let h0 = sar(ld32a(xb, qh), bq8_offset);
+                    let h1 = sar(ld32a(xb, qh + 16), bq8_offset);
+                    (
+                        [(l0 & 0x0F0F0F0F) | ((h0 << 4) & 0x10101010), (l1 & 0x0F0F0F0F) | ((h1 << 4) & 0x10101010)],
+                        [
+                            (sar(l0, 4) & 0x0F0F0F0F) | ((sar(h0, 1) << 4) & 0x10101010),
+                            (sar(l1, 4) & 0x0F0F0F0F) | ((sar(h1, 1) << 4) & 0x10101010),
+                        ],
+                    )
+                };
+                w.a = [v0[0], v0[1], v1[0], v1[1]];
+                let s16 = |k: usize| ld16(xb, 4 + 2 * k);
+                let j = bq8_offset / 2;
+                let (aux0, aux1) = if j < 2 {
+                    (s16(j) & 0x3f3f, s16(j + 2) & 0x3f3f)
+                } else {
+                    (
+                        (s16(j + 2) & 0x0f0f) | ((s16(j - 2) & 0xc0c0) >> 2),
+                        ((s16(j + 2) >> 4) & 0x0f0f) | ((s16(j) & 0xc0c0) >> 2),
+                    )
+                };
+                w.s = [aux0 & 0xFF, aux0 >> 8, aux1 & 0xFF, aux1 >> 8];
+                let dm = ld32a(xb, 0);
+                w.f0 = h2f(dm);
+                w.f1 = h2f(dm >> 16);
+            }
+            // a: the two signed 6-bit quant words, s: the two int8 scales, f0: d
+            9 => {
+                let scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+                let vh_shift = 2 * ((iqs % 16) / 8);
+                let vl = ld32u(xb, 4 * iqs);
+                let vh = sar(ld32u(xb, 128 + 4 * (8 * (iqs / 16) + iqs % 8)), vh_shift);
+                let q6v = |i: usize| {
+                    let vil = sar(vl, 4 * i) & 0x0F0F0F0F;
+                    let vih = (sar(vh, 4 * i) << 4) & 0x30303030;
+                    vsubss4u(vil | vih, 0x20202020)
+                };
+                w.a = [q6v(0), q6v(1), 0, 0];
+                w.s = [
+                    ld8(xb, 192 + scale_offset) as u8 as i8 as i32 as u32,
+                    ld8(xb, 192 + scale_offset + 4) as u8 as i8 as i32 as u32,
+                    0,
+                    0,
+                ];
+                w.f0 = h2f(ld16(xb, 208));
+            }
+            // q4_0..q8_0: the decode is a couple of masks per word; `wdot` runs `vdot` on `xb`.
+            _ => {}
+        }
+        w
+    }
+
+    /// The activation half of `vdot`: the Q8_1 words and scales one thread's dot needs from one
+    /// column, loaded once and shared by both weight rows of the block.
+    #[derive(Clone, Copy)]
+    pub struct Yq {
+        pub yb: *const u8,
+        pub iqs: usize,
+        pub u: [u32; 4],
+        pub d: [f32; 4],
+        /// `dp4a(0x01010101, ..)` sums of `u` (the min terms): activation-only, so once per column.
+        pub s: [i32; 4],
+    }
+
+    #[inline(always)]
+    pub unsafe fn yload<const FMT: u32>(yb: *const u8, iqs: usize) -> Yq {
+        let mut y = Yq { yb, iqs, u: [0; 4], d: [0.0; 4], s: [0; 4] };
+        match FMT {
+            5 | 6 => {
+                let bq8_offset = 4 * (iqs / 8);
+                let b = |i: usize| yb.add((bq8_offset + i) * 36);
+                y.u = [yq(b(0), iqs % 8), yq(b(1), iqs % 8), yq(b(2), iqs % 8), yq(b(3), iqs % 8)];
+                y.d = [h2f(ld16(b(0), 0)), h2f(ld16(b(1), 0)), h2f(ld16(b(2), 0)), h2f(ld16(b(3), 0))];
+                if FMT == 5 {
+                    let one = |u: u32| dp4a(0x01010101, u, 0);
+                    y.s = [one(y.u[0]), one(y.u[1]), one(y.u[2]), one(y.u[3])];
+                }
+            }
+            // u: (u0, u1) of sub-block 0, then of sub-block 1
+            7 | 8 => {
+                let bq8_offset = 2 * ((iqs / 2) / 4);
+                let (b0, b1) = (yb.add(bq8_offset * 36), yb.add((bq8_offset + 1) * 36));
+                let k = (iqs / 2) % 4;
+                y.u = [yq(b0, k), yq(b0, k + 4), yq(b1, k), yq(b1, k + 4)];
+                y.d = [h2f(ld16(b0, 0)), h2f(ld16(b1, 0)), 0.0, 0.0];
+                y.s = [
+                    dp4a(0x01010101, y.u[1], dp4a(0x01010101, y.u[0], 0)),
+                    dp4a(0x01010101, y.u[3], dp4a(0x01010101, y.u[2], 0)),
+                    0,
+                    0,
+                ];
+            }
+            9 => {
+                let bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+                let (b0, b1) = (yb.add(bq8_offset * 36), yb.add((bq8_offset + 2) * 36));
+                y.u = [yq(b0, iqs % 8), yq(b1, iqs % 8), 0, 0];
+                y.d = [h2f(ld16(b0, 0)), h2f(ld16(b1, 0)), 0.0, 0.0];
+            }
+            _ => {}
+        }
+        y
+    }
+
+    /// `vdot(tmp, w.xb, y.yb, y.iqs)` given the decoded weights of `wdec` and the activations of
+    /// `yload`: the same float operations in the same order.
+    #[inline(always)]
+    pub unsafe fn wdot<const FMT: u32>(tmp: f32, w: &Wq, y: &Yq) -> f32 {
+        match FMT {
+            5 => {
+                let mut sumf_d = 0f32;
+                let mut sumf_m = 0f32;
+                // dp4a(m, u, 0) with m the min byte replicated equals m * sum(u) exactly (|m| <= 15,
+                // |sum| <= 512), and sum(u) is per column (y.s).
+                let mut q2 = |u: u32, d8: f32, us: i32, vi: u32, scl: u32, m: u32| {
+                    sumf_d = fma(d8, dp4a(vi, u, 0).wrapping_mul(scl as i32) as f32, sumf_d);
+                    sumf_m = fma(d8, us.wrapping_mul(m as i32) as f32, sumf_m);
+                };
+                q2(y.u[0], y.d[0], y.s[0], w.a[0], w.h[0], w.s[0]);
+                q2(y.u[1], y.d[1], y.s[1], w.a[1], w.h[1], w.s[1]);
+                q2(y.u[2], y.d[2], y.s[2], w.a[2], w.h[2], w.s[2]);
+                q2(y.u[3], y.d[3], y.s[3], w.a[3], w.h[3], w.s[3]);
+                add(fma(sumf_d, w.f0, -mul(sumf_m, w.f1)), tmp)
+            }
+            6 => {
+                let mut sumf = 0f32;
+                sumf = fma(y.d[0], (dp4a(w.a[0], y.u[0], 0) - dp4a(w.h[0], y.u[0], 0)).wrapping_mul(w.s[0] as i32) as f32, sumf);
+                sumf = fma(y.d[1], (dp4a(w.a[1], y.u[1], 0) - dp4a(w.h[1], y.u[1], 0)).wrapping_mul(w.s[1] as i32) as f32, sumf);
+                sumf = fma(y.d[2], (dp4a(w.a[2], y.u[2], 0) - dp4a(w.h[2], y.u[2], 0)).wrapping_mul(w.s[2] as i32) as f32, sumf);
+                sumf = fma(y.d[3], (dp4a(w.a[3], y.u[3], 0) - dp4a(w.h[3], y.u[3], 0)).wrapping_mul(w.s[3] as i32) as f32, sumf);
+                fma(w.f0, sumf, tmp)
+            }
+            7 | 8 => {
+                let mut sumf_d = 0f32;
+                let mut sumf_m = 0f32;
+                let mut k4 = |u0: u32, u1: u32, d8: f32, dot2: i32, va: u32, vb: u32, sc: u32, m: u32| {
+                    let dot1 = dp4a(vb, u1, dp4a(va, u0, 0));
+                    sumf_d = fma(d8, dot1.wrapping_mul(sc as i32) as f32, sumf_d);
+                    sumf_m = fma(d8, dot2.wrapping_mul(m as i32) as f32, sumf_m);
+                };
+                k4(y.u[0], y.u[1], y.d[0], y.s[0], w.a[0], w.a[1], w.s[0], w.s[2]);
+                k4(y.u[2], y.u[3], y.d[1], y.s[1], w.a[2], w.a[3], w.s[1], w.s[3]);
+                add(fma(sumf_d, w.f0, -mul(sumf_m, w.f1)), tmp)
+            }
+            9 => {
+                let mut sumf = 0f32;
+                sumf = fma(y.d[0], dp4a(w.a[0], y.u[0], 0).wrapping_mul(w.s[0] as i32) as f32, sumf);
+                sumf = fma(y.d[1], dp4a(w.a[1], y.u[1], 0).wrapping_mul(w.s[1] as i32) as f32, sumf);
+                fma(w.f0, sumf, tmp)
+            }
+            _ => vdot::<FMT>(tmp, w.xb, y.yb, y.iqs),
         }
     }
 
@@ -599,21 +871,43 @@ pub mod kernels {
         while kbx < bpr {
             let kby = kbx.wrapping_mul(qk / 32);
             let kqs = (vdr * (tid % (qi / vdr))) as usize;
-            let mut j = 0;
-            while j < NC {
-                let yb = vy.offset((j as i32).wrapping_mul(stride_col_y).wrapping_add(kby) as isize * 36);
-                let mut i = 0;
-                while i < rpb as usize {
-                    let row = row0.wrapping_add(i as i32);
-                    if !GUARD || row < nrows_guard {
-                        let wk = row.wrapping_mul(bpr).wrapping_add(kbx);
-                        let xb = vx.offset(wk as isize * bs as isize);
-                        tmp[j][i] = vdot::<FMT>(tmp[j][i], xb, yb, kqs);
+            // Both weight rows (rpb is 2 for every caller) are decoded before any dot, so all of
+            // their loads are in flight at once - a loop over rows issued row 1's loads only after
+            // row 0's math. Each column's activations are loaded once for both rows. Every
+            // tmp[j][i] is its own accumulator, so none of this reorders a sum.
+            let r1 = row0.wrapping_add(1);
+            let ok0 = !GUARD || row0 < nrows_guard;
+            let ok1 = rpb > 1 && (!GUARD || r1 < nrows_guard);
+            let x0 = vx.offset(row0.wrapping_mul(bpr).wrapping_add(kbx) as isize * bs as isize);
+            // an out-of-range second row re-reads row 0's block (always valid); its result is dropped
+            let x1 = if ok1 { vx.offset(r1.wrapping_mul(bpr).wrapping_add(kbx) as isize * bs as isize) } else { x0 };
+            let w0 = wdec::<FMT>(x0, kqs);
+            let w1 = wdec::<FMT>(x1, kqs);
+            // Unrolled with constant column indices: a `while j < NC` loop that LLVM left rolled
+            // (it did at NC = 2) indexes tmp dynamically and moves the accumulators to local memory.
+            macro_rules! col {
+                ($j:expr) => {
+                    if $j < NC {
+                        let yb = vy.offset(($j as i32).wrapping_mul(stride_col_y).wrapping_add(kby) as isize * 36);
+                        let y = yload::<FMT>(yb, kqs);
+                        let t = tmp.get_unchecked_mut($j);
+                        if ok0 {
+                            t[0] = wdot::<FMT>(t[0], &w0, &y);
+                        }
+                        if ok1 {
+                            t[1] = wdot::<FMT>(t[1], &w1, &y);
+                        }
                     }
-                    i += 1;
-                }
-                j += 1;
+                };
             }
+            col!(0);
+            col!(1);
+            col!(2);
+            col!(3);
+            col!(4);
+            col!(5);
+            col!(6);
+            col!(7);
             kbx += bpi;
         }
     }
@@ -700,9 +994,20 @@ pub mod kernels {
     pub unsafe fn mmvq_rows<const FMT: u32, const NC: usize, D: Dst>(
         vx: *const u8, vy: *const u8, dst: *mut D, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32,
     ) {
-        // tmp_shared[7][NC][2][32]: at most 7 * 8 * 2 * 32 floats.
+        mmvq_rows_nw::<FMT, NC, 8, D>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst)
+    }
+
+    /// Same computation as `mmvq_rows`, with the warp count as a constant so the block can be sized
+    /// (32, NW). An issue-bound kernel (SM 67%, DRAM 30%) can care a lot about this: more warps per
+    /// block means a finer k split per thread, fewer blocks resident, and different load/DP4A ILP.
+    #[device]
+    #[inline(always)]
+    pub unsafe fn mmvq_rows_nw<const FMT: u32, const NC: usize, const NW: i32, D: Dst>(
+        vx: *const u8, vy: *const u8, dst: *mut D, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32,
+    ) {
+        // tmp_shared[NW - 1][NC][2][32]; 3584 covers NC = 8 at NW = 8 and NC = 1 at NW = 16.
         static mut TMP_ROWS: SharedArray<f32, 3584> = SharedArray::UNINIT;
-        let nwarps: i32 = 8;
+        let nwarps: i32 = NW;
         let rpb: i32 = 2;
         let tx = thread::threadIdx_x() as i32;
         let row0 = rpb.wrapping_mul(thread::blockIdx_x() as i32);
@@ -872,6 +1177,8 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q2_k_f32_rows6(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<5, 6, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q2_k_f32_rows7(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<5, 7, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q2_k_f32_rows8(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<5, 8, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] pub unsafe fn mmvq_gguf_q3_k_bf16_rows1w4(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows_nw::<6, 1, 4, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] pub unsafe fn mmvq_gguf_q3_k_bf16_rows1w16(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows_nw::<6, 1, 16, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q3_k_bf16_rows1(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<6, 1, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q3_k_bf16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<6, 2, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q3_k_bf16_rows3(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<6, 3, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }

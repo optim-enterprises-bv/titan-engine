@@ -1043,6 +1043,7 @@ impl Engine {
             }
         }
 
+        let t_submit = std::time::Instant::now();
         let submission = {
             let mut guards = rows
                 .iter()
@@ -1073,14 +1074,22 @@ impl Engine {
             }
         };
 
+        if titan_eng_prof_on() {
+            titan_eng_prof_add("submit", t_submit.elapsed());
+        }
         let has_next_tail = submission.has_tail();
         if has_next_tail {
             let mut scheduler = get_mut_arcmutex!(self.scheduler);
             scheduler.record_decode_continuation();
         }
+        let t_complete = std::time::Instant::now();
         let mut completion = self.complete_cuda_step(worker, submission).await?;
+        if titan_eng_prof_on() {
+            titan_eng_prof_add("complete", t_complete.elapsed());
+        }
 
         let step_duration = started.elapsed();
+        let t_finish = std::time::Instant::now();
         let completion = {
             let mut guards = rows
                 .iter()
@@ -1119,6 +1128,10 @@ impl Engine {
             completion
         };
 
+        if titan_eng_prof_on() {
+            titan_eng_prof_add("finish", t_finish.elapsed());
+            titan_eng_prof_report();
+        }
         let Some(mut next_tail) = completion.into_cuda_tail() else {
             return Ok(None);
         };
@@ -2337,6 +2350,52 @@ impl Engine {
                 let req = format!("{}\n", serde_json::to_string(&request).unwrap());
                 writer.write_all(req.as_bytes()).unwrap();
             }
+        }
+    }
+}
+
+// ---- TITAN_STEP_PROF: where a resident decode step's time goes -----------------------------
+// The model-side profiler (`quantized_qwen35_moe`) says forward vs gap; this splits the gap of
+// the resident decode path into submit (lock + pipeline submit, i.e. the forward), complete (the
+// completion worker round trip: sampling) and finish (guards, token accounting, detokenize,
+// response, prefix cache).
+static TITAN_ENG: std::sync::Mutex<Vec<(&'static str, std::time::Duration, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn titan_eng_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+fn titan_eng_prof_add(tag: &'static str, d: std::time::Duration) {
+    if let Ok(mut p) = TITAN_ENG.lock() {
+        match p.iter_mut().find(|e| e.0 == tag) {
+            Some(e) => {
+                e.1 += d;
+                e.2 += 1;
+            }
+            None => p.push((tag, d, 1)),
+        }
+    }
+}
+
+fn titan_eng_prof_report() {
+    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % 64 != 0 {
+        return;
+    }
+    if let Ok(mut p) = TITAN_ENG.lock() {
+        let mut line = String::new();
+        for (tag, d, c) in p.iter() {
+            if *c > 0 {
+                line.push_str(&format!("{}={:.2}ms ", tag, d.as_secs_f64() * 1000.0 / *c as f64));
+            }
+        }
+        tracing::info!("titan engine-loop prof ({} steps, avg/step): {}", n, line.trim());
+        for e in p.iter_mut() {
+            e.1 = std::time::Duration::ZERO;
+            e.2 = 0;
         }
     }
 }
