@@ -45,7 +45,7 @@ use crate::{
     Pipeline, Topology, TryIntoDType,
 };
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use either::Either;
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
@@ -195,14 +195,17 @@ pub(super) fn load(
     {
         let devices = device_map::get_all_similar_devices(device)?;
         let kv_dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
+        let kv_dtype = if device.is_cuda() && crate::kv_cache::cuda_kv_fp8() { DType::F8E4M3 } else { kv_dtype };
         let inner = GgufDeviceMapLoaderInner { model: &model, arch };
         let cfg = inner.model_config("this is a dummy config!")?;
         let frac = inner.kv_cache_layer_fraction("this is a dummy config!")?;
         let kv_layers = (cfg.num_layers() as f64 * frac).ceil() as usize;
-        let per_token = kv_layers
-            * cfg.num_kv_heads()
-            * (cfg.k_head_dim() + cfg.v_head_dim())
-            * kv_dtype.size_in_bytes();
+        // TITAN_KV_HOST keeps the KV in host RAM: none of it is device memory
+        let per_token = if device.is_cuda() && crate::titan_hostkv::enabled() {
+            0
+        } else {
+            kv_layers * cfg.num_kv_heads() * (cfg.k_head_dim() + cfg.v_head_dim()) * kv_dtype.size_in_bytes()
+        };
         tracing::info!(
             "titan admit sizing: {kv_layers} kv layers x {} heads x ({}+{}) x {:?} = {} bytes/token",
             cfg.num_kv_heads(), cfg.k_head_dim(), cfg.v_head_dim(), kv_dtype, per_token

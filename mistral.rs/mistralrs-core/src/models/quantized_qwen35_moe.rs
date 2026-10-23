@@ -513,6 +513,9 @@ impl FullAttention {
         mask: &AttentionMask,
         flash_params: Option<&crate::pipeline::text_models_inputs_processor::FlashParams>,
     ) -> Result<Tensor> {
+        if k.device().is_cpu() {
+            return crate::titan_hostkv::attend(q, k, v, &self.sdpa_params);
+        }
         let rows = q.dim(2)?;
         if matches!(mask, AttentionMask::Custom(_))
             && rows > MTP_CATCHUP_MAX_ROWS
@@ -604,6 +607,11 @@ impl FullAttention {
     ) -> Result<Tensor> {
         let (b_sz, _, n, _) = q.dims4()?;
         let (k, v) = kv_cache.append(k, v)?;
+        if k.device().is_cpu() {
+            // one pass over the host cache for all rows; each row still equals its decode step
+            let y = Sdpa.run_attention(q, &k, &v, &AttentionMask::None, flash_params, &self.sdpa_params)?;
+            return y.transpose(1, 2)?.reshape((b_sz, n, ()));
+        }
         let past = k.dim(2)? - n;
         // rows from `first` on (their key counts at or above TITAN_ATTN_FLASH_MIN) share one
         // flash-decode call; each still equals its decode step (the kernel is row-exact)
@@ -1311,6 +1319,7 @@ fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
 
 /// A KV cache on `dev` holding the first `len` positions of a host copy, with room for `cap`.
 fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usize, dev: &Device) -> Result<KvCache> {
+    let dev = if dev.is_cuda() && crate::titan_hostkv::enabled() { &Device::Cpu } else { dev };
     let single = |t: &Tensor| -> Result<SingleCache> {
         let mut shape = t.dims().to_vec();
         shape[2] = cap;
@@ -2500,7 +2509,10 @@ impl ModelWeights {
             )
         })?;
 
-        let mask = if ctx.is_paged() {
+        let mask = if input_ids.dim(1)? > 1 && crate::titan_hostkv::enabled() {
+            // host-RAM KV attends positionally; a (rows, keys) mask would cost 1 KiB of device memory per cached token
+            AttentionMask::Custom(Tensor::zeros((1, 1), self.dtype, &self.device)?)
+        } else if ctx.is_paged() {
             let cache = ForwardMaskCache::Paged(ctx.seqlen_offsets());
             CausalMasker.make_causal_mask(
                 input_ids,
@@ -3031,7 +3043,8 @@ impl ModelWeights {
                 Mixer::Linear(_) => true,
             });
             let layers_ok = mixers_ok && (self.all_moe() || (self.all_dense() && Self::dense_graphs_enabled()));
-            let ok = one_device && layers_ok && lookahead_depth() == 0;
+            // host-RAM KV attends on the CPU between segments, outside any capture
+            let ok = one_device && layers_ok && lookahead_depth() == 0 && !crate::titan_hostkv::enabled();
             tracing::info!("titan graphs: piecewise CUDA graphs for batch-1 decode {}", if ok { "on" } else { "off (unsupported model setup)" });
             ok
         })

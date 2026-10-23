@@ -1,7 +1,7 @@
 use crate::attention::AttentionMask;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use candle_core::{Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 
 use crate::{
     get_mut_arcmutex,
@@ -88,6 +88,18 @@ pub(crate) fn cpu_kv_f16() -> bool {
         let on = fast && std::env::var("MISTRALRS_CPU_KV_F32").map_or(true, |v| v == "0");
         if on {
             tracing::info!("Using f16 KV cache on CPU (set MISTRALRS_CPU_KV_F32=1 for f32).");
+        }
+        on
+    })
+}
+
+/// `TITAN_KV_FP8=1`: CUDA KV caches store F8E4M3 (half of bf16) and `append` hands back the 16-bit dtype.
+pub(crate) fn cuda_kv_fp8() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| {
+        let on = mistralrs_quant::titan_cfg::var("TITAN_KV_FP8").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!("titan kv: CUDA KV cache stored as F8E4M3");
         }
         on
     })
@@ -185,6 +197,18 @@ impl KvCache {
         } else {
             (k, v)
         };
+        let dt = k.dtype();
+        let to_f8 = k.device().is_cuda() && matches!(dt, DType::BF16 | DType::F16);
+        let host = to_f8 && crate::titan_hostkv::enabled();
+        let fp8 = to_f8 && !host && cuda_kv_fp8();
+        let (k, v) = if host {
+            let cpu = candle_core::Device::Cpu;
+            (k.to_dtype(DType::F8E4M3)?.to_device(&cpu)?, v.to_dtype(DType::F8E4M3)?.to_device(&cpu)?)
+        } else if fp8 {
+            (k.to_dtype(DType::F8E4M3)?, v.to_dtype(DType::F8E4M3)?)
+        } else {
+            (k, v)
+        };
         let (out_k, out_v) = match self {
             Self::Normal { k: kc, v: vc } => {
                 kc.append(&k)?;
@@ -226,6 +250,9 @@ impl KvCache {
             }
             Some(v) => v,
         };
+        if fp8 {
+            return Ok((k.to_dtype(dt)?, v.to_dtype(dt)?));
+        }
         Ok((k, v))
     }
 

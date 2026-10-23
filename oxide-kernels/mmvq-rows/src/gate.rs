@@ -98,12 +98,21 @@ fn compare(t: &mut Tally, label: &str, a: &[u8], b: &[u8]) {
 }
 
 pub fn run() -> bool {
-    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    // ROWS_ROOT: the oxide-kernels dir holding mmvq-rows/mmvq_rows.ptx (default: this crate's parent);
+    // ROWS_REF_DIR: the dir holding the nvcc reference cubins (default: <root>/reference).
+    let root = std::env::var("ROWS_ROOT").unwrap_or(format!("{}/..", env!("CARGO_MANIFEST_DIR")));
+    let refs = std::env::var("ROWS_REF_DIR").unwrap_or(format!("{root}/reference"));
     // (a) the M6 WIP nvcc launcher's kernel (cuda1 + blockIdx.y offsets, grid.y = b)
-    let rows_ref = std::env::var("ROWS_REF").unwrap_or(format!("{root}/reference/mistralrs-quant-rows/mmvq_gguf_rows.cubin"));
+    // ROWS_PLAIN_ONLY=1: skip (a) and gate against (b) alone (when the launcher cubin is unavailable).
+    let plain_only = std::env::var("ROWS_PLAIN_ONLY").is_ok_and(|v| v == "1");
+    let rows_ref = if plain_only {
+        format!("{refs}/mistralrs-quant/mmvq_gguf.cubin")
+    } else {
+        std::env::var("ROWS_REF").unwrap_or(format!("{refs}/mistralrs-quant-rows/mmvq_gguf_rows.cubin"))
+    };
     let h = Harness::from_files(&rows_ref, &format!("{root}/mmvq-rows/mmvq_rows.ptx"));
     // (b) the unmodified nvcc batch-1 kernel decode runs, one launch per column
-    let plain_ref = h.ctx.load_module_from_file(&format!("{root}/reference/mistralrs-quant/mmvq_gguf.cubin")).unwrap();
+    let plain_ref = h.ctx.load_module_from_file(&format!("{refs}/mistralrs-quant/mmvq_gguf.cubin")).unwrap();
     let mut t = Tally::default();
     let mut r = Rng(0x0A7E_5EED);
     let mut finite = (0usize, 0usize);
@@ -137,10 +146,12 @@ pub fn run() -> bool {
                     let nb = (nrows as u32).div_ceil(2);
                     let label = format!("{ox_name} ncols {ncols} nrows {nrows}");
                     let ox = launch(&h, &fo, (nb, 1, 1), &bufs, ncols, nrows, scy, scd, *es, &[0]);
-                    let ra = launch(&h, &fa, (nb, b as u32, 1), &bufs, ncols, nrows, scy, scd, *es, &[0]);
                     let cols: Vec<usize> = (0..b).collect();
                     let rb = launch(&h, &fb, (nb, 1, 1), &bufs, ncols, nrows, scy, scd, *es, &cols);
-                    compare(&mut t, &format!("{label} vs nvcc rows launcher"), &ra, &ox);
+                    if !plain_only {
+                        let ra = launch(&h, &fa, (nb, b as u32, 1), &bufs, ncols, nrows, scy, scd, *es, &[0]);
+                        compare(&mut t, &format!("{label} vs nvcc rows launcher"), &ra, &ox);
+                    }
                     compare(&mut t, &format!("{label} vs nvcc batch-1 per column"), &rb, &ox);
                     if *dn == "f32" {
                         for c in 0..b {
@@ -163,17 +174,25 @@ pub fn run() -> bool {
     t.finish("mmvq-rows kernel-level kdiff vs nvcc") && finite.0 * 10 > finite.1 * 9
 }
 
-/// Wall time (200 repetitions, stream-synchronised) on the shapes of Qwen3.6-35B-A3B verification
-/// (hidden 2048): b nvcc batch-1 launches (one per row) vs one oxide rows<b> launch.
+/// Wall time (200 repetitions, stream-synchronised): b nvcc batch-1 launches (one per row) vs one
+/// oxide rows<b> launch, on the dense Qwen3.x 27B shapes (hidden 5120, ffn 17408, vocab 248320).
+/// The weights rotate through enough copies (>= 256 MiB) that every launch reads DRAM: a single
+/// 17408x5120 K-quant matrix fits the 64 MiB L2, and timing it hot measures the wrong thing.
 fn time(h: &Harness, plain_ref: &std::sync::Arc<kdiff::cuda_core::CudaModule>, r: &mut Rng) {
     use kdiff::cuda_core::DeviceBuffer;
-    for (fi, ncols, nrows) in [(7usize, 2048usize, 4096usize), (9, 2048, 4096), (4, 2048, 512), (4, 4096, 2048), (9, 2048, 248320)] {
+    let shapes = [(6usize, 5120usize, 17408usize), (7, 5120, 17408), (7, 17408, 5120), (8, 17408, 5120), (8, 5120, 248320), (9, 5120, 6144)];
+    for (fi, ncols, nrows) in shapes {
         let f = &FMTS[fi];
-        for b in [1usize, 2, 3, 5] {
-            let bufs: Vec<DeviceBuffer<u8>> = [weights(r, f, nrows * ncols / f.1), q8_1(r, b * ncols / 32), vec![0u8; b * nrows * 4]]
+        let w = weights(r, f, nrows * ncols / f.1);
+        let wbytes = w.len();
+        let copies = (256usize << 20).div_ceil(wbytes).max(1);
+        let wall: Vec<u8> = w.iter().copied().cycle().take(wbytes * copies).collect();
+        for b in [1usize, 2, 3, 4] {
+            let bufs: Vec<DeviceBuffer<u8>> = [wall.clone(), q8_1(r, b * ncols / 32), vec![0u8; b * nrows * 4]]
                 .iter()
                 .map(|v| DeviceBuffer::from_host(&h.stream, v).unwrap())
                 .collect();
+            let it = std::cell::Cell::new(0usize);
             let mut res = Vec::new();
             for side in 0..2 {
                 let func = if side == 0 {
@@ -184,9 +203,11 @@ fn time(h: &Harness, plain_ref: &std::sync::Arc<kdiff::cuda_core::CudaModule>, r
                 let cols = if side == 0 { b } else { 1 };
                 let grid = ((nrows as u32).div_ceil(2), 1, 1);
                 let run = || {
+                    let copy = it.get() % copies;
+                    it.set(it.get() + 1);
                     for c in 0..cols {
                         let mut vals: Vec<[u8; 8]> = vec![
-                            bufs[0].cu_deviceptr().to_le_bytes(),
+                            (bufs[0].cu_deviceptr() + (copy * wbytes) as u64).to_le_bytes(),
                             (bufs[1].cu_deviceptr() + (c * ncols / 32 * 36) as u64).to_le_bytes(),
                             (bufs[2].cu_deviceptr() + (c * nrows * 4) as u64).to_le_bytes(),
                             (ncols as u64).to_le_bytes(),
@@ -209,7 +230,11 @@ fn time(h: &Harness, plain_ref: &std::sync::Arc<kdiff::cuda_core::CudaModule>, r
                 h.stream.synchronize().unwrap();
                 res.push(t0.elapsed().as_secs_f64() * 1e6 / 200.0);
             }
-            println!("  time {} f32 {ncols}x{nrows} b {b}: nvcc batch-1 x{b} {:.2} us, oxide rows{b} {:.2} us ({:.2}x)", f.0, res[0], res[1], res[1] / res[0]);
+            let gbs = |us: f64| wbytes as f64 / us / 1e3;
+            println!(
+                "  time {} f32 {ncols}x{nrows} b {b}: nvcc batch-1 x{b} {:.2} us, oxide rows{b} {:.2} us ({:.2}x)  [{:.0} GB/s per weight pass, oxide]",
+                f.0, res[0], res[1], res[1] / res[0], gbs(res[1])
+            );
         }
     }
 }
