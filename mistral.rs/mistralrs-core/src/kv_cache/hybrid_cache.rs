@@ -748,6 +748,20 @@ impl RecurrentStatePool {
         self.conv_state.index_select(state_indices, 0)
     }
 
+    /// A view of one slot's conv state, for the zero-copy decode path: the GDN kernels update
+    /// the cache tensors in place, so passing the pool row itself (instead of gathering a copy
+    /// and scattering it back) leaves the state where it already lives.
+    pub fn conv_state_row(&self, slot: usize) -> Result<Tensor> {
+        let physical = self.physical_slot(slot, 0)?;
+        self.conv_state.narrow(0, physical, 1)
+    }
+
+    /// A view of one slot's recurrent state, same idea as `conv_state_row`.
+    pub fn recurrent_state_row(&self, slot: usize) -> Result<Tensor> {
+        let physical = self.physical_slot(slot, 0)?;
+        self.recurrent_state.narrow(0, physical, 1)
+    }
+
     /// Gather recurrent states for the given slot indices
     pub fn gather_recurrent_state(&self, state_indices: &Tensor) -> Result<Tensor> {
         self.recurrent_state.index_select(state_indices, 0)

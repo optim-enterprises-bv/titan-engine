@@ -1408,6 +1408,7 @@ pub async fn sample_sequence(
     sample_speculative: bool,
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
+    let titan_t_sample = std::time::Instant::now();
     activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, false);
     let rng = seq.sampling_rng(&rng);
 
@@ -1550,6 +1551,9 @@ pub async fn sample_sequence(
         }
     }
 
+    if std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false) {
+        super::titan_prof_add(&super::TITAN_SAMPLE, titan_t_sample.elapsed());
+    }
     Ok(second_logprobs_response)
 }
 

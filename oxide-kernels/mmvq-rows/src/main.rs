@@ -304,6 +304,31 @@ pub mod kernels {
         r
     }
 
+    /// Per-byte subtract with no cross-byte borrow, branchless. This is what the Q3_K path needs:
+    /// its low nibbles are 0..3 and the high bits add at most 4, so the range is -4..3 and the
+    /// saturating form of `vsubss4u` can never clamp. Compiles to one subtract plus masks, where the
+    /// loop form above expands to four scalar subtracts and a clamp chain per call.
+    #[inline(always)]
+    pub fn sub4s(a: u32, b: u32) -> u32 {
+        const H: u32 = 0x8080_8080;
+        ((a | H) - (b & !H)) ^ ((a ^ !b) & H)
+    }
+
+    /// One 6-bit Q3_K scale, `isc` in 0..16: low nibble from `scales[isc % 8]` shifted by
+    /// `4 * (isc / 8)`, high two bits from `scales[8 + isc % 4]` shifted by `2 * (isc / 4)`.
+    #[inline(always)]
+    pub unsafe fn q3_scale(xb: *const u8, isc: usize) -> i32 {
+        let sc_low = (ld8(xb, 96 + isc % 8) >> (4 * (isc / 8))) & 0xF;
+        let sc_high = ((ld8(xb, 96 + 8 + isc % 4) >> (2 * (isc / 4))) & 3) << 4;
+        (sc_low | sc_high) as i32 - 32
+    }
+
+    /// `((sar(vh, i) << 2) & 0x04040404)`, the Q3_K high bits for sub-block `i`.
+    #[inline(always)]
+    pub fn vih_i(vh: u32, i: usize) -> u32 {
+        (sar(vh, i) << 2) & 0x04040404
+    }
+
     /// Output element of the GEMVs (`dst_t`).
     pub trait Dst: Copy {
         /// `(dst_t) v`.
@@ -470,22 +495,41 @@ pub mod kernels {
                 let scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
                 let vl = ld32u(xb, 32 + 4 * iqs);
                 let vh = sar(!ld32u(xb, 4 * (iqs % 8)), bq8_offset);
+                // Unrolled over the four 8-element sub-blocks, with the scale bytes and the
+                // activation words hoisted: the loop form reloaded eight single bytes per block
+                // and ptxas kept them inside the loop, which is why Q3_K ran at ~370 GB/s where
+                // the unrolled Q4_K path runs at ~660 on the same launcher. Same operations in the
+                // same order, so the result is bit-identical.
+                let isc0 = scale_offset;
+                let isc1 = scale_offset + 2;
+                let isc2 = scale_offset + 4;
+                let isc3 = scale_offset + 6;
+                let sc0 = q3_scale(xb, isc0);
+                let sc1 = q3_scale(xb, isc1);
+                let sc2 = q3_scale(xb, isc2);
+                let sc3 = q3_scale(xb, isc3);
+                let sc = [sc0, sc1, sc2, sc3];
+                // Fully unrolled: the toolchain warns "not unrolled" for bounded loops it cannot
+                // flatten, and a `[i32; 4]` indexed by a loop counter would spill to local memory.
+                let u0 = yq(yb.add(bq8_offset * 36), iqs % 8);
+                let u1 = yq(yb.add((bq8_offset + 1) * 36), iqs % 8);
+                let u2 = yq(yb.add((bq8_offset + 2) * 36), iqs % 8);
+                let u3 = yq(yb.add((bq8_offset + 3) * 36), iqs % 8);
+                let d0 = h2f(ld16(yb.add(bq8_offset * 36), 0));
+                let d1 = h2f(ld16(yb.add((bq8_offset + 1) * 36), 0));
+                let d2 = h2f(ld16(yb.add((bq8_offset + 2) * 36), 0));
+                let d3 = h2f(ld16(yb.add((bq8_offset + 3) * 36), 0));
                 let mut sumf = 0f32;
-                let mut i = 0;
-                while i < 4 {
-                    let b8 = yb.add((bq8_offset + i) * 36);
-                    let u = yq(b8, iqs % 8);
-                    let d8 = h2f(ld16(b8, 0));
-                    let isc = scale_offset + 2 * i;
-                    let sc_low = (ld8(xb, 96 + isc % 8) >> (4 * (isc / 8))) & 0xF;
-                    let sc_high = ((ld8(xb, 96 + 8 + isc % 4) >> (2 * (isc / 4))) & 3) << 4;
-                    let sc = (sc_low | sc_high) as i32 - 32;
-                    let vil = (vl >> (2 * i)) & 0x03030303;
-                    let vih = (sar(vh, i) << 2) & 0x04040404;
-                    let vi = vsubss4u(vil, vih);
-                    sumf = fma(d8, dp4a(vi, u, 0).wrapping_mul(sc) as f32, sumf);
-                    i += 1;
-                }
+                // llama.cpp's trick (vecdotq.cuh: vec_dot_q3_K_q8_1_impl_mmvq): instead of
+                // subtracting the high bits per byte (a SWAR subtract, ~6 ALU ops each), dot the
+                // low nibbles and the high-bit mask separately and subtract the two integer sums.
+                // dp4a is one instruction, so this trades ~24 ALU ops per block for 4 more dp4a.
+                // The counter data says this kernel is issue-bound (SM 57-62%, DRAM 23-27%), so
+                // instruction count is exactly what to cut.
+                sumf = fma(d0, (dp4a(vl & 0x03030303, u0, 0) - dp4a(vih_i(vh, 0), u0, 0)).wrapping_mul(sc[0]) as f32, sumf);
+                sumf = fma(d1, (dp4a((vl >> 2) & 0x03030303, u1, 0) - dp4a(vih_i(vh, 1), u1, 0)).wrapping_mul(sc[1]) as f32, sumf);
+                sumf = fma(d2, (dp4a((vl >> 4) & 0x03030303, u2, 0) - dp4a(vih_i(vh, 2), u2, 0)).wrapping_mul(sc[2]) as f32, sumf);
+                sumf = fma(d3, (dp4a((vl >> 6) & 0x03030303, u3, 0) - dp4a(vih_i(vh, 3), u3, 0)).wrapping_mul(sc[3]) as f32, sumf);
                 fma(h2f(ld16(xb, 108)), sumf, tmp)
             }
             7 | 8 => {

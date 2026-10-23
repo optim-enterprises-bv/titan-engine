@@ -188,6 +188,27 @@ pub(super) fn load(
             max_batch_size,
         });
     }
+    // TITAN_ADMIT sizes each request's KV from the loader's own numbers. This must not live in the
+    // Auto device-map branch: `-n 0:N` is an explicit map, so a dense model loaded that way never
+    // set it and every admission logged "kv <n> tokens 0 MiB" - admitting 36k prompts that then
+    // OOM'd in the prompt step. Per token the seq-len and batch terms cancel, so size it here.
+    {
+        let devices = device_map::get_all_similar_devices(device)?;
+        let kv_dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
+        let inner = GgufDeviceMapLoaderInner { model: &model, arch };
+        let cfg = inner.model_config("this is a dummy config!")?;
+        let frac = inner.kv_cache_layer_fraction("this is a dummy config!")?;
+        let kv_layers = (cfg.num_layers() as f64 * frac).ceil() as usize;
+        let per_token = kv_layers
+            * cfg.num_kv_heads()
+            * (cfg.k_head_dim() + cfg.v_head_dim())
+            * kv_dtype.size_in_bytes();
+        tracing::info!(
+            "titan admit sizing: {kv_layers} kv layers x {} heads x ({}+{}) x {:?} = {} bytes/token",
+            cfg.num_kv_heads(), cfg.k_head_dim(), cfg.v_head_dim(), kv_dtype, per_token
+        );
+        crate::titan_admit::set_kv_bytes_per_token(per_token);
+    }
     if let DeviceMapSetting::Auto(params) = mapper.clone() {
         crate::titan_monitor::set_max_seq_len(params.max_seq_len());
         let devices = device_map::get_all_similar_devices(device)?;
@@ -207,10 +228,6 @@ pub(super) fn load(
                 * (cfg.k_head_dim() + cfg.v_head_dim())
                 * dtype.size_in_bytes();
             let kv = (per_layer as f64 * cfg.num_layers() as f64 * frac).ceil() as usize;
-            // TITAN_ADMIT sizes each request's KV from the same numbers
-            crate::titan_admit::set_kv_bytes_per_token(
-                kv.div_ceil((params.max_batch_size() * params.max_seq_len()).max(1)),
-            );
             // TITAN_CUDA_GRAPHS=1: graph memory (captured decode segments) comes from its own pool
             let graphs = if mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1") {
                 mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS_RESERVE_MIB")

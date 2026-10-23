@@ -2129,6 +2129,7 @@ impl Sampler {
     /// With `top-p` sampling, if the `top-p` value is `<= 0.0` or `>= 1.0`, multinomial sampling is used.
     /// `context` is the full token history (prompt + generated); `prompt_len` marks where sampling started.
     #[allow(clippy::too_many_arguments)]
+
     pub fn sample(
         &self,
         logits: Tensor,
@@ -2150,6 +2151,7 @@ impl Sampler {
             let logits =
                 self.apply_device_sparse_penalties_if_needed(logits, context, prompt_len)?;
             let logits = self.apply_device_logits_bias_if_needed(logits)?;
+            titan_note_path("greedy_device");
             return self.sample_greedy_on_device(logits);
         }
 
@@ -2166,6 +2168,7 @@ impl Sampler {
                 let logits =
                     self.apply_device_sparse_penalties_if_needed(logits, context, prompt_len)?;
                 let logits = self.apply_device_logits_bias_if_needed(logits)?;
+                titan_note_path("topk_device");
                 return self.sample_topk_on_device(logits, temperature, rng);
             }
         }
@@ -2186,6 +2189,7 @@ impl Sampler {
             }
         }
 
+        titan_note_path("cpu_d2h");
         let logits = logits.to_vec1()?;
         let mut logits = self.apply_penalties(logits, context, prompt_len)?;
         for processor in &self.logits_processors {
@@ -2898,5 +2902,16 @@ mod tests {
         assert_eq!(sampled.logprob, 0.0);
         assert!(sampler.sample_cuda_top1_row(&[4.5]).is_err());
         assert!(sampler.sample_cuda_top1_row(&[f32::NAN, f32::NAN]).is_err());
+    }
+}
+
+
+/// TITAN_STEP_PROF: name the sampling path (it decides whether each token's 151k logits copy to
+/// the host — a full stream sync of ~15 ms on a dense 27B).
+fn titan_note_path(path: &'static str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 3 || n % 256 == 0 {
+        tracing::info!("titan sample path: {} (call {})", path, n);
     }
 }

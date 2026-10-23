@@ -1012,9 +1012,15 @@ impl DenseFfn {
                 }
             }
         }
-        let g = self.gate.forward(xs)?;
-        let u = self.up.forward(xs)?;
-        self.down.forward(&crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?)
+        let narrowed = narrow_matvec(xs);
+        let xq = narrowed.as_ref().unwrap_or(xs);
+        let g = self.gate.forward(xq)?.to_dtype(xs.dtype())?;
+        let u = self.up.forward(xq)?.to_dtype(xs.dtype())?;
+        let h = crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?;
+        let hq = narrow_matvec(&h);
+        self.down
+            .forward(hq.as_ref().unwrap_or(&h))?
+            .to_dtype(xs.dtype())
     }
 }
 
@@ -1378,6 +1384,44 @@ fn mtp_prof_on() -> bool {
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_MTP_PROF").is_ok_and(|v| v == "1"))
 }
 
+
+/// Per-step wall accounting for `TITAN_STEP_PROF=1` (see `forward_inner`).
+static STEP_PROF: std::sync::Mutex<Vec<(&'static str, std::time::Duration, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn step_prof_add(tag: &'static str, d: std::time::Duration) {
+    if let Ok(mut p) = STEP_PROF.lock() {
+        match p.iter_mut().find(|e| e.0 == tag) {
+            Some(e) => {
+                e.1 += d;
+                e.2 += 1;
+            }
+            None => p.push((tag, d, 1)),
+        }
+    }
+}
+
+fn step_prof_report() {
+    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % 64 != 0 {
+        return;
+    }
+    if let Ok(mut p) = STEP_PROF.lock() {
+        let mut line = String::new();
+        for (tag, d, c) in p.iter() {
+            if *c > 0 {
+                line.push_str(&format!("{}={:.2}ms/step ", tag, d.as_secs_f64() * 1000.0 / *c as f64));
+            }
+        }
+        tracing::info!("titan step prof (last {} steps, avg): {}", n, line.trim());
+        for e in p.iter_mut() {
+            e.1 = std::time::Duration::ZERO;
+            e.2 = 0;
+        }
+    }
+}
+
 /// `TITAN_MTP_PROF=wall`: no syncs; wall time inside forward (`in.*`) and between forwards (`gap.*`,
 /// sampling, verification, drafting and the engine loop), keyed by the forward's row count.
 fn mtp_prof_wall() -> bool {
@@ -1462,10 +1506,44 @@ fn mtp_verify_rowwise() -> bool {
 /// `w @ x` for the rows of a verification, each row bit-identical to the decode step's matmul:
 /// the batch-1 MMVQ reduction for all rows in one launch (`mistralrs_quant::mmvq_rows`), or one
 /// plain forward per row where that kernel does not apply (e.g. F32 weights through cuBLAS).
+/// `TITAN_DENSE_BF16_MATVEC` (default on): run a quantized decode-row matvec with
+/// bf16 activations even when the residual stream is f32. Profiled on this card
+/// with a Q3_K_M 27B: the f32-activation mmvq kernel costs ~107us per call where
+/// its bf16 twin costs ~24us, and 48 of 64 layers here keep an f32 residual (the
+/// GDN mixer returns f32). The residual add and the norms stay f32; only the
+/// matvec input is narrowed. `=0` restores the old path.
+fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
+    if mistralrs_quant::titan_cfg::var("TITAN_DENSE_BF16_MATVEC").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    if x.dtype() == DType::F32 && x.device().is_cuda() {
+        x.to_dtype(DType::BF16).ok()
+    } else {
+        None
+    }
+}
+
 fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
     let k = x.dim(D::Minus1)?;
     let rows = x.elem_count() / k;
     if rows == 1 {
+        // TITAN_Q3K_ROWS=1 (default off): a single decode row for Q3_K goes through our own
+        // cuda-oxide rows kernel instead of the nvcc twin. The rows kernel is gated
+        // bit-identical to nvcc's batch-1 `mmvq_gguf_*_plain_cuda1`, and it is the copy we can
+        // rebuild and tune here (the nvcc twin runs Q3_K at ~370 GB/s against ~660 for Q4_K).
+        // Measured: bit-identical output, no throughput change (27.3 both ways), so it stays
+        // opt-in - the unrolled, branchless kernel below is kept as the base for real work.
+        #[cfg(feature = "cuda")]
+        if mistralrs_quant::titan_cfg::var("TITAN_Q3K_ROWS").is_ok_and(|v| v == "1") {
+            if let Some(q) = w.get_qtensor() {
+                if q.dtype() == GgmlDType::Q3K && !w.has_bias() && mistralrs_quant::mmvq_rows::supports(&q, x) {
+                    if let Some(xn) = narrow_matvec(x) {
+                        return mistralrs_quant::mmvq_rows::plain_rows(&q, &xn)?.to_dtype(x.dtype());
+                    }
+                    return mistralrs_quant::mmvq_rows::plain_rows(&q, x);
+                }
+            }
+        }
         return w.forward(x);
     }
     if rows <= PTQ1_0_ROWS && w.get_qtensor().is_some_and(|q| q.dtype() == GgmlDType::PTQ1_0) {
@@ -1488,6 +1566,9 @@ fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
                     | GgmlDType::Q6K
             ) && mistralrs_quant::mmvq_rows::supports(&q, x)
             {
+                if let Some(xn) = narrow_matvec(x) {
+                    return mistralrs_quant::mmvq_rows::plain_rows(&q, &xn)?.to_dtype(x.dtype());
+                }
                 return mistralrs_quant::mmvq_rows::plain_rows(&q, x);
             }
         }
@@ -2149,6 +2230,36 @@ impl ModelWeights {
     }
 
     fn forward_inner(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        // `TITAN_STEP_PROF=1`: attribute a decode step's wall time to the forward (`in`) and to
+        // everything between forwards (`gap`: sampling, tokenizer, engine loop). Printed every 64
+        // batch-1 forwards. This is the measurement the `MTP_PROF` path cannot give — it only
+        // exists inside the eager trunk, and the answer matters because a dense decode's kernels
+        // are ~23 ms of a ~38 ms token.
+        let prof_step = input_ids.dim(1).ok() == Some(1) && input_ids.dim(0).ok() == Some(1);
+        let prof_on = prof_step
+            && mistralrs_quant::titan_cfg::var("TITAN_STEP_PROF").is_ok_and(|v| v == "1");
+        static STEP_PROF_LAST: std::sync::Mutex<Option<std::time::Instant>> =
+            std::sync::Mutex::new(None);
+        let prof_t0 = std::time::Instant::now();
+        if prof_on {
+            if let Ok(prev) = STEP_PROF_LAST.lock() {
+                if let Some(p) = *prev {
+                    step_prof_add("gap", p.elapsed());
+                }
+            }
+        }
+        let out = self.forward_inner_body(input_ids, ctx);
+        if prof_on {
+            step_prof_add("in", prof_t0.elapsed());
+            if let Ok(mut prev) = STEP_PROF_LAST.lock() {
+                *prev = Some(std::time::Instant::now());
+            }
+            step_prof_report();
+        }
+        out
+    }
+
+    fn forward_inner_body(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         if input_ids.dim(1)? > 1
             && matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Decode))
         {
@@ -2186,7 +2297,11 @@ impl ModelWeights {
         let mut t_fwd = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         let x = if self.graphable_decode(input_ids, ctx)? {
-            self.forward_trunk_graphed(input_ids, ctx)?
+            if self.all_dense() && Self::dense_graphs_enabled() {
+                self.forward_trunk_graphed_dense(input_ids, ctx)?
+            } else {
+                self.forward_trunk_graphed(input_ids, ctx)?
+            }
         } else {
             self.forward_trunk(input_ids, ctx, prefill && base > 0)?
         };
@@ -2387,28 +2502,58 @@ impl ModelWeights {
                     attn.forward(&h, &mask.get(h.device()), kv_cache, ctx, i)?
                 }
                 (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
-                    let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
-                    let mut gdn_cache = GdnLayerCache {
-                        conv_state: pool.gather_conv_state(indices)?,
-                        recurrent_state: pool.gather_recurrent_state(indices)?,
+                    // Zero-copy decode: with one recurrent slot and one row, the pool row *is* the
+                    // state the GDN kernels update in place, so gathering it out and scattering it
+                    // back (a copy of the whole conv + recurrent state, per layer, per token) is
+                    // pure overhead. TITAN_GDN_DIRECT=0 restores the copy path.
+                    let direct_slot = if matches!(recurrent_metadata.batch_kind(), RecurrentBatchKind::Decode)
+                        && mistralrs_quant::titan_cfg::var("TITAN_GDN_DIRECT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
+                    {
+                        recurrent_metadata
+                            .state_indices_host()
+                            .filter(|h| h.len() == 1)
+                            .map(|h| h[0] as usize)
+                    } else {
+                        None
                     };
-                    let out = gdn.forward_with_conv_carry(
-                        &h.to_dtype(self.gdn_dtype)?,
-                        &mut gdn_cache,
-                        recurrent_metadata.batch_kind(),
-                        conv_carry,
-                    )?;
-                    pool.scatter_conv_state_with_host_indices(
-                        indices,
-                        recurrent_metadata.state_indices_host(),
-                        &gdn_cache.conv_state,
-                    )?;
-                    pool.scatter_recurrent_state_with_host_indices(
-                        indices,
-                        recurrent_metadata.state_indices_host(),
-                        &gdn_cache.recurrent_state,
-                    )?;
-                    out.to_dtype(DType::F32)?
+                    if let Some(slot) = direct_slot {
+                        let mut gdn_cache = GdnLayerCache {
+                            conv_state: pool.conv_state_row(slot)?,
+                            recurrent_state: pool.recurrent_state_row(slot)?,
+                        };
+                        let out = gdn.forward_with_conv_carry(
+                            &h.to_dtype(self.gdn_dtype)?,
+                            &mut gdn_cache,
+                            recurrent_metadata.batch_kind(),
+                            conv_carry,
+                        )?;
+                        out.to_dtype(DType::F32)?
+                    } else {
+                        let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
+                        let mut gdn_cache = GdnLayerCache {
+                            conv_state: pool.gather_conv_state(indices)?,
+                            recurrent_state: pool.gather_recurrent_state(indices)?,
+                        };
+                        let out = gdn.forward_with_conv_carry(
+                            &h.to_dtype(self.gdn_dtype)?,
+                            &mut gdn_cache,
+                            recurrent_metadata.batch_kind(),
+                            conv_carry,
+                        )?;
+                        pool.scatter_conv_state_with_host_indices(
+                            indices,
+                            recurrent_metadata.state_indices_host(),
+                            &gdn_cache.conv_state,
+                        )?;
+                        pool.scatter_recurrent_state_with_host_indices(
+                            indices,
+                            recurrent_metadata.state_indices_host(),
+                            &gdn_cache.recurrent_state,
+                        )?;
+                        out.to_dtype(DType::F32)?
+                    }
                 }
                 _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
             };
@@ -2842,13 +2987,13 @@ impl ModelWeights {
         static STATIC_OK: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
         *STATIC_OK.get_or_init(|| {
             let one_device = self.mapper.as_ref().is_none_or(|m| m.get_unique_devices().len() == 1);
-            let layers_ok = self.layers.iter().all(|l| {
-                matches!(l.ffn, Ffn::Moe(_))
-                    && match &l.mixer {
-                        Mixer::Attention(a) => a.paged_attn.is_none(),
-                        Mixer::Linear(_) => true,
-                    }
+            // A dense qwen35 has no router and no experts: its FFN is captureable too (see
+            // forward_trunk_graphed_dense). A model that mixes the two is not supported.
+            let mixers_ok = self.layers.iter().all(|l| match &l.mixer {
+                Mixer::Attention(a) => a.paged_attn.is_none(),
+                Mixer::Linear(_) => true,
             });
+            let layers_ok = mixers_ok && (self.all_moe() || (self.all_dense() && Self::dense_graphs_enabled()));
             let ok = one_device && layers_ok && lookahead_depth() == 0;
             tracing::info!("titan graphs: piecewise CUDA graphs for batch-1 decode {}", if ok { "on" } else { "off (unsupported model setup)" });
             ok
@@ -3023,6 +3168,148 @@ impl ModelWeights {
 
     /// Verify-path twin of `graph_route`: `[x_attn, flat, ids, weights, gates]`.
     #[cfg(feature = "cuda")]
+    /// `TITAN_DENSE_GRAPHS=1`: capture the dense trunk as piecewise graphs. Measured on the optim
+    /// 27B Q3_K_M: 145 segments captured and replayed cleanly, decode 26.4 tok/s against 26.9
+    /// eager — no win, so this is off unless asked for. The per-token cost it was meant to remove
+    /// (launch gaps) turns out to follow the *number of graph launches* just as it followed the
+    /// number of kernel launches; the remaining lever is fewer, larger segments.
+    fn dense_graphs_enabled() -> bool {
+        mistralrs_quant::titan_cfg::var("TITAN_DENSE_GRAPHS").is_ok_and(|v| v == "1")
+    }
+
+    /// Every layer dense (no experts)? Then the dense graphed trunk can run.
+    fn all_dense(&self) -> bool {
+        self.layers.iter().all(|l| matches!(l.ffn, Ffn::Dense(_)))
+    }
+
+    /// Every layer MoE? The condition `graph_model_ok` was written for.
+    fn all_moe(&self) -> bool {
+        self.layers.iter().all(|l| matches!(l.ffn, Ffn::Moe(_)))
+    }
+
+    /// `forward_trunk` of one dense decode row as piecewise CUDA graphs (`titan_graph`): per layer
+    /// one segment from the layer input through the mixer and its residual add, one through the
+    /// post-attention norm, the dense FFN and the second residual add; a last segment for the final
+    /// norm. Same ops as `forward_trunk`, so the output is bit-identical. The MoE path keeps the
+    /// routed experts eager (routing-id sync and CPU misses cannot be captured); a dense FFN has
+    /// nothing host-dependent, so it is captured like the rest — that is the whole point: an eager
+    /// dense decode issues ~1600 kernel launches per token, and ~40% of its wall time is the gaps
+    /// between them.
+    #[cfg(feature = "cuda")]
+    fn forward_trunk_graphed_dense(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        use super::titan_graph::{dptr, SegKey};
+        let g = &self.graphs;
+        let mut x = self
+            .tok_embeddings
+            .forward(input_ids, &self.device)?
+            .to_dtype(DType::F32)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {
+            candle_core::Error::msg("qwen35: hybrid recurrent metadata is required for the linear-attention layers")
+        })?;
+        let mask = CausalMasker.make_causal_mask(
+            input_ids,
+            &*hybrid_cache as &dyn PastKvLenCache,
+            self.dtype,
+            &CausalMaskConfig::default(),
+        )?;
+        let mask = if ctx.is_first_prompt_chunk() { mask } else { AttentionMask::None };
+        let masked = !matches!(mask, AttentionMask::None);
+        let positions = ctx
+            .text_positions(&self.device, 1)?
+            .ok_or_else(|| candle_core::Error::msg("missing RoPE positions"))?
+            .clone();
+        let flash_params = ctx.flash_params();
+        let indices = recurrent_metadata.state_indices().clone();
+        let slot = recurrent_metadata
+            .state_indices_host()
+            .and_then(|h| h.first().copied())
+            .ok_or_else(|| candle_core::Error::msg("qwen35 graphs: missing recurrent slot"))? as u64;
+        let batch_kind = recurrent_metadata.batch_kind();
+        let host_indices = recurrent_metadata.state_indices_host();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let x_attn = match (&layer.mixer, hybrid_cache.get_mut(i)) {
+                (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
+                    let key = SegKey {
+                        tag: "d.gdn",
+                        layer: i,
+                        extra: vec![slot, dptr(&pool.conv_state)?, dptr(&pool.recurrent_state)?],
+                    };
+                    let inputs: Vec<&Tensor> = vec![&x, &indices];
+                    let out = g.run(key, &inputs, |ins| {
+                        let (xin, idx) = ins.split_at(ins.len() - 1);
+                        let h = layer.attn_norm.forward(&xin[0])?;
+                        let mut gdn_cache = GdnLayerCache {
+                            conv_state: pool.gather_conv_state(&idx[0])?,
+                            recurrent_state: pool.gather_recurrent_state(&idx[0])?,
+                        };
+                        let mixer = gdn.forward_with_conv_carry(
+                            &h.to_dtype(self.gdn_dtype)?,
+                            &mut gdn_cache,
+                            batch_kind,
+                            false,
+                        )?;
+                        pool.scatter_conv_state_with_host_indices(&idx[0], host_indices, &gdn_cache.conv_state)?;
+                        pool.scatter_recurrent_state_with_host_indices(&idx[0], host_indices, &gdn_cache.recurrent_state)?;
+                        Ok(vec![(mixer.to_dtype(DType::F32)? + &xin[0])?])
+                    })?;
+                    out[0].clone()
+                }
+                (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
+                    let pre = g.run(
+                        SegKey { tag: "d.attn.pre", layer: i, extra: vec![] },
+                        &[&x, &positions],
+                        |ins| {
+                            let h = layer.attn_norm.forward(&ins[0])?;
+                            let (q, k, v, gate) = attn.decode_qkv(&h, &ins[1])?;
+                            Ok(vec![q, k, v, gate])
+                        },
+                    )?;
+                    let (q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3]);
+                    let (k, v) = kv_cache.append(k, v)?;
+                    let y = Sdpa
+                        .run_attention(q, &k, &v, &mask, Some(flash_params), &attn.sdpa_params)?
+                        .contiguous()?;
+                    let post = g.run(
+                        SegKey { tag: "d.attn.post", layer: i, extra: vec![masked as u64] },
+                        &[&y, gate, &x],
+                        |ins| {
+                            let out = attn.decode_out(&ins[0], &ins[1], masked, ins[2].dtype())?;
+                            Ok(vec![(out + &ins[2])?])
+                        },
+                    )?;
+                    post[0].clone()
+                }
+                _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
+            };
+            let out = g.run(
+                SegKey { tag: "d.ffn", layer: i, extra: vec![] },
+                &[&x_attn],
+                |ins| {
+                    let h = layer.post_attention_norm.forward(&ins[0])?;
+                    let h = match &layer.ffn {
+                        Ffn::Dense(ffn) => ffn.forward(&h)?,
+                        Ffn::Moe(_) => candle_core::bail!("qwen35 dense graphs: layer {i} has experts"),
+                    };
+                    Ok(vec![(h + &ins[0])?])
+                },
+            )?;
+            x = out[0].clone();
+        }
+        drop(hybrid_cache);
+
+        let n = self.layers.len();
+        let out = g.run(SegKey { tag: "final", layer: n, extra: vec![] }, &[&x], |ins| {
+            Ok(vec![self.norm.forward(&ins[0])?])
+        })?;
+        static STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 2 {
+            tracing::info!("titan graphs (dense): {}", g.report(&self.device));
+        }
+        Ok(out[0].copy()?)
+    }
+
     fn graph_route_rows(&self, i: usize, mixer_out: Tensor, residual: &Tensor) -> Result<Vec<Tensor>> {
         let layer = &self.layers[i];
         let Ffn::Moe(moe) = &layer.ffn else {
