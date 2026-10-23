@@ -1022,6 +1022,21 @@ impl DenseFfn {
             .forward(hq.as_ref().unwrap_or(&h))?
             .to_dtype(xs.dtype())
     }
+
+    /// Rows of a speculative verification. The three matvecs run through `lin_rows`, i.e. the
+    /// row-exact rows kernel (one launch for all rows, weights read once, every row bit-identical
+    /// to its decode step); the SiLU gating is elementwise and therefore row-independent. The old
+    /// path called `forward` once per row - N full FFN passes, which is why a 2-row verify step
+    /// cost 1.9x a decode step instead of ~1.1x.
+    fn forward_rows(&self, xs: &Tensor) -> Result<Tensor> {
+        let narrowed = narrow_matvec(xs);
+        let xq = narrowed.as_ref().unwrap_or(xs);
+        let g = lin_rows(&self.gate, xq)?.to_dtype(xs.dtype())?;
+        let u = lin_rows(&self.up, xq)?.to_dtype(xs.dtype())?;
+        let h = crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?;
+        let hq = narrow_matvec(&h);
+        lin_rows(&self.down, hq.as_ref().unwrap_or(&h))?.to_dtype(xs.dtype())
+    }
 }
 
 enum Ffn {
@@ -1045,12 +1060,7 @@ impl Ffn {
             Self::Moe(moe) => moe.forward_rows(xs),
             // the PTQ1_0 mat-vec gives every row its single-row bits at 1..=4 rows
             Self::Dense(ffn) if ffn.ptq1_0_pair() && xs.dim(1)? <= PTQ1_0_ROWS => ffn.forward(xs),
-            Self::Dense(_) => {
-                let rows = (0..xs.dim(1)?)
-                    .map(|r| self.forward(&xs.narrow(1, r, 1)?))
-                    .collect::<Result<Vec<_>>>()?;
-                Tensor::cat(&rows, 1)
-            }
+            Self::Dense(ffn) => ffn.forward_rows(xs),
         }
     }
 }

@@ -13,7 +13,7 @@ BIN=/home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs
 # ("invalid value: integer -1, expected usize").
 MODELS=/home/dingo/src/titan-engine/models-optim
 FILE="${TITAN_FILE:-Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q3_K_M.gguf}"
-export TITAN_MTP="${TITAN_MTP:-0}"
+export TITAN_MTP="${TITAN_MTP:-1}"
 export TITAN_PREFILL_BIG_CHUNK="${TITAN_PREFILL_BIG_CHUNK:-0}"
 export TITAN_RECURRENT_SLOTS="${TITAN_RECURRENT_SLOTS:-8}"
 export TITAN_ADMIT="${TITAN_ADMIT:-log}"
