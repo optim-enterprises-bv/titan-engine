@@ -2306,7 +2306,11 @@ impl ModelWeights {
                 && self.device.is_cuda()
                 && self.graph_model_ok()
             {
-                self.forward_verify_graphed(input_ids, ctx)
+                if self.all_dense() {
+                    self.forward_verify_graphed_dense(input_ids, ctx)
+                } else {
+                    self.forward_verify_graphed(input_ids, ctx)
+                }
             } else {
                 self.forward_verify(input_ids, ctx)
             };
@@ -3367,6 +3371,10 @@ impl ModelWeights {
     /// like `forward_trunk_graphed`; segments are keyed by the row count. The GDN state snapshots taken
     /// for rollback are graph outputs: `SpecRollback::keep` consumes them before the next verification.
     #[cfg(feature = "cuda")]
+    /// `forward_verify` (batched rows, not `TITAN_MTP_VERIFY=rowwise`) as piecewise CUDA graphs, cut
+    /// like `forward_trunk_graphed`; segments are keyed by the row count. The GDN state snapshots taken
+    /// for rollback are graph outputs: `SpecRollback::keep` consumes them before the next verification.
+    #[cfg(feature = "cuda")]
     fn forward_verify_graphed(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         use super::titan_graph::{dptr, SegKey};
         let g = &self.graphs;
@@ -3469,6 +3477,149 @@ impl ModelWeights {
         let inputs: Vec<&Tensor> = carry.iter().collect();
         let out = g.run(SegKey { tag: "v.final", layer: nl, extra: vec![n as u64] }, &inputs, |ins| {
             let x = self.graph_rows_input(nl, ins)?;
+            Ok(vec![self.norm.forward(&x)?])
+        })?;
+        // detach from the graph's output buffer: `st.last` keeps the normed rows past this step
+        let normed = out[0].copy()?;
+        static STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 2 {
+            tracing::info!("titan graphs: {}", g.report(&self.device));
+        }
+        let logits = lin_rows(&self.output, &normed.contiguous()?)?;
+        {
+            let mut st = self.spec.lock().expect("spec state poisoned");
+            st.last = Some((start, normed.squeeze(0)?));
+            st.verify = Some(VerifyRecord {
+                start,
+                rows: n,
+                slot,
+                gdn: gdn_record,
+            });
+        }
+        Ok(logits)
+    }
+
+    /// Verify-path twin of `graph_route` for a dense trunk: the FFN is captureable as it stands, so
+    /// the carry is just `[x_attn, ff_out]`.
+    #[cfg(feature = "cuda")]
+    fn graph_dense_route_rows(&self, i: usize, mixer_out: Tensor, residual: &Tensor) -> Result<Vec<Tensor>> {
+        let layer = &self.layers[i];
+        let Ffn::Dense(dense) = &layer.ffn else {
+            candle_core::bail!("qwen35 graphs: layer {i} is not dense");
+        };
+        let x_attn = (mixer_out + residual)?;
+        let h = layer.post_attention_norm.forward(&x_attn)?;
+        let ff = dense.forward_rows(&h)?;
+        Ok(vec![x_attn, ff])
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_dense_rows_input(&self, i: usize, carry: &[Tensor]) -> Result<Tensor> {
+        if i == 0 {
+            return Ok(carry[0].clone());
+        }
+        Ok((&carry[1] + &carry[0])?)
+    }
+
+    fn forward_verify_graphed_dense(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        use super::titan_graph::{dptr, SegKey};
+        let g = &self.graphs;
+        let n = input_ids.dim(1)?;
+        let start = ctx
+            .seqlen_offsets()
+            .first()
+            .copied()
+            .ok_or_else(|| candle_core::Error::msg("qwen35 verify: missing seqlen offset"))?;
+        let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {
+            candle_core::Error::msg("qwen35: hybrid recurrent metadata is required for the linear-attention layers")
+        })?;
+        let slot = recurrent_metadata
+            .state_indices_host()
+            .and_then(|h| h.first().copied())
+            .ok_or_else(|| candle_core::Error::msg("qwen35 verify: missing recurrent slot"))? as usize;
+        let flash_params = ctx.flash_params();
+        let positions = crate::pipeline::text_positions_tensor(&[start], n, &self.device)?;
+        let indices = recurrent_metadata.state_indices().clone();
+        let host = recurrent_metadata.state_indices_host();
+
+        let x = self
+            .tok_embeddings
+            .forward(input_ids, &self.device)?
+            .to_dtype(DType::F32)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let mut gdn_record = Vec::new();
+        let mut carry = vec![x];
+        for (i, layer) in self.layers.iter().enumerate() {
+            if !matches!(layer.ffn, Ffn::Dense(_)) {
+                candle_core::bail!("qwen35 graphs: layer {i} is not dense");
+            }
+            let routed_in = match (&layer.mixer, hybrid_cache.get_mut(i)) {
+                (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
+                    let key = SegKey {
+                        tag: "v.gdn",
+                        layer: i,
+                        extra: vec![n as u64, slot as u64, dptr(&pool.conv_state)?, dptr(&pool.recurrent_state)?],
+                    };
+                    let mut inputs: Vec<&Tensor> = carry.iter().collect();
+                    inputs.push(&indices);
+                    let mut outs = g.run(key, &inputs, |ins| {
+                        let (carry_in, idx) = ins.split_at(ins.len() - 1);
+                        let x = self.graph_dense_rows_input(i, carry_in)?;
+                        let h = layer.attn_norm.forward(&x)?;
+                        let mut gdn_cache = GdnLayerCache {
+                            conv_state: pool.gather_conv_state(&idx[0])?,
+                            recurrent_state: pool.gather_recurrent_state(&idx[0])?,
+                        };
+                        let mut snaps = Vec::with_capacity(2 * (n - 1));
+                        let out = gdn.forward_decode_rows(
+                            &h.to_dtype(self.gdn_dtype)?,
+                            &mut gdn_cache,
+                            &|w, x| lin_rows(w, x),
+                            &mut |r, c| {
+                                if r + 1 < n {
+                                    snaps.push(c.conv_state.copy()?);
+                                    snaps.push(c.recurrent_state.copy()?);
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        pool.scatter_conv_state_with_host_indices(&idx[0], host, &gdn_cache.conv_state)?;
+                        pool.scatter_recurrent_state_with_host_indices(&idx[0], host, &gdn_cache.recurrent_state)?;
+                        let mut o = self.graph_dense_route_rows(i, out.to_dtype(DType::F32)?, &x)?;
+                        o.extend(snaps);
+                        Ok(o)
+                    })?;
+                    let snaps = outs.split_off(2);
+                    gdn_record.push((i, snaps.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect::<Vec<_>>()));
+                    outs
+                }
+                (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
+                    let mut inputs: Vec<&Tensor> = carry.iter().collect();
+                    inputs.push(&positions);
+                    let pre = g.run(SegKey { tag: "v.attn.pre", layer: i, extra: vec![n as u64] }, &inputs, |ins| {
+                        let (carry_in, pos) = ins.split_at(ins.len() - 1);
+                        let x = self.graph_dense_rows_input(i, carry_in)?;
+                        let h = layer.attn_norm.forward(&x)?;
+                        let (q, k, v, gate) = attn.decode_rows_qkv(&h, &pos[0])?;
+                        Ok(vec![x, q, k, v, gate])
+                    })?;
+                    let (x, q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3], &pre[4]);
+                    let y = attn.decode_rows_attend(q, k, v, kv_cache, Some(flash_params))?.contiguous()?;
+                    g.run(SegKey { tag: "v.attn.post", layer: i, extra: vec![n as u64] }, &[&y, gate, x], |ins| {
+                        let out = attn.decode_rows_out(&ins[0], &ins[1], ins[2].dtype())?;
+                        self.graph_dense_route_rows(i, out, &ins[2])
+                    })?
+                }
+                _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
+            };
+            carry = routed_in;
+        }
+        drop(hybrid_cache);
+
+        let nl = self.layers.len();
+        let inputs: Vec<&Tensor> = carry.iter().collect();
+        let out = g.run(SegKey { tag: "v.final", layer: nl, extra: vec![n as u64] }, &inputs, |ins| {
+            let x = self.graph_dense_rows_input(nl, ins)?;
             Ok(vec![self.norm.forward(&x)?])
         })?;
         // detach from the graph's output buffer: `st.last` keeps the normed rows past this step
