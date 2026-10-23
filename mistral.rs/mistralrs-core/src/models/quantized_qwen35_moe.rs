@@ -2162,6 +2162,29 @@ impl ModelConfig::FromGGUF for ModelWeights {
             None
         };
 
+        {
+            // Nothing is gated silently: every tunable path and its state, once per load.
+            let flag = |name: &str, on_by_default: bool| -> String {
+                mistralrs_quant::titan_cfg::var(name).unwrap_or_else(|_| {
+                    if on_by_default { "default-on".into() } else { "default-off".into() }
+                })
+            };
+            tracing::info!(
+                "titan paths: mtp={} graphs={} dense_graphs={} q3k_rows={} rows_all={} mmvq_max_batch={} mmq_small_cols={} gdn_direct={} admit={} prefill_chunk={} lookahead={}",
+                flag("TITAN_MTP", false),
+                flag("TITAN_CUDA_GRAPHS", true),
+                flag("TITAN_DENSE_GRAPHS", false),
+                flag("TITAN_Q3K_ROWS", true),
+                flag("TITAN_ROWS_ALL", false),
+                flag("TITAN_MMVQ_MAX_BATCH", false),
+                flag("TITAN_MMQ_SMALL_COLS", false),
+                flag("TITAN_GDN_DIRECT", true),
+                flag("TITAN_ADMIT", false),
+                prefill_chunk_size(),
+                lookahead_depth()
+            );
+        }
+
         let num_attn = is_attn.iter().filter(|a| **a).count();
         tracing::info!(
             "{arch}: {num_attn} full-attention layers, {} gated-deltanet layers, GDN dtype {gdn_dtype:?}",
