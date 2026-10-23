@@ -3340,7 +3340,16 @@ impl ModelWeights {
         if STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 2 {
             tracing::info!("titan graphs (dense): {}", g.report(&self.device));
         }
-        Ok(out[0].copy()?)
+        // The drafter needs the trunk hidden of the row just decoded. The eager decode records it and
+        // this graphed one did not, so MTP stopped after the first draft ("no trunk hidden for
+        // position N") and the step silently dropped from 1.73 tokens to 1. `out` is a graph-owned
+        // buffer, so copy before keeping it.
+        let normed = out[0].copy()?;
+        if let Some(start) = ctx.seqlen_offsets().first().copied() {
+            let mut st = self.spec.lock().expect("spec state poisoned");
+            st.last = Some((start, normed.squeeze(0)?));
+        }
+        Ok(normed)
     }
 
     fn graph_route_rows(&self, i: usize, mixer_out: Tensor, residual: &Tensor) -> Result<Vec<Tensor>> {
