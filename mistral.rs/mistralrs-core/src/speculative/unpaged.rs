@@ -18,8 +18,8 @@ use super::proposer::SpeculativeKvCache;
 
 /// Model side of an unpaged rollback.
 pub trait SpeculativeRollback: Send + Sync {
-    /// Keep the first `keep_len` positions of the sequence that was just verified.
-    fn keep(&self, keep_len: usize) -> Result<()>;
+    /// Keep the first `keep_len` positions of sequence `seq_id`, just verified.
+    fn keep(&self, seq_id: usize, keep_len: usize) -> Result<()>;
 }
 
 pub struct UnpagedSpeculativeCacheAccess {
@@ -34,16 +34,17 @@ impl UnpagedSpeculativeCacheAccess {
 
 pub struct UnpagedSpeculativeCacheGuard {
     rollback: Arc<dyn SpeculativeRollback>,
+    seq_id: usize,
     reserved_len: usize,
 }
 
 impl SpeculativeCacheGuard for UnpagedSpeculativeCacheGuard {
     fn commit(&mut self) -> Result<()> {
-        self.rollback.keep(self.reserved_len)
+        self.rollback.keep(self.seq_id, self.reserved_len)
     }
 
     fn rollback_to(&mut self, keep_len: usize) -> Result<()> {
-        self.rollback.keep(keep_len.min(self.reserved_len))
+        self.rollback.keep(self.seq_id, keep_len.min(self.reserved_len))
     }
 }
 
@@ -59,9 +60,10 @@ impl SpeculativeCacheAccess for UnpagedSpeculativeCacheAccess {
         Ok(Some(self.guard_for_reserved(seq_id, base_len, verify_len)))
     }
 
-    fn guard_for_reserved(&self, _seq_id: usize, base_len: usize, verify_len: usize) -> Self::Guard {
+    fn guard_for_reserved(&self, seq_id: usize, base_len: usize, verify_len: usize) -> Self::Guard {
         UnpagedSpeculativeCacheGuard {
             rollback: self.rollback.clone(),
+            seq_id,
             reserved_len: base_len + verify_len,
         }
     }

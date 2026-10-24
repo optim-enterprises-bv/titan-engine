@@ -58,6 +58,8 @@ use tracing::{info, warn};
 
 /// Default VRAM the tiered auto plan leaves for CUDA graph memory when `TITAN_CUDA_GRAPHS=1`.
 const TITAN_CUDA_GRAPHS_RESERVE_MIB: usize = 256;
+/// Rows of a batched verification the row-exact matmul takes in one launch (`mmvq_rows::MAX_ROWS`).
+const MAX_VERIFY_ROWS: usize = 8;
 
 /// The titan architecture of a GGUF file (its `general.architecture`), when it loads through the
 /// fork-local models.
@@ -522,6 +524,13 @@ impl Pipeline for TitanGGUFPipeline {
         false
     }
 
+    /// qwen35 with host KV decodes sequences of different lengths together (`HybridCache::ragged`).
+    fn supports_ragged_completion_batch(&self) -> bool {
+        matches!(self.model, Model::Qwen35MoE(_))
+            && self.metadata.cache_engine.is_none()
+            && crate::titan_hostkv::enabled()
+    }
+
     fn forward_inputs(
         &mut self,
         inputs: Box<dyn Any>,
@@ -647,9 +656,7 @@ impl Pipeline for TitanGGUFPipeline {
         seq: &Sequence,
     ) -> Result<Option<crate::kv_cache::HybridPrefixEntry>, candle_core::Error> {
         match &self.model {
-            Model::Qwen35MoE(m) if self.metadata.cache_engine.is_none() => {
-                m.prefix_export(seq.get_toks())
-            }
+            Model::Qwen35MoE(m) if self.metadata.cache_engine.is_none() => m.prefix_export(seq),
             _ => Ok(None),
         }
     }
@@ -701,13 +708,16 @@ impl crate::speculative::driver::SpeculativePipelineExt for TitanGGUFPipeline {
         self.mtp_model().is_some()
     }
 
-    /// One batch-1 plan at the TITAN_MTP draft length, fed the trunk hidden of the last kept row.
+    /// A plan at the TITAN_MTP draft length for one sequence, or with host KV for a batch whose verification
+    /// rows fit the row-exact matmul. The MTP block keeps each sequence's trunk hidden rows itself.
     fn speculative_plan(&self, batch_size: usize) -> Option<crate::speculative::SpeculativeBatchPlan> {
         let m = self.mtp_model()?;
-        if batch_size != 1 {
+        let draft = m.mtp_draft_len()?;
+        let batched = self.supports_ragged_completion_batch() && batch_size * (draft + 1) <= MAX_VERIFY_ROWS;
+        if batch_size != 1 && !batched {
             return None;
         }
-        Some(crate::speculative::SpeculativeBatchPlan::new(m.mtp_draft_len()?))
+        Some(crate::speculative::SpeculativeBatchPlan::new(draft).without_target_hiddens())
     }
 
     fn speculative_observe(&self, _observation: crate::speculative::SpeculativeBatchObservation) {}
@@ -733,16 +743,20 @@ impl crate::speculative::driver::SpeculativePipelineExt for TitanGGUFPipeline {
         let Some(m) = self.mtp_model() else {
             return Ok(None);
         };
-        if ctx.sequences.len() != 1 || ctx.base_lens.len() != 1 {
-            return Ok(None);
-        }
-        Ok(m
-            .mtp_propose(ctx.sequences[0].get_toks(), ctx.base_lens[0])?
-            .map(|tokens| {
-                crate::speculative::SpeculativeProposalBatch::new(vec![
-                    crate::speculative::SpeculativeProposal::new(tokens),
-                ])
-            }))
+        // a sequence that cannot draft gets an empty proposal: the driver runs it without one
+        let proposals = ctx
+            .sequences
+            .iter()
+            .zip(ctx.base_lens)
+            .map(|(seq, &pos_c)| {
+                let tokens = match seq.recurrent_state_idx() {
+                    Some(slot) => m.mtp_propose(slot, seq.get_toks(), pos_c)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                Ok(crate::speculative::SpeculativeProposal::new(tokens))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Some(crate::speculative::SpeculativeProposalBatch::new(proposals)))
     }
 
     fn speculative_prepare_propose(

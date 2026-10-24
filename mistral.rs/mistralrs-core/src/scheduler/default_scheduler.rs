@@ -73,7 +73,15 @@ pub trait BucketingManager<Backer: FcfsBacker>: Send + Sync {
 // (cache length, media bucket, sequence offset, raw request)
 type BucketKey = (usize, u8, usize, Option<usize>);
 
-struct FixedBucketingManager;
+/// Bucket length of every completion when they batch across lengths: above any prompt, so a waiting prompt
+/// still wins the shortest-bucket pick.
+const RAGGED_COMPLETION_BUCKET: usize = usize::MAX;
+
+#[derive(Default)]
+struct FixedBucketingManager {
+    /// Completions of any length share a bucket and every prompt runs alone (`set_ragged_completion_batch`).
+    ragged: bool,
+}
 
 impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
     /// Move the sequences into buckets, and run the ones with the shortest lengths.
@@ -96,12 +104,21 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
             } else {
                 u8::from(seq.images().is_some() && seq.is_prompt())
             };
-            let key = (
-                len,
-                media,
-                seq.token_offset(),
-                seq.return_raw_logits.then_some(*seq.id()),
-            );
+            let key = match (self.ragged, seq.is_prompt()) {
+                (true, true) => (len, media, seq.token_offset(), Some(*seq.id())),
+                (true, false) => (
+                    RAGGED_COMPLETION_BUCKET,
+                    media,
+                    0,
+                    seq.return_raw_logits.then_some(*seq.id()),
+                ),
+                (false, _) => (
+                    len,
+                    media,
+                    seq.token_offset(),
+                    seq.return_raw_logits.then_some(*seq.id()),
+                ),
+            };
             match seq_buckets.get_mut(&key) {
                 Some(bucket) => {
                     if !discrete {
@@ -170,7 +187,7 @@ pub struct DefaultScheduler<Backer: FcfsBacker> {
 impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
     pub fn new(method: DefaultSchedulerMethod) -> Self {
         let bucketing_manager: Box<dyn BucketingManager<_>> = match method {
-            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager),
+            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager::default()),
         };
         Self {
             running: Vec::new(),
@@ -368,6 +385,9 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
     fn set_requires_uniform_media_batch(&mut self, required: bool) {
         self.requires_uniform_media_batch = required;
     }
+    fn set_ragged_completion_batch(&mut self, enabled: bool) {
+        self.bucketing_manager = Box::new(FixedBucketingManager { ragged: enabled });
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +403,10 @@ mod tests {
     use tokio::sync::{mpsc::channel, Mutex as TokioMutex};
 
     fn test_sequence(id: usize, input_images: Option<Vec<image::DynamicImage>>) -> Sequence {
+        test_sequence_of(id, input_images, 4)
+    }
+
+    fn test_sequence_of(id: usize, input_images: Option<Vec<image::DynamicImage>>, len: usize) -> Sequence {
         let (tx, _rx) = channel(1);
         let sampler = Sampler::new(
             None,
@@ -401,7 +425,7 @@ mod tests {
         .unwrap();
         let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, true, None)));
         let seq = Sequence::new_waiting(
-            vec![1; 4],
+            vec![1; len],
             "prompt".to_string(),
             id,
             id as u128,
@@ -457,7 +481,7 @@ mod tests {
 
     #[test]
     fn uniform_media_gate_uses_persistent_features() {
-        let mut manager = FixedBucketingManager;
+        let mut manager = FixedBucketingManager::default();
         let bucketed = manager.bucket_and_waitlist_seqs_waiting(
             vec![test_sequence(0, None), persistent_image_sequence(1)],
             VecDeque::new(),
@@ -471,7 +495,7 @@ mod tests {
 
     #[test]
     fn mixed_media_batches_can_share_a_completion_bucket() {
-        let mut manager = FixedBucketingManager;
+        let mut manager = FixedBucketingManager::default();
         let bucketed = manager.bucket_and_waitlist_seqs_waiting(
             vec![test_sequence(0, None), persistent_image_sequence(1)],
             VecDeque::new(),
@@ -484,8 +508,39 @@ mod tests {
     }
 
     #[test]
+    fn completions_of_different_lengths_batch_only_when_ragged() {
+        let seqs = || vec![test_sequence_of(0, None, 4), test_sequence_of(1, None, 9)];
+        let mut uniform = FixedBucketingManager::default();
+        let bucketed = uniform.bucket_and_waitlist_seqs_waiting(seqs(), VecDeque::new(), true, false);
+        assert_eq!((bucketed.running.len(), bucketed.waiting.len()), (1, 1));
+
+        let mut ragged = FixedBucketingManager { ragged: true };
+        let bucketed = ragged.bucket_and_waitlist_seqs_waiting(seqs(), VecDeque::new(), true, false);
+        assert_eq!((bucketed.running.len(), bucketed.waiting.len()), (2, 0));
+    }
+
+    #[test]
+    fn ragged_prompts_run_alone_and_before_completions() {
+        let prompt = |id| {
+            let seq = test_sequence_of(id, None, 4);
+            seq.set_state(SequenceState::RunningPrompt);
+            seq
+        };
+        let mut ragged = FixedBucketingManager { ragged: true };
+        let bucketed = ragged.bucket_and_waitlist_seqs_waiting(
+            vec![test_sequence_of(0, None, 9), prompt(1), prompt(2)],
+            VecDeque::new(),
+            true,
+            false,
+        );
+        assert_eq!(bucketed.running.len(), 1);
+        assert!(bucketed.running[0].is_prompt());
+        assert_eq!(bucketed.waiting.len(), 2);
+    }
+
+    #[test]
     fn raw_logits_requests_do_not_share_default_buckets() {
-        let mut manager = FixedBucketingManager;
+        let mut manager = FixedBucketingManager::default();
         let normal = test_sequence(0, None);
         let mut raw = test_sequence(1, None);
         raw.return_raw_logits = true;
@@ -502,7 +557,7 @@ mod tests {
 
     #[test]
     fn raw_logits_requests_are_singleton_default_buckets() {
-        let mut manager = FixedBucketingManager;
+        let mut manager = FixedBucketingManager::default();
         let mut first = test_sequence(0, None);
         first.return_raw_logits = true;
         let mut second = test_sequence(1, None);

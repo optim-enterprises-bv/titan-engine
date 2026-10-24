@@ -47,13 +47,84 @@ fn tile() -> usize {
     })
 }
 
-static POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get()))
-        .thread_name(|i| format!("titan-hostkv-{i}"))
-        .build()
-        .expect("titan host-kv thread pool")
-});
+/// Cached keys below which a call runs on the small pool. There a call costs latency (thread wake-up and clock
+/// ramp after the ~3 ms of GPU work between two attentions, which a few pre-woken threads hide), above it memory
+/// bandwidth (every core). Q4_K_M 27B decode on the 24-core 285HX, at ~0.3k / 12k / 40k context: 8 threads 41.3 /
+/// 27.8 / 13.6 tok/s, every core 40.1 / 31.5 / 18.0.
+const SMALL_POOL_MAX_KEYS: usize = 4096;
+/// Default `TITAN_HOSTKV_SMALL_THREADS`.
+const SMALL_POOL_THREADS: usize = 8;
+/// Longest a pre-woken attention thread spins waiting for its call (see `prewarm`).
+const PREWARM_SPIN_LIMIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+struct Pool {
+    pool: rayon::ThreadPool,
+    /// set by `prewarm`, cleared when the call arrives
+    prewarming: std::sync::atomic::AtomicBool,
+}
+
+fn pool(env: &str, default: usize, name: &'static str) -> Pool {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let n = mistralrs_quant::titan_cfg::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default).clamp(1, cores);
+    Pool {
+        pool: rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(move |i| format!("{name}-{i}"))
+            .build()
+            .expect("titan host-kv thread pool"),
+        prewarming: std::sync::atomic::AtomicBool::new(false),
+    }
+}
+
+/// `TITAN_HOSTKV_THREADS=<n>`: threads for caches of `SMALL_POOL_MAX_KEYS` keys or more (default: every core).
+static POOL: LazyLock<Pool> = LazyLock::new(|| pool("TITAN_HOSTKV_THREADS", usize::MAX, "titan-hostkv"));
+/// `TITAN_HOSTKV_SMALL_THREADS=<n>`: threads for shorter caches.
+static SMALL_POOL: LazyLock<Pool> =
+    LazyLock::new(|| pool("TITAN_HOSTKV_SMALL_THREADS", SMALL_POOL_THREADS, "titan-hostkv-small"));
+
+fn pool_for(kv_len: usize) -> &'static Pool {
+    if kv_len < SMALL_POOL_MAX_KEYS { &SMALL_POOL } else { &POOL }
+}
+
+/// Wake the threads that will attend over `kv_len` cached keys, ahead of a decode attention while the GPU still runs
+/// the layer's queued work: waking them in the call itself cost ~0.4-0.6 ms per call at any context length (16 calls
+/// a step). Each spins until the call arrives (`run_host`) or `PREWARM_SPIN_LIMIT` passes.
+pub(crate) fn prewarm(kv_len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = pool_for(kv_len);
+    if p.prewarming.swap(true, Relaxed) {
+        return;
+    }
+    p.pool.spawn_broadcast(move |_| {
+        let t0 = std::time::Instant::now();
+        while p.prewarming.load(Relaxed) && t0.elapsed() < PREWARM_SPIN_LIMIT {
+            std::hint::spin_loop();
+        }
+    });
+}
+
+/// `TITAN_HOSTKV_PROF=1`: per-phase wall time of decode host attentions, logged every `PROF_EVERY` calls.
+pub(crate) fn prof_on() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_HOSTKV_PROF").is_ok_and(|v| v == "1"))
+}
+
+const PROF_EVERY: u64 = 2048;
+pub(crate) const PROF_PHASES: [&str; 5] = ["gpu drain", "kv append", "q download", "cpu attention", "upload"];
+static PROF_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Add `t0.elapsed()` to `phase` and restart `t0`.
+pub(crate) fn prof_mark(phase: usize, t0: &mut std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PROF_NS[phase].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    *t0 = std::time::Instant::now();
+    if phase + 1 == PROF_PHASES.len() && PROF_CALLS.fetch_add(1, Relaxed) % PROF_EVERY == PROF_EVERY - 1 {
+        let n = PROF_CALLS.load(Relaxed) as f64;
+        let per = PROF_PHASES.iter().zip(&PROF_NS).map(|(p, ns)| format!("{p} {:.1} us", ns.load(Relaxed) as f64 / n / 1e3));
+        tracing::info!("titan host kv prof ({n} calls): {}", per.collect::<Vec<_>>().join(", "));
+    }
+}
 
 /// Causal attention of the last `s` positions of `q` (1, h, s, 256) on CUDA over a host F8E4M3 cache `k`, `v`
 /// (1, kvh, kv_len, 256): (1, h, s, 256) in `q`'s dtype and device.
@@ -69,21 +140,74 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Resu
     if s > CPU_MAX_ROWS {
         return crate::attention::flash_prefill_host_tiles(q, k, v, p, tile());
     }
+    prewarm(kv_len);
+    let mut t0 = std::time::Instant::now();
     let qh = q.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.contiguous()?;
-    let out = {
-        let (qg, ql) = qh.storage_and_layout();
-        let (kg, kl) = k.storage_and_layout();
-        let (vg, vl) = v.storage_and_layout();
-        let (Storage::Cpu(qc), Storage::Cpu(kc), Storage::Cpu(vc)) = (&*qg, &*kg, &*vg) else {
-            candle_core::bail!("titan host kv: q / K / V not on the CPU");
-        };
-        let qd = &qc.as_slice::<f32>()?[ql.start_offset()..];
-        let kd = as_bytes(&kc.as_slice::<float8::F8E4M3>()?[kl.start_offset()..]);
-        let vd = as_bytes(&vc.as_slice::<float8::F8E4M3>()?[vl.start_offset()..]);
-        let shape = Shape { h, kvh, s, kv_len, k_hs: k.stride()[1], v_hs: v.stride()[1], scale: p.softmax_scale };
-        POOL.install(|| run(qd, kd, vd, &shape))
+    if prof_on() {
+        prof_mark(2, &mut t0);
+    }
+    let (qg, ql) = qh.storage_and_layout();
+    let Storage::Cpu(qc) = &*qg else {
+        candle_core::bail!("titan host kv: q not on the CPU");
     };
-    Tensor::from_vec(out, (1, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
+    let out = run_host(&qc.as_slice::<f32>()?[ql.start_offset()..], k, v, h, s, p.softmax_scale, pool_for(kv_len))?;
+    drop(qg);
+    if prof_on() {
+        prof_mark(3, &mut t0);
+    }
+    let y = Tensor::from_vec(out, (1, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())?;
+    if prof_on() {
+        q.device().synchronize()?;
+        prof_mark(4, &mut t0);
+    }
+    Ok(y)
+}
+
+/// `attend` for a batch whose sequences keep their own host caches: row `i` of `q` (b, h, s, 256) on CUDA over
+/// `kvs[i]` (1, kvh, len_i, 256), with one device round trip for the batch. Each row equals its `attend` call.
+pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) -> Result<Tensor> {
+    let (b, h, s, d) = q.dims4()?;
+    if b != kvs.len() || d != HEAD_DIM || s > CPU_MAX_ROWS {
+        candle_core::bail!("titan host kv: unsupported batched q {:?} over {} caches", q.shape(), kvs.len());
+    }
+    let longest = kvs.iter().map(|(k, _)| k.dim(2)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
+    prewarm(longest);
+    let qh = q.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.contiguous()?;
+    let (qg, ql) = qh.storage_and_layout();
+    let Storage::Cpu(qc) = &*qg else {
+        candle_core::bail!("titan host kv: q not on the CPU");
+    };
+    let qd = &qc.as_slice::<f32>()?[ql.start_offset()..];
+    let per = h * s * HEAD_DIM;
+    let mut out = Vec::with_capacity(b * per);
+    for (i, (k, v)) in kvs.iter().enumerate() {
+        let (kb, kvh, kv_len, kd) = k.dims4()?;
+        if kb != 1 || kd != HEAD_DIM || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
+            candle_core::bail!("titan host kv: unsupported cache {:?} for batch row {i}", k.shape());
+        }
+        out.extend(run_host(&qd[i * per..][..per], k, v, h, s, p.softmax_scale, pool_for(longest))?);
+    }
+    drop(qg);
+    Tensor::from_vec(out, (b, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
+}
+
+/// `run` of host queries `q` (h, s, 256) over the host F8E4M3 cache `k`, `v` (1, kvh, kv_len, 256).
+fn run_host(q: &[f32], k: &Tensor, v: &Tensor, h: usize, s: usize, scale: f32, p: &Pool) -> Result<Vec<f32>> {
+    if k.dtype() != DType::F8E4M3 || v.dtype() != DType::F8E4M3 {
+        candle_core::bail!("titan host kv: K/V must be F8E4M3, got {:?}", k.dtype());
+    }
+    let (_, kvh, kv_len, _) = k.dims4()?;
+    let (kg, kl) = k.storage_and_layout();
+    let (vg, vl) = v.storage_and_layout();
+    let (Storage::Cpu(kc), Storage::Cpu(vc)) = (&*kg, &*vg) else {
+        candle_core::bail!("titan host kv: K / V not on the CPU");
+    };
+    let kd = as_bytes(&kc.as_slice::<float8::F8E4M3>()?[kl.start_offset()..]);
+    let vd = as_bytes(&vc.as_slice::<float8::F8E4M3>()?[vl.start_offset()..]);
+    let shape = Shape { h, kvh, s, kv_len, k_hs: k.stride()[1], v_hs: v.stride()[1], scale };
+    // release the pre-woken threads: they take this call's units within microseconds
+    p.prewarming.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(p.pool.install(|| run(q, kd, vd, &shape)))
 }
 
 fn as_bytes(x: &[float8::F8E4M3]) -> &[u8] {
@@ -102,34 +226,55 @@ struct Shape {
     scale: f32,
 }
 
-/// One unit's online-softmax state per (row, query head of the group): un-normalised o, then (max, sum).
+/// One unit's online-softmax state per query it covers: un-normalised o, then (max, sum).
 struct Partial(Vec<f32>);
 
 const STRIDE: usize = HEAD_DIM + 2;
 /// Keys dequantised per block (32 KiB of f32 K, reused from L1 by every query of the group).
 const BK: usize = 32;
+/// Queries sharing each K/V load in the scores and P.V microkernels.
+const QB: usize = 3;
+
+/// Query split of a KV head's queries: with so few key chunks (short contexts) that most threads would idle, a
+/// unit covers fewer of them. Each split dequantises the chunk again, so it only pays there. Each query runs the
+/// same ops in any split.
+fn query_groups(nq: usize, units: usize) -> usize {
+    let threads = rayon::current_num_threads();
+    if units * 2 > threads {
+        return 1;
+    }
+    threads.div_ceil(units).clamp(1, nq.div_ceil(QB))
+}
 
 fn run(q: &[f32], k: &[u8], v: &[u8], sh: &Shape) -> Vec<f32> {
     let n_rep = sh.h / sh.kvh;
     let nq = n_rep * sh.s;
     let chunks = sh.kv_len.div_ceil(KEY_CHUNK);
-    let units: Vec<(usize, usize)> = (0..sh.kvh).flat_map(|g| (0..chunks).map(move |c| (g, c))).collect();
-    let parts: Vec<Partial> = units.par_iter().map(|&(g, c)| unit(q, k, v, sh, g, c * KEY_CHUNK)).collect();
+    let qg = query_groups(nq, sh.kvh * chunks);
+    let per = nq.div_ceil(qg).next_multiple_of(QB).min(nq);
+    let spans: Vec<(usize, usize)> = (0..nq).step_by(per).map(|a| (a, (a + per).min(nq))).collect();
+    let ns = spans.len();
+    let units: Vec<(usize, usize, usize)> =
+        (0..sh.kvh).flat_map(|g| (0..chunks).flat_map(move |c| (0..ns).map(move |s| (g, c, s)))).collect();
+    let parts: Vec<Partial> =
+        units.par_iter().map(|&(g, c, s)| unit(q, k, v, sh, g, c * KEY_CHUNK, spans[s])).collect();
     let mut out = vec![0f32; sh.h * sh.s * HEAD_DIM];
     out.par_chunks_mut(nq * HEAD_DIM).enumerate().for_each(|(g, out)| {
-        let ps = &parts[g * chunks..(g + 1) * chunks];
         for qi in 0..nq {
-            let m = ps.iter().map(|p| p.0[qi * STRIDE + HEAD_DIM]).fold(f32::NEG_INFINITY, f32::max);
+            let s = qi / per;
+            let at = (qi - spans[s].0) * STRIDE;
+            let ps = || (0..chunks).map(|c| &parts[(g * chunks + c) * ns + s].0);
+            let m = ps().map(|p| p[at + HEAD_DIM]).fold(f32::NEG_INFINITY, f32::max);
             let o = &mut out[qi * HEAD_DIM..][..HEAD_DIM];
             let mut l = 0f32;
-            for p in ps {
-                let pm = p.0[qi * STRIDE + HEAD_DIM];
+            for p in ps() {
+                let pm = p[at + HEAD_DIM];
                 if pm == f32::NEG_INFINITY {
                     continue;
                 }
                 let w = (pm - m).exp();
-                l += w * p.0[qi * STRIDE + HEAD_DIM + 1];
-                for (o, a) in o.iter_mut().zip(&p.0[qi * STRIDE..qi * STRIDE + HEAD_DIM]) {
+                l += w * p[at + HEAD_DIM + 1];
+                for (o, a) in o.iter_mut().zip(&p[at..at + HEAD_DIM]) {
                     *o += w * a;
                 }
             }
@@ -140,12 +285,12 @@ fn run(q: &[f32], k: &[u8], v: &[u8], sh: &Shape) -> Vec<f32> {
     out
 }
 
-/// Keys `a .. a + KEY_CHUNK` of KV head `g` for every row and query head of the group (query `qi` = head
-/// `qi / s` of the group, row `qi % s`), online softmax over blocks of `BK` keys. Row `r` sees keys
-/// `< kv_len - s + r + 1`; only those enter its block, so its operations do not depend on the other rows.
-fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize) -> Partial {
+/// Keys `a .. a + KEY_CHUNK` of KV head `g` for queries `qa .. qb` of the group (query `qi` = head `qi / s` of the
+/// group, row `qi % s`), online softmax over blocks of `BK` keys. Row `r` sees keys `< kv_len - s + r + 1`; only
+/// those enter its block, so its operations do not depend on the other rows.
+fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize, (qa, qb): (usize, usize)) -> Partial {
     let n_rep = sh.h / sh.kvh;
-    let nq = n_rep * sh.s;
+    let nq = qb - qa;
     let past = sh.kv_len - sh.s;
     let b = (a + KEY_CHUNK).min(sh.kv_len);
     let mut part = vec![0f32; nq * STRIDE];
@@ -153,40 +298,55 @@ fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize) -> Partia
     let mut l = vec![0f32; nq];
     let mut kb = vec![0f32; BK * HEAD_DIM];
     let mut vb = vec![0f32; BK * HEAD_DIM];
-    let mut p = [0f32; BK];
+    let mut sc = vec![0f32; nq * BK];
+    let mut alpha = vec![0f32; nq];
+    let mut vis = vec![0usize; nq];
+    let qrow = |i: usize| {
+        let qi = qa + i;
+        &q[((g * n_rep + qi / sh.s) * sh.s + qi % sh.s) * HEAD_DIM..][..HEAD_DIM]
+    };
     let mut j0 = a;
     while j0 < b {
         let n = BK.min(b - j0);
         for j in 0..n {
             dequant(&k[g * sh.k_hs + (j0 + j) * HEAD_DIM..][..HEAD_DIM], &mut kb[j * HEAD_DIM..][..HEAD_DIM]);
+            dequant(&v[g * sh.v_hs + (j0 + j) * HEAD_DIM..][..HEAD_DIM], &mut vb[j * HEAD_DIM..][..HEAD_DIM]);
         }
-        let mut v_ready = false;
-        for qi in 0..nq {
-            let vis = (past + qi % sh.s + 1).saturating_sub(j0).min(n);
+        for i in 0..nq {
+            vis[i] = (past + (qa + i) % sh.s + 1).saturating_sub(j0).min(n);
+        }
+        for i0 in (0..nq).step_by(QB) {
+            let t = QB.min(nq - i0);
+            let n_any = vis[i0..i0 + t].iter().copied().max().unwrap_or(0);
+            let qs: [&[f32]; QB] = std::array::from_fn(|r| qrow(i0 + r.min(t - 1)));
+            scores(&qs[..t], &kb, n_any, sh.scale, &mut sc[i0 * BK..][..t * BK]);
+        }
+        for i in 0..nq {
+            let vis = vis[i];
             if vis == 0 {
+                alpha[i] = 1.0;
                 continue;
             }
-            let qr = &q[((g * n_rep + qi / sh.s) * sh.s + qi % sh.s) * HEAD_DIM..][..HEAD_DIM];
-            scores(qr, &kb, vis, sh.scale, &mut p);
-            let bm = p[..vis].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mn = m[qi].max(bm);
-            let alpha = if m[qi] == f32::NEG_INFINITY { 0.0 } else { (m[qi] - mn).exp() };
-            let ps = exp_sub_sum(&mut p[..vis], mn);
-            l[qi] = l[qi] * alpha + ps;
-            m[qi] = mn;
-            if !v_ready {
-                for j in 0..n {
-                    dequant(&v[g * sh.v_hs + (j0 + j) * HEAD_DIM..][..HEAD_DIM], &mut vb[j * HEAD_DIM..][..HEAD_DIM]);
-                }
-                v_ready = true;
+            let p = &mut sc[i * BK..][..vis];
+            let bm = p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mn = m[i].max(bm);
+            alpha[i] = if m[i] == f32::NEG_INFINITY { 0.0 } else { (m[i] - mn).exp() };
+            let ps = exp_sub_sum(p, mn);
+            l[i] = l[i] * alpha[i] + ps;
+            m[i] = mn;
+        }
+        for i0 in (0..nq).step_by(QB) {
+            let t = QB.min(nq - i0);
+            if vis[i0..i0 + t].iter().any(|&n| n > 0) {
+                let acc = &mut part[i0 * STRIDE..][..t * STRIDE];
+                pv(acc, &alpha[i0..i0 + t], &vis[i0..i0 + t], &sc[i0 * BK..][..t * BK], &vb);
             }
-            pv(&mut part[qi * STRIDE..][..HEAD_DIM], alpha, &p[..vis], &vb);
         }
         j0 += n;
     }
-    for qi in 0..nq {
-        part[qi * STRIDE + HEAD_DIM] = m[qi];
-        part[qi * STRIDE + HEAD_DIM + 1] = l[qi];
+    for i in 0..nq {
+        part[i * STRIDE + HEAD_DIM] = m[i];
+        part[i * STRIDE + HEAD_DIM + 1] = l[i];
     }
     Partial(part)
 }
@@ -203,15 +363,18 @@ fn dequant(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-/// `out[j] = scale * q . kb[j]` for the first `n` rows of the block `kb`.
-fn scores(q: &[f32], kb: &[f32], n: usize, scale: f32, out: &mut [f32; BK]) {
+/// `out[r * BK + j] = scale * qs[r] . kb[j]` for the first `n` rows of the block `kb`.
+fn scores(qs: &[&[f32]], kb: &[f32], n: usize, scale: f32, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if simd() {
-        unsafe { avx::scores(q.as_ptr(), kb.as_ptr(), n, scale, out.as_mut_ptr()) };
+        let qp: [*const f32; QB] = std::array::from_fn(|r| qs[r.min(qs.len() - 1)].as_ptr());
+        unsafe { avx::scores(qp, qs.len(), kb.as_ptr(), n, scale, out.as_mut_ptr()) };
         return;
     }
-    for (j, o) in out.iter_mut().enumerate().take(n) {
-        *o = scale * q.iter().zip(&kb[j * HEAD_DIM..][..HEAD_DIM]).map(|(a, b)| a * b).sum::<f32>();
+    for (r, q) in qs.iter().enumerate() {
+        for j in 0..n {
+            out[r * BK + j] = scale * q.iter().zip(&kb[j * HEAD_DIM..][..HEAD_DIM]).map(|(a, b)| a * b).sum::<f32>();
+        }
     }
 }
 
@@ -229,19 +392,23 @@ fn exp_sub_sum(p: &mut [f32], m: f32) -> f32 {
     s
 }
 
-/// `acc = alpha * acc + sum_j p[j] * vb[j]`.
-fn pv(acc: &mut [f32], alpha: f32, p: &[f32], vb: &[f32]) {
+/// Per query `r`: `acc_r = alpha[r] * acc_r + sum_{j < vis[r]} p_r[j] * vb[j]` (accumulators `STRIDE` apart,
+/// weights `BK` apart).
+fn pv(acc: &mut [f32], alpha: &[f32], vis: &[usize], p: &[f32], vb: &[f32]) {
     #[cfg(target_arch = "x86_64")]
     if simd() {
-        unsafe { avx::pv(acc.as_mut_ptr(), alpha, p.as_ptr(), p.len(), vb.as_ptr()) };
+        unsafe { avx::pv(acc.as_mut_ptr(), alpha, vis, p.as_ptr(), vb.as_ptr()) };
         return;
     }
-    for (d, a) in acc.iter_mut().enumerate() {
-        let mut x = *a * alpha;
-        for (j, pj) in p.iter().enumerate() {
-            x += pj * vb[j * HEAD_DIM + d];
+    for (r, (&al, &n)) in alpha.iter().zip(vis).enumerate() {
+        for d in 0..HEAD_DIM {
+            let a = &mut acc[r * STRIDE + d];
+            let mut x = *a * al;
+            for j in 0..n {
+                x += p[r * BK + j] * vb[j * HEAD_DIM + d];
+            }
+            *a = x;
         }
-        *a = x;
     }
 }
 
@@ -259,7 +426,7 @@ fn simd() -> bool {
 mod avx {
     use std::arch::x86_64::*;
 
-    use super::{E4M3_AS_F16_SCALE, HEAD_DIM};
+    use super::{BK, E4M3_AS_F16_SCALE, HEAD_DIM, QB, STRIDE};
 
     /// 256 e4m3 bytes to f32: sign and the 7 exponent/mantissa bits shifted into an f16, converted, times 2^8
     /// (exact for normals and subnormals; this cache never holds NaN).
@@ -288,31 +455,39 @@ mod avx {
         _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps::<1>(s, s)))
     }
 
-    /// Four keys per pass over q: each q load feeds four FMAs, one horizontal sum per key.
+    /// `t` (<= QB) queries times four keys per pass: each k load feeds `t` FMAs and each q load four, one
+    /// horizontal sum per (query, key).
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn scores(q: *const f32, kb: *const f32, n: usize, scale: f32, out: *mut f32) {
+    pub(super) unsafe fn scores(q: [*const f32; QB], t: usize, kb: *const f32, n: usize, scale: f32, out: *mut f32) {
         let mut j = 0;
         while j + 4 <= n {
             let k0 = kb.add(j * HEAD_DIM);
-            let mut a = [_mm256_setzero_ps(); 4];
+            let mut a = [[_mm256_setzero_ps(); 4]; QB];
             for d in (0..HEAD_DIM).step_by(8) {
-                let qv = _mm256_loadu_ps(q.add(d));
-                for (u, a) in a.iter_mut().enumerate() {
-                    *a = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k0.add(u * HEAD_DIM + d)), *a);
+                let kv: [__m256; 4] = std::array::from_fn(|u| _mm256_loadu_ps(k0.add(u * HEAD_DIM + d)));
+                for (r, a) in a.iter_mut().enumerate().take(t) {
+                    let qv = _mm256_loadu_ps(q[r].add(d));
+                    for (a, kv) in a.iter_mut().zip(&kv) {
+                        *a = _mm256_fmadd_ps(qv, *kv, *a);
+                    }
                 }
             }
-            for (u, a) in a.iter().enumerate() {
-                *out.add(j + u) = scale * hsum(*a);
+            for (r, a) in a.iter().enumerate().take(t) {
+                for (u, a) in a.iter().enumerate() {
+                    *out.add(r * BK + j + u) = scale * hsum(*a);
+                }
             }
             j += 4;
         }
         while j < n {
             let k0 = kb.add(j * HEAD_DIM);
-            let mut a = _mm256_setzero_ps();
-            for d in (0..HEAD_DIM).step_by(8) {
-                a = _mm256_fmadd_ps(_mm256_loadu_ps(q.add(d)), _mm256_loadu_ps(k0.add(d)), a);
+            for (r, q) in q.iter().enumerate().take(t) {
+                let mut a = _mm256_setzero_ps();
+                for d in (0..HEAD_DIM).step_by(8) {
+                    a = _mm256_fmadd_ps(_mm256_loadu_ps(q.add(d)), _mm256_loadu_ps(k0.add(d)), a);
+                }
+                *out.add(r * BK + j) = scale * hsum(a);
             }
-            *out.add(j) = scale * hsum(a);
             j += 1;
         }
     }
@@ -357,26 +532,36 @@ mod avx {
         s
     }
 
-    /// `acc = alpha * acc + sum_j p[j] * vb[j]`, 8 dims at a time held in a register over the block's keys.
+    /// `super::pv` 16 dims at a time held in registers over the block's keys: each v load feeds every query
+    /// still within its `vis` keys.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn pv(acc: *mut f32, alpha: f32, p: *const f32, n: usize, vb: *const f32) {
-        let al = _mm256_set1_ps(alpha);
-        for d in (0..HEAD_DIM).step_by(32) {
-            let mut r = [
-                _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(d))),
-                _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(d + 8))),
-                _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(d + 16))),
-                _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(d + 24))),
-            ];
-            for j in 0..n {
-                let w = _mm256_set1_ps(*p.add(j));
-                let row = vb.add(j * HEAD_DIM + d);
+    pub(super) unsafe fn pv(acc: *mut f32, alpha: &[f32], vis: &[usize], p: *const f32, vb: *const f32) {
+        let t = alpha.len();
+        let n = vis.iter().copied().max().unwrap_or(0);
+        for d in (0..HEAD_DIM).step_by(16) {
+            let mut r = [[_mm256_setzero_ps(); 2]; QB];
+            for (q, r) in r.iter_mut().enumerate().take(t) {
+                let al = _mm256_set1_ps(alpha[q]);
                 for (u, r) in r.iter_mut().enumerate() {
-                    *r = _mm256_fmadd_ps(w, _mm256_loadu_ps(row.add(8 * u)), *r);
+                    *r = _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(q * STRIDE + d + 8 * u)));
                 }
             }
-            for (u, r) in r.iter().enumerate() {
-                _mm256_storeu_ps(acc.add(d + 8 * u), *r);
+            for j in 0..n {
+                let row = vb.add(j * HEAD_DIM + d);
+                let v = [_mm256_loadu_ps(row), _mm256_loadu_ps(row.add(8))];
+                for (q, r) in r.iter_mut().enumerate().take(t) {
+                    if j < vis[q] {
+                        let w = _mm256_set1_ps(*p.add(q * BK + j));
+                        for (r, v) in r.iter_mut().zip(&v) {
+                            *r = _mm256_fmadd_ps(w, *v, *r);
+                        }
+                    }
+                }
+            }
+            for (q, r) in r.iter().enumerate().take(t) {
+                for (u, r) in r.iter().enumerate() {
+                    _mm256_storeu_ps(acc.add(q * STRIDE + d + 8 * u), *r);
+                }
             }
         }
     }
@@ -440,14 +625,14 @@ mod tests {
         for s in [1usize, 2] {
             let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
             let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
-            let _ = POOL.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
+            let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             let t0 = std::time::Instant::now();
             for _ in 0..10 {
-                let _ = POOL.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
+                let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             }
             let ms = t0.elapsed().as_secs_f64() * 100.0;
             let gb = (2 * kvh * kv_len * HEAD_DIM) as f64 / 1e9;
-            println!("rows {s}: {ms:.2} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, POOL.current_num_threads());
+            println!("rows {s}: {ms:.2} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, POOL.pool.current_num_threads());
         }
     }
 

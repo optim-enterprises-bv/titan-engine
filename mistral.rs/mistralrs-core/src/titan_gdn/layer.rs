@@ -12,6 +12,53 @@ use super::norm::RmsNormGated;
 use super::projection::{GdnInputProjection, GdnProjection};
 use super::weights::{GdnInputProjectionKind, GdnWeightLoadCtx, GdnWeights};
 
+/// One decode row's inputs to the GDN state update: its causal-conv input and gates, `(batch, 1, ..)`.
+#[derive(Clone, Debug)]
+pub struct DecodeRowInputs {
+    pub mixed_qkv: Tensor,
+    pub b: Tensor,
+    pub a: Tensor,
+}
+
+impl DecodeRowInputs {
+    /// Batch row `i` of these inputs.
+    pub fn batch_row(&self, i: usize) -> Result<Self> {
+        Ok(Self { mixed_qkv: self.mixed_qkv.narrow(0, i, 1)?, b: self.b.narrow(0, i, 1)?, a: self.a.narrow(0, i, 1)? })
+    }
+}
+
+/// A GDN layer's state update alone: advances a state by one decode row with the decode kernels, the same
+/// conv and recurrence `forward_decode_rows` ran for that row, so replaying a row onto the state before it
+/// gives exactly the state after it.
+#[derive(Clone, Debug)]
+pub struct GdnStateStep {
+    conv1d_weight: Tensor,
+    a_log: Tensor,
+    dt_bias: Tensor,
+    dims: GdnDims,
+    dtype: DType,
+}
+
+impl GdnStateStep {
+    pub fn apply(&self, cache: &mut GdnLayerCache, row: &DecodeRowInputs) -> Result<()> {
+        let mixed =
+            backend::causal_conv1d(&row.mixed_qkv, &self.conv1d_weight, &self.dims, cache, RecurrentBatchKind::Decode)?;
+        backend::apply_recurrence_from_convolved(
+            &mixed,
+            &row.b,
+            &row.a,
+            &self.a_log,
+            &self.dt_bias,
+            &self.dims,
+            row.mixed_qkv.dim(0)?,
+            1,
+            cache,
+            self.dtype,
+        )?;
+        Ok(())
+    }
+}
+
 pub struct GatedDeltaNet {
     pub input_proj: GdnInputProjection,
     pub conv1d_weight: Tensor,
@@ -99,6 +146,17 @@ impl GatedDeltaNet {
         self
     }
 
+    /// The state update of `forward_decode_rows` on `dtype` inputs, for replaying its rows.
+    pub fn state_step(&self, dtype: DType) -> GdnStateStep {
+        GdnStateStep {
+            conv1d_weight: self.conv1d_weight.clone(),
+            a_log: self.a_log.clone(),
+            dt_bias: self.dt_bias.clone(),
+            dims: self.dims,
+            dtype,
+        }
+    }
+
     pub fn forward(
         &self,
         x: &Tensor,
@@ -161,21 +219,19 @@ impl GatedDeltaNet {
         self.finish_forward(y, projected.z, batch_size, seq_len, dtype)
     }
 
-    /// Decode steps for the `seq_len` rows of `x` (batch 1) in one call, each row bit-identical to
-    /// `forward(row, cache, Decode)`: the projections go through `lin` (a row-exact batched matmul),
-    /// the causal conv and the recurrence run row by row with the decode kernels, and `on_row(r, cache)`
-    /// sees the state after row `r` (speculative verification keeps it for rollback).
+    /// Decode steps for the `seq_len` rows of each sequence of `x` in one call, each row bit-identical to
+    /// `forward(row, cache, Decode)` of its sequence alone: the projections go through `lin` (a row-exact batched
+    /// matmul), the causal conv and the recurrence run row by row with the decode kernels, and
+    /// `on_row(r, cache, inputs)` sees the state after row `r` and that row's inputs (speculative verification
+    /// keeps one or the other for its rollback; `state_step` replays a row from its inputs).
     pub fn forward_decode_rows(
         &self,
         x: &Tensor,
         cache: &mut GdnLayerCache,
         lin: &super::projection::LinearFn<'_>,
-        on_row: &mut dyn FnMut(usize, &GdnLayerCache) -> Result<()>,
+        on_row: &mut dyn FnMut(usize, &GdnLayerCache, DecodeRowInputs) -> Result<()>,
     ) -> Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
-        if batch_size != 1 {
-            candle_core::bail!("GDN decode rows expects batch 1, got {batch_size}");
-        }
         let dtype = x.dtype();
         let d = &self.dims;
         // (conv input, z, per-row (b, a)): b and a feed the recurrence one row at a time
@@ -190,14 +246,18 @@ impl GatedDeltaNet {
                 let f32_in = x.dtype() != DType::F32
                     && [in_proj_b, in_proj_a].iter().all(|w| w.quantized_act_type() == Some(DType::F32));
                 let xs = if f32_in { x.to_dtype(DType::F32)? } else { x.clone() };
+                // one sequence's row per call: the decode step's kernel at its shape
                 let row = |w: &Arc<dyn QuantMethod>, r: usize| -> Result<Tensor> {
-                    let y = w.forward(&xs.narrow(1, r, 1)?)?;
+                    let ys = (0..batch_size)
+                        .map(|b| w.forward(&xs.narrow(0, b, 1)?.narrow(1, r, 1)?))
+                        .collect::<Result<Vec<_>>>()?;
+                    let y = Tensor::cat(&ys, 0)?;
                     let y = if f32_in { y.to_dtype(dtype)? } else { y };
-                    y.reshape((1, 1, d.num_v_heads))
+                    y.reshape((batch_size, 1, d.num_v_heads))
                 };
                 (
-                    lin(in_proj_qkv, x)?.reshape((1, seq_len, d.conv_dim))?,
-                    lin(in_proj_z, x)?.reshape((1, seq_len, d.num_v_heads, d.head_v_dim))?,
+                    lin(in_proj_qkv, x)?.reshape((batch_size, seq_len, d.conv_dim))?,
+                    lin(in_proj_z, x)?.reshape((batch_size, seq_len, d.num_v_heads, d.head_v_dim))?,
                     (0..seq_len)
                         .map(|r| Ok((row(in_proj_b, r)?, row(in_proj_a, r)?)))
                         .collect::<Result<Vec<_>>>()?,
@@ -213,8 +273,9 @@ impl GatedDeltaNet {
         };
         let mut ys = Vec::with_capacity(seq_len);
         for r in 0..seq_len {
+            let row = DecodeRowInputs { mixed_qkv: mixed_qkv.narrow(1, r, 1)?, b: ba[r].0.clone(), a: ba[r].1.clone() };
             let mixed = backend::causal_conv1d(
-                &mixed_qkv.narrow(1, r, 1)?,
+                &row.mixed_qkv,
                 &self.conv1d_weight,
                 &self.dims,
                 cache,
@@ -232,7 +293,7 @@ impl GatedDeltaNet {
                 cache,
                 dtype,
             )?);
-            on_row(r, cache)?;
+            on_row(r, cache, row)?;
         }
         let y = Tensor::cat(&ys, 1)?;
         self.finish_forward_with(y, z, batch_size, seq_len, lin)

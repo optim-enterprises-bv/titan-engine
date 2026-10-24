@@ -14,11 +14,11 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfi
 use super::quantized_qwen3_moe::{load_experts, Experts};
 use crate::attention::{AttentionMask, SdpaParams};
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
-use crate::titan_gdn::{GatedDeltaNet, GdnConfig, GdnLayerCache};
+use crate::titan_gdn::{DecodeRowInputs, GatedDeltaNet, GdnConfig, GdnLayerCache, GdnStateStep};
 use crate::gguf::Content;
 use crate::kv_cache::{
     HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, HybridPrefixEntry,
-    HybridPrefixPoint, RecurrentLayerConfig, RecurrentStateSnapshot, RecurrentStateSpec,
+    HybridPrefixPoint, RecurrentLayerConfig, RecurrentStatePool, RecurrentStateSnapshot, RecurrentStateSpec,
     SingleCache,
 };
 use crate::layers::{CausalMaskConfig, CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
@@ -606,7 +606,20 @@ impl FullAttention {
         flash_params: Option<&crate::pipeline::text_models_inputs_processor::FlashParams>,
     ) -> Result<Tensor> {
         let (b_sz, _, n, _) = q.dims4()?;
+        if crate::titan_hostkv::enabled() && q.device().is_cuda() {
+            // the append below waits for the layer's queued GPU work: wake the CPU attention meanwhile
+            crate::titan_hostkv::prewarm(kv_cache.current_seq_len() + n);
+        }
+        let prof = crate::titan_hostkv::prof_on() && q.device().is_cuda();
+        let mut t0 = std::time::Instant::now();
+        if prof {
+            q.device().synchronize()?;
+            crate::titan_hostkv::prof_mark(0, &mut t0);
+        }
         let (k, v) = kv_cache.append(k, v)?;
+        if prof {
+            crate::titan_hostkv::prof_mark(1, &mut t0);
+        }
         if k.device().is_cpu() {
             // one pass over the host cache for all rows; each row still equals its decode step
             let y = Sdpa.run_attention(q, &k, &v, &AttentionMask::None, flash_params, &self.sdpa_params)?;
@@ -635,6 +648,58 @@ impl FullAttention {
             )?);
         }
         Tensor::cat(&ys, 1)
+    }
+
+    /// `forward_decode_rows` of a batch whose sequences keep their own host caches `kvs` and start at `starts`: the
+    /// projections run batched (row-exact), then each sequence gets its batch-1 step's RoPE, append and attention.
+    fn forward_decode_rows_many(
+        &self,
+        x: &Tensor,
+        kvs: &mut [&mut KvCache],
+        starts: &[usize],
+        lin: LinRows,
+    ) -> Result<Tensor> {
+        let (b_sz, n, _) = x.dims3()?;
+        crate::titan_hostkv::prewarm(kvs.iter().map(|kv| kv.current_seq_len()).max().unwrap_or(0) + n);
+        let q_gate = lin(&self.wq, x)?.reshape((b_sz, n, self.n_head, self.head_dim * 2))?;
+        let k = lin(&self.wk, x)?;
+        let v = lin(&self.wv, x)?;
+        let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?.transpose(1, 2)?.contiguous()?;
+        let gate = q_gate
+            .narrow(D::Minus1, self.head_dim, self.head_dim)?
+            .reshape((b_sz, n, self.n_head * self.head_dim))?;
+        let k = k.reshape((b_sz, n, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let v = v.reshape((b_sz, n, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let mut qs = Vec::with_capacity(b_sz);
+        let mut ks = Vec::with_capacity(b_sz);
+        for (s, &start) in starts.iter().enumerate() {
+            let positions = crate::pipeline::text_positions_tensor(&[start], n, x.device())?;
+            let (q, k) = self.rotary.forward_qk_norm(
+                &q.narrow(0, s, 1)?,
+                &k.narrow(0, s, 1)?,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &positions,
+            )?;
+            qs.push(q.to_dtype(self.dtype)?);
+            ks.push(k.to_dtype(self.dtype)?);
+        }
+        let q = Tensor::cat(&qs, 0)?;
+        // the cache's own F8E4M3 conversion, once for the batch
+        let host = |t: &Tensor| t.contiguous()?.to_dtype(DType::F8E4M3)?.to_device(&Device::Cpu);
+        let k = host(&Tensor::cat(&ks, 0)?)?;
+        let v = host(&v.to_dtype(self.dtype)?)?;
+        let caches = kvs
+            .iter_mut()
+            .enumerate()
+            .map(|(s, kv)| kv.append(&k.narrow(0, s, 1)?, &v.narrow(0, s, 1)?))
+            .collect::<Result<Vec<_>>>()?;
+        let y = crate::titan_hostkv::attend_many(&q, &caches, &self.sdpa_params)?;
+        let y = y.transpose(1, 2)?.reshape((b_sz, n, ()))?;
+        let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
+        lin(&self.wo, &y.broadcast_mul(&gate)?.to_dtype(x.dtype())?)
     }
 
     /// `forward_decode_rows` after the attention `y`: the output gate and `wo`.
@@ -1336,6 +1401,28 @@ fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usi
     Ok(KvCache::Normal { k: single(k)?, v: single(v)? })
 }
 
+/// `forward_decode_rows`' row callback of a verification: the state after row 0 goes into the pool (where a
+/// rejection of every draft leaves it) and the inputs of the later rows are kept for `GdnRollback::Replay`.
+#[allow(clippy::too_many_arguments)]
+fn keep_row_zero(
+    pool: &mut RecurrentStatePool,
+    indices: &Tensor,
+    host: Option<&[u32]>,
+    r: usize,
+    n: usize,
+    cache: &GdnLayerCache,
+    inputs: DecodeRowInputs,
+    rows: &mut Vec<DecodeRowInputs>,
+) -> Result<()> {
+    if n > 1 && r == 0 {
+        pool.scatter_conv_state_with_host_indices(indices, host, &cache.conv_state)?;
+        pool.scatter_recurrent_state_with_host_indices(indices, host, &cache.recurrent_state)?;
+    } else if r > 0 {
+        rows.push(inputs);
+    }
+    Ok(())
+}
+
 /// The batch's recurrent slot indices on a GDN layer's state pool device (a CPU-mapped layer keeps its pool in
 /// host memory; the indices come on the main device).
 fn pool_indices(indices: &Tensor, pool_device: &Device) -> Result<Tensor> {
@@ -1542,7 +1629,19 @@ fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
     }
 }
 
+type LinRows = fn(&Arc<dyn QuantMethod>, &Tensor) -> Result<Tensor>;
+
 fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
+    lin_rows_as(w, x, true)
+}
+
+/// `lin_rows` for rows that are each a sequence's lone decode step (a batch of one-token decodes): F32 rows are
+/// not narrowed to BF16, so each equals `w.forward` of it alone as `lin_rows` of one row does.
+fn lin_rows_decode(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
+    lin_rows_as(w, x, false)
+}
+
+fn lin_rows_as(w: &Arc<dyn QuantMethod>, x: &Tensor, narrow: bool) -> Result<Tensor> {
     let k = x.dim(D::Minus1)?;
     let rows = x.elem_count() / k;
     if rows == 1 {
@@ -1585,7 +1684,7 @@ fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
                     | GgmlDType::Q6K
             ) && mistralrs_quant::mmvq_rows::supports(&q, x)
             {
-                if let Some(xn) = narrow_matvec(x) {
+                if let Some(xn) = narrow_matvec(x).filter(|_| narrow) {
                     return mistralrs_quant::mmvq_rows::plain_rows(&q, &xn)?.to_dtype(x.dtype());
                 }
                 return mistralrs_quant::mmvq_rows::plain_rows(&q, x);
@@ -1640,14 +1739,63 @@ pub(crate) struct SpecState {
     /// Recurrent states after each row but the last of the running verification.
     verify: Option<VerifyRecord>,
     stats: MtpStats,
+    /// Recurrent slot of the sequence the fields above belong to (`None`: not claimed yet).
+    owner: Option<usize>,
+    /// The other running sequences' states, by recurrent slot.
+    parked: HashMap<usize, SpecState>,
+}
+
+impl SpecState {
+    fn new() -> Self {
+        Self {
+            last: None,
+            pending: None,
+            mtp_kv: None,
+            mtp_len: 0,
+            mtp_valid: false,
+            verify: None,
+            stats: MtpStats::default(),
+            owner: None,
+            parked: HashMap::new(),
+        }
+    }
+
+    /// Make the fields those of the sequence in recurrent `slot`, parking the current owner's; the stats are
+    /// the model's and stay.
+    fn switch_to(&mut self, slot: usize) {
+        match self.owner {
+            Some(o) if o == slot => return,
+            None => {
+                self.owner = Some(slot);
+                return;
+            }
+            Some(_) => {}
+        }
+        let mut next = self.parked.remove(&slot).unwrap_or_else(SpecState::new);
+        next.owner = Some(slot);
+        std::mem::swap(&mut next.stats, &mut self.stats);
+        next.parked = std::mem::take(&mut self.parked);
+        let prev = std::mem::replace(self, next);
+        if let Some(o) = prev.owner {
+            self.parked.insert(o, prev);
+        }
+    }
 }
 
 struct VerifyRecord {
     start: usize,
     rows: usize,
     slot: usize,
+    gdn: GdnRollback,
+}
+
+/// How a verification's GDN layers return to the state after its last kept row.
+enum GdnRollback {
     /// per GDN layer: (layer, [(conv_state, recurrent_state) after row r] for r < rows - 1)
-    gdn: Vec<(usize, Vec<(Tensor, Tensor)>)>,
+    States(Vec<(usize, Vec<(Tensor, Tensor)>)>),
+    /// The pool holds the state after row 0. Per GDN layer: (layer, its state update, the inputs of rows 1..):
+    /// the kept ones are replayed onto it, so no copy of the states (~150 MiB per sequence) is ever made.
+    Replay(Vec<(usize, GdnStateStep, Vec<DecodeRowInputs>)>),
 }
 
 #[derive(Default)]
@@ -2245,15 +2393,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             dtype,
             gdn_dtype,
             mtp,
-            spec: Arc::new(Mutex::new(SpecState {
-                last: None,
-                pending: None,
-                mtp_kv: None,
-                mtp_len: 0,
-                mtp_valid: false,
-                verify: None,
-                stats: MtpStats::default(),
-            })),
+            spec: Arc::new(Mutex::new(SpecState::new())),
             prefix_points: Mutex::new(HashMap::new()),
             #[cfg(feature = "cuda")]
             graphs: Default::default(),
@@ -2302,19 +2442,33 @@ impl ModelWeights {
     }
 
     fn forward_inner_body(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        if input_ids.dim(0)? > 1
+            && matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Decode))
+            && self.cache.hybrid().ragged.is_some()
+        {
+            return self.forward_ragged(input_ids, ctx);
+        }
+        if self.mtp.is_some() && input_ids.dim(0)? == 1 {
+            let slot = ctx.recurrent_metadata().and_then(|m| m.state_indices_host()).and_then(|h| h.first().copied());
+            if let Some(slot) = slot {
+                self.spec.lock().expect("spec state poisoned").switch_to(slot as usize);
+            }
+        }
         if input_ids.dim(1)? > 1
             && matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Decode))
         {
             // a decode step carrying staged speculative tokens
             let mut t = std::time::Instant::now();
             #[cfg(feature = "cuda")]
-            let r = if super::titan_graph::enabled()
+            let graphable = super::titan_graph::enabled()
                 && input_ids.dim(0)? == 1
                 && !ctx.is_paged()
                 && !mtp_verify_rowwise()
-                && self.device.is_cuda()
-                && self.graph_model_ok()
-            {
+                && self.device.is_cuda();
+            #[cfg(feature = "cuda")]
+            let r = if graphable && self.host_graphs_ok() {
+                self.forward_verify_graphed_host(input_ids, ctx)
+            } else if graphable && self.graph_model_ok() {
                 if self.all_dense() {
                     self.forward_verify_graphed_dense(input_ids, ctx)
                 } else {
@@ -2704,7 +2858,7 @@ impl ModelWeights {
             .forward(input_ids, &self.device)?
             .to_dtype(DType::F32)?;
         let mut hybrid_cache = self.cache.hybrid();
-        let mut gdn_record = Vec::new();
+        let mut gdn_states = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(mapper) = &self.mapper {
                 x = mapper.map(x, i)?;
@@ -2722,12 +2876,15 @@ impl ModelWeights {
                             conv_state: pool.gather_conv_state(indices)?,
                             recurrent_state: pool.gather_recurrent_state(indices)?,
                         };
+                        let host = recurrent_metadata.state_indices_host();
+                        // one sequence copies its states (~150 MiB in all, the fastest rollback); a batch
+                        // replays rows instead (forward_ragged), where the copies do not fit next to a prefill
                         let mut snaps = Vec::with_capacity(n - 1);
                         let out = gdn.forward_decode_rows(
                             &h.to_dtype(self.gdn_dtype)?,
                             &mut gdn_cache,
                             &|w, x| lin_rows(w, x),
-                            &mut |r, c| {
+                            &mut |r, c, _| {
                                 if r + 1 < n {
                                     // the recurrent state is updated in place by the next row: copy it
                                     snaps.push((c.conv_state.copy()?, c.recurrent_state.copy()?));
@@ -2735,17 +2892,9 @@ impl ModelWeights {
                                 Ok(())
                             },
                         )?;
-                        pool.scatter_conv_state_with_host_indices(
-                            indices,
-                            recurrent_metadata.state_indices_host(),
-                            &gdn_cache.conv_state,
-                        )?;
-                        pool.scatter_recurrent_state_with_host_indices(
-                            indices,
-                            recurrent_metadata.state_indices_host(),
-                            &gdn_cache.recurrent_state,
-                        )?;
-                        gdn_record.push((i, snaps));
+                        pool.scatter_conv_state_with_host_indices(indices, host, &gdn_cache.conv_state)?;
+                        pool.scatter_recurrent_state_with_host_indices(indices, host, &gdn_cache.recurrent_state)?;
+                        gdn_states.push((i, snaps));
                         out.to_dtype(DType::F32)?
                     }
                     _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
@@ -2796,10 +2945,7 @@ impl ModelWeights {
                         )?;
                         if r + 1 < n {
                             // the recurrent state is updated in place by the next row: copy it
-                            snaps.push((
-                                gdn_cache.conv_state.copy()?,
-                                gdn_cache.recurrent_state.copy()?,
-                            ));
+                            snaps.push((gdn_cache.conv_state.copy()?, gdn_cache.recurrent_state.copy()?));
                         }
                         x_attn_rows.push((out.to_dtype(DType::F32)? + &residual)?);
                     }
@@ -2813,7 +2959,7 @@ impl ModelWeights {
                         recurrent_metadata.state_indices_host(),
                         &gdn_cache.recurrent_state,
                     )?;
-                    gdn_record.push((i, snaps));
+                    gdn_states.push((i, snaps));
                 }
                 _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
             }
@@ -2844,12 +2990,112 @@ impl ModelWeights {
         {
             let mut st = self.spec.lock().expect("spec state poisoned");
             st.last = Some((start, normed.squeeze(0)?));
-            st.verify = Some(VerifyRecord {
-                start,
-                rows: n,
-                slot,
-                gdn: gdn_record,
-            });
+            st.verify = Some(VerifyRecord { start, rows: n, slot, gdn: GdnRollback::States(gdn_states) });
+        }
+        Ok(logits)
+    }
+
+    /// A decode step of several sequences whose host attention caches are kept apart (`HybridCache::ragged`):
+    /// each sequence's `n` rows (its last token, then any staged drafts) equal its own batch-1 step row for row,
+    /// while the weight matmuls run once for the batch. Leaves every sequence's MTP rows and, for a
+    /// verification, its recurrent states per row for the rollback.
+    fn forward_ragged(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        let (b, n) = input_ids.dims2()?;
+        let starts = ctx.seqlen_offsets().to_vec();
+        let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {
+            candle_core::Error::msg("qwen35: hybrid recurrent metadata is required for the linear-attention layers")
+        })?;
+        let slots: Vec<usize> = recurrent_metadata
+            .state_indices_host()
+            .ok_or_else(|| candle_core::Error::msg("qwen35 batched decode: missing recurrent slots"))?
+            .iter()
+            .map(|&s| s as usize)
+            .collect();
+        if starts.len() != b || slots.len() != b {
+            candle_core::bail!("qwen35 batched decode: {b} rows, {} offsets, {} slots", starts.len(), slots.len());
+        }
+        let mut x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let hc = &mut *hybrid_cache;
+        let ragged = hc
+            .ragged
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::msg("qwen35 batched decode: no per-sequence caches"))?;
+        if ragged.len() != b {
+            candle_core::bail!("qwen35 batched decode: {b} rows over {} sequence caches", ragged.len());
+        }
+        // one-token rows match the batch-1 decode step's matmuls, verification rows its verification's
+        let lin: LinRows = if n == 1 { lin_rows_decode } else { lin_rows };
+        let mut gdn_record = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(mapper) = &self.mapper {
+                x = mapper.map(x, i)?;
+            }
+            let h = layer.attn_norm.forward(&x)?;
+            let h = match (&layer.mixer, hc.caches.get_mut(i)) {
+                (Mixer::Attention(attn), Some(HybridLayerCache::Attention(_))) => {
+                    let mut kvs = ragged
+                        .iter_mut()
+                        .map(|(id, kv)| {
+                            kv[i].as_mut().ok_or_else(|| {
+                                candle_core::Error::msg(format!("qwen35: sequence {id} has no cache for layer {i}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    attn.forward_decode_rows_many(&h, &mut kvs, &starts, lin)?
+                }
+                (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
+                    let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
+                    let mut gdn_cache = GdnLayerCache {
+                        conv_state: pool.gather_conv_state(indices)?,
+                        recurrent_state: pool.gather_recurrent_state(indices)?,
+                    };
+                    let host = recurrent_metadata.state_indices_host();
+                    let mut rows = Vec::with_capacity(n - 1);
+                    let out = gdn.forward_decode_rows(
+                        &h.to_dtype(self.gdn_dtype)?,
+                        &mut gdn_cache,
+                        &|w, x| lin(w, x),
+                        &mut |r, c, inputs| keep_row_zero(pool, indices, host, r, n, c, inputs, &mut rows),
+                    )?;
+                    if n == 1 {
+                        pool.scatter_conv_state_with_host_indices(indices, host, &gdn_cache.conv_state)?;
+                        pool.scatter_recurrent_state_with_host_indices(indices, host, &gdn_cache.recurrent_state)?;
+                    }
+                    gdn_record.push((i, gdn.state_step(self.gdn_dtype), rows));
+                    out.to_dtype(DType::F32)?
+                }
+                _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
+            };
+            let x_attn = (h + &x)?;
+            let h = layer.post_attention_norm.forward(&x_attn)?;
+            // every FFN row is independent: the sequences' rows go through as one batch-1 verification's
+            let h = layer.ffn.forward_rows(&h.reshape((1, b * n, ()))?)?.reshape((b, n, ()))?;
+            x = (h + x_attn)?;
+        }
+        drop(hybrid_cache);
+
+        let x = x.to_device(&self.device)?;
+        let normed = self.norm.forward(&x)?;
+        let logits = lin(&self.output, &normed.reshape((1, b * n, ()))?.contiguous()?)?.reshape((b, n, ()))?;
+        if self.mtp.is_some() {
+            let mut st = self.spec.lock().expect("spec state poisoned");
+            for (s, &slot) in slots.iter().enumerate() {
+                st.switch_to(slot);
+                st.last = Some((starts[s], normed.narrow(0, s, 1)?.squeeze(0)?));
+                st.verify = if n > 1 {
+                    let gdn = gdn_record
+                        .iter()
+                        .map(|(layer, step, rows)| {
+                            let rows = rows.iter().map(|r| r.batch_row(s)).collect::<Result<Vec<_>>>()?;
+                            Ok((*layer, step.clone(), rows))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Some(VerifyRecord { start: starts[s], rows: n, slot, gdn: GdnRollback::Replay(gdn) })
+                } else {
+                    None
+                };
+            }
         }
         Ok(logits)
     }
@@ -3442,7 +3688,7 @@ impl ModelWeights {
                             &h.to_dtype(self.gdn_dtype)?,
                             &mut gdn_cache,
                             &|w, x| lin_rows(w, x),
-                            &mut |r, c| {
+                            &mut |r, c, _| {
                                 if r + 1 < n {
                                     snaps.push(c.conv_state.copy()?);
                                     snaps.push(c.recurrent_state.copy()?);
@@ -3506,7 +3752,7 @@ impl ModelWeights {
                 start,
                 rows: n,
                 slot,
-                gdn: gdn_record,
+                gdn: GdnRollback::States(gdn_record),
             });
         }
         Ok(logits)
@@ -3588,7 +3834,7 @@ impl ModelWeights {
                             &h.to_dtype(self.gdn_dtype)?,
                             &mut gdn_cache,
                             &|w, x| lin_rows(w, x),
-                            &mut |r, c| {
+                            &mut |r, c, _| {
                                 if r + 1 < n {
                                     snaps.push(c.conv_state.copy()?);
                                     snaps.push(c.recurrent_state.copy()?);
@@ -3649,9 +3895,194 @@ impl ModelWeights {
                 start,
                 rows: n,
                 slot,
-                gdn: gdn_record,
+                gdn: GdnRollback::States(gdn_record),
             });
         }
+        Ok(logits)
+    }
+
+    /// `TITAN_HOST_GRAPHS=1` (with `TITAN_CUDA_GRAPHS=1`, the host-RAM KV cache, a dense model on one device;
+    /// checked once): verification steps run as `forward_verify_graphed_host`. Measured on the Q4_K_M 27B, MTP 1:
+    /// 17 segments, no failed capture, bit-identical tokens, 39.7 tok/s against 39.4 eager - no win, as with the
+    /// per-layer segments: the GPU waits on the 16 host attentions per step, not on launches. The segments' buffers
+    /// and graph memory also take the ~300 MiB a prompt pass needs next to two recurrent slots (prompt OOMs), so
+    /// it is off unless asked for.
+    #[cfg(feature = "cuda")]
+    fn host_graphs_ok(&self) -> bool {
+        static OK: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+        *OK.get_or_init(|| {
+            if !mistralrs_quant::titan_cfg::var("TITAN_HOST_GRAPHS").is_ok_and(|v| v == "1") {
+                return false;
+            }
+            let one_device = self.mapper.as_ref().is_none_or(|m| m.get_unique_devices().len() == 1);
+            let unpaged = self.layers.iter().all(|l| match &l.mixer {
+                Mixer::Attention(a) => a.paged_attn.is_none(),
+                Mixer::Linear(_) => true,
+            });
+            let ok = crate::titan_hostkv::enabled() && one_device && unpaged && self.all_dense() && lookahead_depth() == 0;
+            if ok {
+                tracing::info!("titan graphs: host-KV verification, one graph per stretch between attention layers");
+            }
+            ok
+        })
+    }
+
+    /// `forward_verify_graphed_dense` over the host-RAM KV cache. Attention runs on the CPU between graphs, so a
+    /// segment is all of the trunk between two attention layers: the previous one's output projection and FFN, the
+    /// GDN layers in between and the next one's norm and q/k/v. That is 17 graph launches per step on the 64-layer
+    /// 27B, where one segment per layer took 81 and saved nothing. GDN rows roll back by `GdnRollback::Replay`, so a
+    /// segment's extra outputs are its rows' inputs rather than ~150 MiB of state copies. The same kernels on the
+    /// same arguments as `forward_verify`, so the same rows.
+    #[cfg(feature = "cuda")]
+    fn forward_verify_graphed_host(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
+        use super::titan_graph::{dptr, SegKey};
+        let g = &self.graphs;
+        let n = input_ids.dim(1)?;
+        let start = ctx
+            .seqlen_offsets()
+            .first()
+            .copied()
+            .ok_or_else(|| candle_core::Error::msg("qwen35 verify: missing seqlen offset"))?;
+        let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {
+            candle_core::Error::msg("qwen35: hybrid recurrent metadata is required for the linear-attention layers")
+        })?;
+        let host = recurrent_metadata.state_indices_host();
+        let slot = host
+            .and_then(|h| h.first().copied())
+            .ok_or_else(|| candle_core::Error::msg("qwen35 verify: missing recurrent slot"))? as usize;
+        let flash_params = ctx.flash_params();
+        let positions = crate::pipeline::text_positions_tensor(&[start], n, &self.device)?;
+        let indices = recurrent_metadata.state_indices().clone();
+        let nl = self.layers.len();
+
+        let x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let mut caches: Vec<Option<&mut HybridLayerCache>> = hybrid_cache.caches.iter_mut().map(Some).collect();
+        let ends: Vec<Option<usize>> = (0..nl)
+            .filter(|&i| matches!(self.layers[i].mixer, Mixer::Attention(_)))
+            .map(Some)
+            .chain([None])
+            .collect();
+        let mut carry = vec![x];
+        // the attention layer before the segment, with its (y, gate, residual)
+        let mut prev: Option<(usize, Tensor, Tensor, Tensor)> = None;
+        let mut gdn_record = Vec::new();
+        let mut first = 0;
+        let mut normed = None;
+        for end in ends {
+            let last = end.unwrap_or(nl);
+            let mut gdns = Vec::with_capacity(last - first);
+            let mut extra = vec![n as u64, slot as u64];
+            for i in first..last {
+                let (Mixer::Linear(gdn), Some(Some(HybridLayerCache::Recurrent(pool)))) =
+                    (&self.layers[i].mixer, caches.get_mut(i).map(Option::take))
+                else {
+                    candle_core::bail!("qwen35 graphs: layer {i} between attention layers is not a GDN layer");
+                };
+                extra.push(dptr(&pool.conv_state)?);
+                extra.push(dptr(&pool.recurrent_state)?);
+                gdns.push((i, gdn, pool));
+            }
+            let prev_attn = prev.as_ref().map(|(p, ..)| *p);
+            let nc = carry.len();
+            let mut inputs: Vec<&Tensor> = carry.iter().collect();
+            if let Some((_, y, gate, residual)) = &prev {
+                inputs.extend([y, gate, residual]);
+            }
+            inputs.push(&indices);
+            inputs.push(&positions);
+            let outs = g.run(SegKey { tag: "h.seg", layer: last, extra }, &inputs, |ins| {
+                let mut k = nc;
+                let mut cur = ins[..nc].to_vec();
+                if let Some(p) = prev_attn {
+                    let Mixer::Attention(attn) = &self.layers[p].mixer else {
+                        candle_core::bail!("qwen35 graphs: layer {p} is not an attention layer");
+                    };
+                    let out = attn.decode_rows_out(&ins[k], &ins[k + 1], ins[k + 2].dtype())?;
+                    cur = self.graph_dense_route_rows(p, out, &ins[k + 2])?;
+                    k += 3;
+                }
+                let (idx, pos) = (&ins[k], &ins[k + 1]);
+                let mut rows_out = Vec::new();
+                for (i, gdn, pool) in gdns.iter_mut() {
+                    let x = self.graph_dense_rows_input(*i, &cur)?;
+                    let h = self.layers[*i].attn_norm.forward(&x)?;
+                    let mut gdn_cache = GdnLayerCache {
+                        conv_state: pool.gather_conv_state(idx)?,
+                        recurrent_state: pool.gather_recurrent_state(idx)?,
+                    };
+                    let mut rows = Vec::with_capacity(n - 1);
+                    let out = gdn.forward_decode_rows(
+                        &h.to_dtype(self.gdn_dtype)?,
+                        &mut gdn_cache,
+                        &|w, x| lin_rows(w, x),
+                        &mut |r, c, inputs| keep_row_zero(pool, idx, host, r, n, c, inputs, &mut rows),
+                    )?;
+                    if n == 1 {
+                        pool.scatter_conv_state_with_host_indices(idx, host, &gdn_cache.conv_state)?;
+                        pool.scatter_recurrent_state_with_host_indices(idx, host, &gdn_cache.recurrent_state)?;
+                    }
+                    cur = self.graph_dense_route_rows(*i, out.to_dtype(DType::F32)?, &x)?;
+                    for r in rows {
+                        rows_out.extend([r.mixed_qkv, r.b, r.a]);
+                    }
+                }
+                let mut o = match end {
+                    Some(a) => {
+                        let Mixer::Attention(attn) = &self.layers[a].mixer else {
+                            candle_core::bail!("qwen35 graphs: layer {a} is not an attention layer");
+                        };
+                        let x = self.graph_dense_rows_input(a, &cur)?;
+                        let h = self.layers[a].attn_norm.forward(&x)?;
+                        let (q, k, v, gate) = attn.decode_rows_qkv(&h, pos)?;
+                        vec![x, q, k, v, gate]
+                    }
+                    None => vec![self.norm.forward(&self.graph_dense_rows_input(nl, &cur)?)?],
+                };
+                o.extend(rows_out);
+                Ok(o)
+            })?;
+            let head = if end.is_some() { 5 } else { 1 };
+            let mut row_outs = outs[head..].chunks(3);
+            for (i, gdn, _) in &gdns {
+                let rows = (1..n)
+                    .map(|_| match row_outs.next() {
+                        Some([mixed_qkv, b, a]) => {
+                            Ok(DecodeRowInputs { mixed_qkv: mixed_qkv.clone(), b: b.clone(), a: a.clone() })
+                        }
+                        _ => candle_core::bail!("qwen35 graphs: segment {last} returned too few row inputs"),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                gdn_record.push((*i, gdn.state_step(self.gdn_dtype), rows));
+            }
+            match end {
+                Some(a) => {
+                    let (Mixer::Attention(attn), Some(Some(HybridLayerCache::Attention(kv_cache)))) =
+                        (&self.layers[a].mixer, caches.get_mut(a).map(Option::take))
+                    else {
+                        candle_core::bail!("qwen35: layer {a} cache kind does not match its mixer");
+                    };
+                    let y = attn.decode_rows_attend(&outs[1], &outs[2], &outs[3], kv_cache, Some(flash_params))?;
+                    prev = Some((a, y.contiguous()?, outs[4].clone(), outs[0].clone()));
+                    carry = Vec::new();
+                    first = a + 1;
+                }
+                // detach from the graph's output buffer: `st.last` keeps the normed rows past this step
+                None => normed = Some(outs[0].copy()?),
+            }
+        }
+        drop(caches);
+        drop(hybrid_cache);
+
+        let normed = normed.ok_or_else(|| candle_core::Error::msg("qwen35 graphs: no final segment"))?;
+        static STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 2 {
+            tracing::info!("titan graphs: {}", g.report(&self.device));
+        }
+        let logits = lin_rows(&self.output, &normed.contiguous()?)?;
+        let mut st = self.spec.lock().expect("spec state poisoned");
+        st.last = Some((start, normed.squeeze(0)?));
+        st.verify = Some(VerifyRecord { start, rows: n, slot, gdn: GdnRollback::Replay(gdn_record) });
         Ok(logits)
     }
 
@@ -3678,10 +4109,10 @@ impl ModelWeights {
         Ok(Some(last.narrow(0, rows[0].1, 1)?))
     }
 
-    /// Draft `n_draft` tokens after `toks` (whose last token, at position `pos_c`, was just sampled
-    /// by the trunk): catch the MTP KV cache up with the verified rows `mtp_len..=pos_c`, then run
-    /// the block recurrently on its own greedy drafts.
-    pub(crate) fn mtp_propose(&self, toks: &[u32], pos_c: usize) -> Result<Option<Vec<u32>>> {
+    /// Draft `n_draft` tokens after `toks` of the sequence in recurrent `slot` (whose last token, at position
+    /// `pos_c`, was just sampled by the trunk): catch the MTP KV cache up with the verified rows `mtp_len..=pos_c`,
+    /// then run the block recurrently on its own greedy drafts.
+    pub(crate) fn mtp_propose(&self, slot: usize, toks: &[u32], pos_c: usize) -> Result<Option<Vec<u32>>> {
         let Some(mtp) = &self.mtp else {
             return Ok(None);
         };
@@ -3690,6 +4121,7 @@ impl ModelWeights {
         }
         let t0 = std::time::Instant::now();
         let mut st = self.spec.lock().expect("spec state poisoned");
+        st.switch_to(slot);
         if !st.mtp_valid
             || toks.len() != pos_c + 1
             || st.mtp_len > pos_c
@@ -3891,33 +4323,41 @@ impl ModelWeights {
         Ok(Some((host, h_last.to_device(&Device::Cpu)?, reach)))
     }
 
-    /// Host copies of the caches of the sequence the last step ran alone (it just finished): its
-    /// attention KV, the recurrent state at its end and the points saved during its prompt passes.
-    pub(crate) fn prefix_export(&self, toks: &[u32]) -> Result<Option<HybridPrefixEntry>> {
+    /// Host copies of the caches of `seq`, which just finished (alone or in a batch): its attention KV, the
+    /// recurrent state at its end and the points saved during its prompt passes.
+    pub(crate) fn prefix_export(&self, seq: &crate::sequence::Sequence) -> Result<Option<HybridPrefixEntry>> {
         if !crate::prefix_cacher::hybrid_prefix_cache_on() {
             return Ok(None);
         }
-        let hybrid = self.cache.hybrid();
-        let slot = match hybrid.state_indices_host() {
-            Some([slot]) => *slot as usize,
-            _ => return Ok(None),
+        let toks = seq.get_toks();
+        let Some(slot) = seq.recurrent_state_idx() else {
+            return Ok(None);
         };
-        let p = hybrid.get_past_kv_len()?;
+        let hybrid = self.cache.hybrid();
+        let seq_kv = seq.normal_cache_ref();
+        let attention = |i: usize| seq_kv.get(i).and_then(Option::as_ref);
+        let p = (0..hybrid.num_layers())
+            .find(|&i| matches!(hybrid.caches[i], HybridLayerCache::Attention(_)))
+            .and_then(attention)
+            .map_or(0, KvCache::current_seq_len);
         if p == 0 || p > toks.len() {
             return Ok(None);
         }
         let mut kv = Vec::with_capacity(hybrid.num_layers());
-        for c in &hybrid.caches {
+        for (i, c) in hybrid.caches.iter().enumerate() {
             kv.push(match c {
-                HybridLayerCache::Attention(layer) => match kv_to_host(layer, p)? {
-                    Some(host) => Some(host),
-                    None => return Ok(None),
-                },
+                HybridLayerCache::Attention(_) => {
+                    match attention(i).map(|layer| kv_to_host(layer, p)).transpose()?.flatten() {
+                        Some(host) => Some(host),
+                        None => return Ok(None),
+                    }
+                }
                 HybridLayerCache::Recurrent(_) => None,
             });
         }
         let gdn_end = Self::gdn_to_host(hybrid.titan_snapshot_physical(slot)?)?;
         drop(hybrid);
+        self.spec.lock().expect("spec state poisoned").switch_to(slot);
         let mut points = self
             .prefix_points
             .lock()
@@ -3981,6 +4421,7 @@ impl ModelWeights {
         *seq.normal_cache() = caches;
         if self.mtp.is_some() {
             let mut st = self.spec.lock().expect("spec state poisoned");
+            st.switch_to(slot);
             if st.stats.steps > 0 || mtp_prof_wall() || mtp_prof_on() {
                 log_mtp_stats(&st.stats);
             }
@@ -4014,10 +4455,14 @@ struct SpecRollback {
 }
 
 impl crate::speculative::unpaged::SpeculativeRollback for SpecRollback {
-    /// Keep the first `keep_len` positions: the verification's rows up to and including the last
+    /// Keep the first `keep_len` positions of `seq_id`: the verification's rows up to and including the last
     /// accepted draft. Attention layers truncate; GDN layers get the state saved after that row.
-    fn keep(&self, keep_len: usize) -> Result<()> {
+    fn keep(&self, seq_id: usize, keep_len: usize) -> Result<()> {
+        let Some(slot) = self.hybrid.lock().expect("hybrid cache poisoned").slot_of_sequence(seq_id) else {
+            candle_core::bail!("qwen35 rollback: sequence {seq_id} holds no recurrent slot");
+        };
         let mut st = self.spec.lock().expect("spec state poisoned");
+        st.switch_to(slot);
         let Some(rec) = st.verify.take() else {
             return Ok(());
         };
@@ -4033,17 +4478,38 @@ impl crate::speculative::unpaged::SpeculativeRollback for SpecRollback {
         if stats.steps.is_multiple_of(200) {
             log_mtp_stats(stats);
         }
-        if kept < rec.rows {
-            let mut hybrid = self.hybrid.lock().expect("hybrid cache poisoned");
-            for (layer, snaps) in &rec.gdn {
-                let (conv, recurrent) = &snaps[kept - 1];
-                let Some(HybridLayerCache::Recurrent(pool)) = hybrid.get_mut(*layer) else {
-                    candle_core::bail!("qwen35 rollback: layer {layer} is not recurrent");
-                };
-                pool.scatter_conv_state_for_indices(&[rec.slot as u32], conv)?;
-                pool.scatter_recurrent_state_for_indices(&[rec.slot as u32], recurrent)?;
+        let mut hybrid = self.hybrid.lock().expect("hybrid cache poisoned");
+        let slot = [rec.slot as u32];
+        match &rec.gdn {
+            GdnRollback::States(layers) if kept < rec.rows => {
+                for (layer, snaps) in layers {
+                    let (conv, recurrent) = &snaps[kept - 1];
+                    let Some(HybridLayerCache::Recurrent(pool)) = hybrid.get_mut(*layer) else {
+                        candle_core::bail!("qwen35 rollback: layer {layer} is not recurrent");
+                    };
+                    pool.scatter_conv_state_for_indices(&slot, conv)?;
+                    pool.scatter_recurrent_state_for_indices(&slot, recurrent)?;
+                }
             }
-            hybrid.truncate_attention_to(rec.start + kept)?;
+            GdnRollback::Replay(layers) if kept > 1 => {
+                for (layer, step, rows) in layers {
+                    let Some(HybridLayerCache::Recurrent(pool)) = hybrid.get_mut(*layer) else {
+                        candle_core::bail!("qwen35 rollback: layer {layer} is not recurrent");
+                    };
+                    // the slot's pool rows themselves: the decode kernels update them in place
+                    let mut cache = GdnLayerCache {
+                        conv_state: pool.conv_state_row(rec.slot)?,
+                        recurrent_state: pool.recurrent_state_row(rec.slot)?,
+                    };
+                    for row in &rows[..kept - 1] {
+                        step.apply(&mut cache, row)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if kept < rec.rows {
+            hybrid.truncate_sequence_attention_to(seq_id, rec.start + kept)?;
         }
         Ok(())
     }

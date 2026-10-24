@@ -4731,7 +4731,9 @@ $L__BB8_8:                              // %mmvq_rowsKm2_Kj1_fEB4_.exit
 	.param .u32 mmvq_gguf_q5_k_f32_rows2_param_4,
 	.param .u32 mmvq_gguf_q5_k_f32_rows2_param_5,
 	.param .u32 mmvq_gguf_q5_k_f32_rows2_param_6
-)                                       // @mmvq_gguf_q5_k_f32_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q5_k_f32_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;
@@ -5571,7 +5573,9 @@ $L__BB11_10:                            // %mmvq_rowsKm4_Kj3_NtB2_1BEB4_.exit
 	.param .u32 mmvq_gguf_q5_k_f16_rows2_param_4,
 	.param .u32 mmvq_gguf_q5_k_f16_rows2_param_5,
 	.param .u32 mmvq_gguf_q5_k_f16_rows2_param_6
-)                                       // @mmvq_gguf_q5_k_f16_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q5_k_f16_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;
@@ -12862,7 +12866,9 @@ $L__BB62_10:                            // %mmvq_rowsKm1_Kj2_fEB4_.exit
 	.param .u32 mmvq_gguf_q4_k_bf16_rows2_param_4,
 	.param .u32 mmvq_gguf_q4_k_bf16_rows2_param_5,
 	.param .u32 mmvq_gguf_q4_k_bf16_rows2_param_6
-)                                       // @mmvq_gguf_q4_k_bf16_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q4_k_bf16_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;
@@ -15990,7 +15996,9 @@ $L__BB92_8:                             // %mmvq_rowsKm1_Kj1_fEB4_.exit
 	.param .u32 mmvq_gguf_q4_k_f16_rows2_param_4,
 	.param .u32 mmvq_gguf_q4_k_f16_rows2_param_5,
 	.param .u32 mmvq_gguf_q4_k_f16_rows2_param_6
-)                                       // @mmvq_gguf_q4_k_f16_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q4_k_f16_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;
@@ -17776,7 +17784,9 @@ $L__BB104_8:                            // %mmvq_rowsKm9_Kj1_NtB2_1HEB4_.exit
 	.param .u32 mmvq_gguf_q4_k_f32_rows2_param_4,
 	.param .u32 mmvq_gguf_q4_k_f32_rows2_param_5,
 	.param .u32 mmvq_gguf_q4_k_f32_rows2_param_6
-)                                       // @mmvq_gguf_q4_k_f32_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q4_k_f32_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;
@@ -31560,7 +31570,9 @@ $L__BB199_10:                           // %mmvq_rowsKm0_Kj2_NtB2_1HEB4_.exit
 	.param .u32 mmvq_gguf_q5_k_bf16_rows2_param_4,
 	.param .u32 mmvq_gguf_q5_k_bf16_rows2_param_5,
 	.param .u32 mmvq_gguf_q5_k_bf16_rows2_param_6
-)                                       // @mmvq_gguf_q5_k_bf16_rows2
+)
+.maxntid 256, 1, 1
+.minnctapersm 5                         // @mmvq_gguf_q5_k_bf16_rows2
 {
 	.reg .b32 	%r<5>;
 	.reg .b64 	%rd<4>;

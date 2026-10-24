@@ -786,6 +786,14 @@ impl CausalLogitsBatch {
         }
     }
 
+    /// One row per sequence, where the forward left them.
+    fn into_rows(self) -> Result<Vec<Tensor>> {
+        match self {
+            Self::PerSequence(logits) => Ok(logits),
+            Self::Batched(logits) => (0..logits.dim(0)?).map(|idx| logits.i(idx)).collect(),
+        }
+    }
+
     fn into_cpu_rows(self) -> Result<Vec<Tensor>> {
         match self {
             Self::PerSequence(logits) => coalesce_batch_logits_to_cpu(logits),
@@ -809,16 +817,19 @@ async fn sample_and_add_toks_inner(
     let seqs_len = seqs.len();
     debug_assert_eq!(logits.len()?, seqs_len);
 
-    let use_async_pool = seqs_len > 1;
+    // a ragged batch samples each row as its sequence alone would (the device top-1 breaks ties unlike the host)
+    let ragged = seqs_len > 1 && this.supports_ragged_completion_batch();
+    let use_async_pool = seqs_len > 1 && !ragged;
     let metadata = this.get_metadata();
     let llg_factory = metadata.llg_factory.clone();
     let max_model_len = metadata.max_seq_len;
     let eos_toks = metadata.eos_tok.clone();
 
-    let sampled_vec = match try_sample_batch_cuda(&logits, seqs, &rng)? {
+    let batched = if ragged { None } else { try_sample_batch_cuda(&logits, seqs, &rng)? };
+    let sampled_vec = match batched {
         Some(sampled) => sampled,
         None => {
-            let logits_seq = logits.into_cpu_rows()?;
+            let logits_seq = if ragged { logits.into_rows()? } else { logits.into_cpu_rows()? };
             let sampling_futures: Vec<_> = std::iter::zip(logits_seq, seqs.iter_mut())
                 .map(|(logits_per_seq, seq)| {
                     let return_logprobs = seq.return_logprobs();

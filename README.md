@@ -32,6 +32,25 @@ Numbers are medians of repeated runs; raw per-run JSON is in [`release/bench/`](
 Decode is 1.59x llama.cpp with MTP on both sides (1.37x without); prompt processing is 1.47x at 4k, 1.65x at 13k and
 1.48x at 28k. A repeated prompt that hits the prefix cache starts generating in 0.4-0.9 s instead of recomputing it.
 
+### Qwen3.8-27B dense, Q4_K_M, 256k context (15.5 GB model, KV in host RAM)
+
+Measured 2026-10-24 on the same machine, `serve-q4.sh` defaults (MTP=1, host-RAM FP8 KV, `--max-seqs 2`), greedy,
+one request unless stated. The GGUF is the stock Q4_K_M with `output.weight` and the 33 Q6_K `ffn_down` tensors
+requantised to Q5_K, so the weights fit the 16 GB card.
+
+| context | decode tok/s | prompt tok/s |
+|---|---:|---:|
+| short (~0.3k) | 42.0 | - |
+| 3k | 38.3 | - |
+| 12k | 31.4 | - |
+| 20.7k | - | 823 |
+| 40k | 18.1 | - |
+| 57.6k | - | 641 |
+| 248k | 4.5 | 310 |
+
+Two concurrent requests decode together at 46.5 tok/s combined at short context (about 24 each) and ~30 at 12k.
+VRAM stays flat at 15.3 GiB from 0 to 248k tokens; the KV takes 32 KiB per token of RAM.
+
 ### Other models (preliminary, not from the controlled campaign)
 
 | model | ours decode tok/s | llama.cpp decode tok/s | note |
@@ -40,8 +59,8 @@ Decode is 1.59x llama.cpp with MTP on both sides (1.37x without); prompt process
 | gpt-oss-120b MXFP4 (63.4 GB) | 4.4 | 2.8 | older build, 8-prompt set |
 
 What the numbers do not say:
-- They are one laptop GPU, one user and one request at a time. There is no batching of concurrent users, and no
-  server GPU was used.
+- They are one laptop GPU, one user and one request at a time. The MoE paths do not batch concurrent users (the dense
+  host-KV path batches two), and no server GPU was used.
 - The expert-offload wins depend on this machine's RAM and NVMe. On a card that holds the whole model, the tiering
   does nothing.
 - q100 is a sanity check that the output is not broken: 100 short questions, greedy, scored by regex. It is not a
@@ -99,6 +118,29 @@ Unpaged prompt passes run in chunks (default 512 tokens). KV, RoPE and the mask 
 convolution carries state across chunks, and MTP catches up per chunk. KV is reserved in 8192-token buckets, so long
 prompts do not fragment the device pool.
 
+### Host-RAM KV cache (256k context on 16 GB)
+With `TITAN_KV_HOST=1` the attention layers keep their KV in host RAM as F8E4M3 (32 KiB per token on the dense
+27B). Decode and MTP-verify attention run on the CPU (AVX2/F16C, each cached key read once for all query heads of its
+KV head); prompt chunks stream the cache to the GPU in 8192-key tiles for the flash-prefill kernel. Short caches run
+on a small pool of threads that are woken while the GPU finishes the layer before the attention (`TITAN_HOSTKV_SMALL_THREADS`,
+default 8), long caches on every core (`TITAN_HOSTKV_THREADS`): parked threads cost 0.4-0.6 ms per call to wake,
+16 times a step. `TITAN_HOSTKV_PROF=1` logs where a host attention spends its time.
+
+### Two sequences per step on host KV
+With host KV, `--max-seqs 2` decodes two sequences of different lengths in one step (an agent and a subagent). Each
+keeps its own KV cache and MTP state; the weight matmuls run once for both, attention per sequence. A sequence's
+tokens are the same as when it runs alone: the scheduler runs one prompt at a time and starts drafting from the
+prompt step, one-token rows use the single-row matmul arithmetic, greedy rows are picked on the device as for one
+sequence, and a batched verification rolls the GDN state back by replaying kept rows instead of copying it (the
+copies did not fit next to a prefill). Further requests wait in the admission queue.
+
+### Row-exact batched matvec
+An MTP verification multiplies 2 (or, batched, 4) activation rows by every weight matrix. The `rows` kernels
+(`oxide-kernels/mmvq-rows`) read and decode each weight block once for all rows, while reducing every row exactly as
+the batch-1 kernel does, so a verification row equals its decode step bit for bit (`oxide-kernels/mmvq-rows/src/gate.rs`
+checks this against nvcc). The Q4_K / Q5_K two-row kernels are capped at 48 registers (`#[launch_bounds]`): at 56
+the lost occupancy made one two-row launch slower than two one-row launches.
+
 ### nvcc-free build with cuda-oxide
 The kernels in the service path live in `oxide-kernels/`. They are Rust `#[kernel]` functions compiled to PTX by
 cuda-oxide's rustc backend: GGUF dequantisation, the Q8_0 and K-quant matvecs, the expert GEMVs, MMQ prefill tiles,
@@ -112,7 +154,9 @@ Measured in this release:
 - Qwen3.6-35B-A3B (`qwen35moe`): UD-Q4_K_XL, MXFP4_MOE, with or without the MTP head;
 - Qwen3-Next-80B-A3B (`qwen3next`): Q4_K_M, host experts through mmap;
 - gpt-oss-20b and gpt-oss-120b (`gpt-oss`): MXFP4;
-- Bonsai-27B (`qwen35`, dense): Q1_0.
+- Bonsai-27B (`qwen35`, dense): Q1_0;
+- Qwen3.8-27B (`qwen35`, dense, with the MTP head): Q4_K_M (with `output` and `ffn_down` at Q5_K) and Q3_K_M,
+  host-RAM KV up to 256k.
 
 Tiered expert formats (GPU kernel and CPU twin): Q4_K, Q5_K, Q6_K, IQ4_NL, MXFP4, NVFP4, Q1_0. Other
 architectures work as they do in upstream mistral.rs v0.9.4, without the titan paths.
@@ -149,6 +193,14 @@ TITAN_MTP=2 TITAN_PFS=1 TITAN_DOORBELL=1 TITAN_CPU_ONEPASS=1 TITAN_CUDA_GRAPHS=1
   --format gguf -m <dir> -f Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ```
 
+Serve the dense Qwen3.8-27B Q4_K_M with 256k context and host-RAM KV (`serve-q4.sh`; as a user service,
+`deploy/titan-dense.service`):
+
+```bash
+./serve-q4.sh            # [max-seq-len, default 262144] [extra mistralrs args...]
+cp deploy/titan-dense.service ~/.config/systemd/user/ && systemctl --user enable --now titan-dense.service
+```
+
 It exposes an OpenAI-compatible API on port 1234. The per-model configurations used in the benchmark are in
 `release/bench/campaign.json`, and the exact command lines are in `release/bench/results.md`.
 
@@ -157,8 +209,10 @@ to itself for about several hours.
 
 ## Limitations
 
-- **Single user.** One request at a time. `--paged-attn off` is required on the titan paths. There is no continuous
-  batching of concurrent requests.
+- **Single user.** One request at a time on the MoE paths; the dense host-KV path batches two. `--paged-attn off` is
+  required on the titan paths. There is no continuous batching beyond that.
+- **Host-KV decode slows with context.** CPU attention streams the whole cache from RAM every step (18 tok/s at 40k,
+  4.5 at 248k), and every attention layer is a GPU-CPU round trip. Two sequences at 256k need ~16 GiB of RAM for KV.
 - **One GPU class.** It was developed and tuned on a 16 GB Blackwell laptop GPU at a 150 W cap, and the PTX targets
   sm_120. Other cards are untested.
 - **A 30 GB RAM machine.** The 80B and 120B models do not fit in RAM. Their host experts are read through the page
