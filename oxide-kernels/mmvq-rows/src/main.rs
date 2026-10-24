@@ -15,7 +15,7 @@
 //! (mistralrs-quant/src/gguf/mmvq_rows_oxide.ptx, see export_ptx.sh) and launches it from Rust.
 #![allow(non_snake_case, clippy::missing_safety_doc, dead_code)]
 
-use cuda_device::{SharedArray, bf16x2, convert, device, dotprod, f16x2, float, kernel, ptx_asm, thread, warp};
+use cuda_device::{SharedArray, bf16x2, convert, device, dotprod, f16x2, float, kernel, launch_bounds, ptx_asm, thread, warp};
 use cuda_host::cuda_module;
 
 mod gate;
@@ -23,6 +23,12 @@ mod gate;
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// Blocks per SM the Q4_K / Q5_K rows2 kernels must fit (256 threads each): caps them at 48 registers. Uncapped
+    /// they took 56, so 4 blocks fit, and at ~1 eligible warp per scheduler the lost occupancy made one rows2
+    /// launch slower than two batch-1 launches (110 vs 101 us at 5120x17408). The other formats and column
+    /// counts measured no better or worse under a cap.
+    const ROWS2_MIN_BLOCKS: u32 = 5;
 
     // ------------------------------------------------------------------------------------------
     // shared helpers (fast-math f32: every add / mul / fma is .ftz)
@@ -1204,7 +1210,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q3_k_f32_rows7(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<6, 7, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q3_k_f32_rows8(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<6, 8, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows1(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 1, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q4_k_bf16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows3(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 3, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows4(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 4, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows5(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 5, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
@@ -1212,7 +1218,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows7(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 7, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_bf16_rows8(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 8, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows1(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 1, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q4_k_f16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows3(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 3, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows4(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 4, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows5(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 5, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
@@ -1220,7 +1226,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows7(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 7, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f16_rows8(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 8, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows1(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 1, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows2(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q4_k_f32_rows2(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 2, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows3(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 3, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows4(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 4, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows5(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 5, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
@@ -1228,7 +1234,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows7(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 7, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q4_k_f32_rows8(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<7, 8, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows1(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 1, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q5_k_bf16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows3(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 3, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows4(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 4, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows5(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 5, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
@@ -1236,7 +1242,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows7(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 7, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_bf16_rows8(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 8, B>(vx, vy, dst as *mut B, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows1(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 1, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q5_k_f16_rows2(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows3(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 3, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows4(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 4, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows5(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 5, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
@@ -1244,7 +1250,7 @@ pub mod kernels {
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows7(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 7, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f16_rows8(vx: *const u8, vy: *const u8, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 8, H>(vx, vy, dst as *mut H, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f32_rows1(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 1, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
-    #[kernel] pub unsafe fn mmvq_gguf_q5_k_f32_rows2(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
+    #[kernel] #[launch_bounds(256, ROWS2_MIN_BLOCKS)] pub unsafe fn mmvq_gguf_q5_k_f32_rows2(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 2, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f32_rows3(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 3, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f32_rows4(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 4, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }
     #[kernel] pub unsafe fn mmvq_gguf_q5_k_f32_rows5(vx: *const u8, vy: *const u8, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) { mmvq_rows::<8, 5, f32>(vx, vy, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst) }

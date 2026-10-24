@@ -229,6 +229,10 @@ pub trait Scheduler: Send + Sync {
 
     fn set_requires_uniform_media_batch(&mut self, _required: bool) {}
 
+    /// Batch completions of different lengths together, one prompt per step
+    /// (`Pipeline::supports_ragged_completion_batch`).
+    fn set_ragged_completion_batch(&mut self, _enabled: bool) {}
+
     fn set_supports_packed_prefill(&mut self, _supported: bool) {}
 
     fn set_prefill_has_per_sequence_state(&mut self, _enabled: bool) {}

@@ -630,6 +630,8 @@ impl Engine {
         get_mut_arcmutex!(scheduler)
             .set_requires_uniform_completion_batch(requires_uniform_completion_batch);
         get_mut_arcmutex!(scheduler).set_requires_uniform_media_batch(requires_uniform_media_batch);
+        let ragged_completions = get_mut_arcmutex!(pipeline).supports_ragged_completion_batch();
+        get_mut_arcmutex!(scheduler).set_ragged_completion_batch(ragged_completions);
         get_mut_arcmutex!(scheduler).set_supports_packed_prefill(supports_packed_prefill);
         get_mut_arcmutex!(scheduler)
             .set_prefill_has_per_sequence_state(prefill_has_per_sequence_state);
@@ -756,15 +758,15 @@ impl Engine {
         }
     }
 
-    /// Keep the caches of a hybrid sequence that finished in the step just run, when it ran alone
-    /// (the model's caches are then exactly that sequence's), for prefix reuse by a later request.
+    /// Keep the caches of every hybrid sequence that finished in the step just run (from its own copies, so a
+    /// batched step works too), for prefix reuse by a later request.
     fn save_hybrid_prefix(&self, seqs: &[&mut crate::sequence::Sequence]) {
-        let [seq] = seqs else {
-            return;
-        };
-        if !matches!(seq.getstate(), SequenceState::Done(_)) {
-            return;
+        for seq in seqs.iter().filter(|seq| matches!(seq.getstate(), SequenceState::Done(_))) {
+            self.save_hybrid_prefix_one(seq);
         }
+    }
+
+    fn save_hybrid_prefix_one(&self, seq: &crate::sequence::Sequence) {
         let entry = {
             let pipeline = get_mut_arcmutex!(self.pipeline);
             if pipeline.get_metadata().no_kv_cache
@@ -1457,6 +1459,9 @@ impl Engine {
                     if !scheduled.completion.is_empty() {
                         let current_completion_ids: Vec<usize> =
                             scheduled.completion.iter().map(|seq| *seq.id()).collect();
+                        // a speculative step appends more than one token per sequence
+                        let toks_before: usize =
+                            scheduled.completion.iter().map(|seq| seq.get_toks().len()).sum();
                         for seq in scheduled.completion.iter_mut() {
                             seq.start_completion_timing();
                         }
@@ -1514,8 +1519,10 @@ impl Engine {
                         }
                         self.save_hybrid_prefix(&scheduled.completion);
 
+                        let toks_after: usize =
+                            scheduled.completion.iter().map(|seq| seq.get_toks().len()).sum();
                         self.logger
-                            .add_decode_tokens_processed(scheduled.completion.len());
+                            .add_decode_tokens_processed(toks_after.saturating_sub(toks_before));
 
                         last_completion_ids = current_completion_ids;
                     }

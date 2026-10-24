@@ -1091,6 +1091,9 @@ pub struct HybridCache {
     recurrent_storage_locked: bool,
     // Scratch slot CUDA graph pad rows write into; allocated on first use, dropped on reset
     graph_pad_slot: Option<usize>,
+    /// Attention KV of each sequence of a batched host-KV step, `(sequence id, per-layer cache)` in batch order:
+    /// host caches of different lengths are not concatenated into `caches`. `None` outside such a step.
+    pub ragged: Option<Vec<(usize, Vec<Option<KvCache>>)>>,
 }
 
 impl HybridCache {
@@ -1166,9 +1169,17 @@ impl HybridCache {
             recurrent_storage_generation: 0,
             recurrent_storage_locked: false,
             graph_pad_slot: None,
+            ragged: None,
         };
         cache.publish_recurrent_slot_metrics();
         Ok(cache)
+    }
+
+    /// The recurrent slot `sequence_id` holds.
+    pub fn slot_of_sequence(&self, sequence_id: usize) -> Option<usize> {
+        self.slot_owners
+            .iter()
+            .position(|owner| *owner == Some(RecurrentSlotOwner::Sequence(sequence_id)))
     }
 
     /// Slot reserved for CUDA graph pad rows; never handed to a sequence while it lives.
@@ -3930,6 +3941,20 @@ impl HybridCache {
             if let HybridLayerCache::Attention(kv) = cache {
                 kv.set_len(len)?;
             }
+        }
+        Ok(())
+    }
+
+    /// `truncate_attention_to` for one sequence: its own caches in a batched host-KV step, else the layers'.
+    pub fn truncate_sequence_attention_to(&mut self, sequence_id: usize, len: usize) -> Result<()> {
+        let Some(ragged) = &mut self.ragged else {
+            return self.truncate_attention_to(len);
+        };
+        let Some((_, kv)) = ragged.iter_mut().find(|(id, _)| *id == sequence_id) else {
+            candle_core::bail!("hybrid cache: sequence {sequence_id} is not in the batched step");
+        };
+        for kv in kv.iter_mut().flatten() {
+            kv.set_len(len)?;
         }
         Ok(())
     }

@@ -264,7 +264,8 @@ where
     C: SpeculativeCacheAccess,
 {
     let general_metadata = target.get_metadata();
-    let use_async_pool = seqs.len() > 1;
+    // a ragged batch samples each row as its sequence alone would (the device top-1 breaks ties unlike the host)
+    let use_async_pool = seqs.len() > 1 && !target.supports_ragged_completion_batch();
 
     let mut active_indices = Vec::new();
     let mut sampled_tokens = Vec::new();

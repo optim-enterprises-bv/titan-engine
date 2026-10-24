@@ -1765,6 +1765,11 @@ pub trait Pipeline:
         true
     }
 
+    /// Completion steps may batch sequences of different lengths (and prompt steps then run one sequence each).
+    fn supports_ragged_completion_batch(&self) -> bool {
+        false
+    }
+
     fn requires_uniform_media_batch(&self) -> bool {
         false
     }
@@ -2101,12 +2106,14 @@ pub trait Pipeline:
                         }
                     }
 
+                    // a ragged batch samples each row on the device, as its sequence would alone
                     let preserve_causal_generation = input_seqs.len() > 1
                         && !return_raw_logits
                         && self.device().is_cuda()
                         && ((self.supports_batched_cuda_sampling()
                             && sampling::can_sample_batch_cuda(input_seqs))
-                            || crate::speculative::verifier::can_batch_device_verify(input_seqs));
+                            || crate::speculative::verifier::can_batch_device_verify(input_seqs)
+                            || self.supports_ragged_completion_batch());
                     let start = Instant::now();
                     let raw_logits = self
                         .forward_inputs(inputs, return_raw_logits)?
@@ -2202,7 +2209,10 @@ pub trait Pipeline:
                                 logits
                             })
                             .collect::<Vec<_>>();
-                        if is_prompt
+                        // a ragged batch's sequences draft from their prompt step on: one that joins a running
+                        // batch then verifies like the others instead of forcing a draft-less step on them
+                        let speculative_prompt = is_prompt && self.supports_ragged_completion_batch();
+                        if (is_prompt && !speculative_prompt)
                             || return_raw_logits
                             || !self
                                 .try_sample_speculative_causal_gen(

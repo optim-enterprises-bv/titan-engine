@@ -1,0 +1,17 @@
+[Unit]
+Description=titan-engine dense Qwen3.8-27B Q4_K_M (host-RAM FP8 KV, 256k context, MTP, two sequences batched), OpenAI API on 127.0.0.1:1234
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/titan-engine
+# every TITAN_* default (model, context, KV placement, batching, prefix cache) lives in serve-q4.sh
+ExecStart=%h/src/titan-engine/serve-q4.sh
+# SIGINT lets the engine drain the request in flight; loading the 15.5 GB of weights again takes ~1 min
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

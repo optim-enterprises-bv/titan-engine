@@ -1248,6 +1248,22 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             .collect::<Result<Vec<_>>>()?;
         hybrid_cache.install_sequence_state_indices(&sequence_slots)?;
 
+        // Host caches stay per sequence: their lengths differ and a concatenation would copy the whole KV
+        // through RAM every step.
+        hybrid_cache.ragged = None;
+        if seqs.len() > 1 && !modify_draft_cache && crate::titan_hostkv::enabled() {
+            let ragged = seqs
+                .iter_mut()
+                .map(|seq| {
+                    let mut kv = seq.normal_cache().clone();
+                    kv.resize(num_layers, None);
+                    (*seq.id(), kv)
+                })
+                .collect();
+            hybrid_cache.ragged = Some(ragged);
+            return Ok(());
+        }
+
         // For attention layers, we still need to batch KV caches
         for layer_idx in 0..num_layers {
             let layer_cache = hybrid_cache.caches.get_mut(layer_idx).unwrap();
@@ -1338,6 +1354,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
         let hybrid_cache = pipeline.cache().hybrid();
         let num_layers = hybrid_cache.num_layers();
         let num_seqs = seqs.len();
+
+        if let Some(ragged) = &hybrid_cache.ragged {
+            for seq in seqs.iter_mut() {
+                let id = *seq.id();
+                if let Some((_, kv)) = ragged.iter().find(|(s, _)| *s == id) {
+                    *seq.normal_cache() = kv.clone();
+                }
+            }
+            return;
+        }
 
         // For attention layers, split batched KV caches back to sequences
         for layer_idx in 0..num_layers {
@@ -1433,6 +1459,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             .collect::<Result<Vec<_>>>()?;
         let mut hybrid_cache = pipeline.cache().hybrid();
         hybrid_cache.validate_sequence_slots(&sequence_slots)?;
+        hybrid_cache.ragged = None;
         for seq in seqs.iter_mut() {
             let seq_cache = if modify_draft_cache {
                 seq.normal_draft_cache()
