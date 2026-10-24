@@ -717,7 +717,9 @@ impl crate::speculative::driver::SpeculativePipelineExt for TitanGGUFPipeline {
         if batch_size != 1 && !batched {
             return None;
         }
-        Some(crate::speculative::SpeculativeBatchPlan::new(draft).without_target_hiddens())
+        // context lookup drafts fill a verification up to the rows one launch takes
+        let width = if crate::titan_lookup::enabled() { (MAX_VERIFY_ROWS / batch_size - 1).max(draft) } else { draft };
+        Some(crate::speculative::SpeculativeBatchPlan::new(width).without_target_hiddens())
     }
 
     fn speculative_observe(&self, _observation: crate::speculative::SpeculativeBatchObservation) {}
@@ -744,18 +746,25 @@ impl crate::speculative::driver::SpeculativePipelineExt for TitanGGUFPipeline {
             return Ok(None);
         };
         // a sequence that cannot draft gets an empty proposal: the driver runs it without one
-        let proposals = ctx
+        let mut drafts = ctx
             .sequences
             .iter()
             .zip(ctx.base_lens)
-            .map(|(seq, &pos_c)| {
-                let tokens = match seq.recurrent_state_idx() {
-                    Some(slot) => m.mtp_propose(slot, seq.get_toks(), pos_c)?.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                Ok(crate::speculative::SpeculativeProposal::new(tokens))
+            .map(|(seq, &pos_c)| match seq.recurrent_state_idx() {
+                Some(slot) => m.speculative_draft(slot, seq.get_toks(), pos_c, ctx.proposal_len),
+                None => Ok(Vec::new()),
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
+        // a batch verifies one width: shorter drafts are padded (a padded token counts only where it is the
+        // target's own next token, and the rows before it do not depend on it), so no sequence loses its draft
+        let width = drafts.iter().map(Vec::len).max().unwrap_or(0);
+        if ctx.sequences.len() > 1 {
+            for (d, seq) in drafts.iter_mut().zip(ctx.sequences) {
+                let fill = d.last().or(seq.get_toks().last()).copied().unwrap_or(0);
+                d.resize(width, fill);
+            }
+        }
+        let proposals = drafts.into_iter().map(crate::speculative::SpeculativeProposal::new).collect::<Vec<_>>();
         Ok(Some(crate::speculative::SpeculativeProposalBatch::new(proposals)))
     }
 

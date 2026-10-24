@@ -1491,6 +1491,7 @@ impl Engine {
                                     .all(|seq| seq.return_raw_logits == return_raw_logits),
                                 "All sequences must either return raw logits, or not."
                             );
+                            crate::speculative::staging::align_staged_widths(&mut scheduled.completion);
 
                             pipeline
                                 .step(
@@ -1892,6 +1893,9 @@ impl Engine {
                         let mut guards_mut =
                             guards.iter_mut().map(|seq| &mut **seq).collect::<Vec<_>>();
 
+                        if !is_prompt {
+                            crate::speculative::staging::align_staged_widths(&mut guards_mut);
+                        }
                         let staged_width =
                             crate::speculative::staging::staged_batch_width(&guards_mut);
                         let scheduler_visible_prompt_step =

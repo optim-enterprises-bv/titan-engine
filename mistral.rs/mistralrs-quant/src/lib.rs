@@ -197,7 +197,8 @@ pub use gguf::fast_mmq::{
     grouped as grouped_moe_mmq, grouped_from_glu_packed as grouped_moe_mmq_from_glu_packed,
     grouped_llama_from_glu_packed as grouped_moe_llama_mmq_from_glu_packed,
     grouped_from_glu_pair as grouped_moe_mmq_from_glu_pair, grouped_pair as grouped_moe_mmq_pair,
-    grouped_pair_packed as grouped_moe_mmq_pair_packed, supports as supports_mmq,
+    grouped_pair_packed as grouped_moe_mmq_pair_packed, plain as mmq_plain, plain_shared as mmq_plain_shared,
+    supports as supports_mmq,
 };
 #[cfg(feature = "cuda")]
 pub use gguf::titan_tiered::{QInput, TieredExperts};
@@ -231,9 +232,13 @@ impl TieredExperts {
 }
 pub use gguf::GgufMatMul;
 pub use gguf::{release_titan_state, titan_recover_oom};
+#[cfg(feature = "cuda")]
+pub use gguf::release_kernel_workspaces;
 pub use gguf::{
     GgufBindingMap, GgufBindingResolver, GgufTensorBackend, GgufTensorBinding, GgufWeightSource,
 };
+#[cfg(feature = "cuda")]
+pub use gguf::mmq_rows;
 #[cfg(feature = "cuda")]
 pub use gguf::mmvq_rows;
 pub use gguf::ptq1_0;

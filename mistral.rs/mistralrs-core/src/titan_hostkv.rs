@@ -179,35 +179,69 @@ pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) 
     };
     let qd = &qc.as_slice::<f32>()?[ql.start_offset()..];
     let per = h * s * HEAD_DIM;
-    let mut out = Vec::with_capacity(b * per);
     for (i, (k, v)) in kvs.iter().enumerate() {
         let (kb, kvh, kv_len, kd) = k.dims4()?;
         if kb != 1 || kd != HEAD_DIM || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
             candle_core::bail!("titan host kv: unsupported cache {:?} for batch row {i}", k.shape());
         }
-        out.extend(run_host(&qd[i * per..][..per], k, v, h, s, p.softmax_scale, pool_for(longest))?);
     }
+    let caches = kvs.iter().map(|(k, v)| HostCache::new(k, v)).collect::<Result<Vec<_>>>()?;
+    let pool = pool_for(longest);
+    pool.prewarming.store(false, std::sync::atomic::Ordering::Relaxed);
+    // every cache's units in one parallel pass: one after another, a short cache left most threads idle
+    let outs = pool.pool.install(|| {
+        let jobs = caches
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c.job(&qd[i * per..][..per], h, s, p.softmax_scale))
+            .collect::<Result<Vec<_>>>()?;
+        Ok::<_, candle_core::Error>(run_jobs(&jobs))
+    })?;
+    drop(caches);
     drop(qg);
-    Tensor::from_vec(out, (b, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
+    Tensor::from_vec(outs.concat(), (b, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
 }
 
 /// `run` of host queries `q` (h, s, 256) over the host F8E4M3 cache `k`, `v` (1, kvh, kv_len, 256).
 fn run_host(q: &[f32], k: &Tensor, v: &Tensor, h: usize, s: usize, scale: f32, p: &Pool) -> Result<Vec<f32>> {
-    if k.dtype() != DType::F8E4M3 || v.dtype() != DType::F8E4M3 {
-        candle_core::bail!("titan host kv: K/V must be F8E4M3, got {:?}", k.dtype());
-    }
-    let (_, kvh, kv_len, _) = k.dims4()?;
-    let (kg, kl) = k.storage_and_layout();
-    let (vg, vl) = v.storage_and_layout();
-    let (Storage::Cpu(kc), Storage::Cpu(vc)) = (&*kg, &*vg) else {
-        candle_core::bail!("titan host kv: K / V not on the CPU");
-    };
-    let kd = as_bytes(&kc.as_slice::<float8::F8E4M3>()?[kl.start_offset()..]);
-    let vd = as_bytes(&vc.as_slice::<float8::F8E4M3>()?[vl.start_offset()..]);
-    let shape = Shape { h, kvh, s, kv_len, k_hs: k.stride()[1], v_hs: v.stride()[1], scale };
+    let cache = HostCache::new(k, v)?;
     // release the pre-woken threads: they take this call's units within microseconds
     p.prewarming.store(false, std::sync::atomic::Ordering::Relaxed);
-    Ok(p.pool.install(|| run(q, kd, vd, &shape)))
+    p.pool.install(|| Ok(run_jobs(&[cache.job(q, h, s, scale)?]).pop().expect("one job")))
+}
+
+/// A host F8E4M3 cache `k`, `v` (1, kvh, kv_len, 256) held for reading.
+struct HostCache<'a> {
+    k: &'a Tensor,
+    v: &'a Tensor,
+    kg: std::sync::RwLockReadGuard<'a, Storage>,
+    vg: std::sync::RwLockReadGuard<'a, Storage>,
+}
+
+impl<'a> HostCache<'a> {
+    fn new(k: &'a Tensor, v: &'a Tensor) -> Result<Self> {
+        if k.dtype() != DType::F8E4M3 || v.dtype() != DType::F8E4M3 {
+            candle_core::bail!("titan host kv: K/V must be F8E4M3, got {:?}", k.dtype());
+        }
+        let (kg, _) = k.storage_and_layout();
+        let (vg, _) = v.storage_and_layout();
+        if !matches!((&*kg, &*vg), (Storage::Cpu(_), Storage::Cpu(_))) {
+            candle_core::bail!("titan host kv: K / V not on the CPU");
+        }
+        Ok(Self { k, v, kg, vg })
+    }
+
+    /// Queries `q` (h, s, 256) over this cache, split for the calling pool.
+    fn job<'q>(&'q self, q: &'q [f32], h: usize, s: usize, scale: f32) -> Result<Job<'q>> {
+        let (Storage::Cpu(kc), Storage::Cpu(vc)) = (&*self.kg, &*self.vg) else {
+            candle_core::bail!("titan host kv: K / V not on the CPU");
+        };
+        let (_, kvh, kv_len, _) = self.k.dims4()?;
+        let k = as_bytes(&kc.as_slice::<float8::F8E4M3>()?[self.k.layout().start_offset()..]);
+        let v = as_bytes(&vc.as_slice::<float8::F8E4M3>()?[self.v.layout().start_offset()..]);
+        let sh = Shape { h, kvh, s, kv_len, k_hs: self.k.stride()[1], v_hs: self.v.stride()[1], scale };
+        Ok(Job::new(q, k, v, sh))
+    }
 }
 
 fn as_bytes(x: &[float8::F8E4M3]) -> &[u8] {
@@ -246,18 +280,61 @@ fn query_groups(nq: usize, units: usize) -> usize {
     threads.div_ceil(units).clamp(1, nq.div_ceil(QB))
 }
 
+/// One cache's queries cut into units: (KV head, key chunk, query span).
+struct Job<'a> {
+    q: &'a [f32],
+    k: &'a [u8],
+    v: &'a [u8],
+    sh: Shape,
+    chunks: usize,
+    per: usize,
+    spans: Vec<(usize, usize)>,
+}
+
+impl<'a> Job<'a> {
+    fn new(q: &'a [f32], k: &'a [u8], v: &'a [u8], sh: Shape) -> Self {
+        let nq = sh.h / sh.kvh * sh.s;
+        let chunks = sh.kv_len.div_ceil(KEY_CHUNK);
+        let qg = query_groups(nq, sh.kvh * chunks);
+        let per = nq.div_ceil(qg).next_multiple_of(QB).min(nq);
+        let spans = (0..nq).step_by(per).map(|a| (a, (a + per).min(nq))).collect();
+        Self { q, k, v, sh, chunks, per, spans }
+    }
+
+    fn units(&self) -> usize {
+        self.sh.kvh * self.chunks * self.spans.len()
+    }
+
+    fn unit(&self, i: usize) -> Partial {
+        let ns = self.spans.len();
+        let (g, c, s) = (i / (self.chunks * ns), i / ns % self.chunks, i % ns);
+        unit(self.q, self.k, self.v, &self.sh, g, c * KEY_CHUNK, self.spans[s])
+    }
+}
+
+#[cfg(test)]
 fn run(q: &[f32], k: &[u8], v: &[u8], sh: &Shape) -> Vec<f32> {
-    let n_rep = sh.h / sh.kvh;
-    let nq = n_rep * sh.s;
-    let chunks = sh.kv_len.div_ceil(KEY_CHUNK);
-    let qg = query_groups(nq, sh.kvh * chunks);
-    let per = nq.div_ceil(qg).next_multiple_of(QB).min(nq);
-    let spans: Vec<(usize, usize)> = (0..nq).step_by(per).map(|a| (a, (a + per).min(nq))).collect();
-    let ns = spans.len();
-    let units: Vec<(usize, usize, usize)> =
-        (0..sh.kvh).flat_map(|g| (0..chunks).flat_map(move |c| (0..ns).map(move |s| (g, c, s)))).collect();
-    let parts: Vec<Partial> =
-        units.par_iter().map(|&(g, c, s)| unit(q, k, v, sh, g, c * KEY_CHUNK, spans[s])).collect();
+    run_jobs(&[Job::new(q, k, v, *sh)]).pop().expect("one job")
+}
+
+/// Every job's units in one parallel pass, then each job's chunks merged in key order.
+fn run_jobs(jobs: &[Job]) -> Vec<Vec<f32>> {
+    let units: Vec<(usize, usize)> = jobs.iter().enumerate().flat_map(|(j, job)| (0..job.units()).map(move |i| (j, i))).collect();
+    let parts: Vec<Partial> = units.par_iter().map(|&(j, i)| jobs[j].unit(i)).collect();
+    let mut at = 0;
+    jobs.iter()
+        .map(|job| {
+            let out = merge(job, &parts[at..at + job.units()]);
+            at += job.units();
+            out
+        })
+        .collect()
+}
+
+fn merge(job: &Job, parts: &[Partial]) -> Vec<f32> {
+    let (sh, chunks, per, ns) = (&job.sh, job.chunks, job.per, job.spans.len());
+    let spans = &job.spans;
+    let nq = sh.h / sh.kvh * sh.s;
     let mut out = vec![0f32; sh.h * sh.s * HEAD_DIM];
     out.par_chunks_mut(nq * HEAD_DIM).enumerate().for_each(|(g, out)| {
         for qi in 0..nq {
@@ -620,19 +697,22 @@ mod tests {
     #[test]
     #[ignore]
     fn bench() {
-        let (h, kvh, kv_len) = (24, 4, 57600);
+        let (h, kvh) = (24, 4);
+        let lens: Vec<usize> = std::env::var("BENCH_LENS").ok().map_or(vec![57600], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+        for kv_len in lens {
         let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|i| float8::F8E4M3::from_bits((i % 113) as u8)).collect();
         for s in [1usize, 2] {
             let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
             let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
             let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             let t0 = std::time::Instant::now();
-            for _ in 0..10 {
+            for _ in 0..50 {
                 let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             }
-            let ms = t0.elapsed().as_secs_f64() * 100.0;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / 50.0;
             let gb = (2 * kvh * kv_len * HEAD_DIM) as f64 / 1e9;
-            println!("rows {s}: {ms:.2} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, POOL.pool.current_num_threads());
+            println!("keys {kv_len} rows {s}: {ms:.3} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, POOL.pool.current_num_threads());
+        }
         }
     }
 
@@ -655,6 +735,61 @@ mod tests {
         let one = run(&q1, as_bytes(&kf), as_bytes(&vf), &sh1);
         for hd in 0..h {
             assert_eq!(&two[(hd * 2) * HEAD_DIM..][..HEAD_DIM], &one[hd * HEAD_DIM..][..HEAD_DIM]);
+        }
+    }
+    #[test]
+    #[ignore]
+    fn unit_bench() {
+        let (h, kvh, kv_len) = (24, 4, 4096);
+        let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|i| float8::F8E4M3::from_bits((i % 113) as u8)).collect();
+        for s in [1usize, 2] {
+            let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
+            let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
+            let nq = h / kvh * s;
+            let _ = unit(&q, as_bytes(&kf), as_bytes(&kf), &sh, 0, 0, (0, nq));
+            let t0 = std::time::Instant::now();
+            for _ in 0..200 {
+                std::hint::black_box(unit(&q, as_bytes(&kf), as_bytes(&kf), &sh, 0, 0, (0, nq)));
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+            let fma = (KEY_CHUNK * nq * HEAD_DIM * 2) as f64;
+            println!("unit rows {s}: {us:.1} us, {:.1} GFMA/s one thread", fma / us / 1e3);
+        }
+    }
+
+    #[test]
+    fn batched_jobs_match_each_alone() {
+        let (h, kvh) = (6, 2);
+        let mut seed = 11u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let lens = [300usize, 5000];
+        let data: Vec<(Vec<f32>, Vec<float8::F8E4M3>, Vec<float8::F8E4M3>)> = lens
+            .iter()
+            .map(|&n| {
+                let q = (0..h * 2 * HEAD_DIM).map(|_| rnd()).collect();
+                let k = (0..kvh * n * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
+                let v = (0..kvh * n * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
+                (q, k, v)
+            })
+            .collect();
+        let shape = |n: usize| Shape { h, kvh, s: 2, kv_len: n, k_hs: n * HEAD_DIM, v_hs: n * HEAD_DIM, scale: 0.0625 };
+        for alone_pool in [&*SMALL_POOL, &*POOL] {
+            for batch_pool in [&*SMALL_POOL, &*POOL] {
+                let alone: Vec<Vec<f32>> = data
+                    .iter()
+                    .zip(lens)
+                    .map(|((q, k, v), n)| alone_pool.pool.install(|| run(q, as_bytes(k), as_bytes(v), &shape(n))))
+                    .collect();
+                let batched = batch_pool.pool.install(|| {
+                    let jobs: Vec<Job> =
+                        data.iter().zip(lens).map(|((q, k, v), n)| Job::new(q, as_bytes(k), as_bytes(v), shape(n))).collect();
+                    run_jobs(&jobs)
+                });
+                assert_eq!(alone, batched);
+            }
         }
     }
 }

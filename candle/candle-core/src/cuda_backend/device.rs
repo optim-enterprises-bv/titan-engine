@@ -86,14 +86,35 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        self.stream.alloc::<T>(len).w()
+        match self.stream.alloc::<T>(len) {
+            Err(e) if is_oom(&e) && self.trim_pool_after_oom() => self.stream.alloc::<T>(len).w(),
+            r => r.w(),
+        }
     }
 
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        self.stream.alloc_zeros::<T>(len).w()
+        match self.stream.alloc_zeros::<T>(len) {
+            Err(e) if is_oom(&e) && self.trim_pool_after_oom() => self.stream.alloc_zeros::<T>(len).w(),
+            r => r.w(),
+        }
+    }
+
+    /// After an allocation ran out of memory: wait for the stream, then hand the stream-ordered pool's unused
+    /// reservations back to the driver, so the retry reserves fresh memory where the pool's free fragments were too
+    /// small for it (the device itself being full). Not while a graph is captured, where the stream cannot wait.
+    fn trim_pool_after_oom(&self) -> bool {
+        use cudarc::driver::sys;
+        if self.cuda_graph_capture_active() || self.stream.synchronize().is_err() {
+            return false;
+        }
+        let mut pool = std::ptr::null_mut();
+        unsafe {
+            sys::cuDeviceGetMemPool(&mut pool, self.stream.context().cu_device()) == sys::CUresult::CUDA_SUCCESS
+                && sys::cuMemPoolTrimTo(pool, 0) == sys::CUresult::CUDA_SUCCESS
+        }
     }
 
     pub fn enable_cuda_graph_htod_cache(&self) -> CudaGraphHtodCacheGuard {
@@ -235,6 +256,10 @@ impl CudaDevice {
             Ok(status) if status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
         )
     }
+}
+
+fn is_oom(e: &cudarc::driver::DriverError) -> bool {
+    e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
 }
 
 fn cuda_graph_htod_cache_enabled() -> bool {

@@ -273,7 +273,6 @@ where
     let mut hidden_rows = Vec::new();
 
     for (idx, (seq, logits)) in seqs.iter_mut().zip(logits.iter()).enumerate() {
-        let base_len = seq.get_toks().len();
         let return_logprobs = seq.return_logprobs();
         let eos_tok = seq.effective_eos_tokens(&general_metadata.eos_tok, disable_eos_stop);
         let anchor = sample_sequence(
@@ -292,6 +291,8 @@ where
         let sampled_token = anchor.token;
         finish_or_add_toks_to_seq(target, prefix_cacher, seq, anchor, eos_tok, true).await?;
         if !matches!(seq.getstate(), SequenceState::Done(_)) {
+            // the anchor's position: before it was added, a resumed prompt's tokens were only those after the resume point
+            let base_len = seq.get_toks().len() - 1;
             active_indices.push(idx);
             sampled_tokens.push(sampled_token);
             base_lens.push(base_len);
@@ -735,9 +736,11 @@ where
         );
     }
 
+    // a proposer may draft fewer than `proposal_len` tokens, the same number for every sequence of the batch
+    let width = proposal_batch.proposals.iter().map(|p| p.tokens.len()).max().unwrap_or(0).min(proposal_len);
     let mut bypassed = Vec::new();
     for (idx, proposal) in active_indices.iter().zip(proposal_batch.proposals) {
-        if proposal.tokens.len() == proposal_len {
+        if width > 0 && proposal.tokens.len() == width {
             seqs[*idx].set_staged_speculative(proposal.tokens, proposal.distribution);
         } else {
             bypassed.push(*seqs[*idx].id());

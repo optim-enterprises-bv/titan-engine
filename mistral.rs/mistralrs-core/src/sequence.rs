@@ -1241,6 +1241,18 @@ impl Sequence {
         self.staged_speculative_distribution.as_ref()
     }
 
+    /// Whether the staged draft can be cut short: host tokens without a draft distribution.
+    pub(crate) fn staged_speculative_truncatable(&self) -> bool {
+        matches!(self.staged_speculative_tokens, SpeculativeTokens::Host(_)) && self.staged_speculative_distribution.is_none()
+    }
+
+    /// Keep the first `len` tokens of a truncatable staged draft.
+    pub(crate) fn truncate_staged_speculative(&mut self, len: usize) {
+        if let SpeculativeTokens::Host(tokens) = &mut self.staged_speculative_tokens {
+            tokens.truncate(len);
+        }
+    }
+
     pub(crate) fn clear_staged_speculative_tokens(&mut self) {
         self.staged_speculative_tokens = SpeculativeTokens::default();
         self.staged_speculative_distribution = None;

@@ -16,6 +16,8 @@ pub use weight_source::{
     GgufBindingMap, GgufBindingResolver, GgufTensorBackend, GgufTensorBinding, GgufWeightSource,
 };
 #[cfg(feature = "cuda")]
+pub mod mmq_rows;
+#[cfg(feature = "cuda")]
 pub mod mmvq_rows;
 pub mod ptq1_0;
 #[cfg(any(feature = "cuda", all(test, target_arch = "x86_64")))]
@@ -58,6 +60,16 @@ pub fn release_titan_state() {
 
 #[cfg(not(feature = "cuda"))]
 pub fn release_titan_state() {}
+
+/// Free the kernels' grow-only workspaces (they regrow to the next call's size), e.g. before a prompt step on a
+/// device too full for the prompt's buffers next to them.
+#[cfg(feature = "cuda")]
+pub fn release_kernel_workspaces() {
+    fast_mmvq::release_workspaces();
+    fast_mmq::release_workspaces();
+    ptq1_0::release_workspaces();
+    cuda::release_workspaces();
+}
 
 /// CUDA OOM recovery: drop the staging ring and restart the doorbell (a failed step may have left a layer's
 /// publish unanswered); the model stays loaded.

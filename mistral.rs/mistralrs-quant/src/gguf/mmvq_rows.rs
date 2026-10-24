@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 use candle_core::{
     cuda::{
-        cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg},
+        cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg},
         CudaDevice, DeviceId, WrapErr,
     },
     quantized::{GgmlDType, QTensor},
@@ -92,43 +92,95 @@ pub fn supports(w: &QTensor, xs: &Tensor) -> bool {
 /// `w @ xs^T` for `xs` `[b, k]` or `[b, m, k]` with `b * m` rows in `1..=8`, each row exactly as
 /// `fast_mmvq::plain` computes it alone. Output dtype = input dtype.
 pub fn plain_rows(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
-    let Device::Cuda(dev) = w.device() else {
-        candle_core::bail!("mmvq_rows: weight must live on CUDA");
+    plain_rows_q8(w, &quantize_rows(xs)?)
+}
+
+/// Activation rows quantized to Q8_1 once, for every weight that multiplies them (`plain_rows_q8`).
+pub struct Q8Rows {
+    scratch: CudaSlice<u8>,
+    dims: Vec<usize>,
+    rows: usize,
+    k: usize,
+    dtype: DType,
+    dev: CudaDevice,
+}
+
+/// The Q8_1 quantization `plain_rows` runs before its matvec.
+pub fn quantize_rows(xs: &Tensor) -> Result<Q8Rows> {
+    let Device::Cuda(dev) = xs.device() else {
+        candle_core::bail!("mmvq_rows: input must live on CUDA");
     };
-    let (nrows, ncols) = w.shape().dims2()?;
     let (rows, k) = match xs.dims() {
         [b, k] => (*b, *k),
         [b, m, k] => (*b * *m, *k),
         other => candle_core::bail!("mmvq_rows: unexpected input rank {other:?}"),
     };
-    if k != ncols || rows == 0 || rows > MAX_ROWS {
-        candle_core::bail!("mmvq_rows: weight [{nrows}, {ncols}] vs input {:?}", xs.dims());
+    if rows == 0 || rows > MAX_ROWS {
+        candle_core::bail!("mmvq_rows: {rows} input rows");
     }
-    let fmt = fmt_index(w.dtype()).ok_or_else(|| candle_core::Error::msg(format!("mmvq_rows: unsupported {:?}", w.dtype())))?;
-    let (dst, quantize): (_, unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, i32, i32, i32, *mut std::ffi::c_void)) =
+    let quantize: unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, i32, i32, i32, *mut std::ffi::c_void) =
         match xs.dtype() {
-            DType::BF16 => ((0, "bf16"), ffi::launch_mmvq_gguf_quantize_q8_1_bf16),
-            DType::F16 => ((1, "f16"), ffi::launch_mmvq_gguf_quantize_q8_1_f16),
-            DType::F32 => ((2, "f32"), ffi::launch_mmvq_gguf_quantize_q8_1_f32),
+            DType::BF16 => ffi::launch_mmvq_gguf_quantize_q8_1_bf16,
+            DType::F16 => ffi::launch_mmvq_gguf_quantize_q8_1_f16,
+            DType::F32 => ffi::launch_mmvq_gguf_quantize_q8_1_f32,
             d => candle_core::bail!("mmvq_rows: input dtype {d:?}"),
         };
-    // Issue-bound single-row Q3_K: allow a different warp geometry (same dot, same order per warp).
-    let nw = if rows == 1 && w.dtype() == GgmlDType::Q3K { q3k_warps() } else { 0 };
-    let func = if nw > 0 { rows_func_w(&dev, fmt, dst, rows, nw)? } else { rows_func(&dev, fmt, dst, rows)? };
-
     let stream = dev.cuda_stream();
-    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
     let xs = xs.contiguous()?;
     let (xs_storage, xs_layout) = xs.storage_and_layout();
     let Storage::Cuda(xs_cuda) = &*xs_storage else {
         candle_core::bail!("mmvq_rows: input must live on CUDA");
     };
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-    let blocks_per_row = k_padded / Q8_1_BLOCK_SIZE;
-    let mut scratch = unsafe { dev.alloc::<u8>(rows * blocks_per_row * Q8_1_TYPE_SIZE)? };
+    let mut scratch = unsafe { dev.alloc::<u8>(rows * (k_padded / Q8_1_BLOCK_SIZE) * Q8_1_TYPE_SIZE)? };
+    macro_rules! quantize {
+        ($t:ty) => {{
+            let slice = xs_cuda.as_cuda_slice::<$t>()?;
+            let (x_ptr, _xg) = slice_ptr_on_stream(slice, xs_layout.start_offset(), &stream);
+            let (s_ptr, _sg) = slice_ptr_mut_on_stream(&mut scratch, 0, &stream);
+            unsafe {
+                quantize(
+                    x_ptr as *const std::ffi::c_void,
+                    s_ptr as *mut std::ffi::c_void,
+                    k as i32,
+                    k_padded as i32,
+                    rows as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                );
+            }
+        }};
+    }
+    match xs.dtype() {
+        DType::BF16 => quantize!(half::bf16),
+        DType::F16 => quantize!(half::f16),
+        _ => quantize!(f32),
+    }
+    Ok(Q8Rows { scratch, dims: xs.dims().to_vec(), rows, k, dtype: xs.dtype(), dev: dev.clone() })
+}
+
+/// `plain_rows` of `w` on rows `quantize_rows` already quantized. Output dtype = the rows' dtype.
+pub fn plain_rows_q8(w: &QTensor, x: &Q8Rows) -> Result<Tensor> {
+    let dev = &x.dev;
+    let (nrows, ncols) = w.shape().dims2()?;
+    let (rows, k) = (x.rows, x.k);
+    if k != ncols {
+        candle_core::bail!("mmvq_rows: weight [{nrows}, {ncols}] vs input {:?}", x.dims);
+    }
+    let fmt = fmt_index(w.dtype()).ok_or_else(|| candle_core::Error::msg(format!("mmvq_rows: unsupported {:?}", w.dtype())))?;
+    let dst = match x.dtype {
+        DType::BF16 => (0, "bf16"),
+        DType::F16 => (1, "f16"),
+        _ => (2, "f32"),
+    };
+    // Issue-bound single-row Q3_K: allow a different warp geometry (same dot, same order per warp).
+    let nw = if rows == 1 && w.dtype() == GgmlDType::Q3K { q3k_warps() } else { 0 };
+    let func = if nw > 0 { rows_func_w(dev, fmt, dst, rows, nw)? } else { rows_func(dev, fmt, dst, rows)? };
+
+    let stream = dev.cuda_stream();
+    let blocks_per_row = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING / Q8_1_BLOCK_SIZE;
     let (w_ptr, _w_guard) = w.device_ptr_with_guard(&stream)?;
     let out_shape = {
-        let mut d = xs.dims().to_vec();
+        let mut d = x.dims.clone();
         *d.last_mut().unwrap() = nrows;
         Shape::from(d)
     };
@@ -138,15 +190,10 @@ pub fn plain_rows(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
 
     macro_rules! run {
         ($t:ty) => {{
-            let slice = xs_cuda.as_cuda_slice::<$t>()?;
             let mut out = unsafe { dev.alloc::<$t>(nrows * rows)? };
             {
-                let (x_ptr, _xg) = slice_ptr_on_stream(slice, xs_layout.start_offset(), &stream);
-                let (s_ptr, _sg) = slice_ptr_mut_on_stream(&mut scratch, 0, &stream);
+                let (s_ptr, _sg) = slice_ptr_on_stream(&x.scratch, 0, &stream);
                 let (o_ptr, _og) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
-                unsafe {
-                    quantize(x_ptr as *const std::ffi::c_void, s_ptr as *mut std::ffi::c_void, k as i32, k_padded as i32, rows as i32, stream_ptr);
-                }
                 let mut b = stream.launch_builder(&func);
                 let (w_addr, s_addr, o_addr) = (w_ptr as u64, s_ptr as u64, o_ptr as u64);
                 b.arg(&w_addr).arg(&s_addr).arg(&o_addr).arg(&ncols_x).arg(&nrows_x).arg(&stride_col_y).arg(&stride_col_dst);
@@ -155,7 +202,7 @@ pub fn plain_rows(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
             Ok(Tensor::from((Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())), out_shape)))
         }};
     }
-    match xs.dtype() {
+    match x.dtype {
         DType::BF16 => run!(half::bf16),
         DType::F16 => run!(half::f16),
         _ => run!(f32),

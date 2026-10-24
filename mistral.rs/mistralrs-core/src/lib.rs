@@ -92,6 +92,7 @@ mod titan_admit;
 mod titan_faults;
 mod titan_gdn;
 mod titan_hostkv;
+mod titan_lookup;
 #[cfg(feature = "oxide")]
 mod titan_oxide;
 mod titan_swap;
