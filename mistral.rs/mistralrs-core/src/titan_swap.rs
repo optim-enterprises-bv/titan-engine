@@ -131,14 +131,19 @@ const PROMPT_TRIM_BELOW: usize = 1 << 30;
 /// steps leave the pool holding fragments (~400 MiB on the dense 27B with lookup verifications) that a prompt chunk's
 /// larger buffers cannot reuse, and with ~40 MiB left on the device its new reservation failed.
 pub(crate) fn trim_before_prompt(device: &candle_core::Device) {
+    if device_free(device) < PROMPT_TRIM_BELOW {
+        release_workspaces_and_trim(device);
+    }
+}
+
+/// Free the kernels' cached workspaces and trim the pools (they regrow on the next launch that needs them).
+pub(crate) fn release_workspaces_and_trim(device: &candle_core::Device) {
     #[cfg(feature = "cuda")]
     if let candle_core::Device::Cuda(dev) = device {
-        if device_free(device) < PROMPT_TRIM_BELOW {
-            mistralrs_quant::release_kernel_workspaces();
-            #[cfg(feature = "oxide")]
-            crate::titan_oxide::release_workspaces();
-            trim_cuda(dev);
-        }
+        mistralrs_quant::release_kernel_workspaces();
+        #[cfg(feature = "oxide")]
+        crate::titan_oxide::release_workspaces();
+        trim_cuda(dev);
     }
     #[cfg(not(feature = "cuda"))]
     let _ = device;

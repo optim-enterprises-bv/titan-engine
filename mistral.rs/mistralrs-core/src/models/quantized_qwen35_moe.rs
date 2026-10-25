@@ -3386,9 +3386,27 @@ impl ModelWeights {
             h_prev0
         };
         let mut kv = st.mtp_kv.take().expect("mtp kv");
-        let res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+        let len0 = kv.current_seq_len();
+        let mut res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+        // the head runs last in a prompt step, at its fullest (most fragmented) pool: retry once on freed workspaces,
+        // then give up only this sequence's drafts (until its next prompt), not the request, whose trunk output is done
+        if res.as_ref().is_err_and(crate::titan_swap::is_oom) {
+            kv.set_len(len0)?;
+            crate::titan_swap::release_workspaces_and_trim(&self.device);
+            res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+            if res.is_ok() {
+                tracing::info!("titan mtp: draft head caught up at {start} ({n} rows) after releasing workspaces");
+            }
+        }
         st.mtp_kv = Some(kv);
-        res?;
+        if let Err(e) = res {
+            if !crate::titan_swap::is_oom(&e) {
+                return Err(e);
+            }
+            tracing::warn!("titan mtp: out of memory catching the draft head up at {start} ({n} rows); drafts off for this sequence");
+            st.mtp_valid = false;
+            return Ok(());
+        }
         st.mtp_len = start + n;
         st.pending = Some((start + n - 1, hidden.narrow(0, n - 1, 1)?));
         Ok(())
