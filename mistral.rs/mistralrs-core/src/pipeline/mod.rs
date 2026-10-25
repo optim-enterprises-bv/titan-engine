@@ -2008,6 +2008,9 @@ pub trait Pipeline:
         logger: &IntervalLogger,
     ) -> Result<Duration, candle_core::Error> {
         let memlog = is_prompt && crate::utils::memory_usage::devmap_memlog_enabled();
+        if is_prompt {
+            crate::titan_swap::trim_before_prompt(&self.device());
+        }
         let tokens = input_seqs.iter().map(|s| s.len()).sum::<usize>();
         if memlog {
             crate::utils::memory_usage::devmap_memlog(&self.device(), &format!("before prompt step ({tokens} tokens)"));

@@ -228,9 +228,10 @@ impl GatedDeltaNet {
         &self,
         x: &Tensor,
         cache: &mut GdnLayerCache,
-        lin: &super::projection::LinearFn<'_>,
+        mm: &super::projection::DecodeMatmuls,
         on_row: &mut dyn FnMut(usize, &GdnLayerCache, DecodeRowInputs) -> Result<()>,
     ) -> Result<Tensor> {
+        let lin = &mm.lin;
         let (batch_size, seq_len, _) = x.dims3()?;
         let dtype = x.dtype();
         let d = &self.dims;
@@ -246,21 +247,19 @@ impl GatedDeltaNet {
                 let f32_in = x.dtype() != DType::F32
                     && [in_proj_b, in_proj_a].iter().all(|w| w.quantized_act_type() == Some(DType::F32));
                 let xs = if f32_in { x.to_dtype(DType::F32)? } else { x.clone() };
-                // one sequence's row per call: the decode step's kernel at its shape
-                let row = |w: &Arc<dyn QuantMethod>, r: usize| -> Result<Tensor> {
-                    let ys = (0..batch_size)
-                        .map(|b| w.forward(&xs.narrow(0, b, 1)?.narrow(1, r, 1)?))
-                        .collect::<Result<Vec<_>>>()?;
-                    let y = Tensor::cat(&ys, 0)?;
-                    let y = if f32_in { y.to_dtype(dtype)? } else { y };
-                    y.reshape((batch_size, 1, d.num_v_heads))
+                let [qkv, z] = <[Tensor; 2]>::try_from((mm.many)(&[in_proj_qkv, in_proj_z], x)?)
+                    .map_err(|_| candle_core::Error::msg("GDN decode rows: two input projections expected"))?;
+                // every row as its decode step's kernel computes it alone
+                let [b, a] = <[Tensor; 2]>::try_from((mm.lone)(&[in_proj_b, in_proj_a], &xs)?)
+                    .map_err(|_| candle_core::Error::msg("GDN decode rows: two gate projections expected"))?;
+                let gate = |y: Tensor, r: usize| -> Result<Tensor> {
+                    let y = y.reshape((batch_size, seq_len, d.num_v_heads))?.narrow(1, r, 1)?;
+                    if f32_in { y.to_dtype(dtype) } else { Ok(y) }
                 };
                 (
-                    lin(in_proj_qkv, x)?.reshape((batch_size, seq_len, d.conv_dim))?,
-                    lin(in_proj_z, x)?.reshape((batch_size, seq_len, d.num_v_heads, d.head_v_dim))?,
-                    (0..seq_len)
-                        .map(|r| Ok((row(in_proj_b, r)?, row(in_proj_a, r)?)))
-                        .collect::<Result<Vec<_>>>()?,
+                    qkv.reshape((batch_size, seq_len, d.conv_dim))?,
+                    z.reshape((batch_size, seq_len, d.num_v_heads, d.head_v_dim))?,
+                    (0..seq_len).map(|r| Ok((gate(b.clone(), r)?, gate(a.clone(), r)?))).collect::<Result<Vec<_>>>()?,
                 )
             }
             GdnInputProjection::Grouped { .. } => {

@@ -34,6 +34,20 @@ fn staged_batch_state_from_widths(widths: impl IntoIterator<Item = usize>) -> St
     width.map_or(StagedBatchState::None, StagedBatchState::Homogeneous)
 }
 
+/// Cut every staged draft to the batch's shortest when all hold one (a lone sequence's prompt step drafts wider than
+/// the batch it joins), so the batch verifies them rather than dropping every draft.
+pub(crate) fn align_staged_widths(seqs: &mut [&mut Sequence]) {
+    if staged_batch_state(seqs) != StagedBatchState::Mixed {
+        return;
+    }
+    let common = seqs.iter().map(|seq| seq.active_staged_speculative_len()).min().unwrap_or(0);
+    if common > 0 && seqs.iter().all(|seq| seq.staged_speculative_truncatable()) {
+        for seq in seqs.iter_mut() {
+            seq.truncate_staged_speculative(common);
+        }
+    }
+}
+
 pub(crate) fn staged_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
     match staged_batch_state(seqs) {
         StagedBatchState::Homogeneous(width) => Some(width),

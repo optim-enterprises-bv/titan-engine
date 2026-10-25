@@ -19,6 +19,14 @@ pub enum GdnInputProjection {
 /// How a projection weight is applied to activations (plain `forward`, or a row-exact batched matmul).
 pub type LinearFn<'a> = dyn Fn(&Arc<dyn QuantMethod>, &Tensor) -> Result<Tensor> + 'a;
 
+/// The matmuls of `GatedDeltaNet::forward_decode_rows`: `many` shares the rows' cast and quantization across weights,
+/// `lone` computes each row as its own one-token decode step does (the `b` and `a` gates).
+pub struct DecodeMatmuls {
+    pub lin: fn(&Arc<dyn QuantMethod>, &Tensor) -> Result<Tensor>,
+    pub many: fn(&[&Arc<dyn QuantMethod>], &Tensor) -> Result<Vec<Tensor>>,
+    pub lone: fn(&[&Arc<dyn QuantMethod>], &Tensor) -> Result<Vec<Tensor>>,
+}
+
 impl GdnInputProjection {
     pub fn forward(
         &self,

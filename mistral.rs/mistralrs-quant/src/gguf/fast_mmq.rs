@@ -877,24 +877,38 @@ impl DenseMmqRun<'_> {
             let mut out = unsafe { self.dev.alloc::<T>(nrows * self.batch_size)? };
             {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, self.stream);
-                unsafe {
-                    (self.launcher)(
-                        self.fixup_ptr,
-                        weight_ptr as *const std::ffi::c_void,
-                        self.scratch_ptr as *const std::ffi::c_void,
-                        out_ptr as *mut std::ffi::c_void,
-                        self.k as i64,
-                        nrows as i64,
-                        self.batch_size as i64,
-                        (self.k / self.qk) as i64,
-                        nrows as i64,
-                        self.device_info.cc,
-                        self.device_info.nsm,
-                        self.device_info.smpbo,
-                        self.device_info.warp_size,
-                        self.type_x,
-                        stream_ptr,
-                    );
+                let exact = super::mmq_rows::try_launch(
+                    weight,
+                    weight_ptr as u64,
+                    self.scratch_ptr as u64,
+                    out_ptr as u64,
+                    self.batch_size,
+                    self.type_x,
+                    self.device_info.nsm as usize,
+                    self.device_info.smpbo as usize,
+                    self.dev,
+                    self.stream,
+                )?;
+                if !exact {
+                    unsafe {
+                        (self.launcher)(
+                            self.fixup_ptr,
+                            weight_ptr as *const std::ffi::c_void,
+                            self.scratch_ptr as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                            self.k as i64,
+                            nrows as i64,
+                            self.batch_size as i64,
+                            (self.k / self.qk) as i64,
+                            nrows as i64,
+                            self.device_info.cc,
+                            self.device_info.nsm,
+                            self.device_info.smpbo,
+                            self.device_info.warp_size,
+                            self.type_x,
+                            stream_ptr,
+                        );
+                    }
                 }
             }
             outputs.push(wrap_cuda_output(
@@ -983,6 +997,11 @@ impl DenseGluDownRun<'_> {
             output_shape(self.gate, nrows),
         ))
     }
+}
+
+/// `plain` of several same-dtype weights over the same rows, the rows quantized once for all of them.
+pub fn plain_shared(weights: &[&QTensor], xs: &Tensor) -> Result<Vec<Tensor>> {
+    shared_lhs(weights, xs)
 }
 
 fn shared_lhs(weights: &[&QTensor], xs: &Tensor) -> Result<Vec<Tensor>> {

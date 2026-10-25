@@ -4097,6 +4097,27 @@ impl HybridCache {
         Ok(snapshots)
     }
 
+    /// titan: [`Self::titan_snapshot_physical`] copied to the host one layer at a time, so the device holds one
+    /// layer's copy (~3 MiB on the dense 27B) instead of every layer's (~150 MiB) at once.
+    pub fn titan_snapshot_physical_host(&self, physical_slot: usize) -> Result<Vec<RecurrentStateSnapshot>> {
+        let physical_slot = u32::try_from(physical_slot).map_err(|_| {
+            candle_core::Error::msg(format!("recurrent physical slot {physical_slot} exceeds u32"))
+        })?;
+        let cpu = candle_core::Device::Cpu;
+        let mut snapshots = Vec::new();
+        for cache in &self.caches {
+            if let HybridLayerCache::Recurrent(pool) = cache {
+                let idx_tensor = Tensor::from_vec(vec![physical_slot], (1,), pool.device())?;
+                snapshots.push(RecurrentStateSnapshot {
+                    conv_state: pool.gather_conv_state(&idx_tensor)?.to_device(&cpu)?,
+                    recurrent_state: pool.gather_recurrent_state(&idx_tensor)?.to_device(&cpu)?,
+                    state_layout: pool.state_layout(),
+                });
+            }
+        }
+        Ok(snapshots)
+    }
+
     /// titan: write `snapshots` (from [`Self::titan_snapshot_physical`]) into the pool rows of
     /// logical slot `slot_idx` (a sequence's `recurrent_state_idx`), e.g. to resume a hybrid
     /// prefix-cache hit right before the prompt step. The slot keeps its owner.

@@ -124,6 +124,31 @@ pub fn release_device_memory(device: &candle_core::Device) {
     }
 }
 
+/// Free VRAM below which a prompt step first trims the stream-ordered pool.
+const PROMPT_TRIM_BELOW: usize = 1 << 30;
+
+/// Before a prompt step on a nearly full device: hand the pool's unused reservations back to the driver. Decode
+/// steps leave the pool holding fragments (~400 MiB on the dense 27B with lookup verifications) that a prompt chunk's
+/// larger buffers cannot reuse, and with ~40 MiB left on the device its new reservation failed.
+pub(crate) fn trim_before_prompt(device: &candle_core::Device) {
+    if device_free(device) < PROMPT_TRIM_BELOW {
+        release_workspaces_and_trim(device);
+    }
+}
+
+/// Free the kernels' cached workspaces and trim the pools (they regrow on the next launch that needs them).
+pub(crate) fn release_workspaces_and_trim(device: &candle_core::Device) {
+    #[cfg(feature = "cuda")]
+    if let candle_core::Device::Cuda(dev) = device {
+        mistralrs_quant::release_kernel_workspaces();
+        #[cfg(feature = "oxide")]
+        crate::titan_oxide::release_workspaces();
+        trim_cuda(dev);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+}
+
 /// Whether a failed step ran out of device memory.
 pub(crate) fn is_oom(e: &impl std::fmt::Debug) -> bool {
     let s = format!("{e:?}");

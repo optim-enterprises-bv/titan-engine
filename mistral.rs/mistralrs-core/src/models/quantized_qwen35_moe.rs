@@ -14,11 +14,11 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfi
 use super::quantized_qwen3_moe::{load_experts, Experts};
 use crate::attention::{AttentionMask, SdpaParams};
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
-use crate::titan_gdn::{DecodeRowInputs, GatedDeltaNet, GdnConfig, GdnLayerCache, GdnStateStep};
+use crate::titan_gdn::{DecodeMatmuls, DecodeRowInputs, GatedDeltaNet, GdnConfig, GdnLayerCache, GdnStateStep};
 use crate::gguf::Content;
 use crate::kv_cache::{
     HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, HybridPrefixEntry,
-    HybridPrefixPoint, RecurrentLayerConfig, RecurrentStatePool, RecurrentStateSnapshot, RecurrentStateSpec,
+    HybridPrefixPoint, RecurrentLayerConfig, RecurrentStatePool, RecurrentStateSpec,
     SingleCache,
 };
 use crate::layers::{CausalMaskConfig, CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
@@ -548,19 +548,17 @@ impl FullAttention {
         })
     }
 
-    /// The rows `x` `(1, n, hidden)` of a verification at positions `start..start + n`, each row
+    /// The rows `x` `(1, n, hidden)` of a verification at RoPE `positions` (`start..start + n`), each row
     /// bit-identical to its decode step: batched row-exact projections and RoPE, then one decode-shaped
     /// attention per row over the cache prefix it would have seen.
     fn forward_decode_rows(
         &self,
         x: &Tensor,
         kv_cache: &mut KvCache,
-        start: usize,
+        positions: &Tensor,
         flash_params: Option<&crate::pipeline::text_models_inputs_processor::FlashParams>,
     ) -> Result<Tensor> {
-        let n = x.dim(1)?;
-        let positions = crate::pipeline::text_positions_tensor(&[start], n, x.device())?;
-        let (q, k, v, gate) = self.decode_rows_qkv(x, &positions)?;
+        let (q, k, v, gate) = self.decode_rows_qkv(x, positions)?;
         let y = self.decode_rows_attend(&q, &k, &v, kv_cache, flash_params)?;
         self.decode_rows_out(&y, &gate, x.dtype())
     }
@@ -568,9 +566,8 @@ impl FullAttention {
     /// `forward_decode_rows` up to the attention: `(q, k, v, gate)` at RoPE `positions`.
     fn decode_rows_qkv(&self, x: &Tensor, positions: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let (b_sz, n, _) = x.dims3()?;
-        let q_gate = lin_rows(&self.wq, x)?;
-        let k = lin_rows(&self.wk, x)?;
-        let v = lin_rows(&self.wv, x)?;
+        let [q_gate, k, v] = <[Tensor; 3]>::try_from(lin_rows_many(&[&self.wq, &self.wk, &self.wv], x)?)
+            .map_err(|_| candle_core::Error::msg("qwen35: three projections expected"))?;
         let q_gate = q_gate.reshape((b_sz, n, self.n_head, self.head_dim * 2))?;
         let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
         let gate = q_gate
@@ -650,13 +647,13 @@ impl FullAttention {
         Tensor::cat(&ys, 1)
     }
 
-    /// `forward_decode_rows` of a batch whose sequences keep their own host caches `kvs` and start at `starts`: the
+    /// `forward_decode_rows` of a batch whose sequences keep their own host caches `kvs`, at RoPE `positions`: the
     /// projections run batched (row-exact), then each sequence gets its batch-1 step's RoPE, append and attention.
     fn forward_decode_rows_many(
         &self,
         x: &Tensor,
         kvs: &mut [&mut KvCache],
-        starts: &[usize],
+        positions: &[Tensor],
         lin: LinRows,
     ) -> Result<Tensor> {
         let (b_sz, n, _) = x.dims3()?;
@@ -672,8 +669,7 @@ impl FullAttention {
         let v = v.reshape((b_sz, n, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
         let mut qs = Vec::with_capacity(b_sz);
         let mut ks = Vec::with_capacity(b_sz);
-        for (s, &start) in starts.iter().enumerate() {
-            let positions = crate::pipeline::text_positions_tensor(&[start], n, x.device())?;
+        for (s, positions) in positions.iter().enumerate() {
             let (q, k) = self.rotary.forward_qk_norm(
                 &q.narrow(0, s, 1)?,
                 &k.narrow(0, s, 1)?,
@@ -681,7 +677,7 @@ impl FullAttention {
                 self.k_norm.weight(),
                 self.q_norm.eps(),
                 self.k_norm.eps(),
-                &positions,
+                positions,
             )?;
             qs.push(q.to_dtype(self.dtype)?);
             ks.push(k.to_dtype(self.dtype)?);
@@ -1087,25 +1083,38 @@ impl DenseFfn {
         }
         let narrowed = narrow_matvec(xs);
         let xq = narrowed.as_ref().unwrap_or(xs);
-        let g = self.gate.forward(xq)?.to_dtype(xs.dtype())?;
-        let u = self.up.forward(xq)?.to_dtype(xs.dtype())?;
-        let h = crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?;
-        let hq = narrow_matvec(&h);
-        self.down
-            .forward(hq.as_ref().unwrap_or(&h))?
-            .to_dtype(xs.dtype())
+        let g = self.gate.forward(xq)?;
+        let u = self.up.forward(xq)?;
+        // the gating widens to xs's dtype a block of rows at a time: a prompt chunk's whole f32 gate and up
+        // (~36 MiB each at 512 rows) did not always fit the device next to the weights
+        let k = g.dim(D::Minus1)?;
+        let rows = g.elem_count() / k;
+        let (g, u) = (g.reshape((rows, k))?, u.reshape((rows, k))?);
+        let gated = (0..rows)
+            .step_by(FFN_GATE_ROWS)
+            .map(|r0| {
+                let n = FFN_GATE_ROWS.min(rows - r0);
+                let g = g.narrow(0, r0, n)?.to_dtype(xs.dtype())?;
+                let u = u.narrow(0, r0, n)?.to_dtype(xs.dtype())?;
+                let h = crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?;
+                Ok(narrow_matvec(&h).unwrap_or(h))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut dims = xs.dims().to_vec();
+        *dims.last_mut().unwrap() = k;
+        let h = Tensor::cat(&gated, 0)?.reshape(dims)?;
+        self.down.forward(&h)?.to_dtype(xs.dtype())
     }
 
-    /// Rows of a speculative verification. The three matvecs run through `lin_rows`, i.e. the
-    /// row-exact rows kernel (one launch for all rows, weights read once, every row bit-identical
-    /// to its decode step); the SiLU gating is elementwise and therefore row-independent. The old
-    /// path called `forward` once per row - N full FFN passes, which is why a 2-row verify step
-    /// cost 1.9x a decode step instead of ~1.1x.
+    /// Rows of a speculative verification. The three matmuls run through `lin_rows` (one launch for all rows, each
+    /// row's result independent of how many rows share it); the SiLU gating is elementwise and therefore
+    /// row-independent.
     fn forward_rows(&self, xs: &Tensor) -> Result<Tensor> {
         let narrowed = narrow_matvec(xs);
         let xq = narrowed.as_ref().unwrap_or(xs);
-        let g = lin_rows(&self.gate, xq)?.to_dtype(xs.dtype())?;
-        let u = lin_rows(&self.up, xq)?.to_dtype(xs.dtype())?;
+        let [g, u] = <[Tensor; 2]>::try_from(lin_rows_many(&[&self.gate, &self.up], xq)?)
+            .map_err(|_| candle_core::Error::msg("qwen35: two FFN projections expected"))?;
+        let (g, u) = (g.to_dtype(xs.dtype())?, u.to_dtype(xs.dtype())?);
         let h = crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?;
         let hq = narrow_matvec(&h);
         lin_rows(&self.down, hq.as_ref().unwrap_or(&h))?.to_dtype(xs.dtype())
@@ -1618,6 +1627,19 @@ fn mtp_verify_rowwise() -> bool {
 /// its bf16 twin costs ~24us, and 48 of 64 layers here keep an f32 residual (the
 /// GDN mixer returns f32). The residual add and the norms stay f32; only the
 /// matvec input is narrowed. `=0` restores the old path.
+/// Rows per block of the prompt FFN's gating (`DenseFfn::forward`).
+const FFN_GATE_ROWS: usize = 128;
+
+/// Most rows (a batch's verifications) `lin_rows_as` takes through MMQ, `MAX_ROWS` per launch.
+const VERIFY_MMQ_MAX_ROWS: usize = 64;
+
+/// Verification rows through MMQ (`TITAN_VERIFY_MMQ`, default on): one x8 tile up to 8 rows, so a row's result does
+/// not depend on how many rows share the launch, and 8 rows cost ~1.5x one where the rows kernels cost ~5x.
+fn verify_mmq() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_VERIFY_MMQ").map(|v| v != "0").unwrap_or(true))
+}
+
 fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
     if mistralrs_quant::titan_cfg::var("TITAN_DENSE_BF16_MATVEC").is_ok_and(|v| v == "0") {
         return None;
@@ -1639,6 +1661,147 @@ fn lin_rows(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
 /// not narrowed to BF16, so each equals `w.forward` of it alone as `lin_rows` of one row does.
 fn lin_rows_decode(w: &Arc<dyn QuantMethod>, x: &Tensor) -> Result<Tensor> {
     lin_rows_as(w, x, false)
+}
+
+/// `lin_rows_as` of several weights over the same rows: the BF16 cast and the Q8_1 quantization of the rows run once
+/// for all of them, each product the one `lin_rows_as` gives that weight alone.
+fn lin_rows_shared(ws: &[&Arc<dyn QuantMethod>], x: &Tensor, narrow: bool) -> Result<Vec<Tensor>> {
+    #[cfg(feature = "cuda")]
+    if narrow && verify_mmq() {
+        if let Some(ys) = lin_rows_mmq_shared(ws, x)? {
+            return Ok(ys);
+        }
+    }
+    match lin_rows_q8(ws, x, narrow)? {
+        Some(ys) => Ok(ys),
+        None => ws.iter().map(|w| lin_rows_as(w, x, narrow)).collect(),
+    }
+}
+
+/// `lin_rows_as`'s MMQ products of several weights, each dtype's weights sharing one quantization of the rows per
+/// launch of at most `MAX_ROWS`; `None` when a weight or the row count is outside MMQ.
+#[cfg(feature = "cuda")]
+fn lin_rows_mmq_shared(ws: &[&Arc<dyn QuantMethod>], x: &Tensor) -> Result<Option<Vec<Tensor>>> {
+    let k = x.dim(D::Minus1)?;
+    let rows = x.elem_count() / k;
+    if rows <= 1 || rows > VERIFY_MMQ_MAX_ROWS {
+        return Ok(None);
+    }
+    let Some(qs) = ws
+        .iter()
+        .map(|w| {
+            w.get_qtensor()
+                .filter(|q| !w.has_bias() && q.device().is_cuda() && mistralrs_quant::supports_mmq(q.dtype()))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let xn = narrow_matvec(x).unwrap_or_else(|| x.clone()).reshape((rows, k))?;
+    let mut parts: Vec<Vec<Tensor>> = vec![Vec::new(); qs.len()];
+    for r0 in (0..rows).step_by(mistralrs_quant::mmvq_rows::MAX_ROWS) {
+        let xc = xn.narrow(0, r0, mistralrs_quant::mmvq_rows::MAX_ROWS.min(rows - r0))?;
+        let mut done = vec![false; qs.len()];
+        for i in 0..qs.len() {
+            if done[i] {
+                continue;
+            }
+            let group: Vec<usize> = (i..qs.len()).filter(|&j| !done[j] && qs[j].dtype() == qs[i].dtype()).collect();
+            let ys = mistralrs_quant::mmq_plain_shared(&group.iter().map(|&j| &*qs[j]).collect::<Vec<_>>(), &xc)?;
+            for (j, y) in group.into_iter().zip(ys) {
+                done[j] = true;
+                parts[j].push(y);
+            }
+        }
+    }
+    parts
+        .into_iter()
+        .map(|p| {
+            let mut dims = x.dims().to_vec();
+            *dims.last_mut().unwrap() = p[0].dim(D::Minus1)?;
+            Tensor::cat(&p, 0)?.reshape(dims)?.to_dtype(x.dtype())
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// The rows-kernel products of `lin_rows_shared`, `None` when a weight or the row count is outside them.
+fn lin_rows_q8(ws: &[&Arc<dyn QuantMethod>], x: &Tensor, narrow: bool) -> Result<Option<Vec<Tensor>>> {
+    #[cfg(feature = "cuda")]
+    {
+        let k = x.dim(D::Minus1)?;
+        let rows = x.elem_count() / k;
+        let qs: Option<Vec<_>> = ws
+            .iter()
+            .map(|w| {
+                w.get_qtensor().filter(|q| {
+                    !w.has_bias() && rows_kernel_format(q.dtype()) && mistralrs_quant::mmvq_rows::supports(q, x)
+                })
+            })
+            .collect();
+        if let (true, Some(qs)) = (rows > 1 && rows <= mistralrs_quant::mmvq_rows::MAX_ROWS && !(narrow && verify_mmq()), qs) {
+            let narrowed = narrow_matvec(x).filter(|_| narrow);
+            let q8 = mistralrs_quant::mmvq_rows::quantize_rows(narrowed.as_ref().unwrap_or(x))?;
+            return qs
+                .iter()
+                .map(|q| {
+                    let y = mistralrs_quant::mmvq_rows::plain_rows_q8(q, &q8)?;
+                    if narrowed.is_some() { y.to_dtype(x.dtype()) } else { Ok(y) }
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Each `[b, n, k]` row through `w.forward` alone, as its own one-token decode step: the rows kernels where they
+/// cover the weights (per row the same product), otherwise one call per row.
+fn lin_rows_lone(ws: &[&Arc<dyn QuantMethod>], x: &Tensor) -> Result<Vec<Tensor>> {
+    if let Some(ys) = lin_rows_q8(ws, x, false)? {
+        return Ok(ys);
+    }
+    let (b, n, _) = x.dims3()?;
+    ws.iter()
+        .map(|w| {
+            let ys = (0..b)
+                .flat_map(|i| (0..n).map(move |r| (i, r)))
+                .map(|(i, r)| w.forward(&x.narrow(0, i, 1)?.narrow(1, r, 1)?))
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::cat(&ys, 1)?.reshape((b, n, ()))
+        })
+        .collect()
+}
+
+fn lin_rows_many(ws: &[&Arc<dyn QuantMethod>], x: &Tensor) -> Result<Vec<Tensor>> {
+    lin_rows_shared(ws, x, true)
+}
+
+fn lin_rows_many_decode(ws: &[&Arc<dyn QuantMethod>], x: &Tensor) -> Result<Vec<Tensor>> {
+    lin_rows_shared(ws, x, false)
+}
+
+/// The GDN matmuls of a verification (`lin_rows`), and of a batch of one-token decodes (`lin_rows_decode`).
+static VERIFY_MATMULS: DecodeMatmuls = DecodeMatmuls { lin: lin_rows, many: lin_rows_many, lone: lin_rows_lone };
+static DECODE_MATMULS: DecodeMatmuls =
+    DecodeMatmuls { lin: lin_rows_decode, many: lin_rows_many_decode, lone: lin_rows_lone };
+
+/// Weight formats the rows kernels cover.
+#[cfg(feature = "cuda")]
+fn rows_kernel_format(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    )
 }
 
 fn lin_rows_as(w: &Arc<dyn QuantMethod>, x: &Tensor, narrow: bool) -> Result<Tensor> {
@@ -1666,6 +1829,20 @@ fn lin_rows_as(w: &Arc<dyn QuantMethod>, x: &Tensor, narrow: bool) -> Result<Ten
     }
     if rows <= PTQ1_0_ROWS && w.get_qtensor().is_some_and(|q| q.dtype() == GgmlDType::PTQ1_0) {
         return w.forward(x);
+    }
+    #[cfg(feature = "cuda")]
+    if narrow && rows <= VERIFY_MMQ_MAX_ROWS && verify_mmq() && !w.has_bias() {
+        if let Some(q) = w.get_qtensor().filter(|q| q.device().is_cuda() && mistralrs_quant::supports_mmq(q.dtype())) {
+            let xn = narrow_matvec(x).unwrap_or_else(|| x.clone()).reshape((rows, k))?;
+            // launches of at most one x8 tile: a wider one picks a wider tile, whose rows round differently
+            let ys = (0..rows)
+                .step_by(mistralrs_quant::mmvq_rows::MAX_ROWS)
+                .map(|r0| mistralrs_quant::mmq_plain(&q, &xn.narrow(0, r0, mistralrs_quant::mmvq_rows::MAX_ROWS.min(rows - r0))?))
+                .collect::<Result<Vec<_>>>()?;
+            let mut dims = x.dims().to_vec();
+            *dims.last_mut().unwrap() = ys[0].dim(D::Minus1)?;
+            return Tensor::cat(&ys, 0)?.reshape(dims)?.to_dtype(x.dtype());
+        }
     }
     #[cfg(feature = "cuda")]
     if rows <= mistralrs_quant::mmvq_rows::MAX_ROWS && !w.has_bias() {
@@ -1739,6 +1916,10 @@ pub(crate) struct SpecState {
     /// Recurrent states after each row but the last of the running verification.
     verify: Option<VerifyRecord>,
     stats: MtpStats,
+    /// Context lookup tokens the next draft may add after MTP's, adapted to how many were accepted.
+    lookup_budget: usize,
+    /// The running verification's draft: (MTP tokens, lookup tokens after them).
+    lookup_drafted: Option<(usize, usize)>,
     /// Recurrent slot of the sequence the fields above belong to (`None`: not claimed yet).
     owner: Option<usize>,
     /// The other running sequences' states, by recurrent slot.
@@ -1755,6 +1936,8 @@ impl SpecState {
             mtp_valid: false,
             verify: None,
             stats: MtpStats::default(),
+            lookup_budget: LOOKUP_BUDGET_START,
+            lookup_drafted: None,
             owner: None,
             parked: HashMap::new(),
         }
@@ -1781,6 +1964,15 @@ impl SpecState {
         }
     }
 }
+
+/// Context lookup tokens a sequence's first lookup draft may add, and the most it grows to (each fully accepted
+/// lookup draft doubles the budget, a rejection cuts it to one past the accepted part).
+const LOOKUP_BUDGET_START: usize = 2;
+const LOOKUP_BUDGET_MAX: usize = 7;
+
+/// Rows of a one-sequence verification whose GDN states are copied for the rollback (~150 MiB per row); longer
+/// ones replay the kept rows instead.
+const SNAPSHOT_MAX_ROWS: usize = 2;
 
 struct VerifyRecord {
     start: usize,
@@ -2300,6 +2492,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             #[cfg(feature = "cuda")]
             if let Device::Cuda(dev) = device {
                 mistralrs_quant::mmvq_rows::warm_up(dev)?;
+                mistralrs_quant::mmq_rows::warm_up(dev)?;
             }
             Some(load_mtp_block(
                 &mut ct,
@@ -2849,9 +3042,15 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::msg("qwen35 verify: missing recurrent slot"))?
             as usize;
         let flash_params = ctx.flash_params();
-        let positions = (0..n)
-            .map(|r| crate::pipeline::text_positions_tensor(&[start + r], 1, &self.device))
-            .collect::<Result<Vec<_>>>()?;
+        // one upload per step: a host-to-device copy waits for the stream, so a per-layer one drained the GPU queue
+        // ahead of every attention layer's projections
+        let rows_positions = crate::pipeline::text_positions_tensor(&[start], n, &self.device)?;
+        let positions = if mtp_verify_rowwise() {
+            (0..n).map(|r| rows_positions.narrow(0, r, 1)).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let gdn_direct = mistralrs_quant::titan_cfg::var("TITAN_GDN_DIRECT").map(|v| v != "0").unwrap_or(true);
 
         let mut x = self
             .tok_embeddings
@@ -2859,6 +3058,9 @@ impl ModelWeights {
             .to_dtype(DType::F32)?;
         let mut hybrid_cache = self.cache.hybrid();
         let mut gdn_states = Vec::new();
+        // longer verifications (context lookup drafts) keep row inputs to replay: their state copies do not fit
+        let replay = n > SNAPSHOT_MAX_ROWS;
+        let mut gdn_replay = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(mapper) = &self.mapper {
                 x = mapper.map(x, i)?;
@@ -2868,34 +3070,57 @@ impl ModelWeights {
                 let h = layer.attn_norm.forward(&x)?;
                 let h = match (&layer.mixer, hybrid_cache.get_mut(i)) {
                     (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
-                        attn.forward_decode_rows(&h, kv_cache, start, Some(flash_params))?
+                        attn.forward_decode_rows(&h, kv_cache, &rows_positions, Some(flash_params))?
                     }
                     (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
                         let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
-                        let mut gdn_cache = GdnLayerCache {
-                            conv_state: pool.gather_conv_state(indices)?,
-                            recurrent_state: pool.gather_recurrent_state(indices)?,
+                        // the slot's pool rows themselves, as the decode step takes them (TITAN_GDN_DIRECT): the
+                        // kernels update them in place, where a gather and a scatter copied ~3 MiB each per layer
+                        let mut gdn_cache = if gdn_direct && !replay {
+                            GdnLayerCache {
+                                conv_state: pool.conv_state_row(slot)?,
+                                recurrent_state: pool.recurrent_state_row(slot)?,
+                            }
+                        } else {
+                            GdnLayerCache {
+                                conv_state: pool.gather_conv_state(indices)?,
+                                recurrent_state: pool.gather_recurrent_state(indices)?,
+                            }
                         };
                         let host = recurrent_metadata.state_indices_host();
-                        // one sequence copies its states (~150 MiB in all, the fastest rollback); a batch
-                        // replays rows instead (forward_ragged), where the copies do not fit next to a prefill
-                        let mut snaps = Vec::with_capacity(n - 1);
-                        let out = gdn.forward_decode_rows(
-                            &h.to_dtype(self.gdn_dtype)?,
-                            &mut gdn_cache,
-                            &|w, x| lin_rows(w, x),
-                            &mut |r, c, _| {
-                                if r + 1 < n {
-                                    // the recurrent state is updated in place by the next row: copy it
-                                    snaps.push((c.conv_state.copy()?, c.recurrent_state.copy()?));
-                                }
-                                Ok(())
-                            },
-                        )?;
-                        pool.scatter_conv_state_with_host_indices(indices, host, &gdn_cache.conv_state)?;
-                        pool.scatter_recurrent_state_with_host_indices(indices, host, &gdn_cache.recurrent_state)?;
-                        gdn_states.push((i, snaps));
-                        out.to_dtype(DType::F32)?
+                        if replay {
+                            let mut rows = Vec::new();
+                            let out = gdn.forward_decode_rows(
+                                &h.to_dtype(self.gdn_dtype)?,
+                                &mut gdn_cache,
+                                &VERIFY_MATMULS,
+                                &mut |r, c, inputs| keep_row_zero(pool, indices, host, r, n, c, inputs, &mut rows),
+                            )?;
+                            gdn_replay.push((i, gdn.state_step(self.gdn_dtype), rows));
+                            out.to_dtype(DType::F32)?
+                        } else {
+                            // one sequence copies its states (~150 MiB in all, the fastest rollback); a batch
+                            // replays rows instead (forward_ragged), where the copies do not fit next to a prefill
+                            let mut snaps = Vec::with_capacity(n - 1);
+                            let out = gdn.forward_decode_rows(
+                                &h.to_dtype(self.gdn_dtype)?,
+                                &mut gdn_cache,
+                                &VERIFY_MATMULS,
+                                &mut |r, c, _| {
+                                    if r + 1 < n {
+                                        // the recurrent state is updated in place by the next row: copy it
+                                        snaps.push((c.conv_state.copy()?, c.recurrent_state.copy()?));
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                            if !gdn_direct {
+                                pool.scatter_conv_state_with_host_indices(indices, host, &gdn_cache.conv_state)?;
+                                pool.scatter_recurrent_state_with_host_indices(indices, host, &gdn_cache.recurrent_state)?;
+                            }
+                            gdn_states.push((i, snaps));
+                            out.to_dtype(DType::F32)?
+                        }
                     }
                     _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
                 };
@@ -2990,7 +3215,8 @@ impl ModelWeights {
         {
             let mut st = self.spec.lock().expect("spec state poisoned");
             st.last = Some((start, normed.squeeze(0)?));
-            st.verify = Some(VerifyRecord { start, rows: n, slot, gdn: GdnRollback::States(gdn_states) });
+            let gdn = if replay { GdnRollback::Replay(gdn_replay) } else { GdnRollback::States(gdn_states) };
+            st.verify = Some(VerifyRecord { start, rows: n, slot, gdn });
         }
         Ok(logits)
     }
@@ -3025,7 +3251,11 @@ impl ModelWeights {
             candle_core::bail!("qwen35 batched decode: {b} rows over {} sequence caches", ragged.len());
         }
         // one-token rows match the batch-1 decode step's matmuls, verification rows its verification's
-        let lin: LinRows = if n == 1 { lin_rows_decode } else { lin_rows };
+        let (lin, mm): (LinRows, &DecodeMatmuls) =
+            if n == 1 { (lin_rows_decode, &DECODE_MATMULS) } else { (lin_rows, &VERIFY_MATMULS) };
+        // every sequence's RoPE positions in one upload per step (an upload waits for the stream)
+        let all_positions = crate::pipeline::text_positions_tensor(&starts, n, &self.device)?;
+        let positions = (0..b).map(|s| all_positions.narrow(0, s * n, n)).collect::<Result<Vec<_>>>()?;
         let mut gdn_record = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(mapper) = &self.mapper {
@@ -3042,7 +3272,7 @@ impl ModelWeights {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    attn.forward_decode_rows_many(&h, &mut kvs, &starts, lin)?
+                    attn.forward_decode_rows_many(&h, &mut kvs, &positions, lin)?
                 }
                 (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
                     let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
@@ -3055,7 +3285,7 @@ impl ModelWeights {
                     let out = gdn.forward_decode_rows(
                         &h.to_dtype(self.gdn_dtype)?,
                         &mut gdn_cache,
-                        &|w, x| lin(w, x),
+                        mm,
                         &mut |r, c, inputs| keep_row_zero(pool, indices, host, r, n, c, inputs, &mut rows),
                     )?;
                     if n == 1 {
@@ -3156,9 +3386,27 @@ impl ModelWeights {
             h_prev0
         };
         let mut kv = st.mtp_kv.take().expect("mtp kv");
-        let res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+        let len0 = kv.current_seq_len();
+        let mut res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+        // the head runs last in a prompt step, at its fullest (most fragmented) pool: retry once on freed workspaces,
+        // then give up only this sequence's drafts (until its next prompt), not the request, whose trunk output is done
+        if res.as_ref().is_err_and(crate::titan_swap::is_oom) {
+            kv.set_len(len0)?;
+            crate::titan_swap::release_workspaces_and_trim(&self.device);
+            res = self.mtp_forward(mtp, &mut kv, input_ids, &h_prev, start, false);
+            if res.is_ok() {
+                tracing::info!("titan mtp: draft head caught up at {start} ({n} rows) after releasing workspaces");
+            }
+        }
         st.mtp_kv = Some(kv);
-        res?;
+        if let Err(e) = res {
+            if !crate::titan_swap::is_oom(&e) {
+                return Err(e);
+            }
+            tracing::warn!("titan mtp: out of memory catching the draft head up at {start} ({n} rows); drafts off for this sequence");
+            st.mtp_valid = false;
+            return Ok(());
+        }
         st.mtp_len = start + n;
         st.pending = Some((start + n - 1, hidden.narrow(0, n - 1, 1)?));
         Ok(())
@@ -3208,7 +3456,7 @@ impl ModelWeights {
         let h = if (2..=MTP_CATCHUP_MAX_ROWS).contains(&m)
             && crate::attention::flash_decode_min_kv().is_some_and(|t| past[0] + m >= t)
         {
-            mtp.attn.forward_decode_rows(&h, kv, start, None)?
+            mtp.attn.forward_decode_rows(&h, kv, &positions, None)?
         } else {
             mtp.attn.forward_eager(&h, &mask, kv, &positions, None)?
         };
@@ -3687,7 +3935,7 @@ impl ModelWeights {
                         let out = gdn.forward_decode_rows(
                             &h.to_dtype(self.gdn_dtype)?,
                             &mut gdn_cache,
-                            &|w, x| lin_rows(w, x),
+                            &VERIFY_MATMULS,
                             &mut |r, c, _| {
                                 if r + 1 < n {
                                     snaps.push(c.conv_state.copy()?);
@@ -3833,7 +4081,7 @@ impl ModelWeights {
                         let out = gdn.forward_decode_rows(
                             &h.to_dtype(self.gdn_dtype)?,
                             &mut gdn_cache,
-                            &|w, x| lin_rows(w, x),
+                            &VERIFY_MATMULS,
                             &mut |r, c, _| {
                                 if r + 1 < n {
                                     snaps.push(c.conv_state.copy()?);
@@ -4015,7 +4263,7 @@ impl ModelWeights {
                     let out = gdn.forward_decode_rows(
                         &h.to_dtype(self.gdn_dtype)?,
                         &mut gdn_cache,
-                        &|w, x| lin_rows(w, x),
+                        &VERIFY_MATMULS,
                         &mut |r, c, inputs| keep_row_zero(pool, idx, host, r, n, c, inputs, &mut rows),
                     )?;
                     if n == 1 {
@@ -4176,6 +4424,25 @@ impl ModelWeights {
         Ok(Some(drafts))
     }
 
+    /// The draft for the sequence in `slot` after `pos_c`: MTP's, extended by a context lookup's continuation where
+    /// the lookup agrees with MTP's drafts (a lookup alone guesses the next token worse than MTP).
+    pub(crate) fn speculative_draft(&self, slot: usize, toks: &[u32], pos_c: usize, max_len: usize) -> Result<Vec<u32>> {
+        let mtp = self.mtp_propose(slot, toks, pos_c)?.unwrap_or_default();
+        if mtp.is_empty() || toks.len() != pos_c + 1 {
+            return Ok(mtp);
+        }
+        let mut st = self.spec.lock().expect("spec state poisoned");
+        st.switch_to(slot);
+        let room = self.max_seq_len.saturating_sub(pos_c + 2);
+        let lookup = crate::titan_lookup::draft(toks, max_len.min(room).min(mtp.len() + st.lookup_budget));
+        if lookup.len() > mtp.len() && lookup.starts_with(&mtp) {
+            st.lookup_drafted = Some((mtp.len(), lookup.len() - mtp.len()));
+            return Ok(lookup);
+        }
+        st.lookup_drafted = None;
+        Ok(mtp)
+    }
+
     /// Rollback handle for the speculative verifier (see `speculative::unpaged`).
     pub(crate) fn spec_rollback(&self) -> Arc<dyn crate::speculative::unpaged::SpeculativeRollback> {
         let EitherCache::Hybrid(hybrid) = &self.cache else {
@@ -4205,19 +4472,6 @@ impl ModelWeights {
             Some((p, h)) if *p == pos => Some(h.clone()),
             _ => None,
         })
-    }
-
-    fn gdn_to_host(snaps: Vec<RecurrentStateSnapshot>) -> Result<Vec<RecurrentStateSnapshot>> {
-        snaps
-            .into_iter()
-            .map(|s| {
-                Ok(RecurrentStateSnapshot {
-                    conv_state: s.conv_state.to_device(&Device::Cpu)?,
-                    recurrent_state: s.recurrent_state.to_device(&Device::Cpu)?,
-                    state_layout: s.state_layout,
-                })
-            })
-            .collect()
     }
 
     /// The device trunk layer `i` (and its caches) lives on.
@@ -4271,7 +4525,7 @@ impl ModelWeights {
         } else {
             None
         };
-        let gdn = Self::gdn_to_host(self.cache.hybrid().titan_snapshot_physical(slot)?)?;
+        let gdn = self.cache.hybrid().titan_snapshot_physical_host(slot)?;
         let mut points = self.prefix_points.lock().expect("prefix points poisoned");
         let v = points.entry(slot).or_default();
         v.retain(|p| p.len != len);
@@ -4355,7 +4609,7 @@ impl ModelWeights {
                 HybridLayerCache::Recurrent(_) => None,
             });
         }
-        let gdn_end = Self::gdn_to_host(hybrid.titan_snapshot_physical(slot)?)?;
+        let gdn_end = hybrid.titan_snapshot_physical_host(slot)?;
         drop(hybrid);
         self.spec.lock().expect("spec state poisoned").switch_to(slot);
         let mut points = self
@@ -4467,6 +4721,10 @@ impl crate::speculative::unpaged::SpeculativeRollback for SpecRollback {
             return Ok(());
         };
         let kept = keep_len.saturating_sub(rec.start).clamp(1, rec.rows);
+        if let Some((mtp, extra)) = st.lookup_drafted.take() {
+            let got = (kept - 1).saturating_sub(mtp).min(extra);
+            st.lookup_budget = if got == extra { (st.lookup_budget * 2).min(LOOKUP_BUDGET_MAX) } else { got + 1 };
+        }
         let stats = &mut st.stats;
         stats.steps += 1;
         stats.drafted += (rec.rows - 1) as u64;

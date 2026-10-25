@@ -187,7 +187,7 @@ fn time(h: &Harness, plain_ref: &std::sync::Arc<kdiff::cuda_core::CudaModule>, r
         let wbytes = w.len();
         let copies = (256usize << 20).div_ceil(wbytes).max(1);
         let wall: Vec<u8> = w.iter().copied().cycle().take(wbytes * copies).collect();
-        for b in [1usize, 2, 3, 4] {
+        for b in [1usize, 2, 4, 6, 8] {
             let bufs: Vec<DeviceBuffer<u8>> = [wall.clone(), q8_1(r, b * ncols / 32), vec![0u8; b * nrows * 4]]
                 .iter()
                 .map(|v| DeviceBuffer::from_host(&h.stream, v).unwrap())
