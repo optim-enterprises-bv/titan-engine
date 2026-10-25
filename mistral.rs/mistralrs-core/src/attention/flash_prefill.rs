@@ -318,7 +318,6 @@ pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaPara
     let q_ptr = dptr(&q, &stream)?;
     let scale_log2 = p.softmax_scale * std::f32::consts::LOG2_E;
     let (s_i, h_i, q_hs, o_hs, win_i) = (s as i32, h as i32, (s * HEAD_DIM) as i32, (s * HEAD_DIM) as i32, 0i32);
-    let ln2 = std::f64::consts::LN_2;
     // every buffer of the loop has one size for the whole call: varying tile lengths fragmented the device pool
     // until a 248k-token prompt ran out of memory
     let cap = tile.max(TILE).max(s);
@@ -333,8 +332,17 @@ pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaPara
     let part = Tensor::zeros((ns, h, s, HEAD_DIM), DType::F32, q.device())?;
     let ml = Tensor::zeros((ns, h, s, 2), DType::F32, q.device())?;
     let (part_ptr, ml_ptr) = (dptr_f32(&part, &stream)?, dptr_f32(&ml, &stream)?);
-    let mut run: Option<(Tensor, Tensor, Tensor)> = None;
-    for (a, b) in ranges {
+    // running (o, m, l) merged in place by one kernel per tile: the tensor merge's temporaries were the largest
+    // allocations of a prompt step's last layers
+    let run_o = unsafe { dev.alloc::<f32>(h * s * HEAD_DIM)? };
+    let run_ml = unsafe { dev.alloc::<f32>(h * s * 2)? };
+    let out = unsafe { dev.alloc::<half::bf16>(h0 * s * HEAD_DIM)? };
+    let ptr = |b: &candle_core::cuda::cudarc::driver::CudaSlice<f32>| b.device_ptr(&stream).0;
+    let (run_o_ptr, run_ml_ptr, out_ptr) = (ptr(&run_o), ptr(&run_ml), out.device_ptr(&stream).0);
+    let merge = func_named(dev, "flash_prefill_host_merge")?;
+    let n_rep_i = n_rep as i32;
+    let n = ranges.len();
+    for (i, (a, b)) in ranges.into_iter().enumerate() {
         let len = b - a;
         upload_keys(k, a, len, &kf8, dev)?;
         upload_keys(v, a, len, &vf8, dev)?;
@@ -347,33 +355,16 @@ pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaPara
         lb.arg(&q_hs).arg(&o_hs).arg(&hs).arg(&hs).arg(&win_i);
         let lc = LaunchConfig { grid_dim: (npb as u32, kvh as u32, ns as u32), block_dim: ((32 * nw) as u32, 1, 1), shared_mem_bytes: 0 };
         unsafe { lb.launch(lc) }.w()?;
-        // elementwise over the splits: a reduction over the leading dim runs ~100x slower than these
-        let split = |t: &Tensor, i: usize| t.narrow(0, i, 1).and_then(|t| t.squeeze(0));
-        let (m0, m1) = (split(&ml, 0)?.narrow(2, 0, 1)?, split(&ml, 1)?.narrow(2, 0, 1)?);
-        let (l0, l1) = (split(&ml, 0)?.narrow(2, 1, 1)?, split(&ml, 1)?.narrow(2, 1, 1)?);
-        let (p0, p1) = (split(&part, 0)?, split(&part, 1)?);
-        let mx = match &run {
-            None => m0.maximum(&m1)?,
-            Some((_, mr, _)) => mr.maximum(&m0)?.maximum(&m1)?,
-        };
-        // the kernel's (max, sum) are in base 2: weights are 2^(m - M); an empty split has m = -inf, weight 0
-        let w = |m: &Tensor| (m - &mx).and_then(|d| d * ln2).and_then(|d| d.exp());
-        let (w0, w1) = (w(&m0)?, w(&m1)?);
-        let mut o = (p0.broadcast_mul(&w0)? + p1.broadcast_mul(&w1)?)?;
-        let mut l = ((l0 * &w0)? + (l1 * &w1)?)?;
-        if let Some((or, mr, lr)) = &run {
-            let wr = w(mr)?;
-            o = (o + or.broadcast_mul(&wr)?)?;
-            l = (l + (lr * &wr)?)?;
-        }
-        run = Some((o, mx, l));
+        let (first, last) = ((i == 0) as i32, (i + 1 == n) as i32);
+        let mut mb = stream.launch_builder(&merge);
+        mb.arg(&part_ptr).arg(&ml_ptr).arg(&run_o_ptr).arg(&run_ml_ptr).arg(&out_ptr);
+        mb.arg(&s_i).arg(&h_i).arg(&first).arg(&last).arg(&n_rep_i);
+        let lc = LaunchConfig { grid_dim: (s as u32, h as u32, 1), block_dim: (HEAD_DIM as u32, 1, 1), shared_mem_bytes: 0 };
+        unsafe { mb.launch(lc) }.w()?;
     }
-    let (o, _, l) = run.expect("at least the chunk's own tile");
-    let o = o.broadcast_div(&l)?.to_dtype(DType::BF16)?.reshape((1, h, s, HEAD_DIM))?;
-    if n_rep < N_REP {
-        return o.reshape((kvh, N_REP, s, HEAD_DIM))?.narrow(1, 0, n_rep)?.reshape((1, h0, s, HEAD_DIM))?.contiguous();
-    }
-    Ok(o)
+    // run_o / run_ml are freed stream-ordered after the launches
+    drop((run_o, run_ml));
+    Ok(Tensor::from((Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())), Shape::from((1, h0, s, HEAD_DIM)))))
 }
 
 /// Shapes `attend_any` takes, without tensors: head dim 128 / 256 (at most 8 query heads per KV head) or 512 (a multiple

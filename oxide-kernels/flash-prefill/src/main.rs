@@ -19,7 +19,7 @@
 //! Rust (mistralrs-core/src/attention/flash_prefill.rs).
 #![allow(non_snake_case, clippy::missing_safety_doc, dead_code)]
 
-use cuda_device::{SharedArray, float, kernel, launch_bounds, ptx_asm, thread, warp};
+use cuda_device::{SharedArray, device, float, kernel, launch_bounds, ptx_asm, thread, warp};
 use cuda_host::cuda_module;
 
 mod gate;
@@ -793,6 +793,66 @@ pub mod kernels {
             i += 1;
         }
         *out.add((hd * o_hs as i64 + pos * 256 + d) as usize) = f2bf(div_rn(num, den));
+    }
+
+    #[device]
+    unsafe extern "C" {
+        fn __nv_expf(x: f32) -> f32;
+    }
+
+    /// candle's `max.f32` (no ftz), for the host-tile merge's bits.
+    #[inline(always)]
+    fn max_f32(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("max.f32 %0, %1, %2;", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+
+    /// One host tile's 2 split partials (`part`, `ml`) merged into the running f32 (`run_o`, `run_ml`) of row (pos,
+    /// head), with the op sequence (and so the bits) of the candle tensor merge it replaces; `last` writes o / l as
+    /// bf16 to `out` (heads `hd % 8 < n_rep` only, packed to n_rep per KV head) instead. grid (s, n_heads), block 256.
+    #[kernel]
+    pub unsafe fn flash_prefill_host_merge(
+        part: *const f32, ml: *const f32, run_o: *mut f32, run_ml: *mut f32, out: *mut u16,
+        s: i32, n_heads: i32, first: i32, last: i32, n_rep: i32,
+    ) {
+        let d = thread::threadIdx_x() as usize;
+        let pos = thread::blockIdx_x() as usize;
+        let hd = thread::blockIdx_y() as usize;
+        let row = hd * s as usize + pos;
+        let split = (n_heads as usize) * (s as usize);
+        let (m0, l0) = (*ml.add(row * 2), *ml.add(row * 2 + 1));
+        let (m1, l1) = (*ml.add((split + row) * 2), *ml.add((split + row) * 2 + 1));
+        let (p0, p1) = (*part.add(row * 256 + d), *part.add((split + row) * 256 + d));
+        let ln2 = core::f64::consts::LN_2 as f32;
+        let (mr, lr) = if first != 0 { (NEG_INF, 0.0) } else { (*run_ml.add(row * 2), *run_ml.add(row * 2 + 1)) };
+        let mx = if first != 0 { max_f32(m0, m1) } else { max_f32(max_f32(mr, m0), m1) };
+        let w = |m: f32| __nv_expf(float::fma_rn_f32(float::add_rn_f32(m, -mx), ln2, 0.0));
+        let (w0, w1) = (w(m0), w(m1));
+        let mut o = float::add_rn_f32(float::mul_rn_f32(p0, w0), float::mul_rn_f32(p1, w1));
+        let mut l = float::add_rn_f32(float::mul_rn_f32(l0, w0), float::mul_rn_f32(l1, w1));
+        if first == 0 {
+            let wr = w(mr);
+            o = float::add_rn_f32(o, float::mul_rn_f32(*run_o.add(row * 256 + d), wr));
+            l = float::add_rn_f32(l, float::mul_rn_f32(lr, wr));
+        }
+        if last != 0 {
+            let g = hd as i32 % N_REP;
+            if g < n_rep {
+                let oh = (hd as i32 / N_REP * n_rep + g) as usize;
+                let mut r: u16;
+                ptx_asm!("{ .reg .f32 q; div.rn.f32 q, %1, %2; cvt.rn.bf16.f32 %0, q; }", out("=h") r, in("f") o, in("f") l, options(register_only));
+                *out.add((oh * s as usize + pos) * 256 + d) = r;
+            }
+            return;
+        }
+        *run_o.add(row * 256 + d) = o;
+        // every thread has read the old (m, l) before thread 0 replaces it
+        thread::sync_threads();
+        if d == 0 {
+            *run_ml.add(row * 2) = mx;
+            *run_ml.add(row * 2 + 1) = l;
+        }
     }
 
     // ---- head dim 512 (gemma4 full-attention layers) ----
