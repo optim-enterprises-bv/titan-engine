@@ -17,6 +17,55 @@ use crate::vision_models::qwen3_vl::vision::Qwen3VLVisionModel;
 
 const DEPTH: usize = 27;
 
+/// Bonsai 2 / Offrail GGUF special token ids and rope params (from the GGUF metadata + vocab).
+pub(crate) const BONSAI_IMAGE_PAD_TOKEN: u32 = 248056;
+pub(crate) const BONSAI_VISION_START_TOKEN: u32 = 248053;
+pub(crate) const BONSAI_VISION_END_TOKEN: u32 = 248054;
+/// qwen35.rope.dimension_sections = [11,11,10,0]: mrope pair split t/h/w (sum 32 = rope_dim/2).
+pub(crate) const BONSAI_MROPE_SECTION: [usize; 3] = [11, 11, 10];
+pub(crate) const BONSAI_ROPE_DIM: usize = 64;
+pub(crate) const BONSAI_ROPE_FREQ_BASE: f32 = 1.0e7;
+
+/// Build mrope cos/sin tables `[n, rope_dim/2]` from 3D positions `[3, n]`. Pair `p` uses the t/h/w
+/// position component selected by the mrope sections (`[0,sec0) -> t, [sec0,sec0+sec1) -> h, ...]`).
+/// With equal positions (t==h==w, text) this is exactly the 1D rope, so text is unchanged.
+pub(crate) fn mrope_cos_sin(
+    positions: &Tensor,
+    sections: [usize; 3],
+    rope_dim: usize,
+    freq_base: f32,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let half = rope_dim / 2;
+    let pos = positions.to_dtype(DType::F32)?.to_vec2::<f32>()?; // [3, n]
+    let n = pos[0].len();
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0 / freq_base.powf((2 * i) as f32 / rope_dim as f32))
+        .collect();
+    let comp_of = |p: usize| -> usize {
+        if p < sections[0] {
+            0
+        } else if p < sections[0] + sections[1] {
+            1
+        } else {
+            2
+        }
+    };
+    let mut cos = vec![0f32; n * half];
+    let mut sin = vec![0f32; n * half];
+    for t in 0..n {
+        for p in 0..half {
+            let angle = pos[comp_of(p)][t] * inv_freq[p];
+            cos[t * half + p] = angle.cos();
+            sin[t * half + p] = angle.sin();
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (n, half), device)?,
+        Tensor::from_vec(sin, (n, half), device)?,
+    ))
+}
+
 /// Preprocess one image into the `(patches, grid_thw)` the Bonsai tower consumes, using the shared
 /// Qwen3-VL preprocessing (smart-resize, 0.5/0.5 normalize, patchify) so the patch ordering matches.
 pub(crate) fn preprocess_bonsai_image(
@@ -192,6 +241,23 @@ mod tests {
         let (embeds, _deepstack) = tower.forward(&xs, &grid)?;
         // 16 patches / (2*2 merge) = 4 merged tokens, out_hidden 5120.
         assert_eq!(embeds.dims(), &[4, 5120]);
+        Ok(())
+    }
+
+    #[test]
+    fn mrope_cos_sin_text_equals_1d() -> Result<()> {
+        let dev = Device::Cpu;
+        // text positions (t==h==w) must give identical cos/sin regardless of sectioning.
+        let text = vision_mrope_positions(&[1, 2, 3, 4, 5], 999, (1, 2, 2), &dev)?;
+        let (cos_a, sin_a) = mrope_cos_sin(&text, [11, 11, 10], 64, 1.0e7, &dev)?;
+        // a trivial single-section split must match, since all rows are equal
+        let (cos_b, sin_b) = mrope_cos_sin(&text, [32, 0, 0], 64, 1.0e7, &dev)?;
+        let d = |x: &Tensor, y: &Tensor| -> Result<f32> {
+            Ok((x - y)?.abs()?.max_all()?.to_scalar::<f32>()?)
+        };
+        assert!(d(&cos_a, &cos_b)? < 1e-6);
+        assert!(d(&sin_a, &sin_b)? < 1e-6);
+        assert_eq!(cos_a.dims(), &[5, 32]);
         Ok(())
     }
 
