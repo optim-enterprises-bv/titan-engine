@@ -122,6 +122,8 @@ objc2-metal = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
 
 [features]
+# titan: oxide is the only supported path here; it is the default and the guard below rejects a non-oxide build.
+default = ["oxide"]
 oxide = ["cuda", "mistralrs-quant/oxide", "mistralrs-paged-attn/oxide", "dep:titan-oxide-ffi", "dep:titan-nvcc-only"]
 pyo3_macros = ["pyo3", "mistralrs-mcp/pyo3_macros"]
 cuda = [

@@ -1,3 +1,7 @@
+#[cfg(feature = "cuda")]
+mod oxide;
+#[cfg(feature = "cuda")]
+pub use oxide::fp8_moe_grouped;
 use std::{
     borrow::Cow,
     sync::{atomic::AtomicUsize, Arc},
@@ -49,6 +53,9 @@ enum BlockwiseFp8Provider {
     Legacy,
     #[cfg(all(feature = "cuda", feature = "cutile"))]
     CutileW8A16,
+    /// nvcc-free oxide blockwise W8A16 (the oxide build's fast FP8 path; see blockwise_fp8/oxide.rs).
+    #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+    OxideW8A16,
     #[cfg(all(feature = "cuda", has_cutlass_fp8_sm90_kernels))]
     CutlassSm90,
     #[cfg(all(feature = "cuda", has_deepgemm_fp8_sm90_provider))]
@@ -67,6 +74,8 @@ static DEEPGEMM_FP8_FALLBACK_LOG: std::sync::Once = std::sync::Once::new();
 const FP8_SM90_PROVIDER_ENV: &str = "MISTRALRS_FP8_SM90_PROVIDER";
 #[cfg(all(feature = "cuda", has_blockwise_fp8_kernels))]
 static TENSOR_CORE_GEMV_PROVIDER_LOG: std::sync::Once = std::sync::Once::new();
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
+static OXIDE_FP8_PROVIDER_LOG: std::sync::Once = std::sync::Once::new();
 
 impl BlockwiseFp8Provider {
     fn supports_shared_activation(&self) -> bool {
@@ -74,6 +83,8 @@ impl BlockwiseFp8Provider {
             Self::Legacy => false,
             #[cfg(all(feature = "cuda", feature = "cutile"))]
             Self::CutileW8A16 => false,
+            #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+            Self::OxideW8A16 => false,
             #[cfg(all(feature = "cuda", has_cutlass_fp8_sm90_kernels))]
             Self::CutlassSm90 => true,
             #[cfg(all(feature = "cuda", has_deepgemm_fp8_sm90_provider))]
@@ -115,6 +126,21 @@ impl BlockwiseFP8Linear {
                     return Ok(());
                 }
             }
+        }
+        // Oxide (nvcc-free) W8A16: the fast FP8 path when cuTile is absent. Same conditions as the cuTile branch
+        // (static activation, 128x128 blocks, bf16), launching the verified oxide tensor-core kernel.
+        #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+        if self.activation_scheme.is_none()
+            && self.weight_block_size == [128, 128]
+            && self.dequant_dtype == DType::BF16
+            && matches!(self.weight.device(), Device::Cuda(_))
+            && self.weight.dims2().is_ok()
+        {
+            self.provider = BlockwiseFp8Provider::OxideW8A16;
+            OXIDE_FP8_PROVIDER_LOG.call_once(|| {
+                tracing::info!("Using oxide (nvcc-free) blockwise FP8 W8A16 tensor-core GEMM");
+            });
+            return Ok(());
         }
         if self.activation_scheme != Some(Fp8ActivationScheme::Dynamic) {
             return Ok(());
@@ -294,6 +320,35 @@ impl QuantMethod for BlockwiseFP8Linear {
     }
 
     fn forward_raw(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+        if matches!(self.provider, BlockwiseFp8Provider::OxideW8A16) && x.dtype() == DType::BF16 {
+            let original_shape = x.dims().to_vec();
+            let features = *original_shape
+                .last()
+                .ok_or_else(|| candle_core::Error::msg("FP8 activation cannot be scalar"))?;
+            let rows = original_shape[..original_shape.len() - 1]
+                .iter()
+                .try_fold(1usize, |r, d| r.checked_mul(*d))
+                .ok_or_else(|| candle_core::Error::msg("FP8 activation shape overflows usize"))?;
+            let (output_features, weight_features) = self.weight.dims2()?;
+            if features != weight_features {
+                candle_core::bail!("FP8 activation K={features} does not match weight K={weight_features}")
+            }
+            if rows == 0 {
+                let mut os = original_shape[..original_shape.len() - 1].to_vec();
+                os.push(output_features);
+                return Tensor::zeros(os, x.dtype(), x.device());
+            }
+            let input = x.reshape((rows, features))?.contiguous()?;
+            let result = oxide::fp8_w8a16_block_mma(&input, &self.weight, &self.weight_scale_inv)?;
+            let mut os = original_shape[..original_shape.len() - 1].to_vec();
+            os.push(result.dim(1)?);
+            let result = result.reshape(os)?;
+            return match &self.bias {
+                Some(bias) => result.broadcast_add(bias),
+                None => Ok(result),
+            };
+        }
         #[cfg(all(feature = "cuda", feature = "cutile"))]
         if matches!(self.provider, BlockwiseFp8Provider::CutileW8A16)
             && matches!(x.dtype(), DType::BF16 | DType::F16)

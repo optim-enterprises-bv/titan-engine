@@ -10,13 +10,16 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
-use crate::{EngineConfig, MistralRs, MistralRsError, Request, UnloadedModelState};
+use crate::{
+    search, EngineConfig, McpClientConfig, MistralRs, MistralRsError, Request, SearchEmbeddingModel,
+    TokenSource, UnloadedModelState,
+};
 
 pub const DEFAULT_MAX_RESIDENT: usize = 1;
 /// The binary's global allocator hook that returns freed memory to the kernel (mimalloc's `mi_collect`), run
@@ -69,8 +72,30 @@ impl TitanSwapPolicy {
     }
 }
 
+/// Serving defaults captured at `set_titan_swap`, so a model added at runtime (`titan pull`) is built with the same
+/// globals the configured models used. Only the fields the runtime-create path needs; all are core types.
+#[derive(Clone)]
+pub struct TitanSwapGlobals {
+    pub device: candle_core::Device,
+    pub token_source: TokenSource,
+    pub max_seqs: usize,
+    pub max_num_batched_tokens: usize,
+    pub max_prefill_chunk_tokens: usize,
+    pub max_decode_steps_before_prefill: usize,
+    pub prefix_cache_n: usize,
+    pub no_kv_cache: bool,
+    pub disable_eos_stop: bool,
+    pub interactive_mode: bool,
+    pub search_embedding_model: Option<SearchEmbeddingModel>,
+    pub search_callback: Option<Arc<search::SearchCallback>>,
+    pub mcp_client_config: Option<McpClientConfig>,
+}
+
 pub(crate) struct SwapState {
     policy: TitanSwapPolicy,
+    /// Per-model settings for models added after start (`titan pull`); checked before `policy`.
+    runtime: RwLock<HashMap<String, TitanModelSettings>>,
+    globals: TitanSwapGlobals,
     lock: Mutex<()>,
     swapping: AtomicBool,
     last_used: Mutex<HashMap<String, Instant>>,
@@ -83,6 +108,20 @@ impl SwapState {
 
     fn since_used(&self, id: &str) -> Duration {
         self.last_used.lock().unwrap_or_else(|e| e.into_inner()).get(id).map_or(Duration::MAX, Instant::elapsed)
+    }
+
+    /// A model's TITAN_* settings: a runtime-added model's own, else the policy's.
+    fn settings(&self, id: &str) -> HashMap<String, String> {
+        if let Ok(rt) = self.runtime.read() {
+            if let Some(s) = rt.get(id) {
+                return s.env.clone();
+            }
+        }
+        self.policy.settings(id)
+    }
+
+    pub(crate) fn globals(&self) -> &TitanSwapGlobals {
+        &self.globals
     }
 }
 
@@ -220,11 +259,13 @@ fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
 
 impl MistralRs {
     /// Turn on swap mode: `policy.default_model` must be loaded; the other models registered unloaded.
-    pub fn set_titan_swap(self: &Arc<Self>, policy: TitanSwapPolicy) {
+    pub fn set_titan_swap(self: &Arc<Self>, policy: TitanSwapPolicy, globals: TitanSwapGlobals) {
         let ttl = policy.models.values().any(|m| m.idle_ttl.is_some());
         let default = policy.default_model.clone();
         let st = Arc::new(SwapState {
             policy,
+            runtime: RwLock::new(HashMap::new()),
+            globals,
             lock: Mutex::new(()),
             swapping: AtomicBool::new(false),
             last_used: Mutex::new(HashMap::new()),
@@ -252,6 +293,30 @@ impl MistralRs {
         Ok(())
     }
 
+    /// Add a model to a running swap server (`titan pull`): register it unloaded with its own TITAN_* settings so the
+    /// next request loads it, no restart. Errors if swap mode is off or the name is already known.
+    pub fn titan_add_model(
+        &self,
+        name: &str,
+        state: UnloadedModelState,
+        settings: TitanModelSettings,
+    ) -> Result<(), MistralRsError> {
+        let st = self
+            .titan_swap_state()
+            .ok_or_else(|| MistralRsError::ReloadFailed("titan swap mode is not active".to_string()))?;
+        if self.titan_known(name)? {
+            return Err(MistralRsError::ReloadFailed(format!("model `{name}` already exists")));
+        }
+        st.runtime
+            .write()
+            .map_err(|_| MistralRsError::EnginePoisoned)?
+            .insert(name.to_string(), settings);
+        self.register_unloaded_model(name, state)?;
+        st.touch(name);
+        info!("titan swap: added {name} (loads on first request)");
+        Ok(())
+    }
+
     /// Whether swap mode is on (unknown model names then go to the default model).
     pub fn titan_swap_active(&self) -> bool {
         self.titan_swap.get().is_some()
@@ -259,6 +324,11 @@ impl MistralRs {
 
     pub(crate) fn titan_swap_state(&self) -> Option<&Arc<SwapState>> {
         self.titan_swap.get()
+    }
+
+    /// The serving defaults captured at swap start, for building a model added at runtime.
+    pub fn titan_swap_globals(&self) -> Option<TitanSwapGlobals> {
+        self.titan_swap.get().map(|st| st.globals().clone())
     }
 
     fn titan_known(&self, id: &str) -> Result<bool, MistralRsError> {
@@ -422,7 +492,7 @@ impl MistralRs {
             .ok_or_else(|| MistralRsError::ModelNotFound(id.to_string()))?;
         let t0 = Instant::now();
         let free0 = device_free(&device);
-        mistralrs_quant::titan_cfg::begin_model(st.policy.settings(id));
+        mistralrs_quant::titan_cfg::begin_model(st.settings(id));
         let r = match tokio::runtime::Handle::try_current() {
             Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => h.block_on(self.reload_model_raw(id)),
             Ok(_) => Err(MistralRsError::ReloadFailed("swap needs a multi-threaded tokio runtime".to_string())),

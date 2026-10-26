@@ -2,6 +2,7 @@
 
 mod bench;
 mod cache;
+mod client;
 mod config;
 mod doctor;
 mod login;
@@ -15,6 +16,7 @@ mod uqff;
 
 pub use bench::{run_bench, BenchRunConfig};
 pub use cache::{run_cache_delete, run_cache_list};
+pub use client::{run_ls, run_ps, run_pull};
 pub use config::run_from_config;
 pub use doctor::run_doctor;
 pub use login::run_login;

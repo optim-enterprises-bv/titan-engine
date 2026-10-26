@@ -20,8 +20,8 @@ use clap_complete::generate;
 use args::{resolve_model_type, resolve_quantize_model_type, CacheCommand, Cli, Command};
 use commands::{
     run_bench, run_cache_delete, run_cache_list, run_doctor, run_from_config, run_interactive,
-    run_login, run_quantize, run_server, run_tune, run_uninstall, run_update, run_uqff,
-    BenchRunConfig,
+    run_login, run_ls, run_ps, run_pull, run_quantize, run_server, run_tune, run_uninstall,
+    run_update, run_uqff, BenchRunConfig,
 };
 use mistralrs_core::{initialize_mistralrs_logging, LogVerbosity};
 
@@ -148,6 +148,16 @@ async fn main() -> Result<()> {
             run_login(token)?;
         }
 
+        Command::Ps { url } => run_ps(&url).await?,
+        Command::Ls { url, config } => run_ls(&url, &config).await?,
+        Command::Pull {
+            repo,
+            file,
+            quant,
+            name,
+            url,
+            config,
+        } => run_pull(&repo, file.as_deref(), &quant, name.as_deref(), &url, &config).await?,
         Command::Cache { cmd } => match cmd {
             CacheCommand::List => run_cache_list()?,
             CacheCommand::Delete { model_id } => run_cache_delete(&model_id)?,

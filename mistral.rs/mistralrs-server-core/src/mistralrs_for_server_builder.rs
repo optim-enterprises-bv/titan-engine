@@ -1165,7 +1165,22 @@ impl MistralRsForServerBuilder {
             mistralrs.register_unloaded_model(&id, state).map_err(|e| anyhow::anyhow!("{e}"))?;
             info!("titan swap: registered {id} (loads on first request)");
         }
-        mistralrs.set_titan_swap(policy);
+        let globals = mistralrs_core::TitanSwapGlobals {
+            device: device.clone(),
+            token_source: self.token_source.clone(),
+            max_seqs: self.max_seqs,
+            max_num_batched_tokens: self.max_num_batched_tokens.get(),
+            max_prefill_chunk_tokens: self.max_prefill_chunk_tokens.get(),
+            max_decode_steps_before_prefill: self.max_decode_steps_before_prefill.get(),
+            prefix_cache_n: self.prefix_cache_n,
+            no_kv_cache: self.no_kv_cache,
+            disable_eos_stop: self.disable_eos_stop,
+            interactive_mode: self.interactive_mode,
+            search_embedding_model,
+            search_callback: self.search_callback.clone(),
+            mcp_client_config: self.mcp_client_config.clone(),
+        };
+        mistralrs.set_titan_swap(policy, globals);
         Ok(mistralrs)
     }
 
@@ -1758,6 +1773,85 @@ fn init_cache_config(
 }
 
 /// Initializes the scheduler configuration based on cache settings and pipeline metadata.
+/// Build the `UnloadedModelState` for a model added to a running swap server (`titan pull`), from the model's
+/// `ModelSelected`, its TITAN settings and the serving globals captured at swap start. PagedAttention off only.
+pub(crate) fn build_unloaded_state_for_create(
+    model: mistralrs_core::ModelSelected,
+    max_model_len: Option<usize>,
+    device_layers: Option<Vec<String>>,
+    in_situ_quant: Option<String>,
+    settings: &mistralrs_core::TitanModelSettings,
+    g: &mistralrs_core::TitanSwapGlobals,
+) -> anyhow::Result<mistralrs_core::UnloadedModelState> {
+    use mistralrs_core::{
+        EngineConfig, MistralRsConfig, Modalities, ModelCategory, ModelKind, SupportedModality, UnloadedModelState,
+    };
+    if settings.paged_attn.flatten().unwrap_or(false) {
+        anyhow::bail!("runtime-added models do not support PagedAttention yet; pull with it off");
+    }
+    let dtype = get_model_dtype(&model)?;
+    let params = get_auto_device_map_params(&model)?;
+    let mapper = init_mapper(&device_layers, &params);
+    let isq = in_situ_quant
+        .as_ref()
+        .map(|isq| parse_isq_value(isq, Some(&g.device)).map_err(|e| anyhow::anyhow!("{e}")))
+        .transpose()?;
+    let max_seqs = settings.max_seqs.unwrap_or(g.max_seqs);
+    let batched_tokens = settings.max_num_batched_tokens.unwrap_or(g.max_num_batched_tokens);
+    let loader_config = ModelLoaderConfig {
+        model_selected: model,
+        token_source: g.token_source.clone(),
+        hf_revision: None,
+        dtype,
+        device: g.device.clone(),
+        device_map_setting: mapper,
+        isq,
+        paged_attn_config: None,
+        silent: false,
+        chat_template: None,
+        jinja_explicit: None,
+        max_model_len,
+        hf_config_overrides: None,
+        mtp_config: None,
+        encoder_cache_memory_bytes: None,
+    };
+    let scheduler_config = SchedulerConfig::titan_swap_template(
+        None,
+        max_seqs,
+        batched_tokens,
+        g.max_prefill_chunk_tokens,
+        g.max_decode_steps_before_prefill,
+    )?;
+    let text = || vec![SupportedModality::Text];
+    Ok(UnloadedModelState {
+        scheduler_config,
+        engine_config: EngineConfig {
+            no_kv_cache: g.no_kv_cache,
+            no_prefix_cache: false,
+            prefix_cache_n: settings.prefix_cache_n.unwrap_or(g.prefix_cache_n),
+            disable_eos_stop: g.disable_eos_stop,
+            throughput_logging_enabled: !g.interactive_mode,
+            search_embedding_model: g.search_embedding_model,
+            search_callback: g.search_callback.clone(),
+            tool_callbacks: HashMap::new(),
+        },
+        mcp_client_config: g.mcp_client_config.clone(),
+        category: ModelCategory::Text,
+        mistralrs_config: MistralRsConfig {
+            kind: ModelKind::Normal,
+            device: g.device.clone(),
+            category: ModelCategory::Text,
+            modalities: Modalities {
+                input: text(),
+                output: text(),
+            },
+            max_seq_len: Some(max_model_len.unwrap_or_else(|| params.max_seq_len())),
+            generation_defaults: None,
+        },
+        loader_config,
+    })
+}
+
 async fn init_scheduler_config(
     cache_config: &Option<PagedAttentionConfig>,
     pipeline: &LoadedPipeline,
