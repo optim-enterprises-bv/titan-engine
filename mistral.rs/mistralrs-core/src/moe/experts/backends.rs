@@ -218,6 +218,119 @@ impl CutileFp8ExpertsWeights {
     }
 }
 
+/// Blockwise FP8 experts on the oxide (nvcc-free) grouped FP8 GEMM, used when cuTile is absent.
+/// Two grouped FP8 W8A16 GEMMs (gate_up, down) with candle argsort alignment, GLU, and top-k sum,
+/// mirroring the bf16 FusedExpertsWeights path. Kernels + verification: oxide-kernels/fp8-blockwise.
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
+pub(super) struct OxideFp8ExpertsWeights {
+    gate_up: Tensor,
+    gate_up_scales: Tensor,
+    down: Tensor,
+    down_scales: Tensor,
+    inter: usize,
+}
+
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
+const OXIDE_FP8_MOE_BLOCK: usize = 128;
+
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
+impl OxideFp8ExpertsWeights {
+    pub(super) fn try_from_checkpoint(
+        cfg: &MoEExpertsConfig,
+        experts_vb: &ShardedVarBuilder,
+        comm: &Arc<mistralrs_quant::Comm>,
+        quantization_config: &Option<QuantizedConfig>,
+        act: Activation,
+    ) -> Result<Option<Self>> {
+        let Some(QuantizedConfig::Fp8 {
+            weight_block_size: Some(block),
+            activation_scheme,
+            ..
+        }) = quantization_config
+        else {
+            return Ok(None);
+        };
+        if block.as_slice() != [OXIDE_FP8_MOE_BLOCK, OXIDE_FP8_MOE_BLOCK]
+            || *activation_scheme != Some(mistralrs_quant::Fp8ActivationScheme::Dynamic)
+            || comm.world_size() > 1
+            || super::config::gated_act(act).is_err()
+            || matches!(
+                super::config::MoEExpertsBackend::from_env(),
+                Some(super::config::MoEExpertsBackend::Fast)
+            )
+        {
+            return Ok(None);
+        }
+        let Device::Cuda(_) = experts_vb.device() else {
+            return Ok(None);
+        };
+        let ckpt = ExpertCheckpoint::new(cfg, experts_vb.clone(), comm)?;
+        let Some((gate_up, gate_up_scales, down, down_scales)) =
+            ckpt.stacked_enk_fp8(OXIDE_FP8_MOE_BLOCK)?
+        else {
+            return Ok(None);
+        };
+        let inter = gate_up.dim(1)? / 2;
+        mistralrs_quant::log::once_log_info(
+            "MoE experts backend: oxide blockwise FP8 grouped GEMM",
+        );
+        Ok(Some(Self {
+            gate_up,
+            gate_up_scales,
+            down,
+            down_scales,
+            inter,
+        }))
+    }
+
+    pub(super) fn forward_impl(
+        &self,
+        forward: &MoEForward,
+        config: MoEForwardConfig,
+    ) -> Result<Tensor> {
+        if forward.lora.is_some() {
+            candle_core::bail!("dynamic LoRA is not supported on oxide FP8 experts");
+        }
+        let topk = config.num_experts_per_tok;
+        let (expert_ids, sorted_token_ids) = {
+            use crate::ops::ArgSortOp;
+            forward.topk_ids.flatten_all()?.sort(true)?
+        };
+        let tw = forward
+            .topk_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
+
+        let gate_up = mistralrs_quant::fp8_moe_grouped(
+            forward.xs_flat,
+            &self.gate_up,
+            &self.gate_up_scales,
+            None,
+            &sorted_token_ids,
+            &expert_ids,
+            topk,
+            OXIDE_FP8_MOE_BLOCK,
+        )?;
+        let gate = gate_up.narrow(D::Minus1, 0, self.inter)?.contiguous()?;
+        let up = gate_up.narrow(D::Minus1, self.inter, self.inter)?.contiguous()?;
+        let down_inputs = (up * gate.apply(&config.act)?)?.reshape(((), self.inter))?;
+
+        let ys = mistralrs_quant::fp8_moe_grouped(
+            &down_inputs,
+            &self.down,
+            &self.down_scales,
+            Some(&tw),
+            &sorted_token_ids,
+            &expert_ids,
+            topk,
+            OXIDE_FP8_MOE_BLOCK,
+        )?;
+        ys.reshape((forward.shape.num_tokens, (), forward.shape.hidden_dim))?
+            .sum(D::Minus2)
+    }
+}
+
 #[cfg(feature = "cutile")]
 impl CutileExpertsWeights {
     pub(super) fn from_checkpoint(ckpt: &ExpertCheckpoint) -> Result<CutileExpertsWeights> {

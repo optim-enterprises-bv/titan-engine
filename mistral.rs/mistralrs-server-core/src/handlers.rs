@@ -6,7 +6,8 @@ use axum::response::{IntoResponse, Response};
 use mistralrs_core::{
     auto_tune, collect_system_info, parse_isq_value, run_doctor, AutoDeviceMapParams,
     AutoTuneRequest, MistralRs, MistralRsError, ModelDType, ModelSelected,
-    ModelStatus as CoreModelStatus, Request, SerializedSession, TokenSource, TuneProfile,
+    ModelStatus as CoreModelStatus, Request, SerializedSession, TitanModelSettings, TokenSource,
+    TuneProfile,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -14,6 +15,7 @@ use utoipa::ToSchema;
 use crate::{
     handler_core::{openai_error_from_error, openai_error_response, ApiError, ApiErrorKind},
     lora_adapters::list_lora_adapter_models,
+    mistralrs_for_server_builder::build_unloaded_state_for_create,
     openai::{ModelObject, ModelObjects},
     types::ExtractedMistralRsState,
 };
@@ -443,6 +445,92 @@ pub async fn reload_model(
     let model_id = request.model_id;
     let result = state.reload_model(&model_id).await;
     reload_model_result(model_id, result)
+}
+
+/// Add a model to a running swap server (`titan pull`). The CLI builds and serializes the `ModelSelected`; the TITAN
+/// settings and context length ride alongside. The model registers unloaded and loads on its first request.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct CreateModelRequest {
+    pub name: String,
+    #[schema(value_type = Object)]
+    pub model: ModelSelected,
+    #[serde(default)]
+    pub max_model_len: Option<usize>,
+    #[serde(default)]
+    pub device_layers: Option<Vec<String>>,
+    #[serde(default)]
+    pub in_situ_quant: Option<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub idle_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub prefix_cache_n: Option<usize>,
+    #[serde(default)]
+    pub max_seqs: Option<usize>,
+}
+
+#[utoipa::path(
+  post,
+  tag = "Mistral.rs",
+  path = "/v1/models/create",
+  request_body = CreateModelRequest,
+  responses(
+    (status = 200, description = "Model registered (unloaded); loads on first request", body = ModelStatusResponse),
+    (status = 400, description = "Invalid request or swap mode is not active"),
+    (status = 409, description = "A model with that name already exists"),
+    (status = 500, description = "Model registration failure")
+  )
+)]
+pub async fn create_model(
+    State(state): ExtractedMistralRsState,
+    payload: Result<Json<CreateModelRequest>, JsonRejection>,
+) -> Response {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(rejection) => return openai_error_response(ApiError::from_json_rejection(rejection)),
+    };
+    let globals = match state.titan_swap_globals() {
+        Some(globals) => globals,
+        None => {
+            return openai_error_from_error(
+                &MistralRsError::ReloadFailed("titan swap mode is not active".to_string()),
+                ApiErrorKind::InvalidRequest,
+            )
+        }
+    };
+    let settings = TitanModelSettings {
+        env: request.env,
+        idle_ttl: request.idle_ttl_secs.map(std::time::Duration::from_secs),
+        prefix_cache_n: request.prefix_cache_n,
+        paged_attn: None,
+        pa_cache_type: None,
+        pa_context_len: None,
+        pa_memory_mb: None,
+        max_num_batched_tokens: None,
+        max_seqs: request.max_seqs,
+    };
+    let built = build_unloaded_state_for_create(
+        request.model,
+        request.max_model_len,
+        request.device_layers,
+        request.in_situ_quant,
+        &settings,
+        &globals,
+    );
+    let unloaded = match built {
+        Ok(state) => state,
+        Err(error) => {
+            return openai_error_from_error(
+                &MistralRsError::ReloadFailed(error.to_string()),
+                ApiErrorKind::Internal,
+            )
+        }
+    };
+    match state.titan_add_model(&request.name, unloaded, settings) {
+        Ok(()) => model_status_response(request.name, ModelStatus::Unloaded),
+        Err(error) => openai_error_from_error(&error, ApiErrorKind::Internal),
+    }
 }
 
 #[utoipa::path(

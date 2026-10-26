@@ -10,6 +10,7 @@ const CUTLASS_COMMIT_ENV: &str = "MISTRALRS_CUTLASS_COMMIT";
 const CUDA_BUILD_ROOT_ENV: &str = "MISTRALRS_CUDA_BUILD_ROOT";
 #[cfg(feature = "cuda")]
 const SUPPORTED_CUDA_TOOLKIT_VERSIONS: &[(usize, usize)] = &[
+    (13, 4),
     (13, 3),
     (13, 2),
     (13, 1),

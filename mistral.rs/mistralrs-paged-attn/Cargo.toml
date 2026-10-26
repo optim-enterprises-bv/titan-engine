@@ -30,6 +30,8 @@ anyhow.workspace = true
 mistralrs-metal-compile = { workspace = true, optional = true }
 
 [features]
+# titan: oxide is the only supported path here; it is the default and the guard below rejects a non-oxide build.
+default = ["oxide"]
 oxide = ["cuda", "dep:titan-oxide-ffi"]
 cuda = ["dep:cudaforge", "candle-core/cuda"]
 metal = [

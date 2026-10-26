@@ -1,4 +1,6 @@
 #![deny(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#[cfg(all(feature = "cuda", not(feature = "oxide")))]
+compile_error!("titan-engine is oxide-only: the CUDA build must use the `oxide` feature (the crate default). The cuBLAS/nvcc path is not supported here.");
 #[cfg(feature = "oxide")]
 use titan_oxide_ffi as _;
 #[cfg(feature = "oxide")]
@@ -98,7 +100,7 @@ mod titan_oxide;
 mod titan_swap;
 pub use titan_swap::{
     device_free as titan_device_free, host_rss as titan_host_rss, release_device_memory as titan_release_device_memory,
-    TitanModelSettings, TitanSwapPolicy, DEFAULT_MAX_RESIDENT as TITAN_DEFAULT_MAX_RESIDENT, HEAP_COLLECT as TITAN_HEAP_COLLECT,
+    TitanModelSettings, TitanSwapGlobals, TitanSwapPolicy, DEFAULT_MAX_RESIDENT as TITAN_DEFAULT_MAX_RESIDENT, HEAP_COLLECT as TITAN_HEAP_COLLECT,
 };
 mod gguf;
 pub mod layers;

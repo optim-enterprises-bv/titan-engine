@@ -1,3 +1,5 @@
+#[cfg(all(feature = "cuda", not(feature = "oxide")))]
+compile_error!("titan-engine is oxide-only: the CUDA build must use the `oxide` feature (the crate default). The cuBLAS/nvcc path is not supported here.");
 #[cfg(feature = "oxide")]
 use titan_oxide_ffi as _;
 #[cfg(feature = "oxide")]
@@ -158,6 +160,8 @@ pub use blockwise_fp8::{
     blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
     fused_add_rms_norm_quantized, fused_add_rms_norm_quantized_with_normalized, BlockwiseFP8Linear,
 };
+#[cfg(feature = "cuda")]
+pub use blockwise_fp8::fp8_moe_grouped;
 pub use distributed::{
     layers::{
         compute_kv_shard, compute_n_kv_groups, validate_tp_head_layout, ColumnParallelLayer,

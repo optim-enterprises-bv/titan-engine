@@ -184,6 +184,48 @@ pub enum Command {
         cmd: CacheCommand,
     },
 
+    /// List models resident in VRAM now (queries the running server), like `ollama ps`.
+    Ps {
+        #[arg(long, default_value = "http://127.0.0.1:1234")]
+        url: String,
+    },
+
+    /// List all registered models and their load status (queries the running server), like `ollama ls`.
+    Ls {
+        #[arg(long, default_value = "http://127.0.0.1:1234")]
+        url: String,
+
+        /// Swap config read for each model's on-disk size.
+        #[arg(long, default_value = "/usr/local/etc/titan-engine/models.toml")]
+        config: PathBuf,
+    },
+
+    /// Download a GGUF and register it live on the running swap server with no restart, like `ollama pull`.
+    Pull {
+        /// Hugging Face repo id, e.g. `Qwen/Qwen3-0.6B-GGUF`.
+        repo: String,
+
+        /// GGUF filename within the repo. If omitted, the best file for `--quant` is auto-selected.
+        #[arg(short = 'f', long)]
+        file: Option<String>,
+
+        /// Bit width / quant to auto-select when --file is omitted (e.g. 2,3,4,5,6,8 or Q4_K_M). GGUF repos
+        /// have no hardware "auto" (the engine rejects it), so this picks the width; default Q4-class.
+        #[arg(long, default_value = "4")]
+        quant: String,
+
+        /// Name to register it under (defaults to the repo's short name).
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long, default_value = "http://127.0.0.1:1234")]
+        url: String,
+
+        /// Swap config to append the model to so it persists across restarts.
+        #[arg(long, default_value = "/usr/local/etc/titan-engine/models.toml")]
+        config: PathBuf,
+    },
+
     /// Run performance benchmarks for base or LoRA model generation.
     Bench {
         #[command(subcommand)]

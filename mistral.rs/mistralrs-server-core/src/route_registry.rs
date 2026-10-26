@@ -44,6 +44,8 @@ pub const UNLOAD_MODEL_ROUTE: RouteInfo =
     RouteInfo::new("/v1/models/unload", "POST", RouteKind::MistralRs);
 pub const RELOAD_MODEL_ROUTE: RouteInfo =
     RouteInfo::new("/v1/models/reload", "POST", RouteKind::MistralRs);
+pub const CREATE_MODEL_ROUTE: RouteInfo =
+    RouteInfo::new("/v1/models/create", "POST", RouteKind::MistralRs);
 pub const MODEL_STATUS_ROUTE: RouteInfo =
     RouteInfo::new("/v1/models/status", "POST", RouteKind::MistralRs);
 pub const TUNE_MODEL_ROUTE: RouteInfo =
@@ -124,6 +126,7 @@ pub const MISTRALRS_API_ROUTES: &[RouteInfo] = &[
     LIST_LORA_ADAPTERS_ROUTE,
     UNLOAD_MODEL_ROUTE,
     RELOAD_MODEL_ROUTE,
+    CREATE_MODEL_ROUTE,
     MODEL_STATUS_ROUTE,
     TUNE_MODEL_ROUTE,
     SYSTEM_INFO_ROUTE,

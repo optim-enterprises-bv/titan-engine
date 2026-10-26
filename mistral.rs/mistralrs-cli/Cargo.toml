@@ -51,6 +51,8 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 image = { workspace = true }
 comfy-table = "7"
+reqwest = { workspace = true }
+hf-hub = { workspace = true }
 dirs = { workspace = true }
 walkdir = { workspace = true }
 crossterm = "0.28"
@@ -60,7 +62,9 @@ fuzzy-matcher = "0.3"
 # titan noblas: `oxide` (the nvcc-free build) no longer implies `cuda`, which now also pulls cuBLAS / cuBLASLt / cuRAND
 # (mistralrs-core/cublas): the oxide binary links none of them.
 oxide = ["mistralrs-core/oxide", "mistralrs-server-core/oxide"]
-default = ["code-execution"]
+# titan: this tree is only ever the nvcc-free oxide engine, so oxide is default; a plain `cargo build` is the real
+# build. Needs TITAN_OXIDE_DIR set (the prebuilt PTX). The cuBLAS/nvcc path stays reachable via `--no-default-features`.
+default = ["code-execution", "oxide"]
 cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda", "mistralrs-core/cublas"]
 cutile = ["cuda", "mistralrs-core/cutile"]
 nccl = ["mistralrs-core/nccl", "mistralrs-server-core/nccl"]

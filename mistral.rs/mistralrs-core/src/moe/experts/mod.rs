@@ -25,6 +25,8 @@ pub use config::{prelog_moe_backend, ExpertProj, ExpertProjNames, MoEExpertsConf
 use backends::CutileExpertsWeights;
 #[cfg(feature = "cutile")]
 use backends::CutileFp8ExpertsWeights;
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
+use backends::OxideFp8ExpertsWeights;
 #[cfg(feature = "cuda")]
 use backends::CutlassExpertsWeights;
 use backends::{
@@ -52,6 +54,8 @@ enum MoEExpertsBackendImpl {
     Cutile(CutileExpertsWeights),
     #[cfg(feature = "cutile")]
     CutileFp8(CutileFp8ExpertsWeights),
+    #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+    OxideFp8(OxideFp8ExpertsWeights),
     #[cfg(feature = "cuda")]
     Cutlass(CutlassExpertsWeights),
     Fast(FastExpertsWeights),
@@ -69,6 +73,10 @@ impl MoEExpertsBackendImpl {
             Self::CutileFp8(w) => w
                 .forward_impl(forward, config)
                 .map_err(|err| err.context("moe experts cutile fp8")),
+            #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+            Self::OxideFp8(w) => w
+                .forward_impl(forward, config)
+                .map_err(|err| err.context("moe experts oxide fp8")),
             #[cfg(feature = "cuda")]
             Self::Cutlass(w) => w
                 .forward_impl(forward, config)
@@ -127,6 +135,23 @@ impl MoEExperts {
             let lora_site = Self::register_lora_site(cfg, &experts_vb, comm, false)?;
             return Ok(Self::from_backend(
                 MoEExpertsBackendImpl::CutileFp8(fp8),
+                lora_site,
+                cfg,
+                comm,
+                act,
+            ));
+        }
+        #[cfg(all(feature = "cuda", not(feature = "cutile")))]
+        if let Some(fp8) = OxideFp8ExpertsWeights::try_from_checkpoint(
+            cfg,
+            &experts_vb,
+            comm,
+            quantization_config,
+            act,
+        )? {
+            let lora_site = Self::register_lora_site(cfg, &experts_vb, comm, false)?;
+            return Ok(Self::from_backend(
+                MoEExpertsBackendImpl::OxideFp8(fp8),
                 lora_site,
                 cfg,
                 comm,

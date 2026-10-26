@@ -184,8 +184,8 @@ impl<'a> ExpertCheckpoint<'a> {
     }
 
     /// Blockwise FP8 experts with their `weight_scale_inv` tensors as `(gate_up, gate_up_scales,
-    /// down, down_scales)` in ENK layout; `None` for layouts the cuTile FP8 backend does not take.
-    #[cfg(feature = "cutile")]
+    /// down, down_scales)` in ENK layout; `None` for layouts the FP8 grouped backends do not take.
+    #[cfg(feature = "cuda")]
     pub(super) fn stacked_enk_fp8(
         &self,
         block: usize,

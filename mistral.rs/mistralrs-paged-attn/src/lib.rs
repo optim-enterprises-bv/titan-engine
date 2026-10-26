@@ -1,3 +1,6 @@
+#[cfg(all(feature = "cuda", not(feature = "oxide")))]
+compile_error!("titan-engine is oxide-only: build with the `oxide` feature (the crate default). The cuBLAS/nvcc path is not supported here.");
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KvCacheScales {
     pub k: f32,
