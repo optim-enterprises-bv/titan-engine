@@ -91,8 +91,16 @@ enum Model {
     GptOss(QGptOss),
 }
 
+/// Loaded Bonsai vision front-end held alongside the text model for the GGUF VL path.
+struct BonsaiVision {
+    tower: crate::vision_models::qwen3_vl::vision::Qwen3VLVisionModel,
+    image_token_id: u32,
+    device: Device,
+}
+
 pub struct TitanGGUFPipeline {
     model: Model,
+    vision: Option<BonsaiVision>,
     tokenizer: Arc<Tokenizer>,
     chat_template: Arc<ChatTemplate>,
     model_id: String,
@@ -112,6 +120,8 @@ pub(super) struct TitanLoadArgs<'a> {
     pub jinja_explicit: Option<&'a String>,
     pub topology: Option<&'a Topology>,
     pub kind: ModelKind,
+    /// Resolved clip mmproj GGUF paths (Bonsai vision); empty for text-only.
+    pub mmproj_paths: Vec<std::path::PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -312,7 +322,7 @@ pub(super) fn load(
     let internal_dtype = mapper.get_min_dtype(dtype)?;
     let attention = AttentionImplementation::Eager;
 
-    let model = match arch {
+    let mut model = match arch {
         GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::from_gguf(
             model,
             device,
@@ -337,6 +347,32 @@ pub(super) fn load(
             internal_dtype,
         )?),
         a => anyhow::bail!("titan GGUF loader: unsupported architecture `{a:?}`"),
+    };
+
+    // Bonsai vision: a clip mmproj turns the qwen35 text model into an image+text model.
+    let vision = if !args.mmproj_paths.is_empty() {
+        match &mut model {
+            Model::Qwen35MoE(m) => {
+                let tower = crate::models::bonsai_vision::load_bonsai_vision_tower(
+                    &args.mmproj_paths[0],
+                    device,
+                )?;
+                let image_token_id = crate::models::bonsai_vision::BONSAI_IMAGE_PAD_TOKEN;
+                m.set_image_token_id(Some(image_token_id));
+                info!("titan: Bonsai vision tower loaded from {:?}, image_token_id {image_token_id}", args.mmproj_paths[0]);
+                Some(BonsaiVision {
+                    tower,
+                    image_token_id,
+                    device: device.clone(),
+                })
+            }
+            _ => {
+                warn!("titan: --mmproj given but arch is not qwen35; ignoring the projector");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let gen_conf: Option<GenerationConfig> = match paths.get_gen_conf_filename() {
@@ -389,6 +425,7 @@ pub(super) fn load(
     let eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
     Ok(Arc::new(Mutex::new(TitanGGUFPipeline {
         model,
+        vision,
         tokenizer: tokenizer.into(),
         chat_template: Arc::new(chat_template),
         model_id: args
