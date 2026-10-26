@@ -91,6 +91,11 @@ enum Model {
     GptOss(QGptOss),
 }
 
+/// The Bonsai GGUF chat template inserts the `<|vision_start|><|image_pad|><|vision_end|>` tokens
+/// itself, so the prompt prefixer is a no-op.
+struct BonsaiPrefixer;
+impl crate::pipeline::MultimodalPromptPrefixer for BonsaiPrefixer {}
+
 /// Loaded Bonsai vision front-end held alongside the text model for the GGUF VL path.
 struct BonsaiVision {
     tower: crate::vision_models::qwen3_vl::vision::Qwen3VLVisionModel,
@@ -464,7 +469,27 @@ impl PreProcessingMixin for TitanGGUFPipeline {
         Some(self.chat_template.clone())
     }
     fn get_input_processor_config(&self) -> Option<Arc<dyn Any>> {
-        None
+        if self.vision.is_some() {
+            Some(Arc::new(crate::vision_models::preprocessor_config::PreProcessorConfig {
+                patch_size: Some(16),
+                merge_size: Some(2),
+                temporal_patch_size: Some(2),
+                image_mean: Some([0.5, 0.5, 0.5]),
+                image_std: Some([0.5, 0.5, 0.5]),
+                max_pixels: Some(768 * 768),
+                ..Default::default()
+            }))
+        } else {
+            None
+        }
+    }
+
+    fn get_processor(&self) -> Arc<dyn crate::pipeline::Processor> {
+        if self.vision.is_some() {
+            Arc::new(crate::vision_models::qwen3_vl::Qwen3VLProcessor::new(None))
+        } else {
+            Arc::new(crate::pipeline::processing::BasicProcessor)
+        }
     }
 }
 
@@ -573,6 +598,9 @@ impl Pipeline for TitanGGUFPipeline {
         inputs: Box<dyn Any>,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error> {
+        if self.vision.is_some() {
+            return self.forward_inputs_vision(inputs, return_raw_logits);
+        }
         let ModelInputs {
             input_ids,
             input_ids_full: _,
@@ -649,7 +677,14 @@ impl Pipeline for TitanGGUFPipeline {
     }
 
     fn category(&self) -> ModelCategory {
-        ModelCategory::Text
+        if self.vision.is_some() {
+            ModelCategory::Multimodal {
+                prefixer: Arc::new(BonsaiPrefixer),
+                video_sampling: crate::VideoFrameSampling::default(),
+            }
+        } else {
+            ModelCategory::Text
+        }
     }
 
     fn attach_speculative(
@@ -731,6 +766,97 @@ impl Pipeline for TitanGGUFPipeline {
 }
 
 impl TitanGGUFPipeline {
+    /// Bonsai vision forward: downcast the shared vision ModelInputs, run the tower on pixel_values
+    /// to image embeds, build Qwen3-VL 3D mrope positions, and run the qwen35 model with both on the
+    /// ctx (prefill). Decode steps (no pixel_values) fall through to the plain text forward.
+    fn forward_inputs_vision(
+        &self,
+        inputs: Box<dyn Any>,
+        return_raw_logits: bool,
+    ) -> Result<ForwardInputsResult, candle_core::Error> {
+        let v = *inputs
+            .downcast::<crate::vision_models::ModelInputs>()
+            .expect("titan vision: expected vision ModelInputs");
+        let crate::vision_models::ModelInputs {
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            position_ids,
+            pixel_values,
+            model_specific_args,
+            paged_attn_meta,
+            flash_meta,
+            recurrent_batch_kind,
+            ..
+        } = v;
+
+        let Model::Qwen35MoE(ref model) = self.model else {
+            candle_core::bail!("titan vision: only qwen35 supports the Bonsai vision path");
+        };
+        let bv = self.vision.as_ref().expect("vision loaded");
+
+        let (image_embeds, vision_positions) = if let Some(pv) = pixel_values.as_ref() {
+            let grid = model_specific_args
+                .downcast_ref::<crate::vision_models::qwen3_vl::Qwen3VLVisionSpecificArgs>()
+                .and_then(|a| a.image_grid_thw.clone())
+                .ok_or_else(|| candle_core::Error::msg("titan vision: missing image_grid_thw"))?;
+            let pv = pv.to_device(&bv.device)?.to_dtype(DType::BF16)?;
+            let (embeds, _deepstack) = bv.tower.forward(&pv, &grid)?;
+            let g = grid.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+            let (t, gh, gw) = (g[0][0] as usize, g[0][1] as usize / 2, g[0][2] as usize / 2);
+            let ids_host = input_ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+            let vpos = crate::models::bonsai_vision::vision_mrope_positions(
+                &ids_host,
+                bv.image_token_id,
+                (t, gh, gw),
+                &bv.device,
+            )?;
+            (Some(embeds), Some(vpos))
+        } else {
+            (None, None)
+        };
+
+        let paged_attn_meta = match (&self.metadata.cache_engine, &paged_attn_meta) {
+            (None, _) => None,
+            (Some(_), None) => {
+                candle_core::bail!("Forward step expected a PagedAttention input metadata.")
+            }
+            (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
+        };
+        let recurrent_batch_kind = match recurrent_batch_kind {
+            RecurrentBatchKind::SpeculativeDecode => RecurrentBatchKind::Decode,
+            other => other,
+        };
+        let recurrent_metadata = {
+            let hybrid = model.cache.hybrid();
+            hybrid.state_indices().cloned().map(|indices| {
+                RecurrentMetadata::new(
+                    recurrent_batch_kind,
+                    indices,
+                    hybrid.state_indices_host().map(ToOwned::to_owned),
+                )
+            })
+        };
+        let mut ctx = ModelForwardContext::new(
+            &seqlen_offsets,
+            &context_lens,
+            &position_ids,
+            paged_attn_meta
+                .as_ref()
+                .map(|(kv_cache, meta)| (kv_cache.as_slice(), *meta)),
+            &flash_meta,
+        )
+        .with_recurrent_batch_kind(recurrent_batch_kind)
+        .with_recurrent_metadata(recurrent_metadata)
+        .with_image_embeds(image_embeds)
+        .with_vision_positions(vision_positions);
+        let logits = model.forward(&input_ids, &mut ctx)?;
+        if return_raw_logits {
+            Ok(ForwardInputsResult::RawLogits { logits })
+        } else {
+            Ok(ForwardInputsResult::CausalGeneration { logits })
+        }
+    }
     /// The qwen35moe model when it drafts with its MTP block (unpaged caches only).
     fn mtp_model(&self) -> Option<&QQwen35MoE> {
         match &self.model {
