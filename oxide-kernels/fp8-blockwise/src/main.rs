@@ -548,6 +548,167 @@ mod kernels {
         }
     }
 
+    /// Dynamic FP8 activation quant: bf16 [rows, K] -> e4m3 [rows, K] + per-row-per-128-block f32 scale
+    /// [rows, nkb]. One block per (row, kblk), 128 threads (= block size bs). scale = max(|x|)/448.
+    #[kernel]
+    pub unsafe fn act_quant_e4m3(x: *const u16, q: *mut u8, scales: *mut f32, k_dim: i32, nkb: i32, bs: i32) {
+        static mut RED: SharedArray<f32, 128> = SharedArray::UNINIT;
+        let red = SharedArray::as_raw_mut_ptr(&raw mut RED);
+        let row = thread::blockIdx_x() as usize;
+        let kblk = thread::blockIdx_y() as usize;
+        let (k_dim, bs) = (k_dim as usize, bs as usize);
+        let tid = thread::threadIdx_x() as usize;
+        let col = kblk * bs + tid;
+        let v = if col < k_dim { bf16_f32(*x.add(row * k_dim + col)) } else { 0.0 };
+        let a = if v < 0.0 { -v } else { v };
+        *red.add(tid) = a;
+        thread::sync_threads();
+        let mut off = 64usize;
+        while off > 0 {
+            if tid < off {
+                let o = *red.add(tid + off);
+                if o > *red.add(tid) {
+                    *red.add(tid) = o;
+                }
+            }
+            thread::sync_threads();
+            off >>= 1;
+        }
+        let maxv = *red;
+        let scale = if maxv > 0.0 { maxv / 448.0 } else { 1.0 };
+        if tid == 0 {
+            *scales.add(row * (nkb as usize) + kblk) = scale;
+        }
+        if col < k_dim {
+            let e = convert::cvt_rn_satfinite_e4m3x2_f32(v / scale, 0.0) & 0xFF;
+            *q.add(row * k_dim + col) = e as u8;
+        }
+    }
+
+    /// FP8 W8A8 grouped MoE GEMM (sorted/offsets/tw convention), native m16n8k32 e4m3 MMA. Both operands
+    /// e4m3 with per-128-block scales: activation scale `in_scales[input_row, k/128]` (from act_quant_e4m3)
+    /// times weight scale `ws[e, n/128, k/128]`. M-parallel: one warp block per (expert, 8-wide N tile,
+    /// 16-row M tile) via blockIdx.z, so segment rows run concurrently. Output bf16 [size_m, N] by sorted value.
+    #[kernel]
+    pub unsafe fn fp8_moe_grouped_w8a8(
+        out: *mut u16,
+        input: *const u8,
+        in_scales: *const f32,
+        w: *const u8,
+        ws: *const f32,
+        sorted: *const i32,
+        offsets: *const i32,
+        tw: *const f32,
+        num_experts: i32,
+        topk: i32,
+        has_tw: i32,
+        size_n: i32,
+        size_k: i32,
+        bs: i32,
+    ) {
+        let expert = thread::blockIdx_x() as i32;
+        if expert >= num_experts {
+            return;
+        }
+        let bn_i = (thread::blockIdx_y() as i32) * 8;
+        if bn_i >= size_n {
+            return;
+        }
+        let seg_start = *offsets.add(expert as usize);
+        let seg_end = *offsets.add(expert as usize + 1);
+        let rows = seg_end - seg_start;
+        let m_base = (thread::blockIdx_z() as i32) * 16;
+        if m_base >= rows {
+            return;
+        }
+
+        let (n_dim, k_dim, bs) = (size_n as usize, size_k as usize, bs as usize);
+        let bn = bn_i as usize;
+        let lane = thread::threadIdx_x() as usize;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let nkb = (k_dim + bs - 1) / bs;
+        let w_slab = (expert as usize) * n_dim * k_dim;
+        let ws_slab = (expert as usize) * ((n_dim + bs - 1) / bs) * nkb;
+        let div = if has_tw == 0 { topk } else { 1 };
+
+        let row_src = |r: usize| -> (usize, bool, usize) {
+            let mseg = m_base + r as i32;
+            if mseg < rows {
+                let tokidx = *sorted.add((seg_start + mseg) as usize);
+                ((tokidx / div) as usize, true, tokidx as usize)
+            } else {
+                (0, false, 0)
+            }
+        };
+        let mut acc = [0f32; 4];
+        let mut kb = 0usize;
+        while kb < k_dim {
+            let mut part = [0f32; 4];
+            let mut kk = 0usize;
+            while kk < bs {
+                let kbase = kb + kk;
+                let a_at = |mrow: usize, kcol: usize| -> u8 {
+                    let (iidx, valid, _) = row_src(mrow);
+                    if valid && kcol < k_dim {
+                        *input.add(iidx * k_dim + kcol)
+                    } else {
+                        0
+                    }
+                };
+                let c0 = kbase + tig * 4;
+                let c1 = kbase + tig * 4 + 16;
+                let a = [
+                    pack4(a_at(group, c0), a_at(group, c0 + 1), a_at(group, c0 + 2), a_at(group, c0 + 3)),
+                    pack4(a_at(group + 8, c0), a_at(group + 8, c0 + 1), a_at(group + 8, c0 + 2), a_at(group + 8, c0 + 3)),
+                    pack4(a_at(group, c1), a_at(group, c1 + 1), a_at(group, c1 + 2), a_at(group, c1 + 3)),
+                    pack4(a_at(group + 8, c1), a_at(group + 8, c1 + 1), a_at(group + 8, c1 + 2), a_at(group + 8, c1 + 3)),
+                ];
+                let b_at = |kcol: usize, ncol: usize| -> u8 {
+                    if bn + ncol < n_dim && kcol < k_dim {
+                        *w.add(w_slab + (bn + ncol) * k_dim + kcol)
+                    } else {
+                        0
+                    }
+                };
+                let b = [
+                    pack4(b_at(c0, group), b_at(c0 + 1, group), b_at(c0 + 2, group), b_at(c0 + 3, group)),
+                    pack4(b_at(c1, group), b_at(c1 + 1, group), b_at(c1 + 2, group), b_at(c1 + 3, group)),
+                ];
+                part = mma_fp8(a, b, part);
+                kk += 32;
+            }
+            let kblk = kb / bs;
+            let mut j = 0usize;
+            while j < 4 {
+                let row = group + 8 * (j >> 1);
+                let col = 2 * tig + (j & 1);
+                let (iidx, valid, _) = row_src(row);
+                let nj = bn + col;
+                let asc = if valid { *in_scales.add(iidx * nkb + kblk) } else { 0.0 };
+                let wsc = if nj < n_dim { *ws.add(ws_slab + (nj / bs) * nkb + kblk) } else { 0.0 };
+                acc[j] += part[j] * asc * wsc;
+                j += 1;
+            }
+            kb += bs;
+        }
+        let mut j = 0usize;
+        while j < 4 {
+            let row = group + 8 * (j >> 1);
+            let col = 2 * tig + (j & 1);
+            let (_, valid, tokidx) = row_src(row);
+            let n = bn + col;
+            if valid && n < n_dim {
+                let mut v = acc[j];
+                if has_tw != 0 {
+                    v *= *tw.add(tokidx);
+                }
+                *out.add(tokidx * n_dim + n) = f32_bf16(v);
+            }
+            j += 1;
+        }
+    }
+
     #[kernel]
     pub unsafe fn fp8_w8a16_block_bf16(
         y: *mut u16,
@@ -700,6 +861,17 @@ fn main() {
     }
     for (t, h, i, e, top_k) in [(24usize, 128usize, 256usize, 8usize, 2usize), (64, 256, 384, 16, 4)] {
         if !run_moe_ffn(&stream, &f_cnt, &f_scan, &f_grp, t, h, i, e, top_k, 128) {
+            all_ok = false;
+        }
+    }
+    let f_aq = module.load_function("act_quant_e4m3").expect("act_quant entry");
+    let f_g8 = module.load_function("fp8_moe_grouped_w8a8").expect("grouped w8a8 entry");
+    for (t, n, k, e, top_k, htw) in [
+        (24usize, 256usize, 384usize, 16usize, 4usize, false),
+        (24, 256, 384, 16, 4, true),
+        (64, 768, 128, 16, 4, false),
+    ] {
+        if !run_grouped_w8a8(&stream, &f_cnt, &f_scan, &f_aq, &f_g8, t, n, k, e, top_k, htw, 128) {
             all_ok = false;
         }
     }
@@ -983,6 +1155,180 @@ fn run_moe_w8a8(
     }
     println!(
         "fp8_moe_w8a8_mma:  T={t} N={n} K={k} E={e} top_k={top_k}, {em_rows} routed rows, worst_abs={worst:.5}, {fails} failing -> {}",
+        if fails == 0 { "PASS" } else { "FAIL" }
+    );
+    fails == 0
+}
+
+/// W8A8 path test: act_quant_e4m3 (bf16 -> e4m3 + per-row-128 scales) then fp8_moe_grouped_w8a8,
+/// vs a reference built from the kernel's own quantized bytes. Also checks the quant round-trip error.
+#[allow(clippy::too_many_arguments)]
+fn run_grouped_w8a8(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    f_cnt: &cuda_core::CudaFunction,
+    f_scan: &cuda_core::CudaFunction,
+    f_aq: &cuda_core::CudaFunction,
+    f_g8: &cuda_core::CudaFunction,
+    t: usize,
+    n: usize,
+    k: usize,
+    e: usize,
+    top_k: usize,
+    has_tw: bool,
+    bs: usize,
+) -> bool {
+    let nkb = k.div_ceil(bs);
+    let nmb = n.div_ceil(bs);
+    let mut rng = Rng(0x7e57_c0de_a8a8_1234);
+    let num_valid = t * top_k;
+    let in_rows = if has_tw { num_valid } else { t };
+
+    let input: Vec<u16> = (0..in_rows * k).map(|_| rng.bf16()).collect();
+    let w: Vec<u8> = (0..e * n * k).map(|_| rng.e4m3_small()).collect();
+    let ws: Vec<f32> = (0..e * nmb * nkb).map(|_| rng.scale()).collect();
+
+    let mut topk_ids = vec![0usize; num_valid];
+    let mut topk_w = vec![0f32; num_valid];
+    for ti in 0..t {
+        let mut chosen = Vec::new();
+        while chosen.len() < top_k {
+            let c = (rng.next_u32() as usize) % e;
+            if !chosen.contains(&c) {
+                chosen.push(c);
+            }
+        }
+        for s in 0..top_k {
+            topk_ids[ti * top_k + s] = chosen[s];
+            topk_w[ti * top_k + s] = 0.1 + (rng.next_u32() as f32 / u32::MAX as f32);
+        }
+    }
+    let mut order: Vec<usize> = (0..num_valid).collect();
+    order.sort_by_key(|&sid| topk_ids[sid]);
+    let sorted: Vec<i32> = order.iter().map(|&sid| sid as i32).collect();
+    let expert_ids: Vec<i32> = order.iter().map(|&sid| topk_ids[sid] as i32).collect();
+
+    let i32b = |s: &[i32]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let f32b = |s: &[f32]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let u16b = |s: &[u16]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+
+    // Quantize input to e4m3 + per-row-128 scales on device.
+    let d_x = DeviceBuffer::from_host(stream, &u16b(&input)).unwrap();
+    let d_q = DeviceBuffer::from_host(stream, &vec![0u8; in_rows * k]).unwrap();
+    let d_qs = DeviceBuffer::from_host(stream, &vec![0u8; in_rows * nkb * 4]).unwrap();
+    let mut aq: Vec<[u8; 8]> = vec![
+        d_x.cu_deviceptr().to_le_bytes(),
+        d_q.cu_deviceptr().to_le_bytes(),
+        d_qs.cu_deviceptr().to_le_bytes(),
+        (k as u32 as u64).to_le_bytes(),
+        (nkb as u32 as u64).to_le_bytes(),
+        (bs as u32 as u64).to_le_bytes(),
+    ];
+    let mut aqp: Vec<*mut c_void> = aq.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
+    unsafe {
+        launch_kernel_on_stream(f_aq, (in_rows as u32, nkb as u32, 1), (128, 1, 1), 0, stream, &mut aqp).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let q: Vec<u8> = d_q.to_host_vec(stream).unwrap();
+    let qsb = d_qs.to_host_vec(stream).unwrap();
+    let qs: Vec<f32> = qsb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    // Quant round-trip error (dequant vs original), should be within one e4m3 step of the block max.
+    let mut qerr = 0f32;
+    for r in 0..in_rows {
+        for c in 0..k {
+            let orig = bf16_to_f32(input[r * k + c]);
+            let deq = e4m3_to_f32(q[r * k + c]) * qs[r * nkb + c / bs];
+            qerr = qerr.max((orig - deq).abs());
+        }
+    }
+
+    // Align offsets on device.
+    let d_eid = DeviceBuffer::from_host(stream, &i32b(&expert_ids)).unwrap();
+    let d_counts = DeviceBuffer::from_host(stream, &vec![0u8; e * 4]).unwrap();
+    let d_off = DeviceBuffer::from_host(stream, &vec![0u8; (e + 1) * 4]).unwrap();
+    let mut ca: Vec<[u8; 8]> = vec![
+        d_eid.cu_deviceptr().to_le_bytes(),
+        d_counts.cu_deviceptr().to_le_bytes(),
+        (num_valid as u32 as u64).to_le_bytes(),
+    ];
+    let mut cp: Vec<*mut c_void> = ca.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
+    unsafe {
+        launch_kernel_on_stream(f_cnt, (((num_valid + 255) / 256).max(1) as u32, 1, 1), (256, 1, 1), 0, stream, &mut cp).unwrap();
+    }
+    let mut sa: Vec<[u8; 8]> = vec![
+        d_counts.cu_deviceptr().to_le_bytes(),
+        d_off.cu_deviceptr().to_le_bytes(),
+        (e as u32 as u64).to_le_bytes(),
+    ];
+    let mut sp: Vec<*mut c_void> = sa.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
+    unsafe {
+        launch_kernel_on_stream(f_scan, (1, 1, 1), (1024, 1, 1), 0, stream, &mut sp).unwrap();
+    }
+
+    let d_sorted = DeviceBuffer::from_host(stream, &i32b(&sorted)).unwrap();
+    let d_w = DeviceBuffer::from_host(stream, &w).unwrap();
+    let d_ws = DeviceBuffer::from_host(stream, &f32b(&ws)).unwrap();
+    let d_tw = DeviceBuffer::from_host(stream, &f32b(&topk_w)).unwrap();
+    let d_out = DeviceBuffer::from_host(stream, &vec![0u8; num_valid * n * 2]).unwrap();
+    let htw_i = if has_tw { 1i32 } else { 0 };
+    let mut ga: Vec<[u8; 8]> = vec![
+        d_out.cu_deviceptr().to_le_bytes(),
+        d_q.cu_deviceptr().to_le_bytes(),
+        d_qs.cu_deviceptr().to_le_bytes(),
+        d_w.cu_deviceptr().to_le_bytes(),
+        d_ws.cu_deviceptr().to_le_bytes(),
+        d_sorted.cu_deviceptr().to_le_bytes(),
+        d_off.cu_deviceptr().to_le_bytes(),
+        d_tw.cu_deviceptr().to_le_bytes(),
+        (e as u32 as u64).to_le_bytes(),
+        (top_k as u32 as u64).to_le_bytes(),
+        (htw_i as u32 as u64).to_le_bytes(),
+        (n as u32 as u64).to_le_bytes(),
+        (k as u32 as u64).to_le_bytes(),
+        (bs as u32 as u64).to_le_bytes(),
+    ];
+    let mut gp: Vec<*mut c_void> = ga.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
+    let grid_z = num_valid.div_ceil(16) as u32;
+    unsafe {
+        launch_kernel_on_stream(f_g8, (e as u32, n.div_ceil(8) as u32, grid_z), (32, 1, 1), 0, stream, &mut gp).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let ob = d_out.to_host_vec(stream).unwrap();
+    let gpu: Vec<u16> = ob.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+
+    // Reference from the kernel's own quantized bytes (dequant act * dequant weight, block-scaled).
+    let mut refout = vec![0u16; num_valid * n];
+    for sid in 0..num_valid {
+        let ex = topk_ids[sid];
+        let iidx = if has_tw { sid } else { sid / top_k };
+        for ni in 0..n {
+            let mut acc = 0f32;
+            for ki in 0..k {
+                acc += e4m3_to_f32(q[iidx * k + ki])
+                    * qs[iidx * nkb + ki / bs]
+                    * e4m3_to_f32(w[ex * n * k + ni * k + ki])
+                    * ws[ex * nmb * nkb + (ni / bs) * nkb + ki / bs];
+            }
+            if has_tw {
+                acc *= topk_w[sid];
+            }
+            refout[sid * n + ni] = f32_to_bf16(acc);
+        }
+    }
+
+    let atol = 0.02 * (k as f32).sqrt();
+    let mut fails = 0;
+    let mut worst = 0f32;
+    for idx in 0..num_valid * n {
+        let (fa, fb) = (bf16_to_f32(refout[idx]), bf16_to_f32(gpu[idx]));
+        let ab = (fa - fb).abs();
+        worst = worst.max(ab);
+        if ab > atol + 0.02 * fa.abs() {
+            fails += 1;
+        }
+    }
+    println!(
+        "fp8_moe_grouped_w8a8: T={t} N={n} K={k} E={e} top_k={top_k} has_tw={has_tw}, {num_valid} rows, quant_err={qerr:.4}, worst_abs={worst:.5}, {fails} failing -> {}",
         if fails == 0 { "PASS" } else { "FAIL" }
     );
     fails == 0

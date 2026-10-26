@@ -7,7 +7,8 @@
 .address_size 64
 
 	// .globl	fp8_w8a16_block_bf16_mma // -- Begin function fp8_w8a16_block_bf16_mma
-.visible .shared .align 4 .b8 __shared_mem_0[4096];
+.visible .shared .align 4 .b8 __shared_mem_1[4096];
+.visible .shared .align 4 .b8 __shared_mem_0[512];
                                         // @fp8_w8a16_block_bf16_mma
 .visible .entry fp8_w8a16_block_bf16_mma(
 	.param .u64 .ptr .align 1 fp8_w8a16_block_bf16_mma_param_0,
@@ -2338,6 +2339,181 @@ $L__BB3_20:                             // %bb25
 	trap;
                                         // -- End function
 }
+	// .globl	act_quant_e4m3          // -- Begin function act_quant_e4m3
+.visible .entry act_quant_e4m3(
+	.param .u64 .ptr .align 1 act_quant_e4m3_param_0,
+	.param .u64 .ptr .align 1 act_quant_e4m3_param_1,
+	.param .u64 .ptr .align 1 act_quant_e4m3_param_2,
+	.param .u32 act_quant_e4m3_param_3,
+	.param .u32 act_quant_e4m3_param_4,
+	.param .u32 act_quant_e4m3_param_5
+)                                       // @act_quant_e4m3
+{
+	.reg .pred 	%p<18>;
+	.reg .b16 	%rs<3>;
+	.reg .b32 	%r<28>;
+	.reg .b64 	%rd<29>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd12, [act_quant_e4m3_param_0];
+	cvta.to.global.u64 	%rd13, %rd12;
+	ld.param.b64 	%rd14, [act_quant_e4m3_param_1];
+	ld.param.b64 	%rd15, [act_quant_e4m3_param_2];
+	cvta.to.global.u64 	%rd1, %rd15;
+	cvta.to.global.u64 	%rd2, %rd14;
+	ld.param.s32 	%rd5, [act_quant_e4m3_param_3];
+	mov.u32 	%r10, %ctaid.x;
+	cvt.u64.u32 	%rd3, %r10;
+	ld.param.s32 	%rd16, [act_quant_e4m3_param_5];
+	mov.u32 	%r11, %ctaid.y;
+	cvt.u64.u32 	%rd4, %r11;
+	mov.u32 	%r12, %tid.x;
+	cvt.u64.u32 	%rd6, %r12;
+	mad.lo.s64 	%rd7, %rd16, %rd4, %rd6;
+	setp.ge.u64 	%p1, %rd7, %rd5;
+	mul.lo.s64 	%rd8, %rd5, %rd3;
+	mov.b32 	%r27, 0f00000000;
+	@%p1 bra 	$L__BB4_2;
+	bra.uni 	$L__BB4_1;
+$L__BB4_1:                              // %bb5
+	shl.b64 	%rd17, %rd8, 1;
+	add.s64 	%rd18, %rd13, %rd17;
+	shl.b64 	%rd19, %rd7, 1;
+	add.s64 	%rd9, %rd18, %rd19;
+	ld.global.b16 	%rs1, [%rd9];
+	// begin inline asm
+	cvt.f32.bf16 %r27, %rs1;
+	// end inline asm
+$L__BB4_2:                              // %bb7
+	cvt.u32.u64 	%r13, %rd6;
+	setp.geu.f32 	%p2, %r27, 0f00000000;
+	neg.f32 	%r14, %r27;
+	selp.f32 	%r15, %r27, %r14, %p2;
+	shl.b64 	%rd20, %rd6, 2;
+	mov.b64 	%rd21, __shared_mem_0;
+	add.s64 	%rd10, %rd21, %rd20;
+	st.shared.b32 	[%rd10], %r15;
+	bar.sync 	0;
+	setp.gt.u32 	%p3, %r13, 63;
+	@%p3 bra 	$L__BB4_5;
+	bra.uni 	$L__BB4_3;
+$L__BB4_3:                              // %bb14
+	ld.shared.b32 	%r1, [%rd10+256];
+	ld.shared.b32 	%r16, [%rd10];
+	setp.leu.f32 	%p4, %r1, %r16;
+	@%p4 bra 	$L__BB4_5;
+	bra.uni 	$L__BB4_4;
+$L__BB4_4:                              // %bb15
+	st.shared.b32 	[%rd10], %r1;
+$L__BB4_5:                              // %bb19
+	bar.sync 	0;
+	setp.gt.u32 	%p5, %r13, 31;
+	@%p5 bra 	$L__BB4_8;
+	bra.uni 	$L__BB4_6;
+$L__BB4_6:                              // %bb14.1
+	ld.shared.b32 	%r2, [%rd10+128];
+	ld.shared.b32 	%r17, [%rd10];
+	setp.leu.f32 	%p6, %r2, %r17;
+	@%p6 bra 	$L__BB4_8;
+	bra.uni 	$L__BB4_7;
+$L__BB4_7:                              // %bb15.1
+	st.shared.b32 	[%rd10], %r2;
+$L__BB4_8:                              // %bb19.1
+	bar.sync 	0;
+	setp.gt.u32 	%p7, %r13, 15;
+	@%p7 bra 	$L__BB4_11;
+	bra.uni 	$L__BB4_9;
+$L__BB4_9:                              // %bb14.2
+	ld.shared.b32 	%r3, [%rd10+64];
+	ld.shared.b32 	%r18, [%rd10];
+	setp.leu.f32 	%p8, %r3, %r18;
+	@%p8 bra 	$L__BB4_11;
+	bra.uni 	$L__BB4_10;
+$L__BB4_10:                             // %bb15.2
+	st.shared.b32 	[%rd10], %r3;
+$L__BB4_11:                             // %bb19.2
+	bar.sync 	0;
+	setp.gt.u32 	%p9, %r13, 7;
+	@%p9 bra 	$L__BB4_14;
+	bra.uni 	$L__BB4_12;
+$L__BB4_12:                             // %bb14.3
+	ld.shared.b32 	%r4, [%rd10+32];
+	ld.shared.b32 	%r19, [%rd10];
+	setp.leu.f32 	%p10, %r4, %r19;
+	@%p10 bra 	$L__BB4_14;
+	bra.uni 	$L__BB4_13;
+$L__BB4_13:                             // %bb15.3
+	st.shared.b32 	[%rd10], %r4;
+$L__BB4_14:                             // %bb19.3
+	bar.sync 	0;
+	setp.gt.u32 	%p11, %r13, 3;
+	@%p11 bra 	$L__BB4_17;
+	bra.uni 	$L__BB4_15;
+$L__BB4_15:                             // %bb14.4
+	ld.shared.b32 	%r5, [%rd10+16];
+	ld.shared.b32 	%r20, [%rd10];
+	setp.leu.f32 	%p12, %r5, %r20;
+	@%p12 bra 	$L__BB4_17;
+	bra.uni 	$L__BB4_16;
+$L__BB4_16:                             // %bb15.4
+	st.shared.b32 	[%rd10], %r5;
+$L__BB4_17:                             // %bb19.4
+	bar.sync 	0;
+	setp.gt.u32 	%p13, %r13, 1;
+	@%p13 bra 	$L__BB4_20;
+	bra.uni 	$L__BB4_18;
+$L__BB4_18:                             // %bb14.5
+	ld.shared.b32 	%r6, [%rd10+8];
+	ld.shared.b32 	%r21, [%rd10];
+	setp.leu.f32 	%p14, %r6, %r21;
+	@%p14 bra 	$L__BB4_20;
+	bra.uni 	$L__BB4_19;
+$L__BB4_19:                             // %bb15.5
+	st.shared.b32 	[%rd10], %r6;
+$L__BB4_20:                             // %bb19.5
+	bar.sync 	0;
+	setp.ne.b32 	%p15, %r13, 0;
+	@%p15 bra 	$L__BB4_23;
+	bra.uni 	$L__BB4_21;
+$L__BB4_21:                             // %bb14.6
+	ld.shared.b32 	%r7, [%rd10+4];
+	ld.shared.b32 	%r22, [%rd10];
+	setp.leu.f32 	%p16, %r7, %r22;
+	@%p16 bra 	$L__BB4_23;
+	bra.uni 	$L__BB4_22;
+$L__BB4_22:                             // %bb15.6
+	st.shared.b32 	[%rd10], %r7;
+$L__BB4_23:                             // %bb19.6
+	bar.sync 	0;
+	ld.shared.b32 	%r23, [__shared_mem_0];
+	setp.leu.f32 	%p17, %r23, 0f00000000;
+	div.rn.f32 	%r24, %r23, 0f43E00000;
+	selp.f32 	%r8, 0f3F800000, %r24, %p17;
+	@%p15 bra 	$L__BB4_25;
+	bra.uni 	$L__BB4_24;
+$L__BB4_24:                             // %bb25
+	ld.param.b32 	%r9, [act_quant_e4m3_param_4];
+	cvt.s64.s32 	%rd22, %r9;
+	mul.lo.s64 	%rd23, %rd22, %rd3;
+	shl.b64 	%rd24, %rd23, 2;
+	add.s64 	%rd25, %rd1, %rd24;
+	shl.b64 	%rd26, %rd4, 2;
+	add.s64 	%rd11, %rd25, %rd26;
+	st.global.b32 	[%rd11], %r8;
+$L__BB4_25:                             // %bb26
+	@%p1 bra 	$L__BB4_27;
+	bra.uni 	$L__BB4_26;
+$L__BB4_26:                             // %bb27
+	div.rn.f32 	%r25, %r27, %r8;
+	mov.b32 	%r26, 0f00000000;
+	cvt.rn.satfinite.e4m3x2.f32 	%rs2, %r26, %r25;
+	add.s64 	%rd27, %rd2, %rd8;
+	add.s64 	%rd28, %rd27, %rd7;
+	st.global.b8 	[%rd28], %rs2;
+$L__BB4_27:                             // %bb29
+	ret;
+                                        // -- End function
+}
 	// .globl	moe_count               // -- Begin function moe_count
 .visible .entry moe_count(
 	.param .u64 .ptr .align 1 moe_count_param_0,
@@ -2358,9 +2534,9 @@ $L__BB3_20:                             // %bb25
 	mov.u32 	%r5, %tid.x;
 	mad.lo.s32 	%r1, %r3, %r4, %r5;
 	setp.ge.s32 	%p1, %r1, %r2;
-	@%p1 bra 	$L__BB4_2;
-	bra.uni 	$L__BB4_1;
-$L__BB4_1:                              // %bb4
+	@%p1 bra 	$L__BB5_2;
+	bra.uni 	$L__BB5_1;
+$L__BB5_1:                              // %bb4
 	ld.param.b64 	%rd2, [moe_count_param_1];
 	mul.wide.s32 	%rd5, %r1, 4;
 	add.s64 	%rd6, %rd1, %rd5;
@@ -2371,8 +2547,1251 @@ $L__BB4_1:                              // %bb4
 	// begin inline asm
 	red.global.add.s32 [%rd4], %r6;
 	// end inline asm
-$L__BB4_2:                              // %bb6
+$L__BB5_2:                              // %bb6
 	ret;
+                                        // -- End function
+}
+	// .globl	fp8_moe_grouped_w8a8    // -- Begin function fp8_moe_grouped_w8a8
+.visible .entry fp8_moe_grouped_w8a8(
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_0,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_1,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_2,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_3,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_4,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_5,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_6,
+	.param .u64 .ptr .align 1 fp8_moe_grouped_w8a8_param_7,
+	.param .u32 fp8_moe_grouped_w8a8_param_8,
+	.param .u32 fp8_moe_grouped_w8a8_param_9,
+	.param .u32 fp8_moe_grouped_w8a8_param_10,
+	.param .u32 fp8_moe_grouped_w8a8_param_11,
+	.param .u32 fp8_moe_grouped_w8a8_param_12,
+	.param .u32 fp8_moe_grouped_w8a8_param_13
+)                                       // @fp8_moe_grouped_w8a8
+{
+	.local .align 4 .b8 	__local_depot6[16];
+	.reg .b64 	%SP;
+	.reg .b64 	%SPL;
+	.reg .pred 	%p<96>;
+	.reg .b16 	%rs<8>;
+	.reg .b32 	%r<140>;
+	.reg .b64 	%rd<180>;
+
+// %bb.0:                               // %entry
+	mov.b64 	%SPL, __local_depot6;
+	ld.param.b64 	%rd55, [fp8_moe_grouped_w8a8_param_0];
+	ld.param.b64 	%rd56, [fp8_moe_grouped_w8a8_param_6];
+	cvta.to.global.u64 	%rd1, %rd56;
+	ld.param.b64 	%rd57, [fp8_moe_grouped_w8a8_param_1];
+	ld.param.b64 	%rd58, [fp8_moe_grouped_w8a8_param_5];
+	cvta.to.global.u64 	%rd2, %rd58;
+	ld.param.b64 	%rd59, [fp8_moe_grouped_w8a8_param_2];
+	ld.param.b64 	%rd60, [fp8_moe_grouped_w8a8_param_3];
+	cvta.to.global.u64 	%rd3, %rd60;
+	cvta.to.global.u64 	%rd4, %rd59;
+	ld.param.b64 	%rd61, [fp8_moe_grouped_w8a8_param_4];
+	cvta.to.global.u64 	%rd5, %rd61;
+	ld.param.b64 	%rd62, [fp8_moe_grouped_w8a8_param_7];
+	cvta.to.global.u64 	%rd6, %rd62;
+	cvta.to.global.u64 	%rd7, %rd55;
+	cvta.to.global.u64 	%rd8, %rd57;
+	ld.param.b32 	%r44, [fp8_moe_grouped_w8a8_param_8];
+	add.u64 	%rd9, %SPL, 0;
+	mov.u32 	%r1, %ctaid.x;
+	setp.ge.s32 	%p1, %r1, %r44;
+	@%p1 bra 	$L__BB6_71;
+	bra.uni 	$L__BB6_1;
+$L__BB6_1:                              // %bb3
+	ld.param.b32 	%r41, [fp8_moe_grouped_w8a8_param_11];
+	mov.u32 	%r45, %ctaid.y;
+	shl.b32 	%r2, %r45, 3;
+	setp.ge.s32 	%p2, %r2, %r41;
+	@%p2 bra 	$L__BB6_71;
+	bra.uni 	$L__BB6_2;
+$L__BB6_2:                              // %bb6
+	mul.wide.u32 	%rd63, %r1, 4;
+	add.s64 	%rd64, %rd1, %rd63;
+	ld.global.b32 	%r3, [%rd64];
+	ld.global.b32 	%r46, [%rd64+4];
+	sub.s32 	%r4, %r46, %r3;
+	mov.u32 	%r47, %ctaid.z;
+	shl.b32 	%r5, %r47, 4;
+	setp.ge.s32 	%p3, %r5, %r4;
+	@%p3 bra 	$L__BB6_71;
+	bra.uni 	$L__BB6_3;
+$L__BB6_3:                              // %bb9
+	ld.param.b32 	%r43, [fp8_moe_grouped_w8a8_param_13];
+	setp.eq.b32 	%p4, %r43, 0;
+	@%p4 bra 	$L__BB6_202;
+	bra.uni 	$L__BB6_4;
+$L__BB6_4:                              // %bb12
+	ld.param.b32 	%r42, [fp8_moe_grouped_w8a8_param_12];
+	cvt.u64.u32 	%rd11, %r41;
+	cvt.s64.s32 	%rd12, %r42;
+	cvt.s64.s32 	%rd13, %r43;
+	mov.u32 	%r48, %tid.x;
+	add.s64 	%rd17, %rd13, -1;
+	add.s64 	%rd18, %rd17, %rd12;
+	or.b64 	%rd66, %rd18, %rd13;
+	and.b64 	%rd67, %rd66, -4294967296;
+	setp.ne.b64 	%p5, %rd67, 0;
+	cvt.u32.u64 	%r125, %rd13;
+	@%p5 bra 	$L__BB6_6;
+	bra.uni 	$L__BB6_5;
+$L__BB6_5:
+	cvt.u32.u64 	%r49, %rd18;
+	div.u32 	%r50, %r49, %r125;
+	cvt.u64.u32 	%rd19, %r50;
+	bra.uni 	$L__BB6_7;
+$L__BB6_6:
+	div.u64 	%rd19, %rd18, %rd13;
+$L__BB6_7:                              // %bb12.split
+	cvt.u64.u32 	%rd65, %r48;
+	ld.param.b32 	%r40, [fp8_moe_grouped_w8a8_param_10];
+	ld.param.b32 	%r39, [fp8_moe_grouped_w8a8_param_9];
+	add.s64 	%rd20, %rd17, %rd11;
+	or.b64 	%rd68, %rd20, %rd13;
+	and.b64 	%rd69, %rd68, -4294967296;
+	setp.ne.b64 	%p6, %rd69, 0;
+	@%p6 bra 	$L__BB6_9;
+	bra.uni 	$L__BB6_8;
+$L__BB6_8:
+	cvt.u32.u64 	%r51, %rd20;
+	div.u32 	%r52, %r51, %r125;
+	cvt.u64.u32 	%rd163, %r52;
+	bra.uni 	$L__BB6_10;
+$L__BB6_9:
+	div.u64 	%rd163, %rd20, %rd13;
+$L__BB6_10:                             // %bb12.split.split
+	cvt.u64.u32 	%rd14, %r2;
+	shr.u64 	%rd15, %rd65, 2;
+	and.b64 	%rd16, %rd65, 3;
+	setp.eq.b32 	%p7, %r40, 0;
+	selp.b32 	%r6, %r39, 1, %p7;
+	st.local.b32 	[%rd9], 0;
+	st.local.b32 	[%rd9+4], 0;
+	st.local.b32 	[%rd9+8], 0;
+	st.local.b32 	[%rd9+12], 0;
+	setp.ne.b32 	%p8, %r42, 0;
+	setp.eq.b32 	%p94, %r6, 0;
+	setp.eq.b32 	%p95, %r6, -1;
+	@%p8 bra 	$L__BB6_12;
+	bra.uni 	$L__BB6_11;
+$L__BB6_11:                             // %bb12.bb50.preheader_crit_edge
+	shl.b64 	%rd25, %rd16, 1;
+	bra.uni 	$L__BB6_14;
+$L__BB6_12:                             // %bb19.lr.ph
+	cvt.u64.u32 	%rd10, %r1;
+	mul.lo.s64 	%rd21, %rd163, %rd10;
+	shl.b64 	%rd30, %rd16, 2;
+	cvt.u32.u64 	%r54, %rd15;
+	add.s32 	%r7, %r5, %r54;
+	add.s32 	%r55, %r3, %r7;
+	mul.wide.s32 	%rd71, %r55, 4;
+	add.s64 	%rd22, %rd2, %rd71;
+	add.s32 	%r8, %r7, 8;
+	add.s32 	%r56, %r55, 8;
+	mul.wide.s32 	%rd72, %r56, 4;
+	add.s64 	%rd23, %rd2, %rd72;
+	add.s64 	%rd24, %rd15, %rd14;
+	shl.b64 	%rd25, %rd16, 1;
+	or.b64 	%rd26, %rd25, %rd14;
+	or.b64 	%rd27, %rd26, 1;
+	add.s64 	%rd31, %rd8, %rd30;
+	mad.lo.s64 	%rd73, %rd10, %rd11, %rd24;
+	mad.lo.s64 	%rd74, %rd73, %rd12, %rd30;
+	add.s64 	%rd29, %rd3, %rd74;
+	mov.b64 	%rd70, 0;
+	mov.b32 	%r53, 0f00000000;
+	setp.ge.u32 	%p9, %r7, %r4;
+	setp.ge.u32 	%p26, %r8, %r4;
+	mov.b32 	%r9, %r53;
+	mov.b32 	%r10, %r53;
+	mov.b32 	%r11, %r53;
+	mov.b32 	%r12, %r53;
+	mov.b64 	%rd32, %rd70;
+	bra.uni 	$L__BB6_15;
+$L__BB6_13:                             // %bb50.preheader.loopexit
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+$L__BB6_14:                             // %bb50.preheader
+	or.b64 	%rd28, %rd25, %rd14;
+	mov.b64 	%rd150, 0;
+	mov.b64 	%rd170, %rd150;
+	mov.b64 	%rd171, %rd150;
+	bra.uni 	$L__BB6_61;
+$L__BB6_15:                             // %bb19
+                                        // =>This Loop Header: Depth=1
+                                        //     Child Loop BB6_16 Depth 2
+	mov.b64 	%rd33, %rd70;
+	mov.b32 	%r13, %r53;
+	mov.b32 	%r14, %r53;
+	mov.b32 	%r15, %r53;
+	mov.b32 	%r16, %r53;
+$L__BB6_16:                             // %bb21
+                                        //   Parent Loop BB6_15 Depth=1
+                                        // =>  This Inner Loop Header: Depth=2
+	mov.b64 	%rd164, 0;
+	@%p9 bra 	$L__BB6_22;
+	bra.uni 	$L__BB6_17;
+$L__BB6_17:                             // %bb1.i
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_20;
+	bra.uni 	$L__BB6_18;
+$L__BB6_18:                             // %bb3.i
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r17, [%rd22];
+	setp.eq.b32 	%p10, %r17, -2147483648;
+	and.pred 	%p11, %p95, %p10;
+	@%p11 bra 	$L__BB6_21;
+	bra.uni 	$L__BB6_19;
+$L__BB6_19:                             // %bb5.i
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r57, %r17, %r6;
+	cvt.s64.s32 	%rd75, %r57;
+	mul.lo.s64 	%rd164, %rd75, %rd12;
+	bra.uni 	$L__BB6_22;
+$L__BB6_20:                             // %bb8.i
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_21:                             // %bb9.i
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_22:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd34, %rd30, %rd33;
+	setp.ge.u64 	%p12, %rd34, %rd12;
+	or.pred 	%p13, %p9, %p12;
+	mov.b32 	%r26, 0;
+	@%p13 bra 	$L__BB6_73;
+	bra.uni 	$L__BB6_72;
+$L__BB6_23:                             // %bb32
+                                        //   in Loop: Header=BB6_15 Depth=1
+	or.b64 	%rd115, %rd32, %rd13;
+	and.b64 	%rd116, %rd115, -4294967296;
+	setp.ne.b64 	%p69, %rd116, 0;
+	@%p69 bra 	$L__BB6_25;
+	bra.uni 	$L__BB6_24;
+$L__BB6_24:                             //   in Loop: Header=BB6_15 Depth=1
+	cvt.u32.u64 	%r103, %rd32;
+	div.u32 	%r104, %r103, %r125;
+	cvt.u64.u32 	%rd165, %r104;
+	bra.uni 	$L__BB6_26;
+$L__BB6_25:                             //   in Loop: Header=BB6_15 Depth=1
+	div.u64 	%rd165, %rd32, %rd13;
+$L__BB6_26:                             // %bb32.split
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.ge.s32 	%p70, %r7, %r4;
+	shl.b64 	%rd117, %rd165, 2;
+	add.s64 	%rd37, %rd4, %rd117;
+	mov.b32 	%r127, 0f00000000;
+	mov.b32 	%r126, %r127;
+	@%p70 bra 	$L__BB6_32;
+	bra.uni 	$L__BB6_27;
+$L__BB6_27:                             // %bb1.i39
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p94 bra 	$L__BB6_29;
+	bra.uni 	$L__BB6_28;
+$L__BB6_28:                             // %bb3.i54
+                                        //   in Loop: Header=BB6_15 Depth=1
+	ld.global.b32 	%r18, [%rd22];
+	setp.ne.b32 	%p71, %r6, -1;
+	setp.ne.b32 	%p72, %r18, -2147483648;
+	or.pred 	%p73, %p71, %p72;
+	@%p73 bra 	$L__BB6_31;
+	bra.uni 	$L__BB6_30;
+$L__BB6_29:                             // %bb8.i63
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_30:                             // %bb9.i58
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_31:                             // %bb36
+                                        //   in Loop: Header=BB6_15 Depth=1
+	div.s32 	%r105, %r18, %r6;
+	cvt.s64.s32 	%rd118, %r105;
+	mul.lo.s64 	%rd119, %rd19, %rd118;
+	shl.b64 	%rd120, %rd119, 2;
+	add.s64 	%rd121, %rd37, %rd120;
+	ld.global.b32 	%r126, [%rd121];
+$L__BB6_32:                             // %bb38
+                                        //   in Loop: Header=BB6_15 Depth=1
+	add.s64 	%rd38, %rd5, %rd117;
+	setp.ge.u64 	%p74, %rd26, %rd11;
+	@%p74 bra 	$L__BB6_36;
+	bra.uni 	$L__BB6_33;
+$L__BB6_33:                             // %bb41
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.lt.u64 	%p75, %rd26, %rd13;
+	mov.b64 	%rd166, 0;
+	@%p75 bra 	$L__BB6_35;
+	bra.uni 	$L__BB6_34;
+$L__BB6_34:                             //   in Loop: Header=BB6_15 Depth=1
+	cvt.u32.u64 	%r106, %rd26;
+	div.u32 	%r107, %r106, %r125;
+	cvt.u64.u32 	%rd166, %r107;
+$L__BB6_35:                             // %bb41.split
+                                        //   in Loop: Header=BB6_15 Depth=1
+	add.s64 	%rd122, %rd166, %rd21;
+	mul.lo.s64 	%rd123, %rd122, %rd19;
+	shl.b64 	%rd124, %rd123, 2;
+	add.s64 	%rd125, %rd38, %rd124;
+	ld.global.b32 	%r127, [%rd125];
+$L__BB6_36:                             // %bb45
+                                        //   in Loop: Header=BB6_15 Depth=1
+	mul.f32 	%r108, %r126, %r13;
+	fma.rn.f32 	%r12, %r127, %r108, %r12;
+	mov.b32 	%r129, 0f00000000;
+	mov.b32 	%r128, %r129;
+	@%p70 bra 	$L__BB6_40;
+	bra.uni 	$L__BB6_37;
+$L__BB6_37:                             // %bb1.i39.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p94 bra 	$L__BB6_29;
+	bra.uni 	$L__BB6_38;
+$L__BB6_38:                             // %bb3.i54.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	ld.global.b32 	%r19, [%rd22];
+	setp.eq.b32 	%p76, %r19, -2147483648;
+	and.pred 	%p77, %p95, %p76;
+	@%p77 bra 	$L__BB6_30;
+	bra.uni 	$L__BB6_39;
+$L__BB6_39:                             // %bb36.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	div.s32 	%r109, %r19, %r6;
+	cvt.s64.s32 	%rd126, %r109;
+	mul.lo.s64 	%rd127, %rd19, %rd126;
+	shl.b64 	%rd128, %rd127, 2;
+	add.s64 	%rd129, %rd37, %rd128;
+	ld.global.b32 	%r128, [%rd129];
+$L__BB6_40:                             // %bb38.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.ge.u64 	%p78, %rd27, %rd11;
+	@%p78 bra 	$L__BB6_44;
+	bra.uni 	$L__BB6_41;
+$L__BB6_41:                             // %bb41.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.lt.u64 	%p79, %rd27, %rd13;
+	mov.b64 	%rd167, 0;
+	@%p79 bra 	$L__BB6_43;
+	bra.uni 	$L__BB6_42;
+$L__BB6_42:                             //   in Loop: Header=BB6_15 Depth=1
+	cvt.u32.u64 	%r110, %rd27;
+	div.u32 	%r111, %r110, %r125;
+	cvt.u64.u32 	%rd167, %r111;
+$L__BB6_43:                             // %bb41.1.split
+                                        //   in Loop: Header=BB6_15 Depth=1
+	add.s64 	%rd130, %rd167, %rd21;
+	mul.lo.s64 	%rd131, %rd130, %rd19;
+	shl.b64 	%rd132, %rd131, 2;
+	add.s64 	%rd133, %rd38, %rd132;
+	ld.global.b32 	%r129, [%rd133];
+$L__BB6_44:                             // %bb45.1
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.ge.s32 	%p80, %r8, %r4;
+	mul.f32 	%r112, %r128, %r14;
+	fma.rn.f32 	%r11, %r129, %r112, %r11;
+	mov.b32 	%r131, 0f00000000;
+	mov.b32 	%r130, %r131;
+	@%p80 bra 	$L__BB6_48;
+	bra.uni 	$L__BB6_45;
+$L__BB6_45:                             // %bb1.i39.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p94 bra 	$L__BB6_29;
+	bra.uni 	$L__BB6_46;
+$L__BB6_46:                             // %bb3.i54.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	ld.global.b32 	%r20, [%rd23];
+	setp.eq.b32 	%p81, %r20, -2147483648;
+	and.pred 	%p82, %p95, %p81;
+	@%p82 bra 	$L__BB6_30;
+	bra.uni 	$L__BB6_47;
+$L__BB6_47:                             // %bb36.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	div.s32 	%r113, %r20, %r6;
+	cvt.s64.s32 	%rd134, %r113;
+	mul.lo.s64 	%rd135, %rd19, %rd134;
+	shl.b64 	%rd136, %rd135, 2;
+	add.s64 	%rd137, %rd37, %rd136;
+	ld.global.b32 	%r130, [%rd137];
+$L__BB6_48:                             // %bb38.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p74 bra 	$L__BB6_52;
+	bra.uni 	$L__BB6_49;
+$L__BB6_49:                             // %bb41.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.lt.u64 	%p83, %rd26, %rd13;
+	mov.b64 	%rd168, 0;
+	@%p83 bra 	$L__BB6_51;
+	bra.uni 	$L__BB6_50;
+$L__BB6_50:                             //   in Loop: Header=BB6_15 Depth=1
+	cvt.u32.u64 	%r114, %rd26;
+	div.u32 	%r115, %r114, %r125;
+	cvt.u64.u32 	%rd168, %r115;
+$L__BB6_51:                             // %bb41.2.split
+                                        //   in Loop: Header=BB6_15 Depth=1
+	add.s64 	%rd138, %rd168, %rd21;
+	mul.lo.s64 	%rd139, %rd138, %rd19;
+	shl.b64 	%rd140, %rd139, 2;
+	add.s64 	%rd141, %rd38, %rd140;
+	ld.global.b32 	%r131, [%rd141];
+$L__BB6_52:                             // %bb45.2
+                                        //   in Loop: Header=BB6_15 Depth=1
+	mul.f32 	%r116, %r130, %r15;
+	fma.rn.f32 	%r10, %r131, %r116, %r10;
+	mov.b32 	%r133, 0f00000000;
+	mov.b32 	%r132, %r133;
+	@%p80 bra 	$L__BB6_56;
+	bra.uni 	$L__BB6_53;
+$L__BB6_53:                             // %bb1.i39.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p94 bra 	$L__BB6_29;
+	bra.uni 	$L__BB6_54;
+$L__BB6_54:                             // %bb3.i54.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	ld.global.b32 	%r21, [%rd23];
+	setp.eq.b32 	%p84, %r21, -2147483648;
+	and.pred 	%p85, %p95, %p84;
+	@%p85 bra 	$L__BB6_30;
+	bra.uni 	$L__BB6_55;
+$L__BB6_55:                             // %bb36.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	div.s32 	%r117, %r21, %r6;
+	cvt.s64.s32 	%rd142, %r117;
+	mul.lo.s64 	%rd143, %rd19, %rd142;
+	shl.b64 	%rd144, %rd143, 2;
+	add.s64 	%rd145, %rd37, %rd144;
+	ld.global.b32 	%r132, [%rd145];
+$L__BB6_56:                             // %bb38.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p78 bra 	$L__BB6_60;
+	bra.uni 	$L__BB6_57;
+$L__BB6_57:                             // %bb41.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	setp.lt.u64 	%p86, %rd27, %rd13;
+	mov.b64 	%rd169, 0;
+	@%p86 bra 	$L__BB6_59;
+	bra.uni 	$L__BB6_58;
+$L__BB6_58:                             //   in Loop: Header=BB6_15 Depth=1
+	cvt.u32.u64 	%r118, %rd27;
+	div.u32 	%r119, %r118, %r125;
+	cvt.u64.u32 	%rd169, %r119;
+$L__BB6_59:                             // %bb41.3.split
+                                        //   in Loop: Header=BB6_15 Depth=1
+	add.s64 	%rd146, %rd169, %rd21;
+	mul.lo.s64 	%rd147, %rd146, %rd19;
+	shl.b64 	%rd148, %rd147, 2;
+	add.s64 	%rd149, %rd38, %rd148;
+	ld.global.b32 	%r133, [%rd149];
+$L__BB6_60:                             // %bb45.3
+                                        //   in Loop: Header=BB6_15 Depth=1
+	mul.f32 	%r120, %r132, %r16;
+	fma.rn.f32 	%r9, %r133, %r120, %r9;
+	st.local.b32 	[%rd9+12], %r9;
+	add.s64 	%rd32, %rd32, %rd13;
+	add.s64 	%rd31, %rd31, %rd13;
+	add.s64 	%rd30, %rd30, %rd13;
+	add.s64 	%rd29, %rd29, %rd13;
+	setp.lt.u64 	%p87, %rd32, %rd12;
+	@%p87 bra 	$L__BB6_15;
+	bra.uni 	$L__BB6_13;
+$L__BB6_61:                             // %bb51
+                                        // =>This Inner Loop Header: Depth=1
+	and.b64 	%rd151, %rd170, 8;
+	add.s64 	%rd152, %rd151, %rd15;
+	cvt.u32.u64 	%r121, %rd152;
+	add.s32 	%r22, %r5, %r121;
+	setp.ge.s32 	%p88, %r22, %r4;
+	mov.b64 	%rd172, %rd150;
+	@%p88 bra 	$L__BB6_66;
+	bra.uni 	$L__BB6_62;
+$L__BB6_62:                             // %bb1.i85
+                                        //   in Loop: Header=BB6_61 Depth=1
+	@%p94 bra 	$L__BB6_64;
+	bra.uni 	$L__BB6_63;
+$L__BB6_63:                             // %bb3.i100
+                                        //   in Loop: Header=BB6_61 Depth=1
+	add.s32 	%r122, %r22, %r3;
+	mul.wide.s32 	%rd153, %r122, 4;
+	add.s64 	%rd154, %rd2, %rd153;
+	ld.global.s32 	%rd172, [%rd154];
+	cvt.u32.u64 	%r123, %rd172;
+	setp.eq.b32 	%p89, %r123, -2147483648;
+	and.pred 	%p90, %p95, %p89;
+	@%p90 bra 	$L__BB6_65;
+	bra.uni 	$L__BB6_66;
+$L__BB6_64:                             // %bb8.i109
+	trap;
+$L__BB6_65:                             // %bb9.i104
+	trap;
+$L__BB6_66:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit110
+                                        //   in Loop: Header=BB6_61 Depth=1
+	and.b64 	%rd39, %rd171, 1;
+	or.b64 	%rd155, %rd39, %rd28;
+	setp.ge.u64 	%p91, %rd155, %rd11;
+	or.pred 	%p92, %p88, %p91;
+	@%p92 bra 	$L__BB6_70;
+	bra.uni 	$L__BB6_67;
+$L__BB6_67:                             // %bb56
+                                        //   in Loop: Header=BB6_61 Depth=1
+	add.s64 	%rd156, %rd9, %rd170;
+	ld.local.b32 	%r134, [%rd156];
+	@%p7 bra 	$L__BB6_69;
+	bra.uni 	$L__BB6_68;
+$L__BB6_68:                             // %bb57
+                                        //   in Loop: Header=BB6_61 Depth=1
+	shl.b64 	%rd157, %rd172, 2;
+	add.s64 	%rd40, %rd6, %rd157;
+	ld.global.b32 	%r124, [%rd40];
+	mul.f32 	%r134, %r134, %r124;
+$L__BB6_69:                             // %bb58
+                                        //   in Loop: Header=BB6_61 Depth=1
+	// begin inline asm
+	cvt.rn.bf16.f32 %rs7, %r134;
+	// end inline asm
+	mul.lo.s64 	%rd158, %rd172, %rd11;
+	shl.b64 	%rd159, %rd158, 1;
+	add.s64 	%rd160, %rd7, %rd159;
+	shl.b64 	%rd161, %rd155, 1;
+	add.s64 	%rd162, %rd160, %rd161;
+	st.global.b16 	[%rd162], %rs7;
+$L__BB6_70:                             // %bb59
+                                        //   in Loop: Header=BB6_61 Depth=1
+	add.s64 	%rd171, %rd171, 1;
+	add.s64 	%rd170, %rd170, 4;
+	setp.ne.b64 	%p93, %rd170, 16;
+	@%p93 bra 	$L__BB6_61;
+	bra.uni 	$L__BB6_71;
+$L__BB6_71:                             // %bb63
+	ret;
+$L__BB6_72:                             // %bb66
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd76, %rd164, %rd33;
+	add.s64 	%rd36, %rd31, %rd76;
+	ld.global.b8 	%r26, [%rd36];
+$L__BB6_73:                             // %bb68
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd173, 0;
+	@%p9 bra 	$L__BB6_79;
+	bra.uni 	$L__BB6_74;
+$L__BB6_74:                             // %bb1.i131
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_77;
+	bra.uni 	$L__BB6_75;
+$L__BB6_75:                             // %bb3.i146
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r23, [%rd22];
+	setp.eq.b32 	%p14, %r23, -2147483648;
+	and.pred 	%p15, %p95, %p14;
+	@%p15 bra 	$L__BB6_78;
+	bra.uni 	$L__BB6_76;
+$L__BB6_76:                             // %bb5.i151
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r58, %r23, %r6;
+	cvt.s64.s32 	%rd77, %r58;
+	mul.lo.s64 	%rd173, %rd77, %rd12;
+	bra.uni 	$L__BB6_79;
+$L__BB6_77:                             // %bb8.i155
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_78:                             // %bb9.i150
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_79:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit156
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd41, %rd34, 1;
+	setp.ge.u64 	%p16, %rd41, %rd12;
+	or.pred 	%p17, %p9, %p16;
+	@%p17 bra 	$L__BB6_81;
+	bra.uni 	$L__BB6_80;
+$L__BB6_80:                             // %bb71
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd78, %rd173, %rd33;
+	add.s64 	%rd42, %rd31, %rd78;
+	ld.global.b8 	%rs1, [%rd42+1];
+	mul.wide.u16 	%r59, %rs1, 256;
+	or.b32 	%r26, %r59, %r26;
+$L__BB6_81:                             // %bb73
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd174, 0;
+	@%p9 bra 	$L__BB6_87;
+	bra.uni 	$L__BB6_82;
+$L__BB6_82:                             // %bb1.i177
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_85;
+	bra.uni 	$L__BB6_83;
+$L__BB6_83:                             // %bb3.i192
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r24, [%rd22];
+	setp.eq.b32 	%p18, %r24, -2147483648;
+	and.pred 	%p19, %p95, %p18;
+	@%p19 bra 	$L__BB6_86;
+	bra.uni 	$L__BB6_84;
+$L__BB6_84:                             // %bb5.i197
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r60, %r24, %r6;
+	cvt.s64.s32 	%rd79, %r60;
+	mul.lo.s64 	%rd174, %rd79, %rd12;
+	bra.uni 	$L__BB6_87;
+$L__BB6_85:                             // %bb8.i201
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_86:                             // %bb9.i196
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_87:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit202
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd43, %rd34, 2;
+	setp.ge.u64 	%p20, %rd43, %rd12;
+	or.pred 	%p21, %p9, %p20;
+	@%p21 bra 	$L__BB6_89;
+	bra.uni 	$L__BB6_88;
+$L__BB6_88:                             // %bb76
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd80, %rd174, %rd33;
+	add.s64 	%rd44, %rd31, %rd80;
+	ld.global.b8 	%r61, [%rd44+2];
+	shl.b32 	%r62, %r61, 16;
+	or.b32 	%r26, %r62, %r26;
+$L__BB6_89:                             // %bb78
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd175, 0;
+	@%p9 bra 	$L__BB6_95;
+	bra.uni 	$L__BB6_90;
+$L__BB6_90:                             // %bb1.i223
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_93;
+	bra.uni 	$L__BB6_91;
+$L__BB6_91:                             // %bb3.i238
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r25, [%rd22];
+	setp.eq.b32 	%p22, %r25, -2147483648;
+	and.pred 	%p23, %p95, %p22;
+	@%p23 bra 	$L__BB6_94;
+	bra.uni 	$L__BB6_92;
+$L__BB6_92:                             // %bb5.i243
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r63, %r25, %r6;
+	cvt.s64.s32 	%rd81, %r63;
+	mul.lo.s64 	%rd175, %rd81, %rd12;
+	bra.uni 	$L__BB6_95;
+$L__BB6_93:                             // %bb8.i247
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_94:                             // %bb9.i242
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_95:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit248
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd45, %rd34, 3;
+	setp.ge.u64 	%p24, %rd45, %rd12;
+	or.pred 	%p25, %p9, %p24;
+	@%p25 bra 	$L__BB6_97;
+	bra.uni 	$L__BB6_96;
+$L__BB6_96:                             // %bb81
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd82, %rd175, %rd33;
+	add.s64 	%rd46, %rd31, %rd82;
+	ld.global.b8 	%r64, [%rd46+3];
+	shl.b32 	%r65, %r64, 24;
+	or.b32 	%r26, %r65, %r26;
+$L__BB6_97:                             // %bb83
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b32 	%r135, 0;
+	@%p26 bra 	$L__BB6_104;
+	bra.uni 	$L__BB6_98;
+$L__BB6_98:                             // %bb1.i269
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_101;
+	bra.uni 	$L__BB6_99;
+$L__BB6_99:                             // %bb3.i284
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r27, [%rd23];
+	setp.eq.b32 	%p27, %r27, -2147483648;
+	and.pred 	%p28, %p95, %p27;
+	@%p28 bra 	$L__BB6_102;
+	bra.uni 	$L__BB6_100;
+$L__BB6_100:                            // %bb5.i289
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p12 bra 	$L__BB6_104;
+	bra.uni 	$L__BB6_103;
+$L__BB6_101:                            // %bb8.i293
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_102:                            // %bb9.i288
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_103:                            // %bb86
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r66, %r27, %r6;
+	cvt.s64.s32 	%rd83, %r66;
+	mad.lo.s64 	%rd84, %rd83, %rd12, %rd33;
+	add.s64 	%rd85, %rd31, %rd84;
+	ld.global.b8 	%r135, [%rd85];
+$L__BB6_104:                            // %bb88
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_111;
+	bra.uni 	$L__BB6_105;
+$L__BB6_105:                            // %bb1.i315
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_108;
+	bra.uni 	$L__BB6_106;
+$L__BB6_106:                            // %bb3.i330
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r28, [%rd23];
+	setp.eq.b32 	%p29, %r28, -2147483648;
+	and.pred 	%p30, %p95, %p29;
+	@%p30 bra 	$L__BB6_109;
+	bra.uni 	$L__BB6_107;
+$L__BB6_107:                            // %bb5.i335
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p16 bra 	$L__BB6_111;
+	bra.uni 	$L__BB6_110;
+$L__BB6_108:                            // %bb8.i339
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_109:                            // %bb9.i334
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_110:                            // %bb91
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r67, %r28, %r6;
+	cvt.s64.s32 	%rd86, %r67;
+	mad.lo.s64 	%rd87, %rd86, %rd12, %rd33;
+	add.s64 	%rd88, %rd31, %rd87;
+	ld.global.b8 	%rs2, [%rd88+1];
+	mul.wide.u16 	%r68, %rs2, 256;
+	or.b32 	%r135, %r68, %r135;
+$L__BB6_111:                            // %bb93
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_118;
+	bra.uni 	$L__BB6_112;
+$L__BB6_112:                            // %bb1.i361
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_115;
+	bra.uni 	$L__BB6_113;
+$L__BB6_113:                            // %bb3.i376
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r29, [%rd23];
+	setp.eq.b32 	%p31, %r29, -2147483648;
+	and.pred 	%p32, %p95, %p31;
+	@%p32 bra 	$L__BB6_116;
+	bra.uni 	$L__BB6_114;
+$L__BB6_114:                            // %bb5.i381
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p20 bra 	$L__BB6_118;
+	bra.uni 	$L__BB6_117;
+$L__BB6_115:                            // %bb8.i385
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_116:                            // %bb9.i380
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_117:                            // %bb96
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r69, %r29, %r6;
+	cvt.s64.s32 	%rd89, %r69;
+	mad.lo.s64 	%rd90, %rd89, %rd12, %rd33;
+	add.s64 	%rd91, %rd31, %rd90;
+	ld.global.b8 	%r70, [%rd91+2];
+	shl.b32 	%r71, %r70, 16;
+	or.b32 	%r135, %r71, %r135;
+$L__BB6_118:                            // %bb98
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_125;
+	bra.uni 	$L__BB6_119;
+$L__BB6_119:                            // %bb1.i407
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_122;
+	bra.uni 	$L__BB6_120;
+$L__BB6_120:                            // %bb3.i422
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r30, [%rd23];
+	setp.eq.b32 	%p33, %r30, -2147483648;
+	and.pred 	%p34, %p95, %p33;
+	@%p34 bra 	$L__BB6_123;
+	bra.uni 	$L__BB6_121;
+$L__BB6_121:                            // %bb5.i427
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p24 bra 	$L__BB6_125;
+	bra.uni 	$L__BB6_124;
+$L__BB6_122:                            // %bb8.i431
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_123:                            // %bb9.i426
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_124:                            // %bb101
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r72, %r30, %r6;
+	cvt.s64.s32 	%rd92, %r72;
+	mad.lo.s64 	%rd93, %rd92, %rd12, %rd33;
+	add.s64 	%rd94, %rd31, %rd93;
+	ld.global.b8 	%r73, [%rd94+3];
+	shl.b32 	%r74, %r73, 24;
+	or.b32 	%r135, %r74, %r135;
+$L__BB6_125:                            // %bb103
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd176, 0;
+	@%p9 bra 	$L__BB6_131;
+	bra.uni 	$L__BB6_126;
+$L__BB6_126:                            // %bb1.i453
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_129;
+	bra.uni 	$L__BB6_127;
+$L__BB6_127:                            // %bb3.i468
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r31, [%rd22];
+	setp.eq.b32 	%p35, %r31, -2147483648;
+	and.pred 	%p36, %p95, %p35;
+	@%p36 bra 	$L__BB6_130;
+	bra.uni 	$L__BB6_128;
+$L__BB6_128:                            // %bb5.i473
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r75, %r31, %r6;
+	cvt.s64.s32 	%rd95, %r75;
+	mul.lo.s64 	%rd176, %rd95, %rd12;
+	bra.uni 	$L__BB6_131;
+$L__BB6_129:                            // %bb8.i477
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_130:                            // %bb9.i472
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_131:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit478
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd35, %rd34, 16;
+	setp.ge.u64 	%p37, %rd35, %rd12;
+	or.pred 	%p38, %p9, %p37;
+	mov.b32 	%r136, 0;
+	@%p38 bra 	$L__BB6_133;
+	bra.uni 	$L__BB6_132;
+$L__BB6_132:                            // %bb106
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd96, %rd176, %rd33;
+	add.s64 	%rd47, %rd31, %rd96;
+	ld.global.b8 	%r136, [%rd47+16];
+$L__BB6_133:                            // %bb108
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd177, 0;
+	@%p9 bra 	$L__BB6_139;
+	bra.uni 	$L__BB6_134;
+$L__BB6_134:                            // %bb1.i499
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_137;
+	bra.uni 	$L__BB6_135;
+$L__BB6_135:                            // %bb3.i514
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r32, [%rd22];
+	setp.eq.b32 	%p39, %r32, -2147483648;
+	and.pred 	%p40, %p95, %p39;
+	@%p40 bra 	$L__BB6_138;
+	bra.uni 	$L__BB6_136;
+$L__BB6_136:                            // %bb5.i519
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r76, %r32, %r6;
+	cvt.s64.s32 	%rd97, %r76;
+	mul.lo.s64 	%rd177, %rd97, %rd12;
+	bra.uni 	$L__BB6_139;
+$L__BB6_137:                            // %bb8.i523
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_138:                            // %bb9.i518
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_139:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit524
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd48, %rd34, 17;
+	setp.ge.u64 	%p41, %rd48, %rd12;
+	or.pred 	%p42, %p9, %p41;
+	@%p42 bra 	$L__BB6_141;
+	bra.uni 	$L__BB6_140;
+$L__BB6_140:                            // %bb111
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd98, %rd177, %rd33;
+	add.s64 	%rd49, %rd31, %rd98;
+	ld.global.b8 	%rs3, [%rd49+17];
+	mul.wide.u16 	%r77, %rs3, 256;
+	or.b32 	%r136, %r77, %r136;
+$L__BB6_141:                            // %bb113
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd178, 0;
+	@%p9 bra 	$L__BB6_147;
+	bra.uni 	$L__BB6_142;
+$L__BB6_142:                            // %bb1.i545
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_145;
+	bra.uni 	$L__BB6_143;
+$L__BB6_143:                            // %bb3.i560
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r33, [%rd22];
+	setp.eq.b32 	%p43, %r33, -2147483648;
+	and.pred 	%p44, %p95, %p43;
+	@%p44 bra 	$L__BB6_146;
+	bra.uni 	$L__BB6_144;
+$L__BB6_144:                            // %bb5.i565
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r78, %r33, %r6;
+	cvt.s64.s32 	%rd99, %r78;
+	mul.lo.s64 	%rd178, %rd99, %rd12;
+	bra.uni 	$L__BB6_147;
+$L__BB6_145:                            // %bb8.i569
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_146:                            // %bb9.i564
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_147:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit570
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd50, %rd34, 18;
+	setp.ge.u64 	%p45, %rd50, %rd12;
+	or.pred 	%p46, %p9, %p45;
+	@%p46 bra 	$L__BB6_149;
+	bra.uni 	$L__BB6_148;
+$L__BB6_148:                            // %bb116
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd100, %rd178, %rd33;
+	add.s64 	%rd51, %rd31, %rd100;
+	ld.global.b8 	%r79, [%rd51+18];
+	shl.b32 	%r80, %r79, 16;
+	or.b32 	%r136, %r80, %r136;
+$L__BB6_149:                            // %bb118
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b64 	%rd179, 0;
+	@%p9 bra 	$L__BB6_155;
+	bra.uni 	$L__BB6_150;
+$L__BB6_150:                            // %bb1.i591
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_153;
+	bra.uni 	$L__BB6_151;
+$L__BB6_151:                            // %bb3.i606
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r34, [%rd22];
+	setp.eq.b32 	%p47, %r34, -2147483648;
+	and.pred 	%p48, %p95, %p47;
+	@%p48 bra 	$L__BB6_154;
+	bra.uni 	$L__BB6_152;
+$L__BB6_152:                            // %bb5.i611
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r81, %r34, %r6;
+	cvt.s64.s32 	%rd101, %r81;
+	mul.lo.s64 	%rd179, %rd101, %rd12;
+	bra.uni 	$L__BB6_155;
+$L__BB6_153:                            // %bb8.i615
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_154:                            // %bb9.i610
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_155:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a80B5_.exit616
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd52, %rd34, 19;
+	setp.ge.u64 	%p49, %rd52, %rd12;
+	or.pred 	%p50, %p9, %p49;
+	@%p50 bra 	$L__BB6_157;
+	bra.uni 	$L__BB6_156;
+$L__BB6_156:                            // %bb121
+                                        //   in Loop: Header=BB6_16 Depth=2
+	add.s64 	%rd102, %rd179, %rd33;
+	add.s64 	%rd53, %rd31, %rd102;
+	ld.global.b8 	%r82, [%rd53+19];
+	shl.b32 	%r83, %r82, 24;
+	or.b32 	%r136, %r83, %r136;
+$L__BB6_157:                            // %bb123
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b32 	%r137, 0;
+	@%p26 bra 	$L__BB6_164;
+	bra.uni 	$L__BB6_158;
+$L__BB6_158:                            // %bb1.i637
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_161;
+	bra.uni 	$L__BB6_159;
+$L__BB6_159:                            // %bb3.i652
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r35, [%rd23];
+	setp.eq.b32 	%p51, %r35, -2147483648;
+	and.pred 	%p52, %p95, %p51;
+	@%p52 bra 	$L__BB6_162;
+	bra.uni 	$L__BB6_160;
+$L__BB6_160:                            // %bb5.i657
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p37 bra 	$L__BB6_164;
+	bra.uni 	$L__BB6_163;
+$L__BB6_161:                            // %bb8.i661
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_162:                            // %bb9.i656
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_163:                            // %bb126
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r84, %r35, %r6;
+	cvt.s64.s32 	%rd103, %r84;
+	mad.lo.s64 	%rd104, %rd103, %rd12, %rd33;
+	add.s64 	%rd105, %rd31, %rd104;
+	ld.global.b8 	%r137, [%rd105+16];
+$L__BB6_164:                            // %bb128
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_171;
+	bra.uni 	$L__BB6_165;
+$L__BB6_165:                            // %bb1.i683
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_168;
+	bra.uni 	$L__BB6_166;
+$L__BB6_166:                            // %bb3.i698
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r36, [%rd23];
+	setp.eq.b32 	%p53, %r36, -2147483648;
+	and.pred 	%p54, %p95, %p53;
+	@%p54 bra 	$L__BB6_169;
+	bra.uni 	$L__BB6_167;
+$L__BB6_167:                            // %bb5.i703
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p41 bra 	$L__BB6_171;
+	bra.uni 	$L__BB6_170;
+$L__BB6_168:                            // %bb8.i707
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_169:                            // %bb9.i702
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_170:                            // %bb131
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r85, %r36, %r6;
+	cvt.s64.s32 	%rd106, %r85;
+	mad.lo.s64 	%rd107, %rd106, %rd12, %rd33;
+	add.s64 	%rd108, %rd31, %rd107;
+	ld.global.b8 	%rs4, [%rd108+17];
+	mul.wide.u16 	%r86, %rs4, 256;
+	or.b32 	%r137, %r86, %r137;
+$L__BB6_171:                            // %bb133
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_178;
+	bra.uni 	$L__BB6_172;
+$L__BB6_172:                            // %bb1.i729
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_175;
+	bra.uni 	$L__BB6_173;
+$L__BB6_173:                            // %bb3.i744
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r37, [%rd23];
+	setp.eq.b32 	%p55, %r37, -2147483648;
+	and.pred 	%p56, %p95, %p55;
+	@%p56 bra 	$L__BB6_176;
+	bra.uni 	$L__BB6_174;
+$L__BB6_174:                            // %bb5.i749
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p45 bra 	$L__BB6_178;
+	bra.uni 	$L__BB6_177;
+$L__BB6_175:                            // %bb8.i753
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_176:                            // %bb9.i748
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_177:                            // %bb136
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r87, %r37, %r6;
+	cvt.s64.s32 	%rd109, %r87;
+	mad.lo.s64 	%rd110, %rd109, %rd12, %rd33;
+	add.s64 	%rd111, %rd31, %rd110;
+	ld.global.b8 	%r88, [%rd111+18];
+	shl.b32 	%r89, %r88, 16;
+	or.b32 	%r137, %r89, %r137;
+$L__BB6_178:                            // %bb138
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB6_185;
+	bra.uni 	$L__BB6_179;
+$L__BB6_179:                            // %bb1.i775
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p94 bra 	$L__BB6_182;
+	bra.uni 	$L__BB6_180;
+$L__BB6_180:                            // %bb3.i790
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b32 	%r38, [%rd23];
+	setp.eq.b32 	%p57, %r38, -2147483648;
+	and.pred 	%p58, %p95, %p57;
+	@%p58 bra 	$L__BB6_183;
+	bra.uni 	$L__BB6_181;
+$L__BB6_181:                            // %bb5.i795
+                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p49 bra 	$L__BB6_185;
+	bra.uni 	$L__BB6_184;
+$L__BB6_182:                            // %bb8.i799
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_183:                            // %bb9.i794
+	st.local.b32 	[%rd9], %r12;
+	st.local.b32 	[%rd9+4], %r11;
+	st.local.b32 	[%rd9+8], %r10;
+	trap;
+$L__BB6_184:                            // %bb141
+                                        //   in Loop: Header=BB6_16 Depth=2
+	div.s32 	%r90, %r38, %r6;
+	cvt.s64.s32 	%rd112, %r90;
+	mad.lo.s64 	%rd113, %rd112, %rd12, %rd33;
+	add.s64 	%rd114, %rd31, %rd113;
+	ld.global.b8 	%r91, [%rd114+19];
+	shl.b32 	%r92, %r91, 24;
+	or.b32 	%r137, %r92, %r137;
+$L__BB6_185:                            // %bb143
+                                        //   in Loop: Header=BB6_16 Depth=2
+	setp.ge.u64 	%p59, %rd24, %rd11;
+	add.s64 	%rd54, %rd29, %rd33;
+	mov.b32 	%r138, 0;
+	or.pred 	%p60, %p59, %p12;
+	@%p60 bra 	$L__BB6_187;
+	bra.uni 	$L__BB6_186;
+$L__BB6_186:                            // %bb2.i
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r138, [%rd54];
+$L__BB6_187:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p61, %p59, %p16;
+	@%p61 bra 	$L__BB6_189;
+	bra.uni 	$L__BB6_188;
+$L__BB6_188:                            // %bb2.i830
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%rs5, [%rd54+1];
+	mul.wide.u16 	%r93, %rs5, 256;
+	or.b32 	%r138, %r93, %r138;
+$L__BB6_189:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit840
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p62, %p59, %p20;
+	@%p62 bra 	$L__BB6_191;
+	bra.uni 	$L__BB6_190;
+$L__BB6_190:                            // %bb2.i854
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r94, [%rd54+2];
+	shl.b32 	%r95, %r94, 16;
+	add.s32 	%r138, %r95, %r138;
+$L__BB6_191:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit864
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p63, %p59, %p24;
+	@%p63 bra 	$L__BB6_193;
+	bra.uni 	$L__BB6_192;
+$L__BB6_192:                            // %bb2.i878
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r96, [%rd54+3];
+	shl.b32 	%r97, %r96, 24;
+	add.s32 	%r138, %r97, %r138;
+$L__BB6_193:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit888
+                                        //   in Loop: Header=BB6_16 Depth=2
+	mov.b32 	%r139, 0;
+	or.pred 	%p64, %p59, %p37;
+	@%p64 bra 	$L__BB6_195;
+	bra.uni 	$L__BB6_194;
+$L__BB6_194:                            // %bb2.i902
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r139, [%rd54+16];
+$L__BB6_195:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit912
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p65, %p59, %p41;
+	@%p65 bra 	$L__BB6_197;
+	bra.uni 	$L__BB6_196;
+$L__BB6_196:                            // %bb2.i926
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%rs6, [%rd54+17];
+	mul.wide.u16 	%r98, %rs6, 256;
+	or.b32 	%r139, %r98, %r139;
+$L__BB6_197:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit936
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p66, %p59, %p45;
+	@%p66 bra 	$L__BB6_199;
+	bra.uni 	$L__BB6_198;
+$L__BB6_198:                            // %bb2.i950
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r99, [%rd54+18];
+	shl.b32 	%r100, %r99, 16;
+	add.s32 	%r139, %r100, %r139;
+$L__BB6_199:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit960
+                                        //   in Loop: Header=BB6_16 Depth=2
+	or.pred 	%p67, %p59, %p49;
+	@%p67 bra 	$L__BB6_201;
+	bra.uni 	$L__BB6_200;
+$L__BB6_200:                            // %bb2.i974
+                                        //   in Loop: Header=BB6_16 Depth=2
+	ld.global.b8 	%r101, [%rd54+19];
+	shl.b32 	%r102, %r101, 24;
+	add.s32 	%r139, %r102, %r139;
+$L__BB6_201:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels69cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_grouped_w8a8s0_0B5_.exit984
+                                        //   in Loop: Header=BB6_16 Depth=2
+	// begin inline asm
+	mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%r13,%r14,%r15,%r16}, {%r26,%r135,%r136,%r137}, {%r138,%r139}, {%r13,%r14,%r15,%r16};
+	// end inline asm
+	add.s64 	%rd33, %rd33, 32;
+	setp.lt.u64 	%p68, %rd33, %rd13;
+	@%p68 bra 	$L__BB6_16;
+	bra.uni 	$L__BB6_23;
+$L__BB6_202:                            // %bb146
+	trap;
                                         // -- End function
 }
 	// .globl	moe_scan                // -- Begin function moe_scan
@@ -2406,23 +3825,23 @@ $L__BB4_2:                              // %bb6
 	sub.s32 	%r48, %r2, %r66;
 	sub.s32 	%r49, %r66, %r2;
 	mov.b32 	%r53, %r54;
-	@%p1 bra 	$L__BB5_7;
-	bra.uni 	$L__BB5_1;
-$L__BB5_1:                              // %bb7.preheader
+	@%p1 bra 	$L__BB7_7;
+	bra.uni 	$L__BB7_1;
+$L__BB7_1:                              // %bb7.preheader
 	and.b32 	%r3, %r48, 3;
 	setp.gt.u32 	%p2, %r49, -4;
 	mov.b32 	%r53, 0;
 	mov.b32 	%r51, %r66;
-	@%p2 bra 	$L__BB5_5;
-	bra.uni 	$L__BB5_2;
-$L__BB5_2:                              // %bb7.preheader.new
+	@%p2 bra 	$L__BB7_5;
+	bra.uni 	$L__BB7_2;
+$L__BB7_2:                              // %bb7.preheader.new
 	and.b32 	%r50, %r48, -4;
 	mul.wide.s32 	%rd6, %r66, 4;
 	add.s64 	%rd7, %rd6, %rd1;
 	add.s64 	%rd16, %rd7, 8;
 	mov.b32 	%r53, 0;
 	mov.b32 	%r51, %r66;
-$L__BB5_3:                              // %bb7
+$L__BB7_3:                              // %bb7
                                         // =>This Inner Loop Header: Depth=1
 	ld.global.b32 	%r12, [%rd16+-8];
 	add.s32 	%r13, %r12, %r53;
@@ -2436,17 +3855,17 @@ $L__BB5_3:                              // %bb7
 	add.s32 	%r50, %r50, -4;
 	add.s64 	%rd16, %rd16, 16;
 	setp.ne.b32 	%p3, %r50, 0;
-	@%p3 bra 	$L__BB5_3;
-	bra.uni 	$L__BB5_4;
-$L__BB5_4:                              // %bb8.loopexit.unr-lcssa
+	@%p3 bra 	$L__BB7_3;
+	bra.uni 	$L__BB7_4;
+$L__BB7_4:                              // %bb8.loopexit.unr-lcssa
 	setp.eq.b32 	%p4, %r3, 0;
-	@%p4 bra 	$L__BB5_7;
-	bra.uni 	$L__BB5_5;
-$L__BB5_5:                              // %bb7.epil.preheader
+	@%p4 bra 	$L__BB7_7;
+	bra.uni 	$L__BB7_5;
+$L__BB7_5:                              // %bb7.epil.preheader
 	mul.wide.s32 	%rd8, %r51, 4;
 	add.s64 	%rd17, %rd1, %rd8;
 	shl.b32 	%r52, %r3, 2;
-$L__BB5_6:                              // %bb7.epil
+$L__BB7_6:                              // %bb7.epil
                                         // =>This Inner Loop Header: Depth=1
 	.pragma "nounroll";
 	ld.global.b32 	%r19, [%rd17];
@@ -2454,193 +3873,193 @@ $L__BB5_6:                              // %bb7.epil
 	add.s64 	%rd17, %rd17, 4;
 	add.s32 	%r52, %r52, -4;
 	setp.ne.b32 	%p5, %r52, 0;
-	@%p5 bra 	$L__BB5_6;
-	bra.uni 	$L__BB5_7;
-$L__BB5_7:                              // %bb8
+	@%p5 bra 	$L__BB7_6;
+	bra.uni 	$L__BB7_7;
+$L__BB7_7:                              // %bb8
 	mul.wide.u32 	%rd9, %r1, 4;
-	mov.b64 	%rd10, __shared_mem_0;
+	mov.b64 	%rd10, __shared_mem_1;
 	add.s64 	%rd3, %rd10, %rd9;
 	st.shared.b32 	[%rd3], %r53;
 	bar.sync 	0;
 	setp.eq.b32 	%p6, %r1, 0;
-	@%p6 bra 	$L__BB5_9;
-	bra.uni 	$L__BB5_8;
-$L__BB5_8:                              // %bb12
+	@%p6 bra 	$L__BB7_9;
+	bra.uni 	$L__BB7_8;
+$L__BB7_8:                              // %bb12
 	ld.shared.b32 	%r54, [%rd3+-4];
-$L__BB5_9:                              // %bb14
+$L__BB7_9:                              // %bb14
 	bar.sync 	0;
-	@%p6 bra 	$L__BB5_11;
-	bra.uni 	$L__BB5_10;
-$L__BB5_10:                             // %bb16
+	@%p6 bra 	$L__BB7_11;
+	bra.uni 	$L__BB7_10;
+$L__BB7_10:                             // %bb16
 	ld.shared.b32 	%r20, [%rd3];
 	add.s32 	%r21, %r20, %r54;
 	st.shared.b32 	[%rd3], %r21;
-$L__BB5_11:                             // %bb18
+$L__BB7_11:                             // %bb18
 	bar.sync 	0;
 	setp.lt.u32 	%p7, %r1, 2;
 	mov.b32 	%r55, 0;
-	@%p7 bra 	$L__BB5_13;
-	bra.uni 	$L__BB5_12;
-$L__BB5_12:                             // %bb12.1
+	@%p7 bra 	$L__BB7_13;
+	bra.uni 	$L__BB7_12;
+$L__BB7_12:                             // %bb12.1
 	ld.shared.b32 	%r55, [%rd3+-8];
-$L__BB5_13:                             // %bb14.1
+$L__BB7_13:                             // %bb14.1
 	bar.sync 	0;
-	@%p7 bra 	$L__BB5_15;
-	bra.uni 	$L__BB5_14;
-$L__BB5_14:                             // %bb16.1
+	@%p7 bra 	$L__BB7_15;
+	bra.uni 	$L__BB7_14;
+$L__BB7_14:                             // %bb16.1
 	ld.shared.b32 	%r22, [%rd3];
 	add.s32 	%r23, %r22, %r55;
 	st.shared.b32 	[%rd3], %r23;
-$L__BB5_15:                             // %bb18.1
+$L__BB7_15:                             // %bb18.1
 	bar.sync 	0;
 	setp.lt.u32 	%p8, %r1, 4;
 	mov.b32 	%r56, 0;
-	@%p8 bra 	$L__BB5_17;
-	bra.uni 	$L__BB5_16;
-$L__BB5_16:                             // %bb12.2
+	@%p8 bra 	$L__BB7_17;
+	bra.uni 	$L__BB7_16;
+$L__BB7_16:                             // %bb12.2
 	ld.shared.b32 	%r56, [%rd3+-16];
-$L__BB5_17:                             // %bb14.2
+$L__BB7_17:                             // %bb14.2
 	bar.sync 	0;
-	@%p8 bra 	$L__BB5_19;
-	bra.uni 	$L__BB5_18;
-$L__BB5_18:                             // %bb16.2
+	@%p8 bra 	$L__BB7_19;
+	bra.uni 	$L__BB7_18;
+$L__BB7_18:                             // %bb16.2
 	ld.shared.b32 	%r24, [%rd3];
 	add.s32 	%r25, %r24, %r56;
 	st.shared.b32 	[%rd3], %r25;
-$L__BB5_19:                             // %bb18.2
+$L__BB7_19:                             // %bb18.2
 	bar.sync 	0;
 	setp.lt.u32 	%p9, %r1, 8;
 	mov.b32 	%r57, 0;
-	@%p9 bra 	$L__BB5_21;
-	bra.uni 	$L__BB5_20;
-$L__BB5_20:                             // %bb12.3
+	@%p9 bra 	$L__BB7_21;
+	bra.uni 	$L__BB7_20;
+$L__BB7_20:                             // %bb12.3
 	ld.shared.b32 	%r57, [%rd3+-32];
-$L__BB5_21:                             // %bb14.3
+$L__BB7_21:                             // %bb14.3
 	bar.sync 	0;
-	@%p9 bra 	$L__BB5_23;
-	bra.uni 	$L__BB5_22;
-$L__BB5_22:                             // %bb16.3
+	@%p9 bra 	$L__BB7_23;
+	bra.uni 	$L__BB7_22;
+$L__BB7_22:                             // %bb16.3
 	ld.shared.b32 	%r26, [%rd3];
 	add.s32 	%r27, %r26, %r57;
 	st.shared.b32 	[%rd3], %r27;
-$L__BB5_23:                             // %bb18.3
+$L__BB7_23:                             // %bb18.3
 	bar.sync 	0;
 	setp.lt.u32 	%p10, %r1, 16;
 	mov.b32 	%r58, 0;
-	@%p10 bra 	$L__BB5_25;
-	bra.uni 	$L__BB5_24;
-$L__BB5_24:                             // %bb12.4
+	@%p10 bra 	$L__BB7_25;
+	bra.uni 	$L__BB7_24;
+$L__BB7_24:                             // %bb12.4
 	ld.shared.b32 	%r58, [%rd3+-64];
-$L__BB5_25:                             // %bb14.4
+$L__BB7_25:                             // %bb14.4
 	bar.sync 	0;
-	@%p10 bra 	$L__BB5_27;
-	bra.uni 	$L__BB5_26;
-$L__BB5_26:                             // %bb16.4
+	@%p10 bra 	$L__BB7_27;
+	bra.uni 	$L__BB7_26;
+$L__BB7_26:                             // %bb16.4
 	ld.shared.b32 	%r28, [%rd3];
 	add.s32 	%r29, %r28, %r58;
 	st.shared.b32 	[%rd3], %r29;
-$L__BB5_27:                             // %bb18.4
+$L__BB7_27:                             // %bb18.4
 	bar.sync 	0;
 	setp.lt.u32 	%p11, %r1, 32;
 	mov.b32 	%r59, 0;
-	@%p11 bra 	$L__BB5_29;
-	bra.uni 	$L__BB5_28;
-$L__BB5_28:                             // %bb12.5
+	@%p11 bra 	$L__BB7_29;
+	bra.uni 	$L__BB7_28;
+$L__BB7_28:                             // %bb12.5
 	ld.shared.b32 	%r59, [%rd3+-128];
-$L__BB5_29:                             // %bb14.5
+$L__BB7_29:                             // %bb14.5
 	bar.sync 	0;
-	@%p11 bra 	$L__BB5_31;
-	bra.uni 	$L__BB5_30;
-$L__BB5_30:                             // %bb16.5
+	@%p11 bra 	$L__BB7_31;
+	bra.uni 	$L__BB7_30;
+$L__BB7_30:                             // %bb16.5
 	ld.shared.b32 	%r30, [%rd3];
 	add.s32 	%r31, %r30, %r59;
 	st.shared.b32 	[%rd3], %r31;
-$L__BB5_31:                             // %bb18.5
+$L__BB7_31:                             // %bb18.5
 	bar.sync 	0;
 	setp.lt.u32 	%p12, %r1, 64;
 	mov.b32 	%r60, 0;
-	@%p12 bra 	$L__BB5_33;
-	bra.uni 	$L__BB5_32;
-$L__BB5_32:                             // %bb12.6
+	@%p12 bra 	$L__BB7_33;
+	bra.uni 	$L__BB7_32;
+$L__BB7_32:                             // %bb12.6
 	ld.shared.b32 	%r60, [%rd3+-256];
-$L__BB5_33:                             // %bb14.6
+$L__BB7_33:                             // %bb14.6
 	bar.sync 	0;
-	@%p12 bra 	$L__BB5_35;
-	bra.uni 	$L__BB5_34;
-$L__BB5_34:                             // %bb16.6
+	@%p12 bra 	$L__BB7_35;
+	bra.uni 	$L__BB7_34;
+$L__BB7_34:                             // %bb16.6
 	ld.shared.b32 	%r32, [%rd3];
 	add.s32 	%r33, %r32, %r60;
 	st.shared.b32 	[%rd3], %r33;
-$L__BB5_35:                             // %bb18.6
+$L__BB7_35:                             // %bb18.6
 	bar.sync 	0;
 	setp.lt.u32 	%p13, %r1, 128;
 	mov.b32 	%r61, 0;
-	@%p13 bra 	$L__BB5_37;
-	bra.uni 	$L__BB5_36;
-$L__BB5_36:                             // %bb12.7
+	@%p13 bra 	$L__BB7_37;
+	bra.uni 	$L__BB7_36;
+$L__BB7_36:                             // %bb12.7
 	ld.shared.b32 	%r61, [%rd3+-512];
-$L__BB5_37:                             // %bb14.7
+$L__BB7_37:                             // %bb14.7
 	bar.sync 	0;
-	@%p13 bra 	$L__BB5_39;
-	bra.uni 	$L__BB5_38;
-$L__BB5_38:                             // %bb16.7
+	@%p13 bra 	$L__BB7_39;
+	bra.uni 	$L__BB7_38;
+$L__BB7_38:                             // %bb16.7
 	ld.shared.b32 	%r34, [%rd3];
 	add.s32 	%r35, %r34, %r61;
 	st.shared.b32 	[%rd3], %r35;
-$L__BB5_39:                             // %bb18.7
+$L__BB7_39:                             // %bb18.7
 	bar.sync 	0;
 	setp.lt.u32 	%p14, %r1, 256;
 	mov.b32 	%r62, 0;
-	@%p14 bra 	$L__BB5_41;
-	bra.uni 	$L__BB5_40;
-$L__BB5_40:                             // %bb12.8
+	@%p14 bra 	$L__BB7_41;
+	bra.uni 	$L__BB7_40;
+$L__BB7_40:                             // %bb12.8
 	ld.shared.b32 	%r62, [%rd3+-1024];
-$L__BB5_41:                             // %bb14.8
+$L__BB7_41:                             // %bb14.8
 	bar.sync 	0;
-	@%p14 bra 	$L__BB5_43;
-	bra.uni 	$L__BB5_42;
-$L__BB5_42:                             // %bb16.8
+	@%p14 bra 	$L__BB7_43;
+	bra.uni 	$L__BB7_42;
+$L__BB7_42:                             // %bb16.8
 	ld.shared.b32 	%r36, [%rd3];
 	add.s32 	%r37, %r36, %r62;
 	st.shared.b32 	[%rd3], %r37;
-$L__BB5_43:                             // %bb18.8
+$L__BB7_43:                             // %bb18.8
 	bar.sync 	0;
 	setp.lt.u32 	%p15, %r1, 512;
 	mov.b32 	%r63, 0;
-	@%p15 bra 	$L__BB5_45;
-	bra.uni 	$L__BB5_44;
-$L__BB5_44:                             // %bb12.9
+	@%p15 bra 	$L__BB7_45;
+	bra.uni 	$L__BB7_44;
+$L__BB7_44:                             // %bb12.9
 	ld.shared.b32 	%r63, [%rd3+-2048];
-$L__BB5_45:                             // %bb14.9
+$L__BB7_45:                             // %bb14.9
 	bar.sync 	0;
-	@%p15 bra 	$L__BB5_47;
-	bra.uni 	$L__BB5_46;
-$L__BB5_46:                             // %bb16.9
+	@%p15 bra 	$L__BB7_47;
+	bra.uni 	$L__BB7_46;
+$L__BB7_46:                             // %bb16.9
 	ld.shared.b32 	%r38, [%rd3];
 	add.s32 	%r39, %r38, %r63;
 	st.shared.b32 	[%rd3], %r39;
-$L__BB5_47:                             // %bb18.9
+$L__BB7_47:                             // %bb18.9
 	bar.sync 	0;
 	mov.b32 	%r65, 0;
-	@%p6 bra 	$L__BB5_49;
-	bra.uni 	$L__BB5_48;
-$L__BB5_48:                             // %bb21
+	@%p6 bra 	$L__BB7_49;
+	bra.uni 	$L__BB7_48;
+$L__BB7_48:                             // %bb21
 	ld.shared.b32 	%r65, [%rd3+-4];
-$L__BB5_49:                             // %bb23
-	@%p1 bra 	$L__BB5_56;
-	bra.uni 	$L__BB5_50;
-$L__BB5_50:                             // %bb25.preheader
+$L__BB7_49:                             // %bb23
+	@%p1 bra 	$L__BB7_56;
+	bra.uni 	$L__BB7_50;
+$L__BB7_50:                             // %bb25.preheader
 	and.b32 	%r4, %r48, 3;
 	setp.eq.b32 	%p16, %r4, 0;
-	@%p16 bra 	$L__BB5_53;
-	bra.uni 	$L__BB5_51;
-$L__BB5_51:                             // %bb25.prol.preheader
+	@%p16 bra 	$L__BB7_53;
+	bra.uni 	$L__BB7_51;
+$L__BB7_51:                             // %bb25.prol.preheader
 	mul.wide.s32 	%rd11, %r66, 4;
 	add.s64 	%rd19, %rd1, %rd11;
 	add.s64 	%rd12, %rd11, %rd2;
 	add.s64 	%rd18, %rd12, 4;
 	shl.b32 	%r64, %r4, 2;
-$L__BB5_52:                             // %bb25.prol
+$L__BB7_52:                             // %bb25.prol
                                         // =>This Inner Loop Header: Depth=1
 	.pragma "nounroll";
 	ld.global.b32 	%r40, [%rd19];
@@ -2651,20 +4070,20 @@ $L__BB5_52:                             // %bb25.prol
 	add.s64 	%rd18, %rd18, 4;
 	add.s32 	%r64, %r64, -4;
 	setp.ne.b32 	%p17, %r64, 0;
-	@%p17 bra 	$L__BB5_52;
-	bra.uni 	$L__BB5_53;
-$L__BB5_53:                             // %bb25.prol.loopexit
+	@%p17 bra 	$L__BB7_52;
+	bra.uni 	$L__BB7_53;
+$L__BB7_53:                             // %bb25.prol.loopexit
 	setp.gt.u32 	%p18, %r49, -4;
-	@%p18 bra 	$L__BB5_56;
-	bra.uni 	$L__BB5_54;
-$L__BB5_54:                             // %bb25.preheader13
+	@%p18 bra 	$L__BB7_56;
+	bra.uni 	$L__BB7_54;
+$L__BB7_54:                             // %bb25.preheader13
 	sub.s32 	%r67, %r2, %r66;
 	mul.wide.s32 	%rd13, %r66, 4;
 	add.s64 	%rd14, %rd13, %rd2;
 	add.s64 	%rd21, %rd14, 16;
 	add.s64 	%rd15, %rd13, %rd1;
 	add.s64 	%rd20, %rd15, 8;
-$L__BB5_55:                             // %bb25
+$L__BB7_55:                             // %bb25
                                         // =>This Inner Loop Header: Depth=1
 	ld.global.b32 	%r41, [%rd20+-8];
 	add.s32 	%r42, %r41, %r65;
@@ -2682,14 +4101,14 @@ $L__BB5_55:                             // %bb25
 	add.s64 	%rd21, %rd21, 16;
 	add.s64 	%rd20, %rd20, 16;
 	setp.ne.b32 	%p19, %r67, 0;
-	@%p19 bra 	$L__BB5_55;
-	bra.uni 	$L__BB5_56;
-$L__BB5_56:                             // %bb26
-	@!%p6 bra 	$L__BB5_58;
-	bra.uni 	$L__BB5_57;
-$L__BB5_57:                             // %bb27
+	@%p19 bra 	$L__BB7_55;
+	bra.uni 	$L__BB7_56;
+$L__BB7_56:                             // %bb26
+	@!%p6 bra 	$L__BB7_58;
+	bra.uni 	$L__BB7_57;
+$L__BB7_57:                             // %bb27
 	st.global.b32 	[%rd2], 0;
-$L__BB5_58:                             // %bb28
+$L__BB7_58:                             // %bb28
 	ret;
                                         // -- End function
 }
@@ -2736,26 +4155,26 @@ $L__BB5_58:                             // %bb28
 	add.s64 	%rd89, %rd9, 7;
 	shr.u64 	%rd13, %rd89, 3;
 	setp.eq.b64 	%p1, %rd13, 0;
-	@%p1 bra 	$L__BB6_229;
-	bra.uni 	$L__BB6_1;
-$L__BB6_1:                              // %bb3
+	@%p1 bra 	$L__BB8_229;
+	bra.uni 	$L__BB8_1;
+$L__BB8_1:                              // %bb3
 	ld.param.b32 	%r14, [fp8_moe_w8a8_mma_param_11];
 	mov.u32 	%r1, %ctaid.x;
 	cvt.u64.u32 	%rd14, %r1;
 	setp.lt.u64 	%p2, %rd14, %rd13;
 	mov.b64 	%rd232, 0;
-	@%p2 bra 	$L__BB6_3;
-	bra.uni 	$L__BB6_2;
-$L__BB6_2:
+	@%p2 bra 	$L__BB8_3;
+	bra.uni 	$L__BB8_2;
+$L__BB8_2:
 	cvt.u32.u64 	%r16, %rd13;
 	cvt.u32.u64 	%r17, %rd14;
 	div.u32 	%r18, %r17, %r16;
 	cvt.u64.u32 	%rd232, %r18;
-$L__BB6_3:                              // %bb3.split
+$L__BB8_3:                              // %bb3.split
 	setp.eq.b32 	%p3, %r14, 0;
-	@%p3 bra 	$L__BB6_230;
-	bra.uni 	$L__BB6_4;
-$L__BB6_4:                              // %bb8
+	@%p3 bra 	$L__BB8_230;
+	bra.uni 	$L__BB8_4;
+$L__BB8_4:                              // %bb8
 	ld.param.b32 	%r13, [fp8_moe_w8a8_mma_param_10];
 	cvt.s64.s32 	%rd10, %r13;
 	cvt.s64.s32 	%rd11, %r14;
@@ -2765,23 +4184,23 @@ $L__BB6_4:                              // %bb8
 	and.b64 	%rd94, %rd93, -4294967296;
 	setp.ne.b64 	%p4, %rd94, 0;
 	cvt.u32.u64 	%r127, %rd11;
-	@%p4 bra 	$L__BB6_6;
-	bra.uni 	$L__BB6_5;
-$L__BB6_5:
+	@%p4 bra 	$L__BB8_6;
+	bra.uni 	$L__BB8_5;
+$L__BB8_5:
 	cvt.u32.u64 	%r20, %rd19;
 	div.u32 	%r21, %r20, %r127;
 	cvt.u64.u32 	%rd20, %r21;
-	bra.uni 	$L__BB6_7;
-$L__BB6_6:
+	bra.uni 	$L__BB8_7;
+$L__BB8_6:
 	div.u64 	%rd20, %rd19, %rd11;
-$L__BB6_7:                              // %bb8.split
+$L__BB8_7:                              // %bb8.split
 	shl.b64 	%rd95, %rd232, 2;
 	add.s64 	%rd96, %rd1, %rd95;
 	ld.global.s32 	%rd21, [%rd96];
 	setp.lt.s64 	%p5, %rd21, 0;
-	@%p5 bra 	$L__BB6_90;
-	bra.uni 	$L__BB6_8;
-$L__BB6_8:                              // %bb10
+	@%p5 bra 	$L__BB8_90;
+	bra.uni 	$L__BB8_8;
+$L__BB8_8:                              // %bb10
 	mul.lo.s64 	%rd90, %rd232, %rd13;
 	mov.u32 	%r19, %tid.x;
 	ld.param.b32 	%r15, [fp8_moe_w8a8_mma_param_12];
@@ -2792,16 +4211,16 @@ $L__BB6_8:                              // %bb10
 	or.b64 	%rd97, %rd22, %rd11;
 	and.b64 	%rd98, %rd97, -4294967296;
 	setp.ne.b64 	%p6, %rd98, 0;
-	@%p6 bra 	$L__BB6_10;
-	bra.uni 	$L__BB6_9;
-$L__BB6_9:
+	@%p6 bra 	$L__BB8_10;
+	bra.uni 	$L__BB8_9;
+$L__BB8_9:
 	cvt.u32.u64 	%r22, %rd22;
 	div.u32 	%r23, %r22, %r127;
 	cvt.u64.u32 	%rd233, %r23;
-	bra.uni 	$L__BB6_11;
-$L__BB6_10:
+	bra.uni 	$L__BB8_11;
+$L__BB8_10:
 	div.u64 	%rd233, %rd22, %rd11;
-$L__BB6_11:                             // %bb10.split
+$L__BB8_11:                             // %bb10.split
 	ld.param.b32 	%r12, [fp8_moe_w8a8_mma_param_8];
 	shl.b64 	%rd15, %rd91, 3;
 	and.b64 	%rd17, %rd92, 3;
@@ -2810,9 +4229,9 @@ $L__BB6_11:                             // %bb10.split
 	shl.b64 	%rd230, %rd24, 2;
 	shl.b64 	%rd231, %rd16, 2;
 	setp.eq.b32 	%p74, %r15, 0;
-	@%p7 bra 	$L__BB6_13;
-	bra.uni 	$L__BB6_12;
-$L__BB6_12:                             // %bb10.bb45.preheader_crit_edge
+	@%p7 bra 	$L__BB8_13;
+	bra.uni 	$L__BB8_12;
+$L__BB8_12:                             // %bb10.bb45.preheader_crit_edge
 	add.s64 	%rd206, %rd2, %rd230;
 	add.s64 	%rd207, %rd206, %rd231;
 	ld.global.b32 	%r2, [%rd207];
@@ -2822,8 +4241,8 @@ $L__BB6_12:                             // %bb10.bb45.preheader_crit_edge
 	mov.b32 	%r4, %r3;
 	mov.b32 	%r5, %r3;
 	mov.b32 	%r6, %r3;
-	bra.uni 	$L__BB6_14;
-$L__BB6_13:                             // %bb14.lr.ph
+	bra.uni 	$L__BB8_14;
+$L__BB8_13:                             // %bb14.lr.ph
 	cvt.s64.s32 	%rd12, %r15;
 	mul.lo.s64 	%rd23, %rd233, %rd21;
 	mul.lo.s64 	%rd100, %rd10, %rd9;
@@ -2849,307 +4268,307 @@ $L__BB6_13:                             // %bb14.lr.ph
 	mov.b32 	%r5, %r24;
 	mov.b32 	%r6, %r24;
 	mov.b64 	%rd36, %rd99;
-	bra.uni 	$L__BB6_15;
-$L__BB6_14:                             // %bb45.preheader
+	bra.uni 	$L__BB8_15;
+$L__BB8_14:                             // %bb45.preheader
 	setp.gt.u32 	%p65, %r12, %r2;
 	mov.b32 	%r136, 0f00000000;
-	@%p65 bra 	$L__BB6_72;
-	bra.uni 	$L__BB6_75;
-$L__BB6_15:                             // %bb14
+	@%p65 bra 	$L__BB8_72;
+	bra.uni 	$L__BB8_75;
+$L__BB8_15:                             // %bb14
                                         // =>This Loop Header: Depth=1
-                                        //     Child Loop BB6_16 Depth 2
+                                        //     Child Loop BB8_16 Depth 2
 	add.s64 	%rd37, %rd36, %rd25;
 	mov.b64 	%rd38, %rd99;
 	mov.b32 	%r7, %r24;
 	mov.b32 	%r8, %r24;
 	mov.b32 	%r9, %r24;
 	mov.b32 	%r10, %r24;
-$L__BB6_16:                             // %bb16
-                                        //   Parent Loop BB6_15 Depth=1
+$L__BB8_16:                             // %bb16
+                                        //   Parent Loop BB8_15 Depth=1
                                         // =>  This Inner Loop Header: Depth=2
 	mov.b64 	%rd234, 0;
-	@%p8 bra 	$L__BB6_22;
-	bra.uni 	$L__BB6_17;
-$L__BB6_17:                             // %bb1.i
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_21;
-	bra.uni 	$L__BB6_18;
-$L__BB6_18:                             // %bb3.i
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_22;
+	bra.uni 	$L__BB8_17;
+$L__BB8_17:                             // %bb1.i
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_21;
+	bra.uni 	$L__BB8_18;
+$L__BB8_18:                             // %bb3.i
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd103, %rd27, %rd12;
 	and.b64 	%rd104, %rd103, -4294967296;
 	setp.ne.b64 	%p9, %rd104, 0;
-	@%p9 bra 	$L__BB6_20;
-	bra.uni 	$L__BB6_19;
-$L__BB6_19:                             //   in Loop: Header=BB6_16 Depth=2
+	@%p9 bra 	$L__BB8_20;
+	bra.uni 	$L__BB8_19;
+$L__BB8_19:                             //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r25, %rd12;
 	cvt.u32.u64 	%r26, %rd27;
 	div.u32 	%r27, %r26, %r25;
 	cvt.u64.u32 	%rd42, %r27;
 	mul.lo.s64 	%rd234, %rd42, %rd10;
-	bra.uni 	$L__BB6_22;
-$L__BB6_20:                             //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_22;
+$L__BB8_20:                             //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd43, %rd27, %rd12;
 	mul.lo.s64 	%rd234, %rd43, %rd10;
-	bra.uni 	$L__BB6_22;
-$L__BB6_21:                             // %bb6.i
+	bra.uni 	$L__BB8_22;
+$L__BB8_21:                             // %bb6.i
 	trap;
-$L__BB6_22:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_22:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd40, %rd34, %rd38;
 	setp.ge.u64 	%p10, %rd40, %rd10;
 	or.pred 	%p11, %p8, %p10;
 	mov.b32 	%r11, 0;
-	@%p11 bra 	$L__BB6_92;
-	bra.uni 	$L__BB6_91;
-$L__BB6_23:                             // %bb27
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p11 bra 	$L__BB8_92;
+	bra.uni 	$L__BB8_91;
+$L__BB8_23:                             // %bb27
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd159, %rd36, %rd11;
 	and.b64 	%rd160, %rd159, -4294967296;
 	setp.ne.b64 	%p53, %rd160, 0;
-	@%p53 bra 	$L__BB6_25;
-	bra.uni 	$L__BB6_24;
-$L__BB6_24:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p53 bra 	$L__BB8_25;
+	bra.uni 	$L__BB8_24;
+$L__BB8_24:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r96, %rd36;
 	div.u32 	%r97, %r96, %r127;
 	cvt.u64.u32 	%rd235, %r97;
-	bra.uni 	$L__BB6_26;
-$L__BB6_25:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_26;
+$L__BB8_25:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd235, %rd36, %rd11;
-$L__BB6_26:                             // %bb27.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_26:                             // %bb27.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	shl.b64 	%rd161, %rd235, 2;
 	add.s64 	%rd45, %rd4, %rd161;
 	mov.b32 	%r129, 0f00000000;
 	mov.b32 	%r128, %r129;
-	@%p8 bra 	$L__BB6_33;
-	bra.uni 	$L__BB6_27;
-$L__BB6_27:                             // %bb1.i37
-                                        //   in Loop: Header=BB6_15 Depth=1
-	@!%p74 bra 	$L__BB6_29;
-	bra.uni 	$L__BB6_28;
-$L__BB6_28:                             // %bb6.i49
+	@%p8 bra 	$L__BB8_33;
+	bra.uni 	$L__BB8_27;
+$L__BB8_27:                             // %bb1.i37
+                                        //   in Loop: Header=BB8_15 Depth=1
+	@!%p74 bra 	$L__BB8_29;
+	bra.uni 	$L__BB8_28;
+$L__BB8_28:                             // %bb6.i49
 	trap;
-$L__BB6_29:                             // %bb31
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_29:                             // %bb31
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd162, %rd27, %rd12;
 	and.b64 	%rd163, %rd162, -4294967296;
 	setp.ne.b64 	%p54, %rd163, 0;
-	@%p54 bra 	$L__BB6_31;
-	bra.uni 	$L__BB6_30;
-$L__BB6_30:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p54 bra 	$L__BB8_31;
+	bra.uni 	$L__BB8_30;
+$L__BB8_30:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r98, %rd12;
 	cvt.u32.u64 	%r99, %rd27;
 	div.u32 	%r100, %r99, %r98;
 	cvt.u64.u32 	%rd236, %r100;
-	bra.uni 	$L__BB6_32;
-$L__BB6_31:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_32;
+$L__BB8_31:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd236, %rd27, %rd12;
-$L__BB6_32:                             // %bb31.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_32:                             // %bb31.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mul.lo.s64 	%rd164, %rd236, %rd20;
 	shl.b64 	%rd165, %rd164, 2;
 	add.s64 	%rd166, %rd45, %rd165;
 	ld.global.b32 	%r128, [%rd166];
-$L__BB6_33:                             // %bb33
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_33:                             // %bb33
+                                        //   in Loop: Header=BB8_15 Depth=1
 	add.s64 	%rd46, %rd5, %rd161;
 	setp.ge.u64 	%p55, %rd31, %rd9;
-	@%p55 bra 	$L__BB6_38;
-	bra.uni 	$L__BB6_34;
-$L__BB6_34:                             // %bb36
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p55 bra 	$L__BB8_38;
+	bra.uni 	$L__BB8_34;
+$L__BB8_34:                             // %bb36
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd167, %rd31, %rd11;
 	and.b64 	%rd168, %rd167, -4294967296;
 	setp.ne.b64 	%p56, %rd168, 0;
-	@%p56 bra 	$L__BB6_36;
-	bra.uni 	$L__BB6_35;
-$L__BB6_35:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p56 bra 	$L__BB8_36;
+	bra.uni 	$L__BB8_35;
+$L__BB8_35:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r101, %rd31;
 	div.u32 	%r102, %r101, %r127;
 	cvt.u64.u32 	%rd237, %r102;
-	bra.uni 	$L__BB6_37;
-$L__BB6_36:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_37;
+$L__BB8_36:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd237, %rd31, %rd11;
-$L__BB6_37:                             // %bb36.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_37:                             // %bb36.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	add.s64 	%rd169, %rd237, %rd23;
 	mul.lo.s64 	%rd170, %rd169, %rd20;
 	shl.b64 	%rd171, %rd170, 2;
 	add.s64 	%rd172, %rd46, %rd171;
 	ld.global.b32 	%r129, [%rd172];
-$L__BB6_38:                             // %bb40
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_38:                             // %bb40
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mov.b32 	%r131, 0f00000000;
 	mov.b32 	%r130, %r131;
-	@%p8 bra 	$L__BB6_44;
-	bra.uni 	$L__BB6_39;
-$L__BB6_39:                             // %bb1.i37.1
-                                        //   in Loop: Header=BB6_15 Depth=1
-	@%p74 bra 	$L__BB6_28;
-	bra.uni 	$L__BB6_40;
-$L__BB6_40:                             // %bb31.1
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p8 bra 	$L__BB8_44;
+	bra.uni 	$L__BB8_39;
+$L__BB8_39:                             // %bb1.i37.1
+                                        //   in Loop: Header=BB8_15 Depth=1
+	@%p74 bra 	$L__BB8_28;
+	bra.uni 	$L__BB8_40;
+$L__BB8_40:                             // %bb31.1
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd173, %rd27, %rd12;
 	and.b64 	%rd174, %rd173, -4294967296;
 	setp.ne.b64 	%p57, %rd174, 0;
-	@%p57 bra 	$L__BB6_42;
-	bra.uni 	$L__BB6_41;
-$L__BB6_41:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p57 bra 	$L__BB8_42;
+	bra.uni 	$L__BB8_41;
+$L__BB8_41:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r104, %rd12;
 	cvt.u32.u64 	%r105, %rd27;
 	div.u32 	%r106, %r105, %r104;
 	cvt.u64.u32 	%rd238, %r106;
-	bra.uni 	$L__BB6_43;
-$L__BB6_42:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_43;
+$L__BB8_42:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd238, %rd27, %rd12;
-$L__BB6_43:                             // %bb31.1.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_43:                             // %bb31.1.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mul.lo.s64 	%rd175, %rd238, %rd20;
 	shl.b64 	%rd176, %rd175, 2;
 	add.s64 	%rd177, %rd45, %rd176;
 	ld.global.b32 	%r130, [%rd177];
-$L__BB6_44:                             // %bb33.1
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_44:                             // %bb33.1
+                                        //   in Loop: Header=BB8_15 Depth=1
 	setp.ge.u64 	%p58, %rd32, %rd9;
-	@%p58 bra 	$L__BB6_49;
-	bra.uni 	$L__BB6_45;
-$L__BB6_45:                             // %bb36.1
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p58 bra 	$L__BB8_49;
+	bra.uni 	$L__BB8_45;
+$L__BB8_45:                             // %bb36.1
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd178, %rd32, %rd11;
 	and.b64 	%rd179, %rd178, -4294967296;
 	setp.ne.b64 	%p59, %rd179, 0;
-	@%p59 bra 	$L__BB6_47;
-	bra.uni 	$L__BB6_46;
-$L__BB6_46:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p59 bra 	$L__BB8_47;
+	bra.uni 	$L__BB8_46;
+$L__BB8_46:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r107, %rd32;
 	div.u32 	%r108, %r107, %r127;
 	cvt.u64.u32 	%rd239, %r108;
-	bra.uni 	$L__BB6_48;
-$L__BB6_47:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_48;
+$L__BB8_47:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd239, %rd32, %rd11;
-$L__BB6_48:                             // %bb36.1.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_48:                             // %bb36.1.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	add.s64 	%rd180, %rd239, %rd23;
 	mul.lo.s64 	%rd181, %rd180, %rd20;
 	shl.b64 	%rd182, %rd181, 2;
 	add.s64 	%rd183, %rd46, %rd182;
 	ld.global.b32 	%r131, [%rd183];
-$L__BB6_49:                             // %bb40.1
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_49:                             // %bb40.1
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mov.b32 	%r133, 0f00000000;
 	mov.b32 	%r132, %r133;
-	@%p23 bra 	$L__BB6_55;
-	bra.uni 	$L__BB6_50;
-$L__BB6_50:                             // %bb1.i37.2
-                                        //   in Loop: Header=BB6_15 Depth=1
-	@%p74 bra 	$L__BB6_28;
-	bra.uni 	$L__BB6_51;
-$L__BB6_51:                             // %bb31.2
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p23 bra 	$L__BB8_55;
+	bra.uni 	$L__BB8_50;
+$L__BB8_50:                             // %bb1.i37.2
+                                        //   in Loop: Header=BB8_15 Depth=1
+	@%p74 bra 	$L__BB8_28;
+	bra.uni 	$L__BB8_51;
+$L__BB8_51:                             // %bb31.2
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd184, %rd64, %rd12;
 	and.b64 	%rd185, %rd184, -4294967296;
 	setp.ne.b64 	%p60, %rd185, 0;
-	@%p60 bra 	$L__BB6_53;
-	bra.uni 	$L__BB6_52;
-$L__BB6_52:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p60 bra 	$L__BB8_53;
+	bra.uni 	$L__BB8_52;
+$L__BB8_52:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r110, %rd12;
 	div.u32 	%r111, %r126, %r110;
 	cvt.u64.u32 	%rd240, %r111;
-	bra.uni 	$L__BB6_54;
-$L__BB6_53:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_54;
+$L__BB8_53:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd240, %rd64, %rd12;
-$L__BB6_54:                             // %bb31.2.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_54:                             // %bb31.2.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mul.lo.s64 	%rd186, %rd240, %rd20;
 	shl.b64 	%rd187, %rd186, 2;
 	add.s64 	%rd188, %rd45, %rd187;
 	ld.global.b32 	%r132, [%rd188];
-$L__BB6_55:                             // %bb33.2
-                                        //   in Loop: Header=BB6_15 Depth=1
-	@%p55 bra 	$L__BB6_60;
-	bra.uni 	$L__BB6_56;
-$L__BB6_56:                             // %bb36.2
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_55:                             // %bb33.2
+                                        //   in Loop: Header=BB8_15 Depth=1
+	@%p55 bra 	$L__BB8_60;
+	bra.uni 	$L__BB8_56;
+$L__BB8_56:                             // %bb36.2
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd189, %rd31, %rd11;
 	and.b64 	%rd190, %rd189, -4294967296;
 	setp.ne.b64 	%p61, %rd190, 0;
-	@%p61 bra 	$L__BB6_58;
-	bra.uni 	$L__BB6_57;
-$L__BB6_57:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p61 bra 	$L__BB8_58;
+	bra.uni 	$L__BB8_57;
+$L__BB8_57:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r112, %rd31;
 	div.u32 	%r113, %r112, %r127;
 	cvt.u64.u32 	%rd241, %r113;
-	bra.uni 	$L__BB6_59;
-$L__BB6_58:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_59;
+$L__BB8_58:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd241, %rd31, %rd11;
-$L__BB6_59:                             // %bb36.2.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_59:                             // %bb36.2.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	add.s64 	%rd191, %rd241, %rd23;
 	mul.lo.s64 	%rd192, %rd191, %rd20;
 	shl.b64 	%rd193, %rd192, 2;
 	add.s64 	%rd194, %rd46, %rd193;
 	ld.global.b32 	%r133, [%rd194];
-$L__BB6_60:                             // %bb40.2
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_60:                             // %bb40.2
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mov.b32 	%r135, 0f00000000;
 	mov.b32 	%r134, %r135;
-	@%p23 bra 	$L__BB6_66;
-	bra.uni 	$L__BB6_61;
-$L__BB6_61:                             // %bb1.i37.3
-                                        //   in Loop: Header=BB6_15 Depth=1
-	@%p74 bra 	$L__BB6_28;
-	bra.uni 	$L__BB6_62;
-$L__BB6_62:                             // %bb31.3
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p23 bra 	$L__BB8_66;
+	bra.uni 	$L__BB8_61;
+$L__BB8_61:                             // %bb1.i37.3
+                                        //   in Loop: Header=BB8_15 Depth=1
+	@%p74 bra 	$L__BB8_28;
+	bra.uni 	$L__BB8_62;
+$L__BB8_62:                             // %bb31.3
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd195, %rd64, %rd12;
 	and.b64 	%rd196, %rd195, -4294967296;
 	setp.ne.b64 	%p62, %rd196, 0;
-	@%p62 bra 	$L__BB6_64;
-	bra.uni 	$L__BB6_63;
-$L__BB6_63:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p62 bra 	$L__BB8_64;
+	bra.uni 	$L__BB8_63;
+$L__BB8_63:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r115, %rd12;
 	div.u32 	%r116, %r126, %r115;
 	cvt.u64.u32 	%rd242, %r116;
-	bra.uni 	$L__BB6_65;
-$L__BB6_64:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_65;
+$L__BB8_64:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd242, %rd64, %rd12;
-$L__BB6_65:                             // %bb31.3.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_65:                             // %bb31.3.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mul.lo.s64 	%rd197, %rd242, %rd20;
 	shl.b64 	%rd198, %rd197, 2;
 	add.s64 	%rd199, %rd45, %rd198;
 	ld.global.b32 	%r134, [%rd199];
-$L__BB6_66:                             // %bb33.3
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_66:                             // %bb33.3
+                                        //   in Loop: Header=BB8_15 Depth=1
 	mul.f32 	%r103, %r128, %r7;
 	mul.f32 	%r109, %r130, %r8;
 	mul.f32 	%r114, %r132, %r9;
-	@%p58 bra 	$L__BB6_71;
-	bra.uni 	$L__BB6_67;
-$L__BB6_67:                             // %bb36.3
-                                        //   in Loop: Header=BB6_15 Depth=1
+	@%p58 bra 	$L__BB8_71;
+	bra.uni 	$L__BB8_67;
+$L__BB8_67:                             // %bb36.3
+                                        //   in Loop: Header=BB8_15 Depth=1
 	or.b64 	%rd200, %rd32, %rd11;
 	and.b64 	%rd201, %rd200, -4294967296;
 	setp.ne.b64 	%p63, %rd201, 0;
-	@%p63 bra 	$L__BB6_69;
-	bra.uni 	$L__BB6_68;
-$L__BB6_68:                             //   in Loop: Header=BB6_15 Depth=1
+	@%p63 bra 	$L__BB8_69;
+	bra.uni 	$L__BB8_68;
+$L__BB8_68:                             //   in Loop: Header=BB8_15 Depth=1
 	cvt.u32.u64 	%r117, %rd32;
 	div.u32 	%r118, %r117, %r127;
 	cvt.u64.u32 	%rd243, %r118;
-	bra.uni 	$L__BB6_70;
-$L__BB6_69:                             //   in Loop: Header=BB6_15 Depth=1
+	bra.uni 	$L__BB8_70;
+$L__BB8_69:                             //   in Loop: Header=BB8_15 Depth=1
 	div.u64 	%rd243, %rd32, %rd11;
-$L__BB6_70:                             // %bb36.3.split
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_70:                             // %bb36.3.split
+                                        //   in Loop: Header=BB8_15 Depth=1
 	add.s64 	%rd202, %rd243, %rd23;
 	mul.lo.s64 	%rd203, %rd202, %rd20;
 	shl.b64 	%rd204, %rd203, 2;
 	add.s64 	%rd205, %rd46, %rd204;
 	ld.global.b32 	%r135, [%rd205];
-$L__BB6_71:                             // %bb40.3
-                                        //   in Loop: Header=BB6_15 Depth=1
+$L__BB8_71:                             // %bb40.3
+                                        //   in Loop: Header=BB8_15 Depth=1
 	fma.rn.f32 	%r6, %r129, %r103, %r6;
 	fma.rn.f32 	%r5, %r131, %r109, %r5;
 	fma.rn.f32 	%r4, %r133, %r114, %r4;
@@ -3159,19 +4578,19 @@ $L__BB6_71:                             // %bb40.3
 	add.s64 	%rd35, %rd35, %rd11;
 	add.s64 	%rd34, %rd34, %rd11;
 	setp.lt.u64 	%p64, %rd36, %rd10;
-	@%p64 bra 	$L__BB6_15;
-	bra.uni 	$L__BB6_14;
-$L__BB6_72:                             // %bb1.i68
-	@%p74 bra 	$L__BB6_74;
-	bra.uni 	$L__BB6_73;
-$L__BB6_73:                             // %bb3.i73
+	@%p64 bra 	$L__BB8_15;
+	bra.uni 	$L__BB8_14;
+$L__BB8_72:                             // %bb1.i68
+	@%p74 bra 	$L__BB8_74;
+	bra.uni 	$L__BB8_73;
+$L__BB8_73:                             // %bb3.i73
 	shl.b64 	%rd209, %rd27, 2;
 	add.s64 	%rd210, %rd6, %rd209;
 	ld.global.b32 	%r136, [%rd210];
-	bra.uni 	$L__BB6_75;
-$L__BB6_74:                             // %bb6.i80
+	bra.uni 	$L__BB8_75;
+$L__BB8_74:                             // %bb6.i80
 	trap;
-$L__BB6_75:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit81
+$L__BB8_75:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit81
 	add.s64 	%rd208, %rd2, %rd230;
 	add.s64 	%rd33, %rd208, %rd231;
 	setp.le.u32 	%p66, %r12, %r2;
@@ -3184,9 +4603,9 @@ $L__BB6_75:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwis
 	shl.b64 	%rd215, %rd211, 1;
 	add.s64 	%rd48, %rd214, %rd215;
 	or.pred 	%p68, %p66, %p67;
-	@%p68 bra 	$L__BB6_77;
-	bra.uni 	$L__BB6_76;
-$L__BB6_76:                             // %bb51
+	@%p68 bra 	$L__BB8_77;
+	bra.uni 	$L__BB8_76;
+$L__BB8_76:                             // %bb51
 	mul.f32 	%r120, %r136, %r6;
 	// begin inline asm
 	cvt.rn.bf16.f32 %rs7, %r120;
@@ -3194,43 +4613,43 @@ $L__BB6_76:                             // %bb51
 	st.global.b16 	[%rd48], %rs7;
 	ld.global.b32 	%r2, [%rd33];
 	cvt.s64.s32 	%rd27, %r2;
-$L__BB6_77:                             // %bb52
+$L__BB8_77:                             // %bb52
 	setp.le.u32 	%p69, %r12, %r2;
 	mov.b32 	%r137, 0f00000000;
-	@%p69 bra 	$L__BB6_80;
-	bra.uni 	$L__BB6_78;
-$L__BB6_78:                             // %bb1.i68.1
-	@%p74 bra 	$L__BB6_74;
-	bra.uni 	$L__BB6_79;
-$L__BB6_79:                             // %bb3.i73.1
+	@%p69 bra 	$L__BB8_80;
+	bra.uni 	$L__BB8_78;
+$L__BB8_78:                             // %bb1.i68.1
+	@%p74 bra 	$L__BB8_74;
+	bra.uni 	$L__BB8_79;
+$L__BB8_79:                             // %bb3.i73.1
 	shl.b64 	%rd216, %rd27, 2;
 	add.s64 	%rd217, %rd6, %rd216;
 	ld.global.b32 	%r137, [%rd217];
-$L__BB6_80:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit81.1
+$L__BB8_80:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit81.1
 	or.b64 	%rd49, %rd211, 1;
 	setp.ge.u64 	%p70, %rd49, %rd9;
 	or.pred 	%p71, %p69, %p70;
-	@%p71 bra 	$L__BB6_82;
-	bra.uni 	$L__BB6_81;
-$L__BB6_81:                             // %bb51.1
+	@%p71 bra 	$L__BB8_82;
+	bra.uni 	$L__BB8_81;
+$L__BB8_81:                             // %bb51.1
 	mul.f32 	%r121, %r137, %r5;
 	// begin inline asm
 	cvt.rn.bf16.f32 %rs8, %r121;
 	// end inline asm
 	st.global.b16 	[%rd48+2], %rs8;
-$L__BB6_82:                             // %bb52.1
+$L__BB8_82:                             // %bb52.1
 	ld.global.b32 	%r138, [%rd33+32];
 	cvt.s64.s32 	%rd244, %r138;
 	setp.le.u32 	%p72, %r12, %r138;
-	@%p72 bra 	$L__BB6_86;
-	bra.uni 	$L__BB6_83;
-$L__BB6_83:                             // %bb1.i68.2
-	@%p74 bra 	$L__BB6_74;
-	bra.uni 	$L__BB6_84;
-$L__BB6_84:                             // %bb3.i73.2
-	@%p67 bra 	$L__BB6_86;
-	bra.uni 	$L__BB6_85;
-$L__BB6_85:                             // %bb51.2
+	@%p72 bra 	$L__BB8_86;
+	bra.uni 	$L__BB8_83;
+$L__BB8_83:                             // %bb1.i68.2
+	@%p74 bra 	$L__BB8_74;
+	bra.uni 	$L__BB8_84;
+$L__BB8_84:                             // %bb3.i73.2
+	@%p67 bra 	$L__BB8_86;
+	bra.uni 	$L__BB8_85;
+$L__BB8_85:                             // %bb51.2
 	shl.b64 	%rd218, %rd244, 2;
 	add.s64 	%rd219, %rd6, %rd218;
 	ld.global.b32 	%r123, [%rd219];
@@ -3246,17 +4665,17 @@ $L__BB6_85:                             // %bb51.2
 	st.global.b16 	[%rd224], %rs9;
 	ld.global.b32 	%r138, [%rd33+32];
 	cvt.s64.s32 	%rd244, %r138;
-$L__BB6_86:                             // %bb52.2
+$L__BB8_86:                             // %bb52.2
 	setp.le.u32 	%p73, %r12, %r138;
-	@%p73 bra 	$L__BB6_90;
-	bra.uni 	$L__BB6_87;
-$L__BB6_87:                             // %bb1.i68.3
-	@%p74 bra 	$L__BB6_74;
-	bra.uni 	$L__BB6_88;
-$L__BB6_88:                             // %bb3.i73.3
-	@%p70 bra 	$L__BB6_90;
-	bra.uni 	$L__BB6_89;
-$L__BB6_89:                             // %bb51.3
+	@%p73 bra 	$L__BB8_90;
+	bra.uni 	$L__BB8_87;
+$L__BB8_87:                             // %bb1.i68.3
+	@%p74 bra 	$L__BB8_74;
+	bra.uni 	$L__BB8_88;
+$L__BB8_88:                             // %bb3.i73.3
+	@%p70 bra 	$L__BB8_90;
+	bra.uni 	$L__BB8_89;
+$L__BB8_89:                             // %bb51.3
 	shl.b64 	%rd225, %rd244, 2;
 	add.s64 	%rd50, %rd6, %rd225;
 	add.s64 	%rd226, %rd47, 8;
@@ -3270,688 +4689,688 @@ $L__BB6_89:                             // %bb51.3
 	cvt.rn.bf16.f32 %rs10, %r124;
 	// end inline asm
 	st.global.b16 	[%rd51+2], %rs10;
-$L__BB6_90:                             // %bb54
+$L__BB8_90:                             // %bb54
 	ret;
-$L__BB6_91:                             // %bb57
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_91:                             // %bb57
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd105, %rd234, %rd38;
 	add.s64 	%rd44, %rd35, %rd105;
 	ld.global.b8 	%r11, [%rd44];
-$L__BB6_92:                             // %bb59
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_92:                             // %bb59
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd245, 0;
-	@%p8 bra 	$L__BB6_98;
-	bra.uni 	$L__BB6_93;
-$L__BB6_93:                             // %bb1.i99
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_97;
-	bra.uni 	$L__BB6_94;
-$L__BB6_94:                             // %bb3.i104
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_98;
+	bra.uni 	$L__BB8_93;
+$L__BB8_93:                             // %bb1.i99
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_97;
+	bra.uni 	$L__BB8_94;
+$L__BB8_94:                             // %bb3.i104
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd106, %rd27, %rd12;
 	and.b64 	%rd107, %rd106, -4294967296;
 	setp.ne.b64 	%p12, %rd107, 0;
-	@%p12 bra 	$L__BB6_96;
-	bra.uni 	$L__BB6_95;
-$L__BB6_95:                             //   in Loop: Header=BB6_16 Depth=2
+	@%p12 bra 	$L__BB8_96;
+	bra.uni 	$L__BB8_95;
+$L__BB8_95:                             //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r28, %rd12;
 	cvt.u32.u64 	%r29, %rd27;
 	div.u32 	%r30, %r29, %r28;
 	cvt.u64.u32 	%rd53, %r30;
 	mul.lo.s64 	%rd245, %rd53, %rd10;
-	bra.uni 	$L__BB6_98;
-$L__BB6_96:                             //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_98;
+$L__BB8_96:                             //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd54, %rd27, %rd12;
 	mul.lo.s64 	%rd245, %rd54, %rd10;
-	bra.uni 	$L__BB6_98;
-$L__BB6_97:                             // %bb6.i111
+	bra.uni 	$L__BB8_98;
+$L__BB8_97:                             // %bb6.i111
 	trap;
-$L__BB6_98:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit112
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_98:                             // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit112
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd52, %rd40, 1;
 	setp.ge.u64 	%p13, %rd52, %rd10;
 	or.pred 	%p14, %p8, %p13;
-	@%p14 bra 	$L__BB6_100;
-	bra.uni 	$L__BB6_99;
-$L__BB6_99:                             // %bb62
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p14 bra 	$L__BB8_100;
+	bra.uni 	$L__BB8_99;
+$L__BB8_99:                             // %bb62
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd108, %rd245, %rd38;
 	add.s64 	%rd55, %rd35, %rd108;
 	ld.global.b8 	%rs1, [%rd55+1];
 	mul.wide.u16 	%r31, %rs1, 256;
 	or.b32 	%r11, %r31, %r11;
-$L__BB6_100:                            // %bb64
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_100:                            // %bb64
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd246, 0;
-	@%p8 bra 	$L__BB6_106;
-	bra.uni 	$L__BB6_101;
-$L__BB6_101:                            // %bb1.i130
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_105;
-	bra.uni 	$L__BB6_102;
-$L__BB6_102:                            // %bb3.i135
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_106;
+	bra.uni 	$L__BB8_101;
+$L__BB8_101:                            // %bb1.i130
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_105;
+	bra.uni 	$L__BB8_102;
+$L__BB8_102:                            // %bb3.i135
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd109, %rd27, %rd12;
 	and.b64 	%rd110, %rd109, -4294967296;
 	setp.ne.b64 	%p15, %rd110, 0;
-	@%p15 bra 	$L__BB6_104;
-	bra.uni 	$L__BB6_103;
-$L__BB6_103:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p15 bra 	$L__BB8_104;
+	bra.uni 	$L__BB8_103;
+$L__BB8_103:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r32, %rd12;
 	cvt.u32.u64 	%r33, %rd27;
 	div.u32 	%r34, %r33, %r32;
 	cvt.u64.u32 	%rd57, %r34;
 	mul.lo.s64 	%rd246, %rd57, %rd10;
-	bra.uni 	$L__BB6_106;
-$L__BB6_104:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_106;
+$L__BB8_104:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd58, %rd27, %rd12;
 	mul.lo.s64 	%rd246, %rd58, %rd10;
-	bra.uni 	$L__BB6_106;
-$L__BB6_105:                            // %bb6.i142
+	bra.uni 	$L__BB8_106;
+$L__BB8_105:                            // %bb6.i142
 	trap;
-$L__BB6_106:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit143
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_106:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit143
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd56, %rd40, 2;
 	setp.ge.u64 	%p16, %rd56, %rd10;
 	or.pred 	%p17, %p8, %p16;
-	@%p17 bra 	$L__BB6_108;
-	bra.uni 	$L__BB6_107;
-$L__BB6_107:                            // %bb67
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p17 bra 	$L__BB8_108;
+	bra.uni 	$L__BB8_107;
+$L__BB8_107:                            // %bb67
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd111, %rd246, %rd38;
 	add.s64 	%rd59, %rd35, %rd111;
 	ld.global.b8 	%r35, [%rd59+2];
 	shl.b32 	%r36, %r35, 16;
 	or.b32 	%r11, %r36, %r11;
-$L__BB6_108:                            // %bb69
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_108:                            // %bb69
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd247, 0;
-	@%p8 bra 	$L__BB6_114;
-	bra.uni 	$L__BB6_109;
-$L__BB6_109:                            // %bb1.i161
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_113;
-	bra.uni 	$L__BB6_110;
-$L__BB6_110:                            // %bb3.i166
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_114;
+	bra.uni 	$L__BB8_109;
+$L__BB8_109:                            // %bb1.i161
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_113;
+	bra.uni 	$L__BB8_110;
+$L__BB8_110:                            // %bb3.i166
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd112, %rd27, %rd12;
 	and.b64 	%rd113, %rd112, -4294967296;
 	setp.ne.b64 	%p18, %rd113, 0;
-	@%p18 bra 	$L__BB6_112;
-	bra.uni 	$L__BB6_111;
-$L__BB6_111:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p18 bra 	$L__BB8_112;
+	bra.uni 	$L__BB8_111;
+$L__BB8_111:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r37, %rd12;
 	cvt.u32.u64 	%r38, %rd27;
 	div.u32 	%r39, %r38, %r37;
 	cvt.u64.u32 	%rd61, %r39;
 	mul.lo.s64 	%rd247, %rd61, %rd10;
-	bra.uni 	$L__BB6_114;
-$L__BB6_112:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_114;
+$L__BB8_112:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd62, %rd27, %rd12;
 	mul.lo.s64 	%rd247, %rd62, %rd10;
-	bra.uni 	$L__BB6_114;
-$L__BB6_113:                            // %bb6.i173
+	bra.uni 	$L__BB8_114;
+$L__BB8_113:                            // %bb6.i173
 	trap;
-$L__BB6_114:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit174
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_114:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit174
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd60, %rd40, 3;
 	setp.ge.u64 	%p19, %rd60, %rd10;
 	or.pred 	%p20, %p8, %p19;
-	@%p20 bra 	$L__BB6_116;
-	bra.uni 	$L__BB6_115;
-$L__BB6_115:                            // %bb72
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p20 bra 	$L__BB8_116;
+	bra.uni 	$L__BB8_115;
+$L__BB8_115:                            // %bb72
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd114, %rd247, %rd38;
 	add.s64 	%rd63, %rd35, %rd114;
 	ld.global.b8 	%r40, [%rd63+3];
 	shl.b32 	%r41, %r40, 24;
 	or.b32 	%r11, %r41, %r11;
-$L__BB6_116:                            // %bb74
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_116:                            // %bb74
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd39, %rd37, %rd38;
 	ld.global.b32 	%r42, [%rd26+32];
 	cvt.s64.s32 	%rd64, %r42;
 	setp.le.u32 	%p21, %r12, %r42;
 	mov.b32 	%r139, 0;
 	cvt.u32.u64 	%r126, %rd64;
-	@%p21 bra 	$L__BB6_124;
-	bra.uni 	$L__BB6_117;
-$L__BB6_117:                            // %bb1.i192
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_119;
-	bra.uni 	$L__BB6_118;
-$L__BB6_118:                            // %bb3.i197
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p10 bra 	$L__BB6_124;
-	bra.uni 	$L__BB6_120;
-$L__BB6_119:                            // %bb6.i204
+	@%p21 bra 	$L__BB8_124;
+	bra.uni 	$L__BB8_117;
+$L__BB8_117:                            // %bb1.i192
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_119;
+	bra.uni 	$L__BB8_118;
+$L__BB8_118:                            // %bb3.i197
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p10 bra 	$L__BB8_124;
+	bra.uni 	$L__BB8_120;
+$L__BB8_119:                            // %bb6.i204
 	trap;
-$L__BB6_120:                            // %bb77
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_120:                            // %bb77
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd115, %rd64, %rd12;
 	and.b64 	%rd116, %rd115, -4294967296;
 	setp.ne.b64 	%p22, %rd116, 0;
-	@%p22 bra 	$L__BB6_122;
-	bra.uni 	$L__BB6_121;
-$L__BB6_121:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p22 bra 	$L__BB8_122;
+	bra.uni 	$L__BB8_121;
+$L__BB8_121:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r43, %rd12;
 	div.u32 	%r44, %r126, %r43;
 	cvt.u64.u32 	%rd248, %r44;
-	bra.uni 	$L__BB6_123;
-$L__BB6_122:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_123;
+$L__BB8_122:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd248, %rd64, %rd12;
-$L__BB6_123:                            // %bb77.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_123:                            // %bb77.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd117, %rd248, %rd10, %rd8;
 	add.s64 	%rd118, %rd117, %rd39;
 	ld.global.b8 	%r139, [%rd118];
-$L__BB6_124:                            // %bb79
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_124:                            // %bb79
+                                        //   in Loop: Header=BB8_16 Depth=2
 	setp.le.u32 	%p23, %r12, %r126;
-	@%p23 bra 	$L__BB6_132;
-	bra.uni 	$L__BB6_125;
-$L__BB6_125:                            // %bb1.i223
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_127;
-	bra.uni 	$L__BB6_126;
-$L__BB6_126:                            // %bb3.i228
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p13 bra 	$L__BB6_132;
-	bra.uni 	$L__BB6_128;
-$L__BB6_127:                            // %bb6.i235
+	@%p23 bra 	$L__BB8_132;
+	bra.uni 	$L__BB8_125;
+$L__BB8_125:                            // %bb1.i223
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_127;
+	bra.uni 	$L__BB8_126;
+$L__BB8_126:                            // %bb3.i228
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p13 bra 	$L__BB8_132;
+	bra.uni 	$L__BB8_128;
+$L__BB8_127:                            // %bb6.i235
 	trap;
-$L__BB6_128:                            // %bb82
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_128:                            // %bb82
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd119, %rd64, %rd12;
 	and.b64 	%rd120, %rd119, -4294967296;
 	setp.ne.b64 	%p24, %rd120, 0;
-	@%p24 bra 	$L__BB6_130;
-	bra.uni 	$L__BB6_129;
-$L__BB6_129:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p24 bra 	$L__BB8_130;
+	bra.uni 	$L__BB8_129;
+$L__BB8_129:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r45, %rd12;
 	div.u32 	%r46, %r126, %r45;
 	cvt.u64.u32 	%rd249, %r46;
-	bra.uni 	$L__BB6_131;
-$L__BB6_130:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_131;
+$L__BB8_130:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd249, %rd64, %rd12;
-$L__BB6_131:                            // %bb82.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_131:                            // %bb82.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd121, %rd249, %rd10, %rd8;
 	add.s64 	%rd122, %rd121, %rd39;
 	ld.global.b8 	%rs2, [%rd122+1];
 	mul.wide.u16 	%r47, %rs2, 256;
 	or.b32 	%r139, %r47, %r139;
-$L__BB6_132:                            // %bb84
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p23 bra 	$L__BB6_140;
-	bra.uni 	$L__BB6_133;
-$L__BB6_133:                            // %bb1.i254
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_135;
-	bra.uni 	$L__BB6_134;
-$L__BB6_134:                            // %bb3.i259
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p16 bra 	$L__BB6_140;
-	bra.uni 	$L__BB6_136;
-$L__BB6_135:                            // %bb6.i266
+$L__BB8_132:                            // %bb84
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p23 bra 	$L__BB8_140;
+	bra.uni 	$L__BB8_133;
+$L__BB8_133:                            // %bb1.i254
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_135;
+	bra.uni 	$L__BB8_134;
+$L__BB8_134:                            // %bb3.i259
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p16 bra 	$L__BB8_140;
+	bra.uni 	$L__BB8_136;
+$L__BB8_135:                            // %bb6.i266
 	trap;
-$L__BB6_136:                            // %bb87
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_136:                            // %bb87
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd123, %rd64, %rd12;
 	and.b64 	%rd124, %rd123, -4294967296;
 	setp.ne.b64 	%p25, %rd124, 0;
-	@%p25 bra 	$L__BB6_138;
-	bra.uni 	$L__BB6_137;
-$L__BB6_137:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p25 bra 	$L__BB8_138;
+	bra.uni 	$L__BB8_137;
+$L__BB8_137:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r48, %rd12;
 	div.u32 	%r49, %r126, %r48;
 	cvt.u64.u32 	%rd250, %r49;
-	bra.uni 	$L__BB6_139;
-$L__BB6_138:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_139;
+$L__BB8_138:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd250, %rd64, %rd12;
-$L__BB6_139:                            // %bb87.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_139:                            // %bb87.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd125, %rd250, %rd10, %rd8;
 	add.s64 	%rd126, %rd125, %rd39;
 	ld.global.b8 	%r50, [%rd126+2];
 	shl.b32 	%r51, %r50, 16;
 	or.b32 	%r139, %r51, %r139;
-$L__BB6_140:                            // %bb89
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p23 bra 	$L__BB6_148;
-	bra.uni 	$L__BB6_141;
-$L__BB6_141:                            // %bb1.i285
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_143;
-	bra.uni 	$L__BB6_142;
-$L__BB6_142:                            // %bb3.i290
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p19 bra 	$L__BB6_148;
-	bra.uni 	$L__BB6_144;
-$L__BB6_143:                            // %bb6.i297
+$L__BB8_140:                            // %bb89
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p23 bra 	$L__BB8_148;
+	bra.uni 	$L__BB8_141;
+$L__BB8_141:                            // %bb1.i285
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_143;
+	bra.uni 	$L__BB8_142;
+$L__BB8_142:                            // %bb3.i290
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p19 bra 	$L__BB8_148;
+	bra.uni 	$L__BB8_144;
+$L__BB8_143:                            // %bb6.i297
 	trap;
-$L__BB6_144:                            // %bb92
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_144:                            // %bb92
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd127, %rd64, %rd12;
 	and.b64 	%rd128, %rd127, -4294967296;
 	setp.ne.b64 	%p26, %rd128, 0;
-	@%p26 bra 	$L__BB6_146;
-	bra.uni 	$L__BB6_145;
-$L__BB6_145:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p26 bra 	$L__BB8_146;
+	bra.uni 	$L__BB8_145;
+$L__BB8_145:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r52, %rd12;
 	div.u32 	%r53, %r126, %r52;
 	cvt.u64.u32 	%rd251, %r53;
-	bra.uni 	$L__BB6_147;
-$L__BB6_146:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_147;
+$L__BB8_146:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd251, %rd64, %rd12;
-$L__BB6_147:                            // %bb92.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_147:                            // %bb92.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd129, %rd251, %rd10, %rd8;
 	add.s64 	%rd130, %rd129, %rd39;
 	ld.global.b8 	%r54, [%rd130+3];
 	shl.b32 	%r55, %r54, 24;
 	or.b32 	%r139, %r55, %r139;
-$L__BB6_148:                            // %bb94
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_148:                            // %bb94
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd252, 0;
-	@%p8 bra 	$L__BB6_154;
-	bra.uni 	$L__BB6_149;
-$L__BB6_149:                            // %bb1.i316
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_153;
-	bra.uni 	$L__BB6_150;
-$L__BB6_150:                            // %bb3.i321
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_154;
+	bra.uni 	$L__BB8_149;
+$L__BB8_149:                            // %bb1.i316
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_153;
+	bra.uni 	$L__BB8_150;
+$L__BB8_150:                            // %bb3.i321
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd131, %rd27, %rd12;
 	and.b64 	%rd132, %rd131, -4294967296;
 	setp.ne.b64 	%p27, %rd132, 0;
-	@%p27 bra 	$L__BB6_152;
-	bra.uni 	$L__BB6_151;
-$L__BB6_151:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p27 bra 	$L__BB8_152;
+	bra.uni 	$L__BB8_151;
+$L__BB8_151:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r56, %rd12;
 	cvt.u32.u64 	%r57, %rd27;
 	div.u32 	%r58, %r57, %r56;
 	cvt.u64.u32 	%rd65, %r58;
 	mul.lo.s64 	%rd252, %rd65, %rd10;
-	bra.uni 	$L__BB6_154;
-$L__BB6_152:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_154;
+$L__BB8_152:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd66, %rd27, %rd12;
 	mul.lo.s64 	%rd252, %rd66, %rd10;
-	bra.uni 	$L__BB6_154;
-$L__BB6_153:                            // %bb6.i328
+	bra.uni 	$L__BB8_154;
+$L__BB8_153:                            // %bb6.i328
 	trap;
-$L__BB6_154:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit329
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_154:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit329
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd41, %rd40, 16;
 	setp.ge.u64 	%p28, %rd41, %rd10;
 	or.pred 	%p29, %p8, %p28;
 	mov.b32 	%r140, 0;
-	@%p29 bra 	$L__BB6_156;
-	bra.uni 	$L__BB6_155;
-$L__BB6_155:                            // %bb97
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p29 bra 	$L__BB8_156;
+	bra.uni 	$L__BB8_155;
+$L__BB8_155:                            // %bb97
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd133, %rd252, %rd38;
 	add.s64 	%rd67, %rd35, %rd133;
 	ld.global.b8 	%r140, [%rd67+16];
-$L__BB6_156:                            // %bb99
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_156:                            // %bb99
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd253, 0;
-	@%p8 bra 	$L__BB6_162;
-	bra.uni 	$L__BB6_157;
-$L__BB6_157:                            // %bb1.i347
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_161;
-	bra.uni 	$L__BB6_158;
-$L__BB6_158:                            // %bb3.i352
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_162;
+	bra.uni 	$L__BB8_157;
+$L__BB8_157:                            // %bb1.i347
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_161;
+	bra.uni 	$L__BB8_158;
+$L__BB8_158:                            // %bb3.i352
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd134, %rd27, %rd12;
 	and.b64 	%rd135, %rd134, -4294967296;
 	setp.ne.b64 	%p30, %rd135, 0;
-	@%p30 bra 	$L__BB6_160;
-	bra.uni 	$L__BB6_159;
-$L__BB6_159:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p30 bra 	$L__BB8_160;
+	bra.uni 	$L__BB8_159;
+$L__BB8_159:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r59, %rd12;
 	cvt.u32.u64 	%r60, %rd27;
 	div.u32 	%r61, %r60, %r59;
 	cvt.u64.u32 	%rd69, %r61;
 	mul.lo.s64 	%rd253, %rd69, %rd10;
-	bra.uni 	$L__BB6_162;
-$L__BB6_160:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_162;
+$L__BB8_160:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd70, %rd27, %rd12;
 	mul.lo.s64 	%rd253, %rd70, %rd10;
-	bra.uni 	$L__BB6_162;
-$L__BB6_161:                            // %bb6.i359
+	bra.uni 	$L__BB8_162;
+$L__BB8_161:                            // %bb6.i359
 	trap;
-$L__BB6_162:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit360
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_162:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit360
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd68, %rd40, 17;
 	setp.ge.u64 	%p31, %rd68, %rd10;
 	or.pred 	%p32, %p8, %p31;
-	@%p32 bra 	$L__BB6_164;
-	bra.uni 	$L__BB6_163;
-$L__BB6_163:                            // %bb102
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p32 bra 	$L__BB8_164;
+	bra.uni 	$L__BB8_163;
+$L__BB8_163:                            // %bb102
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd136, %rd253, %rd38;
 	add.s64 	%rd71, %rd35, %rd136;
 	ld.global.b8 	%rs3, [%rd71+17];
 	mul.wide.u16 	%r62, %rs3, 256;
 	or.b32 	%r140, %r62, %r140;
-$L__BB6_164:                            // %bb104
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_164:                            // %bb104
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd254, 0;
-	@%p8 bra 	$L__BB6_170;
-	bra.uni 	$L__BB6_165;
-$L__BB6_165:                            // %bb1.i378
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_169;
-	bra.uni 	$L__BB6_166;
-$L__BB6_166:                            // %bb3.i383
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_170;
+	bra.uni 	$L__BB8_165;
+$L__BB8_165:                            // %bb1.i378
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_169;
+	bra.uni 	$L__BB8_166;
+$L__BB8_166:                            // %bb3.i383
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd137, %rd27, %rd12;
 	and.b64 	%rd138, %rd137, -4294967296;
 	setp.ne.b64 	%p33, %rd138, 0;
-	@%p33 bra 	$L__BB6_168;
-	bra.uni 	$L__BB6_167;
-$L__BB6_167:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p33 bra 	$L__BB8_168;
+	bra.uni 	$L__BB8_167;
+$L__BB8_167:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r63, %rd12;
 	cvt.u32.u64 	%r64, %rd27;
 	div.u32 	%r65, %r64, %r63;
 	cvt.u64.u32 	%rd73, %r65;
 	mul.lo.s64 	%rd254, %rd73, %rd10;
-	bra.uni 	$L__BB6_170;
-$L__BB6_168:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_170;
+$L__BB8_168:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd74, %rd27, %rd12;
 	mul.lo.s64 	%rd254, %rd74, %rd10;
-	bra.uni 	$L__BB6_170;
-$L__BB6_169:                            // %bb6.i390
+	bra.uni 	$L__BB8_170;
+$L__BB8_169:                            // %bb6.i390
 	trap;
-$L__BB6_170:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit391
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_170:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit391
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd72, %rd40, 18;
 	setp.ge.u64 	%p34, %rd72, %rd10;
 	or.pred 	%p35, %p8, %p34;
-	@%p35 bra 	$L__BB6_172;
-	bra.uni 	$L__BB6_171;
-$L__BB6_171:                            // %bb107
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p35 bra 	$L__BB8_172;
+	bra.uni 	$L__BB8_171;
+$L__BB8_171:                            // %bb107
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd139, %rd254, %rd38;
 	add.s64 	%rd75, %rd35, %rd139;
 	ld.global.b8 	%r66, [%rd75+18];
 	shl.b32 	%r67, %r66, 16;
 	or.b32 	%r140, %r67, %r140;
-$L__BB6_172:                            // %bb109
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_172:                            // %bb109
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b64 	%rd255, 0;
-	@%p8 bra 	$L__BB6_178;
-	bra.uni 	$L__BB6_173;
-$L__BB6_173:                            // %bb1.i409
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_177;
-	bra.uni 	$L__BB6_174;
-$L__BB6_174:                            // %bb3.i414
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p8 bra 	$L__BB8_178;
+	bra.uni 	$L__BB8_173;
+$L__BB8_173:                            // %bb1.i409
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_177;
+	bra.uni 	$L__BB8_174;
+$L__BB8_174:                            // %bb3.i414
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd140, %rd27, %rd12;
 	and.b64 	%rd141, %rd140, -4294967296;
 	setp.ne.b64 	%p36, %rd141, 0;
-	@%p36 bra 	$L__BB6_176;
-	bra.uni 	$L__BB6_175;
-$L__BB6_175:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p36 bra 	$L__BB8_176;
+	bra.uni 	$L__BB8_175;
+$L__BB8_175:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r68, %rd12;
 	cvt.u32.u64 	%r69, %rd27;
 	div.u32 	%r70, %r69, %r68;
 	cvt.u64.u32 	%rd77, %r70;
 	mul.lo.s64 	%rd255, %rd77, %rd10;
-	bra.uni 	$L__BB6_178;
-$L__BB6_176:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_178;
+$L__BB8_176:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd78, %rd27, %rd12;
 	mul.lo.s64 	%rd255, %rd78, %rd10;
-	bra.uni 	$L__BB6_178;
-$L__BB6_177:                            // %bb6.i421
+	bra.uni 	$L__BB8_178;
+$L__BB8_177:                            // %bb6.i421
 	trap;
-$L__BB6_178:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit422
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_178:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mma0B5_.exit422
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd76, %rd40, 19;
 	setp.ge.u64 	%p37, %rd76, %rd10;
 	or.pred 	%p38, %p8, %p37;
-	@%p38 bra 	$L__BB6_180;
-	bra.uni 	$L__BB6_179;
-$L__BB6_179:                            // %bb112
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p38 bra 	$L__BB8_180;
+	bra.uni 	$L__BB8_179;
+$L__BB8_179:                            // %bb112
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd142, %rd255, %rd38;
 	add.s64 	%rd79, %rd35, %rd142;
 	ld.global.b8 	%r71, [%rd79+19];
 	shl.b32 	%r72, %r71, 24;
 	or.b32 	%r140, %r72, %r140;
-$L__BB6_180:                            // %bb114
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_180:                            // %bb114
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b32 	%r141, 0;
-	@%p23 bra 	$L__BB6_188;
-	bra.uni 	$L__BB6_181;
-$L__BB6_181:                            // %bb1.i440
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_183;
-	bra.uni 	$L__BB6_182;
-$L__BB6_182:                            // %bb3.i445
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p28 bra 	$L__BB6_188;
-	bra.uni 	$L__BB6_184;
-$L__BB6_183:                            // %bb6.i452
+	@%p23 bra 	$L__BB8_188;
+	bra.uni 	$L__BB8_181;
+$L__BB8_181:                            // %bb1.i440
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_183;
+	bra.uni 	$L__BB8_182;
+$L__BB8_182:                            // %bb3.i445
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p28 bra 	$L__BB8_188;
+	bra.uni 	$L__BB8_184;
+$L__BB8_183:                            // %bb6.i452
 	trap;
-$L__BB6_184:                            // %bb117
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_184:                            // %bb117
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd143, %rd64, %rd12;
 	and.b64 	%rd144, %rd143, -4294967296;
 	setp.ne.b64 	%p39, %rd144, 0;
-	@%p39 bra 	$L__BB6_186;
-	bra.uni 	$L__BB6_185;
-$L__BB6_185:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p39 bra 	$L__BB8_186;
+	bra.uni 	$L__BB8_185;
+$L__BB8_185:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r73, %rd12;
 	div.u32 	%r74, %r126, %r73;
 	cvt.u64.u32 	%rd256, %r74;
-	bra.uni 	$L__BB6_187;
-$L__BB6_186:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_187;
+$L__BB8_186:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd256, %rd64, %rd12;
-$L__BB6_187:                            // %bb117.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_187:                            // %bb117.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd145, %rd256, %rd10, %rd8;
 	add.s64 	%rd146, %rd145, %rd39;
 	ld.global.b8 	%r141, [%rd146+16];
-$L__BB6_188:                            // %bb119
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p23 bra 	$L__BB6_196;
-	bra.uni 	$L__BB6_189;
-$L__BB6_189:                            // %bb1.i471
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_191;
-	bra.uni 	$L__BB6_190;
-$L__BB6_190:                            // %bb3.i476
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p31 bra 	$L__BB6_196;
-	bra.uni 	$L__BB6_192;
-$L__BB6_191:                            // %bb6.i483
+$L__BB8_188:                            // %bb119
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p23 bra 	$L__BB8_196;
+	bra.uni 	$L__BB8_189;
+$L__BB8_189:                            // %bb1.i471
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_191;
+	bra.uni 	$L__BB8_190;
+$L__BB8_190:                            // %bb3.i476
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p31 bra 	$L__BB8_196;
+	bra.uni 	$L__BB8_192;
+$L__BB8_191:                            // %bb6.i483
 	trap;
-$L__BB6_192:                            // %bb122
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_192:                            // %bb122
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd147, %rd64, %rd12;
 	and.b64 	%rd148, %rd147, -4294967296;
 	setp.ne.b64 	%p40, %rd148, 0;
-	@%p40 bra 	$L__BB6_194;
-	bra.uni 	$L__BB6_193;
-$L__BB6_193:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p40 bra 	$L__BB8_194;
+	bra.uni 	$L__BB8_193;
+$L__BB8_193:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r75, %rd12;
 	div.u32 	%r76, %r126, %r75;
 	cvt.u64.u32 	%rd257, %r76;
-	bra.uni 	$L__BB6_195;
-$L__BB6_194:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_195;
+$L__BB8_194:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd257, %rd64, %rd12;
-$L__BB6_195:                            // %bb122.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_195:                            // %bb122.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd149, %rd257, %rd10, %rd8;
 	add.s64 	%rd150, %rd149, %rd39;
 	ld.global.b8 	%rs4, [%rd150+17];
 	mul.wide.u16 	%r77, %rs4, 256;
 	or.b32 	%r141, %r77, %r141;
-$L__BB6_196:                            // %bb124
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p23 bra 	$L__BB6_204;
-	bra.uni 	$L__BB6_197;
-$L__BB6_197:                            // %bb1.i502
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_199;
-	bra.uni 	$L__BB6_198;
-$L__BB6_198:                            // %bb3.i507
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p34 bra 	$L__BB6_204;
-	bra.uni 	$L__BB6_200;
-$L__BB6_199:                            // %bb6.i514
+$L__BB8_196:                            // %bb124
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p23 bra 	$L__BB8_204;
+	bra.uni 	$L__BB8_197;
+$L__BB8_197:                            // %bb1.i502
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_199;
+	bra.uni 	$L__BB8_198;
+$L__BB8_198:                            // %bb3.i507
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p34 bra 	$L__BB8_204;
+	bra.uni 	$L__BB8_200;
+$L__BB8_199:                            // %bb6.i514
 	trap;
-$L__BB6_200:                            // %bb127
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_200:                            // %bb127
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd151, %rd64, %rd12;
 	and.b64 	%rd152, %rd151, -4294967296;
 	setp.ne.b64 	%p41, %rd152, 0;
-	@%p41 bra 	$L__BB6_202;
-	bra.uni 	$L__BB6_201;
-$L__BB6_201:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p41 bra 	$L__BB8_202;
+	bra.uni 	$L__BB8_201;
+$L__BB8_201:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r78, %rd12;
 	div.u32 	%r79, %r126, %r78;
 	cvt.u64.u32 	%rd258, %r79;
-	bra.uni 	$L__BB6_203;
-$L__BB6_202:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_203;
+$L__BB8_202:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd258, %rd64, %rd12;
-$L__BB6_203:                            // %bb127.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_203:                            // %bb127.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd153, %rd258, %rd10, %rd8;
 	add.s64 	%rd154, %rd153, %rd39;
 	ld.global.b8 	%r80, [%rd154+18];
 	shl.b32 	%r81, %r80, 16;
 	or.b32 	%r141, %r81, %r141;
-$L__BB6_204:                            // %bb129
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p23 bra 	$L__BB6_212;
-	bra.uni 	$L__BB6_205;
-$L__BB6_205:                            // %bb1.i533
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p74 bra 	$L__BB6_207;
-	bra.uni 	$L__BB6_206;
-$L__BB6_206:                            // %bb3.i538
-                                        //   in Loop: Header=BB6_16 Depth=2
-	@%p37 bra 	$L__BB6_212;
-	bra.uni 	$L__BB6_208;
-$L__BB6_207:                            // %bb6.i545
+$L__BB8_204:                            // %bb129
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p23 bra 	$L__BB8_212;
+	bra.uni 	$L__BB8_205;
+$L__BB8_205:                            // %bb1.i533
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p74 bra 	$L__BB8_207;
+	bra.uni 	$L__BB8_206;
+$L__BB8_206:                            // %bb3.i538
+                                        //   in Loop: Header=BB8_16 Depth=2
+	@%p37 bra 	$L__BB8_212;
+	bra.uni 	$L__BB8_208;
+$L__BB8_207:                            // %bb6.i545
 	trap;
-$L__BB6_208:                            // %bb132
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_208:                            // %bb132
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.b64 	%rd155, %rd64, %rd12;
 	and.b64 	%rd156, %rd155, -4294967296;
 	setp.ne.b64 	%p42, %rd156, 0;
-	@%p42 bra 	$L__BB6_210;
-	bra.uni 	$L__BB6_209;
-$L__BB6_209:                            //   in Loop: Header=BB6_16 Depth=2
+	@%p42 bra 	$L__BB8_210;
+	bra.uni 	$L__BB8_209;
+$L__BB8_209:                            //   in Loop: Header=BB8_16 Depth=2
 	cvt.u32.u64 	%r82, %rd12;
 	div.u32 	%r83, %r126, %r82;
 	cvt.u64.u32 	%rd259, %r83;
-	bra.uni 	$L__BB6_211;
-$L__BB6_210:                            //   in Loop: Header=BB6_16 Depth=2
+	bra.uni 	$L__BB8_211;
+$L__BB8_210:                            //   in Loop: Header=BB8_16 Depth=2
 	div.u64 	%rd259, %rd64, %rd12;
-$L__BB6_211:                            // %bb132.split
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_211:                            // %bb132.split
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mad.lo.s64 	%rd157, %rd259, %rd10, %rd8;
 	add.s64 	%rd158, %rd157, %rd39;
 	ld.global.b8 	%r84, [%rd158+19];
 	shl.b32 	%r85, %r84, 24;
 	or.b32 	%r141, %r85, %r141;
-$L__BB6_212:                            // %bb134
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_212:                            // %bb134
+                                        //   in Loop: Header=BB8_16 Depth=2
 	add.s64 	%rd80, %rd29, %rd39;
 	mov.b32 	%r142, 0;
 	or.pred 	%p44, %p43, %p10;
-	@%p44 bra 	$L__BB6_214;
-	bra.uni 	$L__BB6_213;
-$L__BB6_213:                            // %bb2.i
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p44 bra 	$L__BB8_214;
+	bra.uni 	$L__BB8_213;
+$L__BB8_213:                            // %bb2.i
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r142, [%rd80];
-$L__BB6_214:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_214:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p45, %p43, %p13;
-	@%p45 bra 	$L__BB6_216;
-	bra.uni 	$L__BB6_215;
-$L__BB6_215:                            // %bb2.i574
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p45 bra 	$L__BB8_216;
+	bra.uni 	$L__BB8_215;
+$L__BB8_215:                            // %bb2.i574
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%rs5, [%rd80+1];
 	mul.wide.u16 	%r86, %rs5, 256;
 	or.b32 	%r142, %r86, %r142;
-$L__BB6_216:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit584
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_216:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit584
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p46, %p43, %p16;
-	@%p46 bra 	$L__BB6_218;
-	bra.uni 	$L__BB6_217;
-$L__BB6_217:                            // %bb2.i599
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p46 bra 	$L__BB8_218;
+	bra.uni 	$L__BB8_217;
+$L__BB8_217:                            // %bb2.i599
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r87, [%rd80+2];
 	shl.b32 	%r88, %r87, 16;
 	add.s32 	%r142, %r88, %r142;
-$L__BB6_218:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit609
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_218:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit609
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p47, %p43, %p19;
-	@%p47 bra 	$L__BB6_220;
-	bra.uni 	$L__BB6_219;
-$L__BB6_219:                            // %bb2.i624
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p47 bra 	$L__BB8_220;
+	bra.uni 	$L__BB8_219;
+$L__BB8_219:                            // %bb2.i624
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r89, [%rd80+3];
 	shl.b32 	%r90, %r89, 24;
 	add.s32 	%r142, %r90, %r142;
-$L__BB6_220:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit634
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_220:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit634
+                                        //   in Loop: Header=BB8_16 Depth=2
 	mov.b32 	%r143, 0;
 	or.pred 	%p48, %p43, %p28;
-	@%p48 bra 	$L__BB6_222;
-	bra.uni 	$L__BB6_221;
-$L__BB6_221:                            // %bb2.i649
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p48 bra 	$L__BB8_222;
+	bra.uni 	$L__BB8_221;
+$L__BB8_221:                            // %bb2.i649
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r143, [%rd80+16];
-$L__BB6_222:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit659
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_222:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit659
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p49, %p43, %p31;
-	@%p49 bra 	$L__BB6_224;
-	bra.uni 	$L__BB6_223;
-$L__BB6_223:                            // %bb2.i674
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p49 bra 	$L__BB8_224;
+	bra.uni 	$L__BB8_223;
+$L__BB8_223:                            // %bb2.i674
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%rs6, [%rd80+17];
 	mul.wide.u16 	%r91, %rs6, 256;
 	or.b32 	%r143, %r91, %r143;
-$L__BB6_224:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit684
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_224:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit684
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p50, %p43, %p34;
-	@%p50 bra 	$L__BB6_226;
-	bra.uni 	$L__BB6_225;
-$L__BB6_225:                            // %bb2.i699
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p50 bra 	$L__BB8_226;
+	bra.uni 	$L__BB8_225;
+$L__BB8_225:                            // %bb2.i699
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r92, [%rd80+18];
 	shl.b32 	%r93, %r92, 16;
 	add.s32 	%r143, %r93, %r143;
-$L__BB6_226:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit709
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_226:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit709
+                                        //   in Loop: Header=BB8_16 Depth=2
 	or.pred 	%p51, %p43, %p37;
-	@%p51 bra 	$L__BB6_228;
-	bra.uni 	$L__BB6_227;
-$L__BB6_227:                            // %bb2.i724
-                                        //   in Loop: Header=BB6_16 Depth=2
+	@%p51 bra 	$L__BB8_228;
+	bra.uni 	$L__BB8_227;
+$L__BB8_227:                            // %bb2.i724
+                                        //   in Loop: Header=BB8_16 Depth=2
 	ld.global.b8 	%r94, [%rd80+19];
 	shl.b32 	%r95, %r94, 24;
 	add.s32 	%r143, %r95, %r143;
-$L__BB6_228:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit734
-                                        //   in Loop: Header=BB6_16 Depth=2
+$L__BB8_228:                            // %_RNCNvNtCs4G5uhS8z4QP_13fp8_blockwise7kernels65cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_fp8_moe_w8a8_mmas0_0B5_.exit734
+                                        //   in Loop: Header=BB8_16 Depth=2
 	// begin inline asm
 	mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%r7,%r8,%r9,%r10}, {%r11,%r139,%r140,%r141}, {%r142,%r143}, {%r7,%r8,%r9,%r10};
 	// end inline asm
 	add.s64 	%rd38, %rd38, 32;
 	setp.lt.u64 	%p52, %rd38, %rd11;
-	@%p52 bra 	$L__BB6_16;
-	bra.uni 	$L__BB6_23;
-$L__BB6_229:                            // %bb137
+	@%p52 bra 	$L__BB8_16;
+	bra.uni 	$L__BB8_23;
+$L__BB8_229:                            // %bb137
 	trap;
-$L__BB6_230:                            // %bb139
+$L__BB8_230:                            // %bb139
 	trap;
                                         // -- End function
 }

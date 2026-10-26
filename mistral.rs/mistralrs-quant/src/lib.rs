@@ -161,7 +161,7 @@ pub use blockwise_fp8::{
     fused_add_rms_norm_quantized, fused_add_rms_norm_quantized_with_normalized, BlockwiseFP8Linear,
 };
 #[cfg(feature = "cuda")]
-pub use blockwise_fp8::fp8_moe_grouped;
+pub use blockwise_fp8::{fp8_moe_grouped, fp8_moe_grouped_w8a8};
 pub use distributed::{
     layers::{
         compute_kv_shard, compute_n_kv_groups, validate_tp_head_layout, ColumnParallelLayer,
