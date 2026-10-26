@@ -461,11 +461,15 @@ impl FullAttention {
         ctx: &mut ModelForwardContext<'_>,
         layer_idx: usize,
     ) -> Result<Tensor> {
-        // IMRoPE with text-only positions (t == h == w) reduces to partial NEOX RoPE
-        let positions = ctx
-            .text_positions(x.device(), x.dim(1)?)?
-            .ok_or_else(|| candle_core::Error::msg("missing RoPE positions"))?
-            .clone();
+        // IMRoPE: text uses 1D positions (t == h == w, partial NEOX); a vision prefill supplies
+        // 3D [3, n] mrope positions (Qwen3-VL), applied per mrope-section in forward_with.
+        let positions = match ctx.vision_positions() {
+            Some(vp) => vp.clone(),
+            None => ctx
+                .text_positions(x.device(), x.dim(1)?)?
+                .ok_or_else(|| candle_core::Error::msg("missing RoPE positions"))?
+                .clone(),
+        };
         let ctx = &*ctx;
         self.forward_with(x, mask, &positions, |q, k, v| match &self.paged_attn {
             Some(paged_attn) => match ctx.paged_layer(layer_idx) {
@@ -580,15 +584,37 @@ impl FullAttention {
         let v = v
             .reshape((b_sz, n, self.n_kv_head, self.head_dim))?
             .transpose(1, 2)?;
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         Ok((q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?, v.to_dtype(self.dtype)?, gate))
     }
 
@@ -740,15 +766,37 @@ impl FullAttention {
             (q, k, v)
         };
 
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         let (q, k, v) = (
             q.to_dtype(self.dtype)?,
             k.to_dtype(self.dtype)?,
@@ -785,15 +833,37 @@ impl FullAttention {
         let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
         let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
         let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         Ok((q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?, v.to_dtype(self.dtype)?, gate))
     }
 

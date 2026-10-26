@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use mistralrs_quant::{GgufArchive, ShardedSafeTensors};
 
 use crate::layers::Activation;
@@ -221,6 +221,29 @@ pub(crate) fn vision_mrope_positions(
     flat.extend(p1);
     flat.extend(p2);
     Tensor::from_vec(flat, (3, n), device)
+}
+
+/// Gather mrope cos/sin from the rotary's precomputed tables `[max_seq, half]` using 3D positions
+/// `[3, n]`: section s of the frequency columns uses the s-th position component (t/h/w). Returns
+/// `[n, half]` cos/sin that `qk_rms_norm_rope` consumes with identity positions, reusing the exact
+/// rope op so text (equal positions) is unchanged.
+pub(crate) fn mrope_gather(cos: &Tensor, sin: &Tensor, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+    let half = cos.dim(1)?;
+    debug_assert_eq!(BONSAI_MROPE_SECTION.iter().sum::<usize>(), half);
+    let p = positions.to_dtype(DType::U32)?;
+    let mut cparts = Vec::new();
+    let mut sparts = Vec::new();
+    let mut col = 0usize;
+    for (ci, &sec) in BONSAI_MROPE_SECTION.iter().enumerate() {
+        if sec == 0 {
+            continue;
+        }
+        let row = p.i(ci)?;
+        cparts.push(cos.index_select(&row, 0)?.narrow(1, col, sec)?);
+        sparts.push(sin.index_select(&row, 0)?.narrow(1, col, sec)?);
+        col += sec;
+    }
+    Ok((Tensor::cat(&cparts, 1)?, Tensor::cat(&sparts, 1)?))
 }
 
 #[cfg(test)]

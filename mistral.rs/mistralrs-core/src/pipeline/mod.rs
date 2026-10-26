@@ -802,6 +802,8 @@ pub(crate) struct ModelForwardContext<'a> {
     /// Precomputed vision embeddings to scatter into image-placeholder token positions (GGUF VL
     /// path, e.g. Bonsai). `None` for the text path, which is then byte-identical.
     image_embeds: Option<Tensor>,
+    /// Qwen3-VL 3D mrope positions `[3, n]` for a vision prefill. `None` -> text 1D positions.
+    vision_positions: Option<Tensor>,
 }
 
 #[allow(dead_code)]
@@ -824,6 +826,7 @@ impl<'a> ModelForwardContext<'a> {
             recurrent_batch_kind: None,
             requires_full_prefill_queries: false,
             image_embeds: None,
+            vision_positions: None,
         }
     }
 
@@ -845,6 +848,7 @@ impl<'a> ModelForwardContext<'a> {
             recurrent_batch_kind: None,
             requires_full_prefill_queries: false,
             image_embeds: None,
+            vision_positions: None,
         }
     }
 
@@ -874,6 +878,15 @@ impl<'a> ModelForwardContext<'a> {
 
     pub(crate) fn image_embeds(&self) -> Option<&Tensor> {
         self.image_embeds.as_ref()
+    }
+
+    pub(crate) fn with_vision_positions(mut self, vision_positions: Option<Tensor>) -> Self {
+        self.vision_positions = vision_positions;
+        self
+    }
+
+    pub(crate) fn vision_positions(&self) -> Option<&Tensor> {
+        self.vision_positions.as_ref()
     }
 
     pub(crate) fn require_full_prefill_queries(&mut self) {
