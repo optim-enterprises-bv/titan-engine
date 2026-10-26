@@ -794,6 +794,11 @@ impl TitanGGUFPipeline {
             candle_core::bail!("titan vision: only qwen35 supports the Bonsai vision path");
         };
         let bv = self.vision.as_ref().expect("vision loaded");
+        {
+            let ids_dbg = input_ids.flatten_all().and_then(|t| t.to_dtype(DType::U32)).and_then(|t| t.to_vec1::<u32>()).unwrap_or_default();
+            let pad = ids_dbg.iter().filter(|&&t| t == bv.image_token_id).count();
+            tracing::info!("titan vision fwd: pixel_values={} seq_len={} image_pad_tokens={}", pixel_values.is_some(), ids_dbg.len(), pad);
+        }
 
         let (image_embeds, vision_positions) = if let Some(pv) = pixel_values.as_ref() {
             let grid = model_specific_args
