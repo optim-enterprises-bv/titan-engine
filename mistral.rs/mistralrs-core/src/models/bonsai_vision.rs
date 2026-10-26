@@ -116,6 +116,64 @@ pub(crate) fn load_bonsai_vision_tower(
     Qwen3VLVisionModel::new(&cfg, vb)
 }
 
+/// Qwen3-VL 3D (t,h,w) rope positions for a single-image sequence, `[3, n]` i64. Text spans use
+/// equal t==h==w (which reduces to the backbone's partial-NEOX rope); the image placeholder block
+/// gets grid (t,h,w) positions offset by the preceding text length. `grid` is post-merge (t, gh, gw).
+/// Mirrors qwen3_vl/mod.rs get_rope_index for one image, one sequence, all tokens valid.
+pub(crate) fn vision_mrope_positions(
+    ids: &[u32],
+    image_token_id: u32,
+    grid: (usize, usize, usize),
+    device: &Device,
+) -> Result<Tensor> {
+    let n = ids.len();
+    let (gt, gh, gw) = grid;
+    let (mut p0, mut p1, mut p2) = (vec![0i64; n], vec![0i64; n], vec![0i64; n]);
+    match ids.iter().position(|&t| t == image_token_id) {
+        None => {
+            for i in 0..n {
+                p0[i] = i as i64;
+                p1[i] = i as i64;
+                p2[i] = i as i64;
+            }
+        }
+        Some(start) => {
+            let count = gt * gh * gw;
+            if start + count > n {
+                candle_core::bail!("image placeholder run {count} exceeds sequence at {start}/{n}");
+            }
+            for i in 0..start {
+                p0[i] = i as i64;
+                p1[i] = i as i64;
+                p2[i] = i as i64;
+            }
+            let base = start as i64;
+            let mut idx = start;
+            for t in 0..gt {
+                for h in 0..gh {
+                    for w in 0..gw {
+                        p0[idx] = base + t as i64;
+                        p1[idx] = base + h as i64;
+                        p2[idx] = base + w as i64;
+                        idx += 1;
+                    }
+                }
+            }
+            let next = base + gt.max(gh).max(gw) as i64;
+            for (off, i) in (idx..n).enumerate() {
+                let v = next + off as i64;
+                p0[i] = v;
+                p1[i] = v;
+                p2[i] = v;
+            }
+        }
+    }
+    let mut flat = p0;
+    flat.extend(p1);
+    flat.extend(p2);
+    Tensor::from_vec(flat, (3, n), device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +192,28 @@ mod tests {
         let (embeds, _deepstack) = tower.forward(&xs, &grid)?;
         // 16 patches / (2*2 merge) = 4 merged tokens, out_hidden 5120.
         assert_eq!(embeds.dims(), &[4, 5120]);
+        Ok(())
+    }
+
+    #[test]
+    fn mrope_positions_text_and_image() -> Result<()> {
+        let dev = Device::Cpu;
+        // text-only: every position is [i,i,i]
+        let text = vision_mrope_positions(&[5, 6, 7, 8], 999, (1, 2, 2), &dev)?;
+        assert_eq!(text.dims(), &[3, 4]);
+        let tv = text.to_vec2::<i64>()?;
+        assert_eq!(tv[0], vec![0, 1, 2, 3]);
+        assert_eq!(tv[1], vec![0, 1, 2, 3]);
+        assert_eq!(tv[2], vec![0, 1, 2, 3]);
+
+        // 2 text, 4 image (grid 1x2x2), 2 text
+        let ids = [5u32, 5, 42, 42, 42, 42, 6, 6];
+        let p = vision_mrope_positions(&ids, 42, (1, 2, 2), &dev)?;
+        let v = p.to_vec2::<i64>()?;
+        // text before: 0,1 ; image base=2: t all 2; h = 2,2,3,3 ; w = 2,3,2,3 ; text after from 4
+        assert_eq!(v[0], vec![0, 1, 2, 2, 2, 2, 4, 5]); // t
+        assert_eq!(v[1], vec![0, 1, 2, 2, 3, 3, 4, 5]); // h
+        assert_eq!(v[2], vec![0, 1, 2, 3, 2, 3, 4, 5]); // w
         Ok(())
     }
 
