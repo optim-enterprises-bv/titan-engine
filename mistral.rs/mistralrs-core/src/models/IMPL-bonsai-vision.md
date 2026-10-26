@@ -73,3 +73,28 @@ Remaining (cross-cutting, multi-session, touches shared prod infra - do gated so
    Qwen3-VL `<|vision_start|><|image_pad|>...<|vision_end|>`; image_token_id from the GGUF.
 5. Cap processor max_pixels ~768^2 to match Bonsai's training (default oversizes: 9072 patches seen).
 6. Validate vs the bundled binary (serve-16gb-mtp-vision.sh) on vision_check.png.
+
+## Status update: all compute bricks built + validated (committed)
+Done & tested: vision tower loader, image processor, image-embed splice into the qwen35 forward
+(embed_with_images + ctx.image_embeds), vision_mrope_positions [3,n], mrope_cos_sin, and the GGUF
+constants. All in models/bonsai_vision.rs + the shared ModelForwardContext field. Text path untouched.
+
+### GGUF constants (verified from Offrail-27B-12G.gguf)
+image_pad=248056, vision_start=248053, vision_end=248054; rope.dimension_sections=[11,11,10];
+rope_dim=64, freq_base=1e7; arch qwen35, heads 24/kv 4, embd 5120, 65 blocks (64 + 1 MTP).
+
+### Remaining = one coupled serve-path block (gguf_titan.rs + friends), validate on GPU:
+A. Loader: get the mmproj path from `paths` (ignored today per gguf_titan.rs:181); if present and
+   arch==qwen35, load_bonsai_vision_tower + preprocess config, store tower on TitanGGUFPipeline,
+   call model.set_image_token_id(Some(BONSAI_IMAGE_PAD_TOKEN)).
+B. Inputs: override PreProcessingMixin to return the Qwen3VL image inputs processor so requests'
+   images reach the pipeline (ModelInputs must carry pixel_values/grid for the titan path).
+C. forward_inputs: when images present, bonsai_image_to_patches -> tower -> embeds; set
+   ctx.with_image_embeds(Some(embeds)); build vision_mrope_positions and feed them as the rope
+   positions (needs a rope-apply using mrope_cos_sin in the qwen35 attention when vision positions
+   are set - isolated to quantized_qwen35_moe, NOT the shared RotaryEmbedding).
+D. Chat template: Qwen3-VL `<|vision_start|>` + image_pad*num_merged_tokens + `<|vision_end|>`.
+E. Validate: `mistralrs serve ... --mmproj Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` + an image request,
+   compare to bonsai2-27b/.../serve-16gb-mtp-vision.sh on vision_check.png.
+
+This block is interdependent and only meaningful once it generates a correct image answer on GPU.
