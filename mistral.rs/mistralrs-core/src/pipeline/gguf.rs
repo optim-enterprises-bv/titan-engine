@@ -1361,6 +1361,30 @@ impl Loader for GGUFLoader {
         // titan: the fork's GGUF architectures load through the fork-local models (gguf_titan.rs)
         if matches!(self.kind, ModelKind::GgufQuantized { .. }) && self.dynamic_lora.is_none() {
             if let Some(arch) = titan::titan_arch(paths)? {
+                let mmproj_paths: Vec<std::path::PathBuf> = self
+                    .mmproj_filenames
+                    .as_ref()
+                    .map(|names| {
+                        let dir = paths
+                            .get_weight_filenames()
+                            .first()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.to_path_buf());
+                        names
+                            .iter()
+                            .map(|n| {
+                                let p = std::path::PathBuf::from(n);
+                                if p.is_absolute() {
+                                    p
+                                } else if let Some(d) = &dir {
+                                    d.join(n)
+                                } else {
+                                    p
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 return titan::load(
                     titan::TitanLoadArgs {
                         model_id: self.model_id.as_ref(),
@@ -1370,6 +1394,7 @@ impl Loader for GGUFLoader {
                         jinja_explicit: self.jinja_explicit.as_ref(),
                         topology: self.config.topology.as_ref(),
                         kind: self.kind.clone(),
+                        mmproj_paths,
                     },
                     &arch,
                     paths,

@@ -434,6 +434,18 @@ impl QEmbedding {
             None => Ok(t),
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn apply_inverse(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.inverse {
+            #[cfg(feature = "cuda")]
+            Some(rot) if x.device().is_cuda() => {
+                mistralrs_quant::ptq1_0::inverse_rows(&x.contiguous()?, rot)
+            }
+            Some(_) => candle_core::bail!("prism rotation needs CUDA"),
+            None => Ok(x.clone()),
+        }
+    }
 }
 
 struct FullAttention {
@@ -461,11 +473,15 @@ impl FullAttention {
         ctx: &mut ModelForwardContext<'_>,
         layer_idx: usize,
     ) -> Result<Tensor> {
-        // IMRoPE with text-only positions (t == h == w) reduces to partial NEOX RoPE
-        let positions = ctx
-            .text_positions(x.device(), x.dim(1)?)?
-            .ok_or_else(|| candle_core::Error::msg("missing RoPE positions"))?
-            .clone();
+        // IMRoPE: text uses 1D positions (t == h == w, partial NEOX); a vision prefill supplies
+        // 3D [3, n] mrope positions (Qwen3-VL), applied per mrope-section in forward_with.
+        let positions = match ctx.vision_positions() {
+            Some(vp) => vp.clone(),
+            None => ctx
+                .text_positions(x.device(), x.dim(1)?)?
+                .ok_or_else(|| candle_core::Error::msg("missing RoPE positions"))?
+                .clone(),
+        };
         let ctx = &*ctx;
         self.forward_with(x, mask, &positions, |q, k, v| match &self.paged_attn {
             Some(paged_attn) => match ctx.paged_layer(layer_idx) {
@@ -580,15 +596,37 @@ impl FullAttention {
         let v = v
             .reshape((b_sz, n, self.n_kv_head, self.head_dim))?
             .transpose(1, 2)?;
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         Ok((q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?, v.to_dtype(self.dtype)?, gate))
     }
 
@@ -740,15 +778,37 @@ impl FullAttention {
             (q, k, v)
         };
 
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         let (q, k, v) = (
             q.to_dtype(self.dtype)?,
             k.to_dtype(self.dtype)?,
@@ -785,15 +845,37 @@ impl FullAttention {
         let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
         let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
         let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-        let (q, k) = self.rotary.forward_qk_norm(
-            &q,
-            &k,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-            self.k_norm.eps(),
-            positions,
-        )?;
+        let (q, k) = if positions.rank() == 2 {
+            // Vision prefill: 3D mrope positions [3, n]. Reuse the rotary's cos/sin tables and the
+            // same qk_rms_norm_rope op, gathering per mrope-section; text (rank 1) is unchanged.
+            let (cos, sin) = self.rotary.get_cos_sin()?;
+            let (cos_m, sin_m) =
+                crate::models::bonsai_vision::mrope_gather(&cos, &sin, positions)?;
+            let n = cos_m.dim(0)?;
+            let ident = Tensor::arange(0u32, n as u32, cos_m.device())?;
+            crate::layers::qk_rms_norm_rope(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                &cos_m,
+                &sin_m,
+                true,
+                &ident,
+            )?
+        } else {
+            self.rotary.forward_qk_norm(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                self.k_norm.eps(),
+                positions,
+            )?
+        };
         Ok((q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?, v.to_dtype(self.dtype)?, gate))
     }
 
@@ -1161,6 +1243,9 @@ struct DecoderLayer {
 
 pub struct ModelWeights {
     tok_embeddings: QEmbedding,
+    /// Image placeholder token id for the GGUF VL path (Bonsai). `None` = text-only; the embed
+    /// splice is a no-op when either this or `ctx.image_embeds()` is absent.
+    image_token_id: Option<u32>,
     layers: Vec<DecoderLayer>,
     norm: QRmsNorm,
     output: Arc<dyn QuantMethod>,
@@ -2576,6 +2661,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         Ok(Self {
             tok_embeddings,
+            image_token_id: None,
             layers,
             norm,
             output,
@@ -2595,6 +2681,54 @@ impl ModelConfig::FromGGUF for ModelWeights {
 }
 
 impl ModelWeights {
+    pub(crate) fn set_image_token_id(&mut self, id: Option<u32>) {
+        self.image_token_id = id;
+    }
+
+    /// Embed `input_ids` (to F32) and, for a vision request, scatter `ctx.image_embeds()` into the
+    /// image-placeholder positions. Byte-identical to the plain embed when either `image_embeds` or
+    /// `image_token_id` is absent, so the text path is unchanged.
+    fn embed_with_images(&self, input_ids: &Tensor, ctx: &ModelForwardContext<'_>) -> Result<Tensor> {
+        let x = self
+            .tok_embeddings
+            .forward(input_ids, &self.device)?
+            .to_dtype(DType::F32)?;
+        let (Some(img), Some(tok_id)) = (ctx.image_embeds(), self.image_token_id) else {
+            return Ok(x);
+        };
+        let ids_host = input_ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+        let dst: Vec<u32> = ids_host
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| (t == tok_id).then_some(i as u32))
+            .collect();
+        if dst.is_empty() {
+            return Ok(x);
+        }
+        let dims = x.dims().to_vec();
+        let hidden = dims[dims.len() - 1];
+        let n: usize = dims[..dims.len() - 1].iter().product();
+        let x_flat = x.reshape((n, hidden))?;
+        let img = img.to_dtype(DType::F32)?.to_device(&self.device)?;
+        if img.dim(0)? != dst.len() {
+            candle_core::bail!(
+                "bonsai vision: {} image embeds != {} image tokens",
+                img.dim(0)?,
+                dst.len()
+            );
+        }
+        let k = dst.len();
+        let dst_t = Tensor::from_vec(dst, (k,), &self.device)?;
+        let scattered = x_flat.zeros_like()?.index_add(&dst_t, &img, 0)?;
+        let keep_vec: Vec<f32> = ids_host
+            .iter()
+            .map(|&t| if t == tok_id { 0.0 } else { 1.0 })
+            .collect();
+        let keep = Tensor::from_vec(keep_vec, (n, 1), &self.device)?;
+        let merged = (x_flat.broadcast_mul(&keep)? + scattered)?;
+        merged.reshape(dims)
+    }
+
     pub fn forward(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         let rows = input_ids.dim(1)?;
         crate::titan_faults::forward_start(rows);
@@ -2730,6 +2864,7 @@ impl ModelWeights {
             || (l <= c && split.is_empty())
             || ctx.is_paged()
             || crate::using_flash_attn()
+            || ctx.image_embeds().is_some()
             || !matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Prefill))
         {
             return Ok(None);
@@ -2844,10 +2979,7 @@ impl ModelWeights {
         ctx: &mut ModelForwardContext<'_>,
         conv_carry: bool,
     ) -> Result<Tensor> {
-        let mut x = self
-            .tok_embeddings
-            .forward(input_ids, &self.device)?
-            .to_dtype(DType::F32)?;
+        let mut x = self.embed_with_images(input_ids, ctx)?;
 
         let mut hybrid_cache = self.cache.hybrid();
         let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {
@@ -3240,7 +3372,7 @@ impl ModelWeights {
         if starts.len() != b || slots.len() != b {
             candle_core::bail!("qwen35 batched decode: {b} rows, {} offsets, {} slots", starts.len(), slots.len());
         }
-        let mut x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let mut x = self.embed_with_images(input_ids, ctx)?;
         let mut hybrid_cache = self.cache.hybrid();
         let hc = &mut *hybrid_cache;
         let ragged = hc
@@ -4203,7 +4335,7 @@ impl ModelWeights {
         let indices = recurrent_metadata.state_indices().clone();
         let nl = self.layers.len();
 
-        let x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let x = self.embed_with_images(input_ids, ctx)?;
         let mut hybrid_cache = self.cache.hybrid();
         let mut caches: Vec<Option<&mut HybridLayerCache>> = hybrid_cache.caches.iter_mut().map(Some).collect();
         let ends: Vec<Option<usize>> = (0..nl)
