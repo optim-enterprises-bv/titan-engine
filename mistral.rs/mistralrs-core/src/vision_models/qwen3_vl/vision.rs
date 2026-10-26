@@ -371,6 +371,8 @@ pub struct Qwen3VLVisionModel {
     spatial_merge_size: usize,
     num_grid_per_side: usize,
     hidden_size: usize,
+    /// SigLIP-style towers (e.g. Bonsai) use learned abs pos only, no 2D rope.
+    no_rope: bool,
 }
 
 impl Qwen3VLVisionModel {
@@ -426,6 +428,7 @@ impl Qwen3VLVisionModel {
             spatial_merge_size: cfg.spatial_merge_size,
             num_grid_per_side,
             hidden_size: cfg.hidden_size,
+            no_rope: false,
         })
     }
 
@@ -614,6 +617,10 @@ impl Qwen3VLVisionModel {
         Ok(cu)
     }
 
+    pub fn set_no_rope(&mut self, no_rope: bool) {
+        self.no_rope = no_rope;
+    }
+
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let dtype = self.pos_embed.embeddings().dtype();
         let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
@@ -622,7 +629,10 @@ impl Qwen3VLVisionModel {
 
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
         let seq_len = hidden_states.dim(0)?;
-        let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
+        let mut rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
+        if self.no_rope {
+            rotary_pos_emb = rotary_pos_emb.zeros_like()?;
+        }
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
         let cos = emb.cos()?.to_dtype(DType::F32)?;
         let sin = emb.sin()?.to_dtype(DType::F32)?;

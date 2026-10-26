@@ -816,6 +816,12 @@ impl TitanGGUFPipeline {
                 (t, gh, gw),
                 &bv.device,
             )?;
+            {
+                let ia = embeds.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+                let te = model.embed_ids(&input_ids)?.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+                let gmax = grid.to_dtype(DType::U32)?.to_vec2::<u32>().ok();
+                tracing::info!("titan vision diag: embeds {:?} image_abs_mean={ia:.5} text_abs_mean={te:.5} grid={gmax:?}", embeds.dims());
+            }
             (Some(embeds), Some(vpos))
         } else {
             (None, None)

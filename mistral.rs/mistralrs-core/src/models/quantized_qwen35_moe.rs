@@ -434,6 +434,18 @@ impl QEmbedding {
             None => Ok(t),
         }
     }
+
+    /// Apply the same prism inverse rotation to arbitrary rows `[n, hidden]` (e.g. vision embeds).
+    pub(crate) fn apply_inverse(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.inverse {
+            #[cfg(feature = "cuda")]
+            Some(rot) if x.device().is_cuda() => {
+                mistralrs_quant::ptq1_0::inverse_rows(&x.contiguous()?, rot)
+            }
+            Some(_) => candle_core::bail!("prism rotation needs CUDA"),
+            None => Ok(x.clone()),
+        }
+    }
 }
 
 struct FullAttention {
@@ -2671,6 +2683,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
 impl ModelWeights {
     pub(crate) fn set_image_token_id(&mut self, id: Option<u32>) {
         self.image_token_id = id;
+    }
+
+    pub(crate) fn embed_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(input_ids, &self.device)
+    }
+
+    /// Apply the prism Hadamard rotation (the same one the token embeddings use) to external
+    /// embeddings so they land in the model's input basis+scale. No-op when the model is not prism.
+    pub(crate) fn apply_prism_rotation(&self, x: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.apply_inverse(x)
     }
 
     /// Embed `input_ids` (to F32) and, for a vision request, scatter `ctx.image_embeds()` into the

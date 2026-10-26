@@ -162,7 +162,10 @@ pub(crate) fn load_bonsai_vision_tower(
         num_position_embeddings: 2304,
         deepstack_visual_indexes: vec![],
     };
-    Qwen3VLVisionModel::new(&cfg, vb)
+    let mut tower = Qwen3VLVisionModel::new(&cfg, vb)?;
+    // Bonsai's clip is SigLIP-so400m (learned abs pos, full attention, no 2D rope).
+    tower.set_no_rope(true);
+    Ok(tower)
 }
 
 /// Qwen3-VL 3D (t,h,w) rope positions for a single-image sequence, `[3, n]` i64. Text spans use
