@@ -1,7 +1,7 @@
 #[cfg(feature = "cuda")]
 mod oxide;
 #[cfg(feature = "cuda")]
-pub use oxide::fp8_moe_grouped;
+pub use oxide::{fp8_moe_grouped, fp8_moe_grouped_w8a8};
 use std::{
     borrow::Cow,
     sync::{atomic::AtomicUsize, Arc},

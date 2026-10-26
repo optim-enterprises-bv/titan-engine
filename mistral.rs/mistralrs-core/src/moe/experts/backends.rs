@@ -302,7 +302,7 @@ impl OxideFp8ExpertsWeights {
             .to_dtype(DType::F32)?
             .contiguous()?;
 
-        let gate_up = mistralrs_quant::fp8_moe_grouped(
+        let gate_up = mistralrs_quant::fp8_moe_grouped_w8a8(
             forward.xs_flat,
             &self.gate_up,
             &self.gate_up_scales,
@@ -316,7 +316,7 @@ impl OxideFp8ExpertsWeights {
         let up = gate_up.narrow(D::Minus1, self.inter, self.inter)?.contiguous()?;
         let down_inputs = (up * gate.apply(&config.act)?)?.reshape(((), self.inter))?;
 
-        let ys = mistralrs_quant::fp8_moe_grouped(
+        let ys = mistralrs_quant::fp8_moe_grouped_w8a8(
             &down_inputs,
             &self.down,
             &self.down_scales,
