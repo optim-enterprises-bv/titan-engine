@@ -10,10 +10,29 @@ use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{GgufArchive, ShardedSafeTensors};
 
 use crate::layers::Activation;
+use crate::vision_models::preprocessor_config::PreProcessorConfig;
 use crate::vision_models::qwen3_vl::config::VisionConfig;
+use crate::vision_models::qwen3_vl::inputs_processor::bonsai_image_to_patches;
 use crate::vision_models::qwen3_vl::vision::Qwen3VLVisionModel;
 
 const DEPTH: usize = 27;
+
+/// Preprocess one image into the `(patches, grid_thw)` the Bonsai tower consumes, using the shared
+/// Qwen3-VL preprocessing (smart-resize, 0.5/0.5 normalize, patchify) so the patch ordering matches.
+pub(crate) fn preprocess_bonsai_image(
+    image: image::DynamicImage,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let cfg = PreProcessorConfig {
+        patch_size: Some(16),
+        merge_size: Some(2),
+        temporal_patch_size: Some(2),
+        image_mean: Some([0.5, 0.5, 0.5]),
+        image_std: Some([0.5, 0.5, 0.5]),
+        ..Default::default()
+    };
+    bonsai_image_to_patches(image, &cfg, device)
+}
 
 fn deq(arch: &GgufArchive, name: &str, dev: &Device) -> Result<Tensor> {
     let q = arch.load_qtensor(name, dev)?;
@@ -115,6 +134,34 @@ mod tests {
         let (embeds, _deepstack) = tower.forward(&xs, &grid)?;
         // 16 patches / (2*2 merge) = 4 merged tokens, out_hidden 5120.
         assert_eq!(embeds.dims(), &[4, 5120]);
+        Ok(())
+    }
+
+    // Real image -> processor -> tower, end to end on CPU. Requires the Bonsai files on disk.
+    #[test]
+    #[ignore = "needs the Bonsai mmproj + vision_check.png on disk"]
+    fn bonsai_image_through_tower() -> Result<()> {
+        let dev = Device::Cpu;
+        let img = image::open("/home/dingo/models/bonsai2-27b/vision_check.png")
+            .map_err(|e| candle_core::Error::msg(format!("open image: {e}")))?;
+        let (patches, grid) = preprocess_bonsai_image(img, &dev)?;
+        let patches = patches.to_dtype(DType::BF16)?;
+        let g = grid.to_vec2::<u32>()?;
+        let expect = (g[0][0] * g[0][1] * g[0][2]) as usize / 4; // spatial merge 2x2
+
+        let path =
+            Path::new("/home/dingo/models/bonsai2-27b/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf");
+        let tower = load_bonsai_vision_tower(path, &dev)?;
+        let (embeds, _deepstack) = tower.forward(&patches, &grid)?;
+        println!(
+            "bonsai vision: grid {:?} -> patches {:?} -> embeds {:?}",
+            g[0],
+            patches.dims(),
+            embeds.dims()
+        );
+        assert_eq!(embeds.dim(0)?, expect);
+        assert_eq!(embeds.dim(1)?, 5120);
+        assert!(embeds.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?.iter().all(|v| v.is_finite()));
         Ok(())
     }
 }

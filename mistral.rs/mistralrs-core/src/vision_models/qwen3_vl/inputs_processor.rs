@@ -768,6 +768,21 @@ fn qwen3_decode_args(input_ids: &Tensor, seqlens: Vec<usize>) -> Qwen3VLVisionSp
     }
 }
 
+/// Single-image preprocessing for the GGUF/Bonsai vision path: returns the patch tensor
+/// `[num_patches, in_chans*temporal*patch*patch]` and `grid_thw` `[1, 3]`, in the exact ordering
+/// `Qwen3VLVisionModel::forward` expects. Uses the shared Qwen3-VL smart-resize/normalize/patchify.
+pub(crate) fn bonsai_image_to_patches(
+    image: DynamicImage,
+    config: &PreProcessorConfig,
+    device: &Device,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let proc = Qwen3VLImageProcessor { max_edge: None };
+    let (w, h) = image.dimensions();
+    let (patches, (t, gh, gw)) = proc.preprocess_inner(vec![image], config, device, (h, w), None)?;
+    let grid = Tensor::new(&[t, gh, gw], &Device::Cpu)?.reshape((1usize, 3usize))?;
+    Ok((patches, grid))
+}
+
 impl InputsProcessor for Qwen3VLImageProcessor {
     fn get_type(&self) -> InputsProcessorType {
         InputsProcessorType::Vision
