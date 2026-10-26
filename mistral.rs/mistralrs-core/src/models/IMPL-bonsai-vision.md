@@ -48,3 +48,28 @@ Reference answer: PrismML bundled binary (`bonsai2-27b/.../serve-16gb-mtp-vision
 Spec verified against the GGUF. Vision tower + bridge + processor are non-invasive and come first;
 the text-path input-embeds splice is the risky multi-session piece and is gated so the text path
 (production) is untouched when no image is present.
+
+## Remaining design (fully mapped; all reference impls located)
+DONE + validated (non-invasive, committed): vision tower loader (models/bonsai_vision.rs) and
+image processor (bonsai_image_to_patches) - image -> [N,5120] embeds proven on vision_check.png.
+
+Backbone is already VL-aware: quantized_qwen35_moe uses IMRoPE and feeds `text_positions` today
+(t==h==w). For images, supply 3D (t,h,w) positions; no new rope math needed in the kernel.
+
+Remaining (cross-cutting, multi-session, touches shared prod infra - do gated so text is identical):
+1. Shared ModelForwardContext (pipeline/mod.rs): add Option fields `image_embeds: Option<Tensor>`
+   and `vision_position_ids: Option<Tensor>` (None = today's text path, byte-identical). Thread
+   through its `new()` and construction sites.
+2. 3D rope-index: port qwen3_vl/mod.rs:112-221 (image_token_id spans, spatial-merge grid -> t/h/w
+   positions) into a shared helper; feed as vision_position_ids when an image is present.
+3. Embed splice: in quantized_qwen35_moe the token-embed happens per forward variant
+   (lines ~3243, 4206, and 2848/3056/3431/3592/3747/3907/4053). Add one helper
+   `embed_with_images(ids, ctx)` = tok_embeddings.forward then scatter ctx.image_embeds into the
+   image_token_id positions; call it in the variants a vision request uses (eager/chunked prefill;
+   decode is post-image text, unchanged). Gate on ctx.image_embeds.is_some().
+4. Vision pipeline + resolver: family arm in gguf/multimodal_vision_registry.rs for projector
+   `qwen3vl_merger` + arch `qwen35` -> new MultimodalLoaderType; loader builds the tower
+   (load_bonsai_vision_tower) + processor, runs the model with image_embeds in ctx. Chat template:
+   Qwen3-VL `<|vision_start|><|image_pad|>...<|vision_end|>`; image_token_id from the GGUF.
+5. Cap processor max_pixels ~768^2 to match Bonsai's training (default oversizes: 9072 patches seen).
+6. Validate vs the bundled binary (serve-16gb-mtp-vision.sh) on vision_check.png.
