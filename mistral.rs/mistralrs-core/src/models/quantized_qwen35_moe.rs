@@ -435,7 +435,7 @@ impl QEmbedding {
         }
     }
 
-    /// Apply the same prism inverse rotation to arbitrary rows `[n, hidden]` (e.g. vision embeds).
+    #[allow(dead_code)]
     pub(crate) fn apply_inverse(&self, x: &Tensor) -> Result<Tensor> {
         match &self.inverse {
             #[cfg(feature = "cuda")]
@@ -2685,16 +2685,6 @@ impl ModelWeights {
         self.image_token_id = id;
     }
 
-    pub(crate) fn embed_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.tok_embeddings.forward(input_ids, &self.device)
-    }
-
-    /// Apply the prism Hadamard rotation (the same one the token embeddings use) to external
-    /// embeddings so they land in the model's input basis+scale. No-op when the model is not prism.
-    pub(crate) fn apply_prism_rotation(&self, x: &Tensor) -> Result<Tensor> {
-        self.tok_embeddings.apply_inverse(x)
-    }
-
     /// Embed `input_ids` (to F32) and, for a vision request, scatter `ctx.image_embeds()` into the
     /// image-placeholder positions. Byte-identical to the plain embed when either `image_embeds` or
     /// `image_token_id` is absent, so the text path is unchanged.
@@ -2874,6 +2864,7 @@ impl ModelWeights {
             || (l <= c && split.is_empty())
             || ctx.is_paged()
             || crate::using_flash_attn()
+            || ctx.image_embeds().is_some()
             || !matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Prefill))
         {
             return Ok(None);
@@ -2988,10 +2979,7 @@ impl ModelWeights {
         ctx: &mut ModelForwardContext<'_>,
         conv_carry: bool,
     ) -> Result<Tensor> {
-        let mut x = self
-            .tok_embeddings
-            .forward(input_ids, &self.device)?
-            .to_dtype(DType::F32)?;
+        let mut x = self.embed_with_images(input_ids, ctx)?;
 
         let mut hybrid_cache = self.cache.hybrid();
         let recurrent_metadata = ctx.recurrent_metadata().cloned().ok_or_else(|| {

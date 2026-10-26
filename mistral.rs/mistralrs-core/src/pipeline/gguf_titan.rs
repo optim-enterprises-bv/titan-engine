@@ -476,7 +476,7 @@ impl PreProcessingMixin for TitanGGUFPipeline {
                 temporal_patch_size: Some(2),
                 image_mean: Some([0.5, 0.5, 0.5]),
                 image_std: Some([0.5, 0.5, 0.5]),
-                max_pixels: Some(768 * 768),
+                max_pixels: Some(4_000_000),
                 ..Default::default()
             }))
         } else {
@@ -794,11 +794,6 @@ impl TitanGGUFPipeline {
             candle_core::bail!("titan vision: only qwen35 supports the Bonsai vision path");
         };
         let bv = self.vision.as_ref().expect("vision loaded");
-        {
-            let ids_dbg = input_ids.flatten_all().and_then(|t| t.to_dtype(DType::U32)).and_then(|t| t.to_vec1::<u32>()).unwrap_or_default();
-            let pad = ids_dbg.iter().filter(|&&t| t == bv.image_token_id).count();
-            tracing::info!("titan vision fwd: pixel_values={} seq_len={} image_pad_tokens={}", pixel_values.is_some(), ids_dbg.len(), pad);
-        }
 
         let (image_embeds, vision_positions) = if let Some(pv) = pixel_values.as_ref() {
             let grid = model_specific_args
@@ -816,12 +811,6 @@ impl TitanGGUFPipeline {
                 (t, gh, gw),
                 &bv.device,
             )?;
-            {
-                let ia = embeds.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-                let te = model.embed_ids(&input_ids)?.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-                let gmax = grid.to_dtype(DType::U32)?.to_vec2::<u32>().ok();
-                tracing::info!("titan vision diag: embeds {:?} image_abs_mean={ia:.5} text_abs_mean={te:.5} grid={gmax:?}", embeds.dims());
-            }
             (Some(embeds), Some(vpos))
         } else {
             (None, None)
