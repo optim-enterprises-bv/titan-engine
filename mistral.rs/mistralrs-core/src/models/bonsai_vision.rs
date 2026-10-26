@@ -268,6 +268,47 @@ mod tests {
     }
 
     #[test]
+    fn mrope_rope_apply_matches_text_for_equal_positions() -> Result<()> {
+        // The key correctness guarantee: with equal t==h==w positions, the mrope rope-apply
+        // (mrope_gather + qk_rms_norm_rope on identity positions) must equal the 1D text path
+        // (qk_rms_norm_rope on the raw positions), so the text path is provably unaffected.
+        let dev = Device::Cpu;
+        let half = 32usize; // sections 11+11+10
+        let head_dim = 2 * half;
+        let maxpos = 16usize;
+        let n = 5usize;
+        // synthetic rope tables [maxpos, half]
+        let cos = Tensor::randn(0f32, 1f32, (maxpos, half), &dev)?;
+        let sin = Tensor::randn(0f32, 1f32, (maxpos, half), &dev)?;
+        let q = Tensor::randn(0f32, 1f32, (1, 4, n, head_dim), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (1, 2, n, head_dim), &dev)?;
+        let qw = Tensor::randn(0f32, 1f32, (head_dim,), &dev)?;
+        let kw = Tensor::randn(0f32, 1f32, (head_dim,), &dev)?;
+
+        let pos1d = Tensor::from_vec(vec![3u32, 4, 5, 6, 7], (n,), &dev)?;
+        let pos3d = Tensor::from_vec(
+            vec![3i64, 4, 5, 6, 7, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7],
+            (3, n),
+            &dev,
+        )?;
+
+        let (q_ref, k_ref) = crate::layers::qk_rms_norm_rope(
+            &q, &k, &qw, &kw, 1e-6, 1e-6, &cos, &sin, true, &pos1d,
+        )?;
+        let (cos_m, sin_m) = mrope_gather(&cos, &sin, &pos3d)?;
+        let ident = Tensor::arange(0u32, n as u32, &dev)?;
+        let (q_m, k_m) = crate::layers::qk_rms_norm_rope(
+            &q, &k, &qw, &kw, 1e-6, 1e-6, &cos_m, &sin_m, true, &ident,
+        )?;
+
+        let dq = (q_ref - q_m)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let dk = (k_ref - k_m)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(dq < 1e-5, "q mismatch {dq}");
+        assert!(dk < 1e-5, "k mismatch {dk}");
+        Ok(())
+    }
+
+    #[test]
     fn mrope_cos_sin_text_equals_1d() -> Result<()> {
         let dev = Device::Cpu;
         // text positions (t==h==w) must give identical cos/sin regardless of sectioning.
