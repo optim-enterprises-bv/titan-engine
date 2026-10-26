@@ -1161,6 +1161,9 @@ struct DecoderLayer {
 
 pub struct ModelWeights {
     tok_embeddings: QEmbedding,
+    /// Image placeholder token id for the GGUF VL path (Bonsai). `None` = text-only; the embed
+    /// splice is a no-op when either this or `ctx.image_embeds()` is absent.
+    image_token_id: Option<u32>,
     layers: Vec<DecoderLayer>,
     norm: QRmsNorm,
     output: Arc<dyn QuantMethod>,
@@ -2576,6 +2579,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         Ok(Self {
             tok_embeddings,
+            image_token_id: None,
             layers,
             norm,
             output,
@@ -2595,6 +2599,54 @@ impl ModelConfig::FromGGUF for ModelWeights {
 }
 
 impl ModelWeights {
+    pub(crate) fn set_image_token_id(&mut self, id: Option<u32>) {
+        self.image_token_id = id;
+    }
+
+    /// Embed `input_ids` (to F32) and, for a vision request, scatter `ctx.image_embeds()` into the
+    /// image-placeholder positions. Byte-identical to the plain embed when either `image_embeds` or
+    /// `image_token_id` is absent, so the text path is unchanged.
+    fn embed_with_images(&self, input_ids: &Tensor, ctx: &ModelForwardContext<'_>) -> Result<Tensor> {
+        let x = self
+            .tok_embeddings
+            .forward(input_ids, &self.device)?
+            .to_dtype(DType::F32)?;
+        let (Some(img), Some(tok_id)) = (ctx.image_embeds(), self.image_token_id) else {
+            return Ok(x);
+        };
+        let ids_host = input_ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+        let dst: Vec<u32> = ids_host
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| (t == tok_id).then_some(i as u32))
+            .collect();
+        if dst.is_empty() {
+            return Ok(x);
+        }
+        let dims = x.dims().to_vec();
+        let hidden = dims[dims.len() - 1];
+        let n: usize = dims[..dims.len() - 1].iter().product();
+        let x_flat = x.reshape((n, hidden))?;
+        let img = img.to_dtype(DType::F32)?.to_device(&self.device)?;
+        if img.dim(0)? != dst.len() {
+            candle_core::bail!(
+                "bonsai vision: {} image embeds != {} image tokens",
+                img.dim(0)?,
+                dst.len()
+            );
+        }
+        let k = dst.len();
+        let dst_t = Tensor::from_vec(dst, (k,), &self.device)?;
+        let scattered = x_flat.zeros_like()?.index_add(&dst_t, &img, 0)?;
+        let keep_vec: Vec<f32> = ids_host
+            .iter()
+            .map(|&t| if t == tok_id { 0.0 } else { 1.0 })
+            .collect();
+        let keep = Tensor::from_vec(keep_vec, (n, 1), &self.device)?;
+        let merged = (x_flat.broadcast_mul(&keep)? + scattered)?;
+        merged.reshape(dims)
+    }
+
     pub fn forward(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         let rows = input_ids.dim(1)?;
         crate::titan_faults::forward_start(rows);
@@ -3240,7 +3292,7 @@ impl ModelWeights {
         if starts.len() != b || slots.len() != b {
             candle_core::bail!("qwen35 batched decode: {b} rows, {} offsets, {} slots", starts.len(), slots.len());
         }
-        let mut x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let mut x = self.embed_with_images(input_ids, ctx)?;
         let mut hybrid_cache = self.cache.hybrid();
         let hc = &mut *hybrid_cache;
         let ragged = hc
@@ -4203,7 +4255,7 @@ impl ModelWeights {
         let indices = recurrent_metadata.state_indices().clone();
         let nl = self.layers.len();
 
-        let x = self.tok_embeddings.forward(input_ids, &self.device)?.to_dtype(DType::F32)?;
+        let x = self.embed_with_images(input_ids, ctx)?;
         let mut hybrid_cache = self.cache.hybrid();
         let mut caches: Vec<Option<&mut HybridLayerCache>> = hybrid_cache.caches.iter_mut().map(Some).collect();
         let ends: Vec<Option<usize>> = (0..nl)

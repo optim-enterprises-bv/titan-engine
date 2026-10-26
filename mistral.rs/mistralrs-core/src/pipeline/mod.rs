@@ -799,6 +799,9 @@ pub(crate) struct ModelForwardContext<'a> {
     recurrent_metadata: Option<RecurrentMetadata>,
     recurrent_batch_kind: Option<RecurrentBatchKind>,
     requires_full_prefill_queries: bool,
+    /// Precomputed vision embeddings to scatter into image-placeholder token positions (GGUF VL
+    /// path, e.g. Bonsai). `None` for the text path, which is then byte-identical.
+    image_embeds: Option<Tensor>,
 }
 
 #[allow(dead_code)]
@@ -820,6 +823,7 @@ impl<'a> ModelForwardContext<'a> {
             recurrent_metadata: None,
             recurrent_batch_kind: None,
             requires_full_prefill_queries: false,
+            image_embeds: None,
         }
     }
 
@@ -840,6 +844,7 @@ impl<'a> ModelForwardContext<'a> {
             recurrent_metadata: None,
             recurrent_batch_kind: None,
             requires_full_prefill_queries: false,
+            image_embeds: None,
         }
     }
 
@@ -860,6 +865,15 @@ impl<'a> ModelForwardContext<'a> {
         }
         self.recurrent_metadata = recurrent_metadata;
         self
+    }
+
+    pub(crate) fn with_image_embeds(mut self, image_embeds: Option<Tensor>) -> Self {
+        self.image_embeds = image_embeds;
+        self
+    }
+
+    pub(crate) fn image_embeds(&self) -> Option<&Tensor> {
+        self.image_embeds.as_ref()
     }
 
     pub(crate) fn require_full_prefill_queries(&mut self) {
