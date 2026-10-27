@@ -1146,17 +1146,20 @@ fn main() {
     let mut skipped: Vec<&str> = Vec::new();
     for spec in llama_specs() {
         if only.as_deref().is_none_or(|o| o == spec.name) {
-            if std::env::var("TITAN_GATE_LLAMA_REF").is_ok() {
-                all_ok &= llama_gate(&spec, &ctx, &stream, &oxide, &mut per_fmt, &mut total, &mut cpu_total);
-            } else {
-                println!(
-                    "== {} gate: SKIPPED -- needs llama.cpp acecd56032ddc (tag b10934); the sm_120 image of that \
-                     build does not execute this kernel from an external harness (loads, resolves, launches, writes \
-                     nothing; PDL launch attribute rejected with CUDA_ERROR_INVALID_VALUE). Set \
-                     TITAN_GATE_LLAMA_REF=1 with reference cubins staged to try anyway.",
-                    spec.name
-                );
-                skipped.push(spec.name);
+            let forced_off = std::env::var("TITAN_GATE_LLAMA_REF").map(|v| v == "0").unwrap_or(false);
+            match (forced_off, llama_ref_path(&spec)) {
+                (false, Some(_)) => {
+                    all_ok &= llama_gate(&spec, &ctx, &stream, &oxide, &mut per_fmt, &mut total, &mut cpu_total);
+                }
+                _ => {
+                    println!(
+                        "== {} gate: SKIPPED -- no reference cubin (expected oxide-kernels/reference/llama/\
+                         mmvq-sm120.cubin, or {}/ref/mmvq.cubin; mine one with \
+                         titan-kernels-oxide/scripts/mine-mmvq-ref.py). TITAN_GATE_LLAMA_REF=0 forces the skip.",
+                        spec.name, spec.name
+                    );
+                    skipped.push(spec.name);
+                }
             }
         }
     }
@@ -1249,6 +1252,25 @@ fn put<T: Copy>(b: &mut Vec<u8>, v: T) {
     b.extend_from_slice(unsafe { std::slice::from_raw_parts(&v as *const T as *const u8, std::mem::size_of::<T>()) });
 }
 
+/// Where this spec's `mul_mat_vec_q` reference cubin lives: a per-spec `ref/mmvq.cubin` if
+/// someone staged one (that is how a different rev is tested), else the shared vendored
+/// `reference/llama/mmvq-sm120.cubin`.
+fn llama_ref_path(spec: &LlamaSpec) -> Option<String> {
+    let here = concat!(env!("CARGO_MANIFEST_DIR"), "/../oxide-kernels");
+    let home = std::env::var("HOME").unwrap_or_default();
+    for root in [here.to_string(), format!("{home}/titan-engine/oxide-kernels")] {
+        let per_spec = format!("{root}/{}/ref/mmvq.cubin", spec.name);
+        if std::path::Path::new(&per_spec).exists() {
+            return Some(per_spec);
+        }
+        let shared = format!("{root}/reference/llama/mmvq-sm120.cubin");
+        if std::path::Path::new(&shared).exists() {
+            return Some(shared);
+        }
+    }
+    None
+}
+
 /// A GGML format whose only CUDA float program is llama.cpp's `mul_mat_vec_q`.
 struct LlamaSpec {
     fmt: cpu::Format,
@@ -1284,19 +1306,33 @@ fn llama_specs() -> Vec<LlamaSpec> {
     ]
 }
 
-/// Expert GEMV gate for a llama.cpp-kernel format. Reference: llama.cpp acecd56's own
+/// Expert GEMV gate for a llama.cpp-kernel format. Reference: llama.cpp's own
 /// `mul_mat_vec_q<type, 1, false, false, false>` (the MUL_MAT_ID decode kernel: channel = task,
-/// `ids` = experts), from the nvcc rebuild in oxide-kernels/<name>/ref/mmvq.cubin (SASS identical
-/// to libggml-cuda.so), launched once per token. Oxide reads permuted slots through the slot map.
+/// `ids` = experts), launched once per token; oxide reads permuted slots through the slot map.
+///
+/// The upstream kernel at the pin in NOTICE.md (acecd560, tag b10934) does not execute from an
+/// external harness on sm_120 -- it loads, resolves, launches, and writes nothing (Blackwell needs
+/// the PDL wait that upstream only got later). The vendored reference is the PrismML fork's sm_120
+/// build of the same kernel, which does run and is bit-identical to oxide. Two template signatures
+/// are accepted: <type, ncols_dst, has_fusion, small_k, halve_iters> and the newer form with an
+/// extra has_gate bool; the runtime parameter list is identical.
 /// The CPU twin (scalar and AVX2) is checked against the oxide GPU output.
 fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::CudaStream>, oxide: &Arc<CudaModule>,
               per_fmt: &mut std::collections::BTreeMap<String, [usize; 4]>, total: &mut usize, cpu_total: &mut usize) -> bool {
     use cuda_core::sys as cu;
     let home = std::env::var("HOME").unwrap();
-    let cubin = format!("{home}/titan-engine/oxide-kernels/{}/ref/mmvq.cubin", spec.name);
+    let cubin = llama_ref_path(spec).unwrap_or_else(|| panic!("no reference cubin for {}", spec.name));
+    if std::env::var("GATE_DEBUG").is_ok() {
+        println!("== {} gate: reference cubin {cubin}", spec.name);
+    }
     let reference = ctx.load_module_from_file(&cubin).unwrap_or_else(|e| panic!("{cubin}: {e:?}"));
     let rf_fn = reference
+        // Two signatures are in the wild for this kernel: <type, ncols_dst, has_fusion, small_k,
+        // halve_iters> (the acecd560 form, 4 bools) and the newer form that inserts has_gate (5
+        // bools, as built by the PrismML fork / unsloth mixed builds). Try both; the runtime
+        // parameter list is the same either way.
         .load_function(&format!("_Z13mul_mat_vec_qIL9ggml_type{}ELi1ELb0ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj", spec.ggml_type))
+        .or_else(|_| reference.load_function(&format!("_Z13mul_mat_vec_qIL9ggml_type{}ELi1ELb0ELb0ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj", spec.ggml_type)))
         .expect("reference mul_mat_vec_q<type, 1>");
     let rf = unsafe { rf_fn.cu_function() };
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/data");
