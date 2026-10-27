@@ -74,5 +74,26 @@ Three traps, each verified the hard way:
   cp libmrpb_rebuilt.a libmistralrspagedattention.a
   ```
 
+## The numeric gate, and what it needs
+
+With the above staged, `./target/release/mistralrs-paged-attn-b` passes against the nvcc reference:
+
+```
+family mla 142 | reshape 222 | gather 190 | decode 4320 | edges 240 | errors 28 | kernels 3468   calls
+8610 launcher calls, 1783951316 bytes compared, 0 failing -> PASS
+coverage: 883 of 883 reachable reference instances launched through their Rust twins (1770 total)
+```
+
+`load_ref()` reads `flashinfer_decode.cubin` / `flashinfer_mla_decode.cubin` from **this repo's**
+`oxide-kernels/reference/...` (via `CARGO_MANIFEST_DIR`), not the deployed tree, and it loads them as
+CUDA images — so the `.o` stand-in that satisfies `cuobjdump` fails here with
+`CUDA_ERROR_INVALID_IMAGE (200)`. Use the real image instead, which `cuobjdump -xelf all` regenerates
+from the object, and which lists the same 1752 functions so the generator is unaffected:
+
+```sh
+cuobjdump -xelf all flashinfer_decode-6f99e1b253bc688f.o     # -> ....1.sm_120a.cubin
+cp flashinfer_decode-6f99e1b253bc688f.1.sm_120a.cubin flashinfer_decode.cubin
+```
+
 The crate still gets no `titan-variants` spec: entry names are positional (`bd0..bdN`, numbered in
 reference order), so an axis product could only transcribe symbol order.
