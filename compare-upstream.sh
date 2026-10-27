@@ -1,11 +1,13 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 # Upstream mistral.rs 0.9.5 (.local/bin/mistralrs) on both quant files, same ctx/prompt as the
 # titan runs, so the two engines are compared on identical inputs.
 set -u
 BIN=/home/dingo/.local/bin/mistralrs
 run() { # label dir file layers ctx
   local label=$1 dir=$2 name=$3 layers=$4 ctx=$5
-  systemctl --user stop titan-dense.service 2>/dev/null; sleep 2
+  bench_stop_prod; sleep 2
   sudo -n pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 5
   echo "=== upstream $label (layers $layers, ctx $ctx) ==="
   ( cd "$dir" && "$BIN" serve -p 1234 --no-ui --max-model-len "$ctx" --format gguf \
@@ -17,7 +19,7 @@ run() { # label dir file layers ctx
     return
   fi
   echo "  VRAM: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
-  cd /tmp && python3 decode-once.py 16 >/dev/null 2>&1; python3 decode-once.py 256; cd /home/dingo
+  cd /tmp && python3 "$REPO/decode-once.py" 16 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 256; cd /home/dingo
   sudo -n pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 4
 }
 

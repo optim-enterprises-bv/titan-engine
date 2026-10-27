@@ -1,6 +1,8 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 set -u
-systemctl --user stop titan-dense.service 2>/dev/null; sleep 2
+bench_stop_prod; sleep 2
 pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 4
 export TITAN_MTP=0 TITAN_Q3K_ROWS=1
 rm -rf /tmp/wk.nsys-rep /tmp/wk.sqlite
@@ -10,7 +12,7 @@ nsys profile -f true --trace=cuda -o /tmp/wk --sample=none \
   -m models-optim -f optim-Q3_K_M.gguf -n 0:64 >/tmp/wk.log 2>&1 &
 NPID=$!
 for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
-cd /tmp && python3 decode-once.py 8 >/dev/null 2>&1; python3 decode-once.py 16 >/dev/null 2>&1
+cd /tmp && python3 "$REPO/decode-once.py" 8 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 16 >/dev/null 2>&1
 sleep 1; kill -INT $NPID 2>/dev/null; sleep 15; kill -9 $NPID 2>/dev/null
 nsys export --type sqlite -o /tmp/wk.sqlite --force-overwrite=true /tmp/wk.nsys-rep >/dev/null 2>&1
 python3 - <<'PY'

@@ -1,4 +1,6 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 # Per-launch DRAM throughput for the q3_k matvec, split by grid size (= matrix shape).
 # Decides whether the tall-skinny projections are bandwidth-starved or latency-bound.
 set -u
@@ -16,8 +18,8 @@ rm -rf "$OUT"*
   -m models-optim -f optim-Q3_K_M.gguf -n 0:64 >/tmp/ncu.log 2>&1 &
 NPID=$!
 for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
-cd /tmp && python3 decode-once.py 8 >/dev/null 2>&1
-python3 decode-once.py 12 >/dev/null 2>&1
+cd /tmp && python3 "$REPO/decode-once.py" 8 >/dev/null 2>&1
+python3 "$REPO/decode-once.py" 12 >/dev/null 2>&1
 sleep 2
 kill -INT $NPID 2>/dev/null; sleep 20; kill -9 $NPID 2>/dev/null
 ls -la "$OUT".ncu-rep 2>/dev/null | awk '{print "report bytes:", $5}'

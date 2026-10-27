@@ -1,4 +1,6 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 # Same model, two quant files, same context and prompt: single-stream decode comparison.
 # `--format gguf` wants -m <dir> -f <file>, and Q4_K_M (16.81 GB) does not fit the 16 GB card,
 # so its tail layers go to CPU via -n 0:N.
@@ -8,7 +10,7 @@ run() { # label file layers ctx
   local label=$1 file=$2 layers=$3 ctx=$4
   local dir name
   dir=$(dirname "$file"); name=$(basename "$file")
-  systemctl --user stop titan-dense.service 2>/dev/null; sleep 2
+  bench_stop_prod; sleep 2
   sudo -n pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 5
   export TITAN_MTP=0 TITAN_CUDA_GRAPHS=1 TITAN_RECURRENT_SLOTS=8
   echo "=== $label  (layers on GPU: $layers, ctx $ctx) ==="
@@ -22,7 +24,7 @@ run() { # label file layers ctx
     return
   fi
   echo "  VRAM: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
-  cd /tmp && python3 decode-once.py 16 >/dev/null 2>&1; python3 decode-once.py 256; cd /home/dingo
+  cd /tmp && python3 "$REPO/decode-once.py" 16 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 256; cd /home/dingo
 }
 
 run "q4km-n60" /home/dingo/src/titan-engine/models-q4km/Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q4_K_M.gguf 60 8192

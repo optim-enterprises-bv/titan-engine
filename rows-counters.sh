@@ -1,4 +1,6 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 # Controlled comparison of the rows kernel at 1 vs 2 activation rows: same weights, same grid
 # (the rows kernel always does 2 weight rows per block, so grid 8704 == the 17408-row FFN matrices
 # in BOTH cases). ncu as root, DRAM vs SM throughput decides "bandwidth-amortised" vs "ALU-bound".
@@ -23,7 +25,7 @@ sudo -n env TITAN_MTP=1 TITAN_GDN_DIRECT=1 \
   -f Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q3_K_M.gguf -n 0:65 \
   > /tmp/rowsq.log 2>&1 &
 for i in $(seq 1 60); do sleep 3; ss -tln | grep -q ':1234' && break; done
-cd /tmp && python3 decode-once.py 8 >/dev/null 2>&1; python3 decode-once.py 30 >/dev/null 2>&1
+cd /tmp && python3 "$REPO/decode-once.py" 8 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 30 >/dev/null 2>&1
 for i in $(seq 1 40); do sleep 5; [ -f /tmp/rowsq.ncu-rep ] && break; [ -f /tmp/rowsq.ncu-repz ] && break; done
 sudo -n "$NCU" --import /tmp/rowsq.ncu-repz --csv --page raw > /tmp/rowsq.csv 2>/dev/null
 [ -s /tmp/rowsq.csv ] || sudo -n "$NCU" --import /tmp/rowsq.ncu-rep --csv --page raw > /tmp/rowsq.csv 2>/dev/null
