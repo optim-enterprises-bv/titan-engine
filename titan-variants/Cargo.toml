@@ -1,0 +1,9 @@
+[package]
+name = "titan-variants"
+version = "0.1.0"
+edition = "2021"
+description = "Variant/route codegen for titan-engine oxide kernels (uzu-style)"
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,86 @@
+# Measured dispatch table for the one machine titan targets (RTX 5080 Laptop, 16 GB, sm_120).
+#
+# Shape: uzu `metal/kernel/matmul/qmv/routes.rs` -- exact device, else same arch only when every
+# measured row agrees, else None (generic kernel, never a guess). Every row carries `measured_by`:
+# the generator refuses a row it cannot attribute.
+#
+# Rows below are filled from the 2026-10-27 A/B (`ab-flash-decode.py`; raw JSONL appended to
+# `release/bench/flash-decode.jsonl`), not from defaults. Models: Qwen3.8-27B Q4_K_M fit2 (attention
+# rows) and Qwen3.8-27B Q3_K_M (rows row), MTP=1, `TITAN_KV_HOST=1` FP8 host KV, greedy, 96-token
+# decode, one request at a time, no prefix-cache hits.
+#
+# Why `keys` is an axis: the flash-decode decision is a function of KV depth, not of rows, so a row
+# keyed only on (quant, role, m) cannot express it.
+
+# --- decode attention -------------------------------------------------------
+# flash-decode keeps its default 1024-key threshold. Medians (tok/s), eager vs flash:
+#   1.0k:  53.96 vs 55.75     2.0k: 54.33 vs 54.05     4.1k: 47.88 vs 46.85
+#   8.2k:  38.19 vs 40.75  (+6.7%)
+#   24.8k: 25.03 vs 25.75  (+2.9%, 3 reps each)
+#   50.0k: 17.36 vs 18.37  (+5.8%, 3 reps each)
+# Run-to-run spread across process restarts is ~±8%, so only the 8k/24.8k/50k rows are worth acting
+# on; below ~1k the two are within noise and the float programs differ, so eager keeps small contexts.
+[[route.row]]
+device = "NVIDIA GeForce RTX 5080 Laptop GPU"
+arch = "sm_120"
+quant = "Q4_K"
+role = "decode_attn"
+m = "1..1"
+keys = "0..1023"
+kernel = "attn_eager"
+measured_by = "ab-flash-decode.py 2026-10-27: <=1k keys within noise; keeps the exact float program"
+
+[[route.row]]
+device = "NVIDIA GeForce RTX 5080 Laptop GPU"
+arch = "sm_120"
+quant = "Q4_K"
+role = "decode_attn"
+m = "1..1"
+keys = "1024..65536"
+kernel = "flash_decode_splitk"
+measured_by = "ab-flash-decode.py 2026-10-27: +6.7% @8.2k, +2.9% @24.8k, +5.8% @50k (3 reps)"
+
+# --- Q3_K single-row decode matvec -----------------------------------------
+# The oxide rows kernel costs the same as the nvcc twin at 1k keys and is ~3% ahead at 8k, so it
+# stays where it already was: on. One decision, one default -- the source currently disagrees with
+# itself: mistralrs-quant/src/gguf/fast_mmvq.rs defaults it ON with a recorded 27.3 -> 29.6 tok/s,
+# while mistralrs-core/src/models/quantized_qwen35_moe.rs defaults it OFF and records "no throughput
+# change (27.3 both ways)". This row is the tie-breaker measurement.
+[[route.row]]
+device = "NVIDIA GeForce RTX 5080 Laptop GPU"
+arch = "sm_120"
+quant = "Q3_K"
+role = "mmvq_decode_row"
+m = "1..1"
+keys = "0..65536"
+kernel = "mmvq_rows_q3k"
+measured_by = "ab-flash-decode.py 2026-10-27: 48.12 vs 48.27 @1k, ~+3% @8.2k (37.6 vs 36.5), +1.4% @24.8k"
+
+# --- MTP draft depth (a config route, consumed at load, not a kernel choice) --
+# Decode tok/s by draft depth, same model/settings, median of 3 at 24.8k:
+#   depth 0: 29.46 @1k  16.68 @24.8k
+#   depth 1: 54.42 @1k  25.75 @24.8k   <- what the served config uses today
+#   depth 2: 58.11 @1k  32.05 @24.8k
+#   depth 3: 59.78 @1k  32.89 @24.8k   <- best at depth
+#   depth 4: 65.31 @1k  29.50 @24.8k   <- best at short context, turns over at depth
+# The knee is the per-position acceptance ([0.96 0.32 0.19 0.04]): the 4th draft token is accepted
+# 4% of the time and no longer pays for its verify row.
+[[route.row]]
+device = "NVIDIA GeForce RTX 5080 Laptop GPU"
+arch = "sm_120"
+quant = "Q4_K"
+role = "mtp_depth"
+m = "1..1"
+keys = "0..4095"
+kernel = "mtp4"
+measured_by = "ab-flash-decode.py 2026-10-27: 65.31 vs 59.78 (mtp3) vs 58.11 (mtp2) @1k"
+
+[[route.row]]
+device = "NVIDIA GeForce RTX 5080 Laptop GPU"
+arch = "sm_120"
+quant = "Q4_K"
+role = "mtp_depth"
+m = "1..1"
+keys = "4096..65536"
+kernel = "mtp3"
+measured_by = "ab-flash-decode.py 2026-10-27: 32.89 vs 32.05 (mtp2) vs 29.50 (mtp4) vs 25.75 (mtp1) @24.8k"

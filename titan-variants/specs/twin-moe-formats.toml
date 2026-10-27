@@ -1,0 +1,67 @@
+# The CPU twin's format enum, generated from one declaration.
+#
+# Why this is the traitgen port: the GPU side enumerates one entry point per (format x variant) --
+# 34 symbols in mmvq-moe -- while the CPU twin dispatches on a runtime `Format` with `_ =>` wildcard
+# arms. Adding a format to the GPU spec therefore compiles fine on the CPU side and silently lands in
+# the wildcard, which is a *wrong float program*, not a compile error. Generating the enum and its
+# exhaustive helpers here means a new format forces every exhaustive match to be revisited first.
+#
+# `twin` also reports, per `match fmt` site in the target, which formats have a real arm and which
+# are absorbed by the wildcard, so the intent is visible instead of inferred.
+
+[twin]
+enum_name = "Format"
+check_file = "../../titan-kernels-oxide/src/cpu.rs"
+
+[[twin.variant]]
+name = "Q4K"
+doc = "block_q4_K: half2 dm, 12 scale bytes, 128 nibble bytes."
+id = 0
+prefix = "q4k"
+ftz = false
+
+[[twin.variant]]
+name = "Q5K"
+doc = "block_q5_K: half2 dm, 12 scale bytes, 32 high-bit bytes, 128 nibble bytes."
+id = 1
+prefix = "q5k"
+ftz = false
+
+[[twin.variant]]
+name = "Q6K"
+doc = "block_q6_K: 210 bytes, byte-addressed (2-byte aligned): ql, qh, int8 scales, half d."
+id = 2
+prefix = "q6k"
+ftz = false
+
+# GGML type 41: half d, 128 sign bits (bit 1 -> +d, bit 0 -> -d).
+[[twin.variant]]
+name = "Q1_0"
+doc = "GGML type 41: half d, 128 sign bits (bit 1 -> +d, bit 0 -> -d)."
+id = 3
+prefix = "q1_0"
+ftz = true
+
+# GGML type 20: half d, 32 4-bit indices into kvalues_iq4nl.
+[[twin.variant]]
+name = "IQ4NL"
+doc = "GGML type 20: half d, 32 4-bit indices into kvalues_iq4nl."
+id = 4
+prefix = "iq4_nl"
+ftz = true
+
+# GGML type 39: E8M0 e, 32 4-bit indices into kvalues_mxfp4.
+[[twin.variant]]
+name = "MXFP4"
+doc = "GGML type 39: E8M0 e, 32 4-bit indices into kvalues_mxfp4."
+id = 5
+prefix = "mxfp4"
+ftz = true
+
+# GGML type 40: 4 UE4M3 sub-block scales, 64 4-bit indices into kvalues_mxfp4.
+[[twin.variant]]
+name = "NVFP4"
+doc = "GGML type 40: 4 UE4M3 sub-block scales, 64 4-bit indices into kvalues_mxfp4."
+id = 6
+prefix = "nvfp4"
+ftz = true

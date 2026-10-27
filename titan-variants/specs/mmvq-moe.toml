@@ -1,0 +1,120 @@
+# mmvq-moe (oxide-kernels/mmvq-moe) as a spec, replacing gen_kernels.py.
+#
+# Today: mmvq-moe/gen_kernels.py hard-codes `if not ftz` inside a Python loop, writes 34 wrappers
+# between markers, and nothing checks that the emitted set matches the FMT consts the crate's
+# `moe_warp`/`b1_block` bodies actually accept. Here the same 34 entries come from axes + 3
+# constraints, and `verify` proves the region is reproduced exactly.
+#
+# What the extra structure buys (see `prune`): 42 naive combinations collapse to 34 viable ones,
+# and adding a format is one value block, not an edit to a Python branch plus the dispatch in
+# mistral.rs.
+
+# Constraints are root-level (TOML: anything after a table header belongs to that table).
+constraints = [
+  'variant.suffix != "_b1_llama" || fmt.ftz == false',
+  'variant.suffix != "_b1_sk_llama" || fmt.ftz == false',
+]
+
+[kernel]
+args = "w: *const u8, x: *const u8, ids: *const u32, slot_map: *const u32, out: *mut f32, n: u32, k: u32, k_padded: u32, topk: u32, input_dim1: u32"
+call = "(w, x, ids, slot_map, out, n, k, k_padded, topk, input_dim1)"
+name_template = "{fmt.name}_moe{variant.suffix}"
+begin = "// GENERATED KERNELS BEGIN (gen_kernels.py)"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mmvq-moe/src/main.rs"
+entry = '''
+    /// {variant.doc}
+    #[kernel]
+    #[launch_bounds({variant.bounds})]
+    pub unsafe fn {name}({args}) {{ {variant.body}{call} }}'''
+
+[[axis]]
+name = "fmt"
+
+[[axis.value]]
+name = "q4k"
+fmt_const = "FMT_Q4K"
+ftz = false
+ftz_txt = "false"
+prog = "candle's program"
+
+[[axis.value]]
+name = "q5k"
+fmt_const = "FMT_Q5K"
+ftz = false
+ftz_txt = "false"
+prog = "candle's program"
+
+[[axis.value]]
+name = "q6k"
+fmt_const = "FMT_Q6K"
+ftz = false
+ftz_txt = "false"
+prog = "candle's program"
+
+[[axis.value]]
+name = "q1_0"
+fmt_const = "FMT_Q1_0"
+ftz = true
+ftz_txt = "true"
+prog = "llama.cpp b1 program"
+
+[[axis.value]]
+name = "iq4_nl"
+fmt_const = "FMT_IQ4_NL"
+ftz = true
+ftz_txt = "true"
+prog = "llama.cpp b1 program"
+
+[[axis.value]]
+name = "mxfp4"
+fmt_const = "FMT_MXFP4"
+ftz = true
+ftz_txt = "true"
+prog = "llama.cpp b1 program"
+
+[[axis.value]]
+name = "nvfp4"
+fmt_const = "FMT_NVFP4"
+ftz = true
+ftz_txt = "true"
+prog = "llama.cpp b1 program"
+
+[[axis]]
+name = "variant"
+
+[[axis.value]]
+suffix = "_mmvq"
+bounds = 256
+body = "moe_warp::<{fmt.fmt_const}, {fmt.ftz_txt}, 4>"
+doc = "{fmt.name}: MoE grid, each column reduced as titan's b1 GEMV ({fmt.prog}). Service kernel, b = 2..8."
+
+[[axis.value]]
+suffix = "_mmvq_llama"
+bounds = 256
+body = "moe_warp::<{fmt.fmt_const}, true, 1>"
+doc = "{fmt.name}: llama.cpp mul_mat_vec_q_moe<type, 2, false> float program (gated against it)."
+
+[[axis.value]]
+suffix = "_b1"
+bounds = 128
+body = "b1_block::<{fmt.fmt_const}, {fmt.ftz_txt}, 1>"
+doc = "{fmt.name}: llama.cpp b1 MUL_MAT_ID grid, rpb 1 ({fmt.prog}). Service kernel, b = 1."
+
+[[axis.value]]
+suffix = "_b1_sk"
+bounds = 128
+body = "b1_block::<{fmt.fmt_const}, {fmt.ftz_txt}, 4>"
+doc = "{fmt.name}: llama.cpp b1 MUL_MAT_ID grid, small_k (rpb 4) ({fmt.prog}). Service kernel, b = 1."
+
+[[axis.value]]
+suffix = "_b1_llama"
+bounds = 128
+body = "b1_block::<{fmt.fmt_const}, true, 1>"
+doc = "{fmt.name}: llama.cpp mul_mat_vec_q<type, 1, false, false> float program (gated against it)."
+
+[[axis.value]]
+suffix = "_b1_sk_llama"
+bounds = 128
+body = "b1_block::<{fmt.fmt_const}, true, 4>"
+doc = "{fmt.name}: llama.cpp mul_mat_vec_q<type, 1, false, true> float program (gated against it)."

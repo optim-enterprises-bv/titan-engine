@@ -116,20 +116,12 @@ fn dp4a(a: u32, b: u32, c: i32) -> i32 {
     s
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Format {
-    Q4K,
-    Q5K,
-    Q6K,
-    /// GGML type 41: half d, 128 sign bits (bit 1 -> +d, bit 0 -> -d).
-    Q1_0,
-    /// GGML type 20: half d, 32 4-bit indices into kvalues_iq4nl.
-    IQ4NL,
-    /// GGML type 39: E8M0 e, 32 4-bit indices into kvalues_mxfp4.
-    MXFP4,
-    /// GGML type 40: 4 UE4M3 sub-block scales, 64 4-bit indices into kvalues_mxfp4.
-    NVFP4,
-}
+// The format enum is generated from `titan-variants/specs/twin-moe-formats.toml` so that adding a
+// format breaks every exhaustive `match` here and in `main.rs` before it can silently fall into a
+// `_ =>` wildcard arm (which is a wrong float program, not a compile error). Regenerate with
+// `titan-variants twin specs/twin-moe-formats.toml > titan-kernels-oxide/src/format_gen.rs`;
+// build.rs fails the build if this file and the spec disagree.
+include!("format_gen.rs");
 
 impl Format {
     pub fn block_bytes(self) -> usize {
