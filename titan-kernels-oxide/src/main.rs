@@ -1149,7 +1149,13 @@ fn main() {
             if std::env::var("TITAN_GATE_LLAMA_REF").is_ok() {
                 all_ok &= llama_gate(&spec, &ctx, &stream, &oxide, &mut per_fmt, &mut total, &mut cpu_total);
             } else {
-                println!("== {} gate: SKIPPED (set TITAN_GATE_LLAMA_REF=<libggml-cuda.so from llama.cpp acecd56> to run it)", spec.name);
+                println!(
+                    "== {} gate: SKIPPED -- needs llama.cpp acecd56032ddc (tag b10934); the sm_120 image of that \
+                     build does not execute this kernel from an external harness (loads, resolves, launches, writes \
+                     nothing; PDL launch attribute rejected with CUDA_ERROR_INVALID_VALUE). Set \
+                     TITAN_GATE_LLAMA_REF=1 with reference cubins staged to try anyway.",
+                    spec.name
+                );
                 skipped.push(spec.name);
             }
         }
@@ -1188,13 +1194,49 @@ fn fastdiv_values(d: u32) -> [u32; 3] {
 }
 
 /// Launch from a packed parameter buffer (CU_LAUNCH_PARAM_BUFFER_POINTER) on the null stream.
-unsafe fn launch_packed(f: cuda_core::sys::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), params: &mut Vec<u8>) {
+unsafe fn launch_packed(f: cuda_core::sys::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), params: &mut Vec<u8>, stream: cuda_core::sys::CUstream) {
     use cuda_core::sys as cu;
     let mut size = params.len();
     let mut extra: [*mut c_void; 5] =
         [1 as *mut c_void, params.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];
+
+    // llama.cpp's mmvq kernels call `ggml_cuda_pdl_sync()` (cudaGridDependencySynchronize) before
+    // reading their activations. A plain cuLaunchKernel leaves that dependency unsatisfied, and on
+    // SM120 the kernel then completes without writing anything -- every output reads back as zero.
+    // Launching with PROGRAMMATIC_STREAM_SERIALIZATION satisfies it. GATE_PDL=0 restores the plain
+    // launch for comparison.
+    if std::env::var("GATE_PDL").map_or(true, |v| v != "0") {
+        // CUlaunchAttribute must be at least 8-byte aligned or the driver rejects the config.
+        #[repr(align(16))]
+        struct AttrBuf([u8; 64]);
+        let mut attr_owned = AttrBuf([0u8; 64]);
+        let attr = attr_owned.0.as_mut_ptr();
+        (attr as *mut u32)
+            .write(cu::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION);
+        (attr.add(8) as *mut u32).write(1);
+        let cfg = cu::CUlaunchConfig_st {
+            gridDimX: grid.0,
+            gridDimY: grid.1,
+            gridDimZ: grid.2,
+            blockDimX: block.0,
+            blockDimY: block.1,
+            blockDimZ: block.2,
+            sharedMemBytes: 0,
+            hStream: stream,
+            attrs: attr as *mut _,
+            numAttrs: 1,
+        };
+        let r = cu::cuLaunchKernelEx(&cfg, f, extra.as_mut_ptr(), std::ptr::null_mut());
+        if r == cu::cudaError_enum_CUDA_SUCCESS {
+            return;
+        }
+        if std::env::var("GATE_PDL").is_ok() {
+            println!("   [dbg] launchEx(pdl) rejected: rc={:?}", r);
+        }
+    }
+
     let r = unsafe {
-        cu::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr())
+        cu::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, stream, std::ptr::null_mut(), extra.as_mut_ptr())
     };
     assert_eq!(r, cu::cudaError_enum_CUDA_SUCCESS, "launch");
 }
@@ -1357,7 +1399,7 @@ fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::
                             put(&mut p, v);
                         }
                         assert_eq!(p.len(), 160);
-                        launch_packed(rf, (c.n as u32, topk as u32, 1), (32, 4, 1), &mut p);
+                        launch_packed(rf, (c.n as u32, topk as u32, 1), (32, 4, 1), &mut p, stream.cu_stream());
                     }
                     assert_eq!(cu::cuCtxSynchronize(), cu::cudaError_enum_CUDA_SUCCESS);
                     let (mut pwo, mut wl) = (w_ox.cu_deviceptr(), slotted.len() as u64);
@@ -1373,6 +1415,12 @@ fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::
                 }
                 stream.synchronize().unwrap();
                 let (a, b) = (out_ref.to_host_vec(stream).unwrap(), out_ox.to_host_vec(stream).unwrap());
+                if std::env::var("GATE_DEBUG").is_ok() {
+                    let nzr = a.iter().filter(|v| **v != 0.0).count();
+                    let nzo = b.iter().filter(|v| **v != 0.0).count();
+                    println!("   [dbg] {} batch={batch} topk={topk} input_dim1={input_dim1} seed={seed}: ref_nz={nzr}/{} ox_nz={nzo}/{} ref[0..4]={:?} ox[0..4]={:?}",
+                        c.tensor, a.len(), b.len(), &a[..4.min(a.len())], &b[..4.min(b.len())]);
+                }
                 let diff = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
                 let nonzero = a.iter().filter(|v| **v != 0.0).count();
                 let nan = a.iter().filter(|v| v.is_nan()).count();
