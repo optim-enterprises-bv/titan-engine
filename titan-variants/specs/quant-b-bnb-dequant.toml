@@ -1,0 +1,38 @@
+# bitsandbytes block dequant: dtype x codebook (int8 / fp4 / nf4).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "bnb_dequant_{t.name}_{k.dn}"
+entry = '''    #[kernel] pub unsafe fn {name}(code: *const f32, a: *const u8, absmax: *const f32, out: *mut {t.ty}, blocksize: i32, n: i32) {{ bnb_dequant::<{t.ty}, {k.dt}>(code, a, absmax, out, blocksize, n) }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "k"
+
+[[axis.value]]
+dn = "int8"
+dt = 0
+
+[[axis.value]]
+dn = "fp4"
+dt = 1
+
+[[axis.value]]
+dn = "nf4"
+dt = 2

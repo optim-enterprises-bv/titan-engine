@@ -1,0 +1,50 @@
+# AFQ quantize (2/4/8-bit only: 3 and 6 bit pack to bytes, so they have no quantizer).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "afq_quantize_{b.value}bit_gs{g.value}_{t.name}"
+entry = '''    #[kernel] pub unsafe fn {name}(w: *const {t.ty}, w_q: *mut u32, scales: *mut {t.ty}, biases: *mut {t.ty}, rows: i32, cols: i32) {{ afq_quantize::<{t.ty}, {b.value}, {g.value}>(w, w_q, scales, biases, rows, cols) }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+wq = "*const u32"
+
+[[axis.value]]
+value = 4
+wq = "*const u32"
+
+[[axis.value]]
+value = 8
+wq = "*const u32"
+
+[[axis]]
+name = "g"
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 128

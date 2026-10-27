@@ -1,0 +1,56 @@
+# FP8 elementwise/vector/blockwise convert and scale, one entry per (dtype, shape).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "{o.nm}"
+entry = '''    #[kernel] pub unsafe fn {o.nm}({o.p}) {{ {o.b} }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "o"
+
+[[axis.value]]
+nm = "fp8_to_{t.name}"
+p = "input: *const u8, output: *mut {t.ty}, n: usize"
+b = "fp8_to_dtype(input, output, n)"
+
+[[axis.value]]
+nm = "{t.name}_to_fp8"
+p = "input: *const {t.ty}, output: *mut u8, n: usize"
+b = "dtype_to_fp8(input, output, n)"
+
+[[axis.value]]
+nm = "dequant_fp8_vector_{t.name}"
+p = "weight: *const u8, scale: *const f32, output: *mut {t.ty}, n: usize"
+b = "dequant_fp8_vector(weight, scale, output, n)"
+
+[[axis.value]]
+nm = "quant_fp8_vector_{t.name}"
+p = "input: *const {t.ty}, weight: *mut u8, scale: *mut f32, n: usize"
+b = "quant_fp8_vector(input, weight, scale, n)"
+
+[[axis.value]]
+nm = "dequant_fp8_blockwise_{t.name}"
+p = "weight: *const u8, scale: *const f32, output: *mut {t.ty}, h: i32, w: i32, rs: i32, ss: i32, by: i32, bx: i32"
+b = "dequant_fp8_blockwise(weight, scale, output, h, w, rs, ss, by, bx)"
+
+[[axis.value]]
+nm = "quant_fp8_blockwise_{t.name}"
+p = "input: *const {t.ty}, weight: *mut u8, scale: *mut f32, h: i32, w: i32, rs: i32, ss: i32, by: i32, bx: i32"
+b = "quant_fp8_blockwise(input, weight, scale, h, w, rs, ss, by, bx)"

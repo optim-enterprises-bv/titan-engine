@@ -1,0 +1,58 @@
+# AFQ dequantize: dtype x bits x group size. w_q is u8 for 3/6-bit (packed byte stream), u32 otherwise.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "afq_dequantize_{b.value}bit_gs{g.value}_{t.name}"
+entry = '''    #[kernel] pub unsafe fn {name}(w_q: {b.wq}, scales: *const {t.ty}, biases: *const {t.ty}, output: *mut {t.ty}, rows: i32, cols: i32) {{ afq_dequant::<{t.ty}, {b.value}, {g.value}>(w_q as *const u8, scales, biases, output, rows, cols) }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+wq = "*const u32"
+
+[[axis.value]]
+value = 3
+wq = "*const u8"
+
+[[axis.value]]
+value = 4
+wq = "*const u32"
+
+[[axis.value]]
+value = 6
+wq = "*const u8"
+
+[[axis.value]]
+value = 8
+wq = "*const u32"
+
+[[axis]]
+name = "g"
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 128

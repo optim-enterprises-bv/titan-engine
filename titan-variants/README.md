@@ -20,7 +20,7 @@ titan-variants route  <spec>   # emit route()/RouteRow from [[route.row]] entrie
 ```
 
 `verify` is the point: a spec is only accepted once it reproduces a crate's existing generated region
-byte for byte. Verified crates (9 / 2243 entry points):
+byte for byte. Verified crates (11 / 2681 entry points):
 
 ```
 specs/candle-mmvq.toml                                  240 entries, 0 diffs
@@ -29,6 +29,8 @@ specs/candle-mmq-mulmatq.toml + candle-mmq-fixup.toml   264 entries, 0 diffs  (t
 specs/q1_0-{mmvq,mmq,fixup}.toml                          59 entries, 0 diffs  (three families)
 specs/ptq1_0-{mmvq,mmq,fixup}.toml                        44 entries, 0 diffs  (three families)
 specs/gemm-*.toml (7 families)                          114 entries, 0 diffs  (interleaved order)
+specs/quant-b-*.toml (14 families)                      240 entries, 0 diffs  (five ABIs, 14 shapes)
+specs/quant-b-marlin{,-repack,-repack-awq}.toml         198 entries, 0 diffs  (sibling crate)
 specs/fmt_mmq-{mulmatq,fixup}.toml                      132 entries, 0 diffs  (96 naive -> 66 viable)
 specs/quant-c-*.toml (7 families)                      1002 entries, 0 diffs  (largest region)
 specs/pa-a-{pa1,pa2,pa2r}.toml + pa-a-{fas,fasv}.toml   354 entries, 0 diffs  (two regions)

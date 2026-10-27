@@ -1,0 +1,52 @@
+# MXFP4 (E2M1 + E8M0 block scale) matvec/matmul/MoE, half dtypes only.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "{o.nm}"
+entry = '''    #[kernel] pub unsafe fn {o.nm}({o.p}) {{ {o.b} }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "o"
+
+[[axis.value]]
+nm = "mxfp4_vecmat_{t.name}"
+p = "input: *const {t.ty}, weight: *const u8, ws: *const u8, bias: *const {t.ty}, output: *mut {t.ty}, m: i32, n: i32, kk: i32, has_bias: u8"
+b = "mxfp4_vecmat(input, weight, ws, bias, output, m, n, kk, has_bias)"
+
+[[axis.value]]
+nm = "mxfp4_matmul_tiled_{t.name}"
+p = "input: *const {t.ty}, weight: *const u8, ws: *const u8, bias: *const {t.ty}, output: *mut {t.ty}, m: i32, n: i32, kk: i32, has_bias: u8"
+b = "mxfp4_matmul_tiled(input, weight, ws, bias, output, m, n, kk, has_bias)"
+
+[[axis.value]]
+nm = "mxfp4_moe_gemm_{t.name}"
+p = "input: *const {t.ty}, weights: *const u8, ws: *const u8, biases: *const {t.ty}, indices: *const u32, output: *mut {t.ty}, nt: i32, topk: i32, ne: i32, n: i32, kk: i32, has_bias: u8, has_topk: u8"
+b = "mxfp4_moe_gemm(input, weights, ws, biases, indices, output, nt, topk, ne, n, kk, has_bias, has_topk)"
+
+[[axis.value]]
+nm = "mxfp4_moe_grouped_tiled_{t.name}"
+p = "input: *const {t.ty}, weights: *const u8, ws: *const u8, biases: *const {t.ty}, indices: *const u32, output: *mut {t.ty}, nt: i32, topk: i32, ne: i32, n: i32, kk: i32, has_bias: u8, has_topk: u8"
+b = "mxfp4_moe_grouped_tiled(input, weights, ws, biases, indices, output, nt, topk, ne, n, kk, has_bias, has_topk)"
+
+[[axis.value]]
+nm = "mxfp4_matmul_wmma_{t.name}"
+p = "input: *const {t.ty}, weight: *const u8, ws: *const u8, bias: *const {t.ty}, output: *mut {t.ty}, m: i32, n: i32, kk: i32, has_bias: u8"
+b = "mxfp4_matmul_wmma(input, weight, ws, bias, output, m, n, kk, has_bias)"
+
+[[axis.value]]
+nm = "mxfp4_moe_grouped_wmma_{t.name}"
+p = "input: *const {t.ty}, weights: *const u8, ws: *const u8, biases: *const {t.ty}, indices: *const u32, output: *mut {t.ty}, nt: i32, topk: i32, ne: i32, n: i32, kk: i32, has_bias: u8, has_topk: u8"
+b = "mxfp4_moe_grouped_wmma(input, weights, ws, biases, indices, output, nt, topk, ne, n, kk, has_bias, has_topk)"

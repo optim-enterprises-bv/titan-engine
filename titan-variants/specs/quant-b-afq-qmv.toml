@@ -1,0 +1,58 @@
+# AFQ quantized mat-vec: dtype x bits x group size.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "afq_qmv_{b.value}bit_gs{g.value}_{t.name}"
+entry = '''    #[kernel] pub unsafe fn {name}(x: *const {t.ty}, w_q: {b.wq}, scales: *const {t.ty}, biases: *const {t.ty}, y: *mut {t.ty}, m: i32, n: i32, kk: i32) {{ afq_qmv::<{t.ty}, {b.value}, {g.value}>(x, w_q as *const u8, scales, biases, y, m, n, kk) }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+wq = "*const u32"
+
+[[axis.value]]
+value = 3
+wq = "*const u8"
+
+[[axis.value]]
+value = 4
+wq = "*const u32"
+
+[[axis.value]]
+value = 6
+wq = "*const u8"
+
+[[axis.value]]
+value = 8
+wq = "*const u32"
+
+[[axis]]
+name = "g"
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 128

@@ -1,0 +1,23 @@
+# GPTQ in-place q_perm shuffle.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "gptq_shuffle_{b.value}bit"
+entry = '''    #[kernel] pub unsafe fn {name}(bq: *mut u32, size_k: i32, size_n: i32) {{ gptq_shuffle::<{b.value}>(bq, size_k, size_n) }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8

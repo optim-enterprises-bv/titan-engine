@@ -1,0 +1,83 @@
+# Marlin GEMM: quant type (gptq/awq) x dtype x thread-block config x m-block x group size (m1 = no groups).
+
+[kernel]
+begin = "    // GENERATED KERNELS BEGIN"
+end = "    // GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/marlin-kernels/src/main.rs"
+name_template = "marlin_{q.name}_{t.name}_t{c.th}_m{mb.value}_n{c.nb}_k{c.kb}_g{gb.gn}"
+entry = '''    #[kernel] pub unsafe fn {name}(a: *const [u32; 4], b: *const [u32; 4], c: *mut [u32; 4], s: *const [u32; 4], zp: *const [u32; 4], g_idx: *const i32, m: i32, n: i32, kk: i32, num_groups: i32, locks: *mut i32) {{ let _ = g_idx; marlin::<{t.ty}, {c.th}, {mb.value}, {c.nb}, {c.kb}, {gb.val}, {q.zp}>(a, b, c, s, zp, m, n, kk, num_groups, locks) }}'''
+
+[[axis]]
+name = "q"
+
+[[axis.value]]
+name = "gptq"
+zp = "false"
+
+[[axis.value]]
+name = "awq"
+zp = "true"
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "c"
+
+[[axis.value]]
+th = 256
+nb = 8
+kb = 8
+
+[[axis.value]]
+th = 256
+nb = 16
+kb = 4
+
+[[axis.value]]
+th = 128
+nb = 8
+kb = 4
+
+[[axis.value]]
+th = 128
+nb = 4
+kb = 8
+
+[[axis]]
+name = "mb"
+
+[[axis.value]]
+value = 1
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis]]
+name = "gb"
+
+[[axis.value]]
+gn = "m1"
+val = -1
+
+[[axis.value]]
+gn = "4"
+val = 4
+
+[[axis.value]]
+gn = "8"
+val = 8

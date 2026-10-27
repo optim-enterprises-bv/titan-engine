@@ -1,0 +1,27 @@
+# GPTQ sequential-weight permutation. 3-bit is a single non-templated entry (`make_sequential_3`).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "make_sequential_{b.sfx}"
+entry = '''    #[kernel] pub unsafe fn {name}(w: *const u32, w_new: *mut u32, q_perm: *const i32, w_width: i32) {{ {b.body} }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+sfx = "3bit"
+body = "make_sequential_3(w, w_new, q_perm, w_width)"
+
+[[axis.value]]
+sfx = "2bit"
+body = "make_sequential::<2>(w, w_new, q_perm, w_width)"
+
+[[axis.value]]
+sfx = "4bit"
+body = "make_sequential::<4>(w, w_new, q_perm, w_width)"
+
+[[axis.value]]
+sfx = "8bit"
+body = "make_sequential::<8>(w, w_new, q_perm, w_width)"

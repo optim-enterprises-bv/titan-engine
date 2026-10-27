@@ -1,0 +1,17 @@
+# AWQ Marlin repack (no permutation, null perm pointer).
+
+[kernel]
+begin = "    // GENERATED KERNELS BEGIN"
+end = "    // GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/marlin-kernels/src/main.rs"
+name_template = "awq_marlin_repack_{bits.value}"
+entry = '''    #[kernel] pub unsafe fn {name}(w: *const u32, out: *mut u32, size_k: i32, size_n: i32) {{ marlin_repack::<{bits.value}, false, true>(w, core::ptr::null(), out, size_k, size_n) }}'''
+
+[[axis]]
+name = "bits"
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8

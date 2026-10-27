@@ -1,0 +1,23 @@
+# GPTQ gptq-layout weight reconstruct.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "reconstruct_gptq_{b.value}bit"
+entry = '''    #[kernel] pub unsafe fn {name}(w: *const u32, sc: *const u16, qz: *const u32, g_idx: *const i32, height: i32, width: i32, group: i32, out: *mut u16) {{ reconstruct_gptq::<{b.value}>(w, sc, qz, g_idx, height, width, group, out) }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8

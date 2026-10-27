@@ -1,0 +1,32 @@
+# FP8 tiled matmul and MoE grouped GEMM: f16/bf16 only, no f32 accumulate entry.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "{o.nm}"
+entry = '''    #[kernel] pub unsafe fn {o.nm}({o.p}) {{ {o.b} }}'''
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "o"
+
+[[axis.value]]
+nm = "fp8_matmul_{t.name}"
+p = "input: *const {t.ty}, weight: *const u8, ws: *const f32, output: *mut {t.ty}, m: i32, n: i32, kk: i32, srs: i32, by: i32, bx: i32"
+b = "fp8_matmul_tiled(input, weight, ws, output, m, n, kk, srs, by, bx)"
+
+[[axis.value]]
+nm = "fp8_moe_gemm_{t.name}"
+p = "input: *const {t.ty}, weights: *const u8, ws: *const f32, indices: *const u32, output: *mut {t.ty}, nt: i32, topk: i32, ne: i32, n: i32, kk: i32, srs: i32, by: i32, bx: i32, has_topk: u8"
+b = "fp8_moe_gemm(input, weights, ws, indices, output, nt, topk, ne, n, kk, srs, by, bx, has_topk)"
