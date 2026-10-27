@@ -13,7 +13,7 @@ rm -rf "$OUT"*
   --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,launch__block_size,launch__registers_per_thread \
   --launch-count 400 \
   -o "$OUT" \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m models-optim -f optim-Q3_K_M.gguf -n 0:64 >/tmp/ncu.log 2>&1 &
 NPID=$!

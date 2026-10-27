@@ -19,7 +19,7 @@ sudo -n env TITAN_MTP=1 TITAN_GDN_DIRECT=1 \
   --metrics gpu__time_duration.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,launch__block_size \
   --launch-count 40 --kill yes \
   -f -o /tmp/rowsq \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m /home/dingo/src/titan-engine/models-optim \
   -f Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q3_K_M.gguf -n 0:65 \

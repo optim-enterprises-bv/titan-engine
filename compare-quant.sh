@@ -5,7 +5,7 @@ source "$REPO/bench-lib.sh"
 # `--format gguf` wants -m <dir> -f <file>, and Q4_K_M (16.81 GB) does not fit the 16 GB card,
 # so its tail layers go to CPU via -n 0:N.
 set -u
-BIN=/home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs
+BIN=${TITAN_BIN:-/usr/local/bin/mistralrs}
 run() { # label file layers ctx
   local label=$1 file=$2 layers=$3 ctx=$4
   local dir name

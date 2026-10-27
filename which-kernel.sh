@@ -7,7 +7,7 @@ pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 4
 export TITAN_MTP=0 TITAN_Q3K_ROWS=1
 rm -rf /tmp/wk.nsys-rep /tmp/wk.sqlite
 nsys profile -f true --trace=cuda -o /tmp/wk --sample=none \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m models-optim -f optim-Q3_K_M.gguf -n 0:64 >/tmp/wk.log 2>&1 &
 NPID=$!

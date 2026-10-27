@@ -7,7 +7,7 @@ sudo -n pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 5
 export TITAN_MTP=1
 rm -rf /tmp/vk.nsys-rep /tmp/vk.sqlite
 nsys profile -f true --trace=cuda -o /tmp/vk --sample=none \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m /home/dingo/src/titan-engine/models-optim \
   -f Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q3_K_M.gguf -n 0:65 >/tmp/vk.log 2>&1 &

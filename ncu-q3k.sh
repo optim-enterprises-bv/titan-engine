@@ -19,7 +19,7 @@ sudo -n env TITAN_MTP=0 TITAN_GDN_DIRECT=1 \
   --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size \
   --launch-count 24 --kill yes \
   -f -o /tmp/ncu-q3k \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m /home/dingo/src/titan-engine/models-optim -f optim-Q3_K_M.gguf -n 0:64 \
   > /tmp/ncu-q3k.log 2>&1 &

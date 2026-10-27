@@ -9,7 +9,7 @@ export TITAN_MTP=0 TITAN_GDN_DIRECT=1
 OUT=/tmp/titan-dec
 rm -rf ${OUT}.nsys-rep ${OUT}.sqlite
 nsys profile -f true --trace=cuda -o "$OUT" --sample=none \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 65536 --format gguf \
   -m models-optim -f optim-Q3_K_M.gguf -n 0:64 >/tmp/titan-nsys.log 2>&1 &
 NPID=$!
