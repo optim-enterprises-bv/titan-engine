@@ -108,6 +108,15 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
 
     let empty = toml::value::Table::new();
     let k = table.get("kernel").and_then(|v| v.as_table()).unwrap_or(&empty);
+    const KERNEL_KEYS: [&str; 7] = ["args", "call", "entry", "name_template", "begin", "end", "target"];
+    for key in k.keys() {
+        if !KERNEL_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown key `{key}` under [kernel] -- constraints and route rows are root-level \
+                 (TOML: anything after a table header belongs to that table)"
+            ));
+        }
+    }
     if !k.is_empty() && !k.contains_key("name_template") {
         return Err("missing kernel.name_template".into());
     }
