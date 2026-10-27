@@ -11,6 +11,11 @@
 
 [twin]
 enum_name = "Format"
+# Q4_K / Q5_K have no hand-written accumulator: they intentionally use the generic `dot()` path where
+# the twin's match falls through to `_ =>`. Declaring them here keeps the coverage report honest --
+# anything else absorbed by a wildcard is reported as UNEXPECTED, i.e. a format that would silently
+# compute the wrong float program.
+generic_path = ["Q4K", "Q5K"]
 check_file = "../../titan-kernels-oxide/src/cpu.rs"
 
 [[twin.variant]]

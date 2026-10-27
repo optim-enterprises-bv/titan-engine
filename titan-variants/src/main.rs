@@ -41,19 +41,19 @@ impl Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AxisValue {
     /// flattened `axis.field` -> value, plus `axis.name`
     fields: BTreeMap<String, Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Axis {
     name: String,
     values: Vec<AxisValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Kernel {
     args: String,
     call: String,
@@ -64,7 +64,7 @@ struct Kernel {
     target: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RouteRow {
     device: String,
     arch: String,
@@ -76,7 +76,7 @@ struct RouteRow {
     measured_by: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TwinVariant {
     name: String,
     id: u32,
@@ -85,13 +85,15 @@ struct TwinVariant {
     doc: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Twin {
     enum_name: String,
     check_file: Option<String>,
+    /// Formats that intentionally take the generic `dot()` fallback at wildcard sites.
+    generic_path: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Spec {
     kernel: Kernel,
     axes: Vec<Axis>,
@@ -180,6 +182,11 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
     if let Some(t) = table.get("twin").and_then(|v| v.as_table()) {
         let enum_name = t.get("enum_name").and_then(|v| v.as_str()).unwrap_or("Format").to_owned();
         let check_file = t.get("check_file").and_then(|v| v.as_str()).map(str::to_owned);
+        let generic_path = t
+            .get("generic_path")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
         let mut vars: Vec<TwinVariant> = Vec::new();
         if let Some(arr) = t.get("variant").and_then(|v| v.as_array()) {
             for v in arr {
@@ -198,7 +205,7 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
                 });
             }
         }
-        twin = Some((Twin { enum_name, check_file }, vars));
+        twin = Some((Twin { enum_name, check_file, generic_path }, vars));
     }
 
     Ok(Spec { kernel, axes, constraints, routes, twin })
@@ -633,7 +640,7 @@ fn emit_twin(e: &str, vars: &[TwinVariant], spec_hash: u64) -> String {
 
 /// Text check of the hand-written CPU twin: which formats have an explicit arm at each
 /// `match fmt {` site, and which are silently absorbed by a `_ =>` wildcard.
-fn check_twin(path: &str, e: &str, vars: &[TwinVariant]) -> Result<(), String> {
+fn check_twin(path: &str, e: &str, vars: &[TwinVariant], generic_path: &[String]) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let lines: Vec<&str> = text.lines().collect();
     let mut sites: Vec<(usize, Vec<String>, bool)> = Vec::new(); // (line, arms, has_wildcard)
@@ -674,7 +681,20 @@ fn check_twin(path: &str, e: &str, vars: &[TwinVariant]) -> Result<(), String> {
             if *wildcard { ", `_ =>` wildcard present" } else { ", NO wildcard (exhaustive)" }
         );
         if !absorbed.is_empty() {
-            eprintln!("           absorbed by the wildcard: {}", absorbed.join(", "));
+            let (declared, unexpected): (Vec<&str>, Vec<&str>) =
+                absorbed.iter().partition(|n| generic_path.iter().any(|g| g == *n));
+            if !declared.is_empty() {
+                eprintln!(
+                    "           absorbed by the wildcard, declared generic-path: {}",
+                    declared.join(", ")
+                );
+            }
+            if !unexpected.is_empty() {
+                eprintln!(
+                    "           absorbed by the wildcard, UNEXPECTED (a new format lands here silently): {}",
+                    unexpected.join(", ")
+                );
+            }
         }
     }
     let unreferenced: Vec<&str> = vars
@@ -683,6 +703,14 @@ fn check_twin(path: &str, e: &str, vars: &[TwinVariant]) -> Result<(), String> {
         .filter(|n| !text.contains(&format!("{e}::{n}")))
         .collect();
     eprintln!("  formats not referenced anywhere in the file: {}", if unreferenced.is_empty() { "none".to_string() } else { unreferenced.join(", ") });
+    let absent: Vec<&str> = generic_path
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !vars.iter().any(|v| v.name == *g))
+        .collect();
+    if !absent.is_empty() {
+        eprintln!("  WARNING: generic_path names formats the spec does not declare: {}", absent.join(", "));
+    }
     Ok(())
 }
 
@@ -696,13 +724,26 @@ fn region_text(path: &str, begin: &str, end: &str) -> Result<String, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().ok_or("usage: titan-variants <gen|verify|prune|route> <spec.toml>")?;
-    let path = args.next().ok_or("missing spec path")?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-    let spec = parse_spec(&text)?;
-    for c in &spec.constraints {
-        validate_expr(c)?;
+    let mode = args.next().ok_or("usage: titan-variants <gen|verify|prune|twin|route> <spec.toml>...")?;
+    let paths: Vec<String> = args.collect();
+    if paths.is_empty() {
+        return Err("missing spec path".into());
     }
+    // One region can be built from several families (e.g. `mmq` + `fixup`), concatenated in the
+    // order the specs are given.
+    let mut specs = Vec::new();
+    for path in &paths {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let spec = parse_spec(&text)?;
+        for c in &spec.constraints {
+            validate_expr(c)?;
+        }
+        specs.push((path.clone(), text, spec));
+    }
+    let (path, text, spec) = {
+        let (p, t, s) = specs.first().cloned().map(|(p, t, s)| (p, t, s)).ok_or("no specs")?;
+        (p, t, s)
+    };
 
     if matches!(mode.as_str(), "gen" | "verify" | "prune")
         && (spec.kernel.name_template.is_empty() || spec.kernel.entry.is_empty() || spec.axes.is_empty())
@@ -713,16 +754,19 @@ fn main() -> Result<(), String> {
     match mode.as_str() {
         "gen" => {
             let mut out = String::new();
-            for combo in viable(&spec) {
-                let name = name_of(&spec, &combo);
-                out.push_str(&render_entry(&spec, &combo, &name));
-                out.push('\n');
+            for (_, _, fam) in &specs {
+                for combo in viable(fam) {
+                    let name = name_of(fam, &combo);
+                    out.push_str(&render_entry(fam, &combo, &name));
+                    out.push('\n');
+                }
             }
             print!("{out}");
         }
-        "prune" => {
+        "prune" => for (path, _t, spec) in &specs {
             let naive: usize = spec.axes.iter().map(|a| a.values.len()).product();
-            let combinations = viable(&spec).len();
+            let combinations = viable(spec).len();
+            println!("spec:        {path}");
             let axes: Vec<String> =
                 spec.axes.iter().map(|a| format!("{}={}", a.name, a.values.len())).collect();
             println!("axes:        {}", axes.join(" x "));
@@ -732,7 +776,8 @@ fn main() -> Result<(), String> {
             for c in &spec.constraints {
                 println!("constraint:  {c}");
             }
-        }
+            println!();
+        },
         "verify" => {
             let target = spec.kernel.target.clone().ok_or("spec has no kernel.target")?;
             let target = if std::path::Path::new(&target).is_absolute() {
@@ -742,7 +787,10 @@ fn main() -> Result<(), String> {
                 specdir.join(&target).to_string_lossy().into_owned()
             };
             let existing = region_names(&target, &spec.kernel.begin, &spec.kernel.end)?;
-            let generated: Vec<String> = viable(&spec).iter().map(|c| name_of(&spec, c)).collect();
+            let mut generated: Vec<String> = Vec::new();
+            for (_, _, fam) in &specs {
+                generated.extend(viable(fam).iter().map(|c| name_of(fam, c)));
+            }
             let existing_set: std::collections::BTreeSet<&String> = existing.iter().collect();
             let generated_set: std::collections::BTreeSet<&String> = generated.iter().collect();
             let missing: Vec<_> = existing_set.difference(&generated_set).collect();
@@ -759,11 +807,13 @@ fn main() -> Result<(), String> {
                 println!("   + {e}");
             }
             let existing_text = region_text(&target, &spec.kernel.begin, &spec.kernel.end)?;
-            let generated_text: String = viable(&spec)
-                .iter()
-                .map(|c| render_entry(&spec, c, &name_of(&spec, c)))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut parts: Vec<String> = Vec::new();
+            for (_, _, fam) in &specs {
+                for c in viable(fam) {
+                    parts.push(render_entry(fam, &c, &name_of(fam, &c)));
+                }
+            }
+            let generated_text: String = parts.join("\n");
             let norm = |t: &str| -> Vec<String> {
                 t.lines().map(|l| l.trim_end().to_string()).filter(|l| !l.trim().is_empty()).collect()
             };
@@ -801,7 +851,7 @@ fn main() -> Result<(), String> {
                     let specdir = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("."));
                     specdir.join(file).to_string_lossy().into_owned()
                 };
-                check_twin(&path, &twin.enum_name, vars)?;
+                check_twin(&path, &twin.enum_name, vars, &twin.generic_path)?;
             }
         }
         "route" => {
