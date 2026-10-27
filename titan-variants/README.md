@@ -29,11 +29,22 @@ specs/candle-mmq-mulmatq.toml + candle-mmq-fixup.toml   264 entries, 0 diffs  (t
 specs/q1_0-{mmvq,mmq,fixup}.toml                          59 entries, 0 diffs  (three families)
 specs/ptq1_0-{mmvq,mmq,fixup}.toml                        44 entries, 0 diffs  (three families)
 specs/gemm-*.toml (7 families)                          114 entries, 0 diffs  (interleaved order)
-specs/quant-b-*.toml (14 families)                      240 entries, 0 diffs  (five ABIs, 14 shapes)
-specs/quant-b-marlin{,-repack,-repack-awq}.toml         198 entries, 0 diffs  (sibling crate)
 specs/fmt_mmq-{mulmatq,fixup}.toml                      132 entries, 0 diffs  (96 naive -> 66 viable)
 specs/quant-c-*.toml (7 families)                      1002 entries, 0 diffs  (largest region)
 specs/pa-a-{pa1,pa2,pa2r}.toml + pa-a-{fas,fasv}.toml   354 entries, 0 diffs  (two regions)
+specs/quant-b-*.toml (14 families)                      240 entries, 0 diffs  (five ABIs, 14 shapes)
+specs/quant-b-marlin{,-repack,-repack-awq}.toml         198 entries, 0 diffs  (sibling crate)
+```
+
+Four reference-cubin crates are not spec-expressible (their entry names transcribe a reference
+PTX/cubin, and `mistralrs-paged-attn-b`'s are positional), but all four regenerate byte for byte
+from their staged references -- 1,108 entry points of free regression check:
+
+```
+candle-conv                                              66 entries, clean git diff
+candle-indexing                                         125 entries, clean git diff
+candle-ternary                                           26 entries, clean git diff
+mistralrs-paged-attn-b                                  891 entries, clean git diff
 ```
 
 Crates whose generator reads entry names out of a reference cubin/PTX (`candle-conv`,
