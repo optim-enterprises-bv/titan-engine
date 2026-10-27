@@ -1,0 +1,39 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-c/src/main.rs"
+name_template = "quantize_mmq_q8_1_glu_{t.name}_{lay.name}"
+entry = '''    #[kernel] pub unsafe fn {name}(gate: *const {t.cty}, up: *const {t.cty}, ids: *const i32, vy: *mut u8, ne00: i64, s01: i64, ne0: i64, ne1: i32, activation: i32) {{ quantize_mmq_q8_1_glu::<{t.idx}, {lay.idx}>(gate as *const u8, up as *const u8, ids, vy, ne00, s01, ne0, ne1, activation) }}'''
+
+[[axis]]
+name = "lay"
+
+[[axis.value]]
+name = "d4"
+idx = 0
+
+[[axis.value]]
+name = "ds4"
+idx = 1
+
+[[axis.value]]
+name = "d2s6"
+idx = 2
+
+[[axis]]
+name = "t"
+
+[[axis.value]]
+name = "f32"
+idx = 0
+cty = "f32"
+
+[[axis.value]]
+name = "f16"
+idx = 1
+cty = "u16"
+
+[[axis.value]]
+name = "bf16"
+idx = 2
+cty = "u16"
