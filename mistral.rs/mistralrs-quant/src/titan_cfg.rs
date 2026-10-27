@@ -110,6 +110,65 @@ impl<T> GenCell<T> {
     }
 }
 
+
+/// Compute capability of the CUDA device behind `dev`, as the route table writes it (`sm_120`).
+/// Empty on a non-CUDA device. Cached: the attribute query costs a driver call.
+#[cfg(feature = "cuda")]
+fn cuda_arch(dev: &candle_core::Device) -> &'static str {
+    use candle_core::cuda::cudarc::driver::sys::CUdevice_attribute;
+    static ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ARCH.get_or_init(|| {
+        let candle_core::Device::Cuda(cd) = dev else {
+            return String::new();
+        };
+        let stream = cd.cuda_stream();
+        let ctx = stream.context();
+        let major = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .unwrap_or(0);
+        let minor = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .unwrap_or(0);
+        if major == 0 && minor == 0 {
+            String::new()
+        } else {
+            format!("sm_{major}{minor}")
+        }
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_arch(_dev: &candle_core::Device) -> &'static str {
+    ""
+}
+
+/// Whether Q3_K single-row decode matvecs take the in-tree cuda-oxide rows kernel.
+///
+/// One decision for one knob. This used to be two divergent defaults (`TITAN_Q3K_ROWS` defaulted on
+/// in `gguf::fast_mmvq` and off in the qwen35 MoE path, each with its own recorded measurement).
+/// Order: an explicit `TITAN_Q3K_ROWS` wins; else the measured route row for this device arch; else
+/// the generic path -- never a guess.
+///
+/// Keyed on compute capability rather than the marketing device name: it is what the row's kernel was
+/// built for and it survives a SKU rename. The row does not depend on key depth, so `keys` only has to
+/// fall inside its range.
+pub fn q3k_rows_enabled(dev: &candle_core::Device) -> bool {
+    match var("TITAN_Q3K_ROWS") {
+        Ok(v) => v != "0",
+        Err(_) => {
+            let key = crate::titan_routes::RouteKey {
+                device: "",
+                arch: cuda_arch(dev),
+                quant: "Q3_K",
+                role: "mmvq_decode_row",
+                m: 1,
+                keys: 8192,
+            };
+            crate::titan_routes::route(&key).is_some_and(|row| row.kernel == "mmvq_rows_q3k")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

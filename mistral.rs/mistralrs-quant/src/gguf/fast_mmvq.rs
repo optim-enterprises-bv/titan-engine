@@ -545,14 +545,15 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
     if !supports_plain(dtype) {
         candle_core::bail!("fast_mmvq: unsupported quant dtype {dtype:?}");
     }
-    // TITAN_Q3K_ROWS (default on, =0 disables): Q3_K decode matvecs run our own cuda-oxide rows
-    // kernel instead of the nvcc twin - the copy that can be rebuilt and tuned in-tree. Worth
-    // 27.3 -> 29.6 tok/s on single-row decode, bit-identical output.
+    // Q3_K decode matvecs run our own cuda-oxide rows kernel instead of the nvcc twin - the copy
+    // that can be rebuilt and tuned in-tree. The decision now comes from one place
+    // (`titan_cfg::q3k_rows_enabled`): an explicit TITAN_Q3K_ROWS wins, else the measured route row
+    // for this device, else the generic path. See titan-variants/specs/route-5080.toml.
     // TITAN_ROWS_ALL=1 widens it to q4_0..q6_k as well. Measured neutral-to-worse (28.8 vs 29.2
     // tok/s at 700 tokens), so it defaults off: the verify step's 2x is NOT the Q4_K per-row
     // launches, it is that the verify forward issues ~330 single-row matvecs per step.
     #[cfg(feature = "cuda")]
-    if crate::titan_cfg::var("TITAN_Q3K_ROWS").map_or(true, |v| v != "0")
+    if crate::titan_cfg::q3k_rows_enabled(&w.device())
         && w.device().is_cuda()
         && (dtype == GgmlDType::Q3K
             || crate::titan_cfg::var("TITAN_ROWS_ALL").is_ok_and(|v| v == "1"))
