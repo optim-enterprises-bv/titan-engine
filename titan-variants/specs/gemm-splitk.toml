@@ -1,0 +1,26 @@
+[kernel]
+begin = "// BEGIN GENERATED"
+end = "// END GENERATED"
+target = "../../oxide-kernels/gemm/src/main.rs"
+name_template = "splitk_reduce_{dt.name}"
+entry = '''    /// split-K merge + epilogue, {dt.name}
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn {name}(ws: *const f32, nsplit: i32, d: *mut u8, c: *const u8, bias: *const u8, m: i32, n: i32, d_s0: i64, d_s1: i64, c_s0: i64, c_s1: i64, bias_s0: i64, bias_s1: i64, sd: i64, sc: i64, alpha: f32, beta: f32) {{
+        reduce_body::<{dt.dt}>(ws, nsplit, d, c, bias, m, n, d_s0, d_s1, c_s0, c_s1, bias_s0, bias_s1, sd, sc, alpha, beta);
+    }}'''
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "f32"
+dt = "DT_F32"
+
+[[axis.value]]
+name = "f16"
+dt = "DT_F16"
+
+[[axis.value]]
+name = "bf16"
+dt = "DT_BF16"

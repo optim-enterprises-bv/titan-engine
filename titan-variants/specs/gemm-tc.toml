@@ -1,0 +1,73 @@
+[kernel]
+begin = "// BEGIN GENERATED"
+end = "// END GENERATED"
+target = "../../oxide-kernels/gemm/src/main.rs"
+name_template = "tc_{dt.name}_{lay.name}_{bm.value}"
+entry = '''    /// tensor cores, {dt.name}, A {lay.adoc}-contiguous, B {lay.bdoc}-contiguous, BM {bm.value}
+    #[kernel]
+    #[launch_bounds({bm.lb})]
+    pub unsafe fn {name}(a: *const u8, b: *const u8, d: *mut u8, c: *const u8, bias: *const u8, m: i32, n: i32, k: i32, a_s0: i64, a_s1: i64, b_s0: i64, b_s1: i64, d_s0: i64, d_s1: i64, c_s0: i64, c_s1: i64, bias_s0: i64, bias_s1: i64, sa: i64, sb: i64, sd: i64, sc: i64, alpha: f32, beta: f32, ws: *mut f32, nsplit: i32) {{
+        static mut SMEM: SharedArray<u16, {bm.words}, 16> = SharedArray::UNINIT;
+        let sm = cuda_device::shared::cvta_generic_to_shared_u32(SharedArray::as_raw_mut_ptr(&raw mut SMEM) as *const u8);
+        tc_body::<{dt.dt}, {lay.at}, {lay.bt}, {bm.value}>(sm, a, b, d, c, bias, m, n, k, a_s0, a_s1, b_s0, b_s1, d_s0, d_s1, c_s0, c_s1, bias_s0, bias_s1, sa, sb, sd, sc, alpha, beta, ws, nsplit);
+    }}'''
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "f16"
+dt = "DT_F16"
+
+[[axis.value]]
+name = "bf16"
+dt = "DT_BF16"
+
+[[axis]]
+name = "lay"
+
+[[axis.value]]
+name = "kk"
+adoc = "k"
+bdoc = "k"
+at = "false"
+bt = "false"
+
+[[axis.value]]
+name = "kn"
+adoc = "k"
+bdoc = "n"
+at = "false"
+bt = "true"
+
+[[axis.value]]
+name = "mk"
+adoc = "m"
+bdoc = "k"
+at = "true"
+bt = "false"
+
+[[axis.value]]
+name = "mn"
+adoc = "m"
+bdoc = "n"
+at = "true"
+bt = "true"
+
+[[axis]]
+name = "bm"
+
+[[axis.value]]
+value = 128
+words = 24576
+lb = "256, 1"
+
+[[axis.value]]
+value = 64
+words = 18432
+lb = "256, 2"
+
+[[axis.value]]
+value = 32
+words = 15360
+lb = "256, 2"

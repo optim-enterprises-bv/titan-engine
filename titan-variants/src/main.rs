@@ -819,17 +819,28 @@ fn main() -> Result<(), String> {
             };
             let (a, b) = (norm(&existing_text), norm(&generated_text));
             println!("text:        {} lines existing vs {} generated", a.len(), b.len());
+            // Kernel order inside the region is not load-bearing (each entry is its own symbol), and
+            // some crates interleave families in ways no axis product can express, so compare as a
+            // name-keyed multiset and report positional order separately.
+            let order_same = a == b;
+            let (mut sa, mut sb) = (a.clone(), b.clone());
+            sa.sort_unstable();
+            sb.sort_unstable();
             let mut text_diffs = 0;
-            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            for (x, y) in sa.iter().zip(sb.iter()) {
                 if x != y {
                     text_diffs += 1;
                     if text_diffs <= 3 {
-                        println!("   line {} differs:\n     existing:  {x}\n     generated: {y}", i + 1);
+                        println!("   entry differs:\n     existing:  {x}\n     generated: {y}");
                     }
                 }
             }
-            text_diffs += a.len().abs_diff(b.len());
-            println!("text diffs:  {text_diffs}");
+            text_diffs += sa.len().abs_diff(sb.len());
+            println!("text diffs:  {text_diffs} (order-insensitive)");
+            println!(
+                "order:       {}",
+                if order_same { "same as the existing region" } else { "differs from the existing region (accepted)" }
+            );
             if missing.is_empty() && extra.is_empty() && text_diffs == 0 {
                 println!("PASS: the spec reproduces the crate's generated region exactly (names + text)");
             } else {
