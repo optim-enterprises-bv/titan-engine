@@ -20,7 +20,7 @@ titan-variants route  <spec>   # emit route()/RouteRow from [[route.row]] entrie
 ```
 
 `verify` is the point: a spec is only accepted once it reproduces a crate's existing generated region
-byte for byte. Verified crates (5 / 641 entry points):
+byte for byte. Verified crates (9 / 2243 entry points):
 
 ```
 specs/candle-mmvq.toml                                  240 entries, 0 diffs
@@ -28,7 +28,24 @@ specs/mmvq-moe.toml                                      34 entries, 0 diffs  (4
 specs/candle-mmq-mulmatq.toml + candle-mmq-fixup.toml   264 entries, 0 diffs  (two families)
 specs/q1_0-{mmvq,mmq,fixup}.toml                          59 entries, 0 diffs  (three families)
 specs/ptq1_0-{mmvq,mmq,fixup}.toml                        44 entries, 0 diffs  (three families)
+specs/gemm-*.toml (7 families)                          114 entries, 0 diffs  (interleaved order)
+specs/fmt_mmq-{mulmatq,fixup}.toml                      132 entries, 0 diffs  (96 naive -> 66 viable)
+specs/quant-c-*.toml (7 families)                      1002 entries, 0 diffs  (largest region)
+specs/pa-a-{pa1,pa2,pa2r}.toml + pa-a-{fas,fasv}.toml   354 entries, 0 diffs  (two regions)
 ```
+
+Crates whose generator reads entry names out of a reference cubin/PTX (`candle-conv`,
+`candle-indexing`, `candle-ternary`, `mistralrs-paged-attn-b`) do not get a spec: the axis product
+would just be a transcription of mangled symbols, with no declaration behind it.
+
+Two shapes need care:
+
+- **Multiple regions per crate**: `verify` takes its begin/end markers from the first spec, so run one
+  invocation per region (`paged-attn-a` has two: the paged-attention block and the flash-attn-sinks
+  block).
+- **Derived launch constants**: when the launch config needs a value computed from the axes (e.g. the
+  `nrt` reduction count from head/block/vv), flatten the axes that feed it into one axis whose values
+  carry the computed field. The product is still generated, but the arithmetic lives in the spec build.
 
 Several families per region: pass one spec per family, in region order.
 

@@ -1,0 +1,1305 @@
+[kernel]
+begin = "// GENERATED paged attention kernels (gen_kernels.py) BEGIN"
+end = "// GENERATED END"
+target = "../../oxide-kernels/mistralrs-paged-attn-a/src/main.rs"
+name_template = "pa1_{v.dt}_{v.c}_{v.head}_{v.block}"
+entry = '''    #[kernel] pub unsafe fn {name}(o: *mut u8, q: *const u8, kc: *const u8, vc: *const u8, nkv: i32, sc: f32, cap: f32, bt: *const u32, cl: *const u32, mb: i32, al: *const f32, qs: i32, kbs: i32, khs: i32, ks: *const f32, vs: *const f32, sk: *const f32) {{ paged_attention::<{v.g}, 0, {v.nrt}>(core::ptr::null_mut(), core::ptr::null_mut(), o as _, q as _, kc, vc, nkv, sc, cap, bt, cl, mb, al, qs, kbs, khs, ks, vs, sk) }}'''
+
+[[axis]]
+name = "v"
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 64
+block = 8
+nrt = 4
+g = """f32, false, 64, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 80
+block = 8
+nrt = 5
+g = """f32, false, 80, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 96
+block = 8
+nrt = 6
+g = """f32, false, 96, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 112
+block = 8
+nrt = 7
+g = """f32, false, 112, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 128
+block = 8
+nrt = 8
+g = """f32, false, 128, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 192
+block = 8
+nrt = 12
+g = """f32, false, 192, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 256
+block = 8
+nrt = 16
+g = """f32, false, 256, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 512
+block = 8
+nrt = 32
+g = """f32, false, 512, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 64
+block = 16
+nrt = 8
+g = """f32, false, 64, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 80
+block = 16
+nrt = 10
+g = """f32, false, 80, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 96
+block = 16
+nrt = 12
+g = """f32, false, 96, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 112
+block = 16
+nrt = 14
+g = """f32, false, 112, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 128
+block = 16
+nrt = 16
+g = """f32, false, 128, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 192
+block = 16
+nrt = 24
+g = """f32, false, 192, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 256
+block = 16
+nrt = 32
+g = """f32, false, 256, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 512
+block = 16
+nrt = 64
+g = """f32, false, 512, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 64
+block = 32
+nrt = 16
+g = """f32, false, 64, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 80
+block = 32
+nrt = 20
+g = """f32, false, 80, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 96
+block = 32
+nrt = 24
+g = """f32, false, 96, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 112
+block = 32
+nrt = 28
+g = """f32, false, 112, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 128
+block = 32
+nrt = 32
+g = """f32, false, 128, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 192
+block = 32
+nrt = 48
+g = """f32, false, 192, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 256
+block = 32
+nrt = 64
+g = """f32, false, 256, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "a"
+head = 512
+block = 32
+nrt = 128
+g = """f32, false, 512, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 64
+block = 8
+nrt = 4
+g = """f32, true, 64, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 80
+block = 8
+nrt = 5
+g = """f32, true, 80, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 96
+block = 8
+nrt = 6
+g = """f32, true, 96, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 112
+block = 8
+nrt = 7
+g = """f32, true, 112, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 128
+block = 8
+nrt = 8
+g = """f32, true, 128, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 192
+block = 8
+nrt = 12
+g = """f32, true, 192, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 256
+block = 8
+nrt = 16
+g = """f32, true, 256, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 512
+block = 8
+nrt = 32
+g = """f32, true, 512, 8"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 64
+block = 16
+nrt = 8
+g = """f32, true, 64, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 80
+block = 16
+nrt = 10
+g = """f32, true, 80, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 96
+block = 16
+nrt = 12
+g = """f32, true, 96, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 112
+block = 16
+nrt = 14
+g = """f32, true, 112, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 128
+block = 16
+nrt = 16
+g = """f32, true, 128, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 192
+block = 16
+nrt = 24
+g = """f32, true, 192, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 256
+block = 16
+nrt = 32
+g = """f32, true, 256, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 512
+block = 16
+nrt = 64
+g = """f32, true, 512, 16"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 64
+block = 32
+nrt = 16
+g = """f32, true, 64, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 80
+block = 32
+nrt = 20
+g = """f32, true, 80, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 96
+block = 32
+nrt = 24
+g = """f32, true, 96, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 112
+block = 32
+nrt = 28
+g = """f32, true, 112, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 128
+block = 32
+nrt = 32
+g = """f32, true, 128, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 192
+block = 32
+nrt = 48
+g = """f32, true, 192, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 256
+block = 32
+nrt = 64
+g = """f32, true, 256, 32"""
+
+[[axis.value]]
+dt = "f32"
+ty = "f32"
+c = "e"
+head = 512
+block = 32
+nrt = 128
+g = """f32, true, 512, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 64
+block = 8
+nrt = 2
+g = """H, false, 64, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 80
+block = 8
+nrt = 3
+g = """H, false, 80, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 96
+block = 8
+nrt = 3
+g = """H, false, 96, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 112
+block = 8
+nrt = 4
+g = """H, false, 112, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 128
+block = 8
+nrt = 4
+g = """H, false, 128, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 192
+block = 8
+nrt = 6
+g = """H, false, 192, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 256
+block = 8
+nrt = 8
+g = """H, false, 256, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 512
+block = 8
+nrt = 16
+g = """H, false, 512, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 64
+block = 16
+nrt = 4
+g = """H, false, 64, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 80
+block = 16
+nrt = 5
+g = """H, false, 80, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 96
+block = 16
+nrt = 6
+g = """H, false, 96, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 112
+block = 16
+nrt = 7
+g = """H, false, 112, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 128
+block = 16
+nrt = 8
+g = """H, false, 128, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 192
+block = 16
+nrt = 12
+g = """H, false, 192, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 256
+block = 16
+nrt = 16
+g = """H, false, 256, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 512
+block = 16
+nrt = 32
+g = """H, false, 512, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 64
+block = 32
+nrt = 8
+g = """H, false, 64, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 80
+block = 32
+nrt = 10
+g = """H, false, 80, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 96
+block = 32
+nrt = 12
+g = """H, false, 96, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 112
+block = 32
+nrt = 14
+g = """H, false, 112, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 128
+block = 32
+nrt = 16
+g = """H, false, 128, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 192
+block = 32
+nrt = 24
+g = """H, false, 192, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 256
+block = 32
+nrt = 32
+g = """H, false, 256, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "a"
+head = 512
+block = 32
+nrt = 64
+g = """H, false, 512, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 64
+block = 8
+nrt = 2
+g = """H, true, 64, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 80
+block = 8
+nrt = 3
+g = """H, true, 80, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 96
+block = 8
+nrt = 3
+g = """H, true, 96, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 112
+block = 8
+nrt = 4
+g = """H, true, 112, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 128
+block = 8
+nrt = 4
+g = """H, true, 128, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 192
+block = 8
+nrt = 6
+g = """H, true, 192, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 256
+block = 8
+nrt = 8
+g = """H, true, 256, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 512
+block = 8
+nrt = 16
+g = """H, true, 512, 8"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 64
+block = 16
+nrt = 4
+g = """H, true, 64, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 80
+block = 16
+nrt = 5
+g = """H, true, 80, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 96
+block = 16
+nrt = 6
+g = """H, true, 96, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 112
+block = 16
+nrt = 7
+g = """H, true, 112, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 128
+block = 16
+nrt = 8
+g = """H, true, 128, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 192
+block = 16
+nrt = 12
+g = """H, true, 192, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 256
+block = 16
+nrt = 16
+g = """H, true, 256, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 512
+block = 16
+nrt = 32
+g = """H, true, 512, 16"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 64
+block = 32
+nrt = 8
+g = """H, true, 64, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 80
+block = 32
+nrt = 10
+g = """H, true, 80, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 96
+block = 32
+nrt = 12
+g = """H, true, 96, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 112
+block = 32
+nrt = 14
+g = """H, true, 112, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 128
+block = 32
+nrt = 16
+g = """H, true, 128, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 192
+block = 32
+nrt = 24
+g = """H, true, 192, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 256
+block = 32
+nrt = 32
+g = """H, true, 256, 32"""
+
+[[axis.value]]
+dt = "f16"
+ty = "H"
+c = "e"
+head = 512
+block = 32
+nrt = 64
+g = """H, true, 512, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 64
+block = 8
+nrt = 2
+g = """B, false, 64, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 80
+block = 8
+nrt = 3
+g = """B, false, 80, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 96
+block = 8
+nrt = 3
+g = """B, false, 96, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 112
+block = 8
+nrt = 4
+g = """B, false, 112, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 128
+block = 8
+nrt = 4
+g = """B, false, 128, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 192
+block = 8
+nrt = 6
+g = """B, false, 192, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 256
+block = 8
+nrt = 8
+g = """B, false, 256, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 512
+block = 8
+nrt = 16
+g = """B, false, 512, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 64
+block = 16
+nrt = 4
+g = """B, false, 64, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 80
+block = 16
+nrt = 5
+g = """B, false, 80, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 96
+block = 16
+nrt = 6
+g = """B, false, 96, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 112
+block = 16
+nrt = 7
+g = """B, false, 112, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 128
+block = 16
+nrt = 8
+g = """B, false, 128, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 192
+block = 16
+nrt = 12
+g = """B, false, 192, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 256
+block = 16
+nrt = 16
+g = """B, false, 256, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 512
+block = 16
+nrt = 32
+g = """B, false, 512, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 64
+block = 32
+nrt = 8
+g = """B, false, 64, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 80
+block = 32
+nrt = 10
+g = """B, false, 80, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 96
+block = 32
+nrt = 12
+g = """B, false, 96, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 112
+block = 32
+nrt = 14
+g = """B, false, 112, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 128
+block = 32
+nrt = 16
+g = """B, false, 128, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 192
+block = 32
+nrt = 24
+g = """B, false, 192, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 256
+block = 32
+nrt = 32
+g = """B, false, 256, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "a"
+head = 512
+block = 32
+nrt = 64
+g = """B, false, 512, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 64
+block = 8
+nrt = 2
+g = """B, true, 64, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 80
+block = 8
+nrt = 3
+g = """B, true, 80, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 96
+block = 8
+nrt = 3
+g = """B, true, 96, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 112
+block = 8
+nrt = 4
+g = """B, true, 112, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 128
+block = 8
+nrt = 4
+g = """B, true, 128, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 192
+block = 8
+nrt = 6
+g = """B, true, 192, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 256
+block = 8
+nrt = 8
+g = """B, true, 256, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 512
+block = 8
+nrt = 16
+g = """B, true, 512, 8"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 64
+block = 16
+nrt = 4
+g = """B, true, 64, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 80
+block = 16
+nrt = 5
+g = """B, true, 80, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 96
+block = 16
+nrt = 6
+g = """B, true, 96, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 112
+block = 16
+nrt = 7
+g = """B, true, 112, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 128
+block = 16
+nrt = 8
+g = """B, true, 128, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 192
+block = 16
+nrt = 12
+g = """B, true, 192, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 256
+block = 16
+nrt = 16
+g = """B, true, 256, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 512
+block = 16
+nrt = 32
+g = """B, true, 512, 16"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 64
+block = 32
+nrt = 8
+g = """B, true, 64, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 80
+block = 32
+nrt = 10
+g = """B, true, 80, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 96
+block = 32
+nrt = 12
+g = """B, true, 96, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 112
+block = 32
+nrt = 14
+g = """B, true, 112, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 128
+block = 32
+nrt = 16
+g = """B, true, 128, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 192
+block = 32
+nrt = 24
+g = """B, true, 192, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 256
+block = 32
+nrt = 32
+g = """B, true, 256, 32"""
+
+[[axis.value]]
+dt = "bf16"
+ty = "B"
+c = "e"
+head = 512
+block = 32
+nrt = 64
+g = """B, true, 512, 32"""
