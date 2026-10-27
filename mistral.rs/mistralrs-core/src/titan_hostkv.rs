@@ -16,6 +16,13 @@ use rayon::prelude::*;
 
 use crate::attention::SdpaParams;
 
+/// Head dims the host cache serves: 256 (dense 27B qwen35) and 128 (llama-family, qwen3). Both are multiples of 16,
+/// so the AVX2 kernels' 8- and 16-wide loops cover them unchanged.
+const SUPPORTED_HEAD_DIMS: [usize; 2] = [128, 256];
+fn hd_supported(d: usize) -> bool {
+    SUPPORTED_HEAD_DIMS.contains(&d)
+}
+#[cfg(test)]
 const HEAD_DIM: usize = 256;
 /// Query rows (decode, MTP verify) that attend on the CPU; longer prompt chunks go to the GPU.
 const CPU_MAX_ROWS: usize = 8;
@@ -131,7 +138,7 @@ pub(crate) fn prof_mark(phase: usize, t0: &mut std::time::Instant) {
 pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Result<Tensor> {
     let (b, h, s, d) = q.dims4()?;
     let (kb, kvh, kv_len, kd) = k.dims4()?;
-    if b != 1 || kb != 1 || d != HEAD_DIM || kd != HEAD_DIM || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
+    if b != 1 || kb != 1 || !hd_supported(d) || kd != d || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
         candle_core::bail!("titan host kv: unsupported q {:?} k {:?} v {:?}", q.shape(), k.shape(), v.shape());
     }
     if k.dtype() != DType::F8E4M3 || v.dtype() != DType::F8E4M3 {
@@ -155,7 +162,7 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Resu
     if prof_on() {
         prof_mark(3, &mut t0);
     }
-    let y = Tensor::from_vec(out, (1, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())?;
+    let y = Tensor::from_vec(out, (1, h, s, d), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())?;
     if prof_on() {
         q.device().synchronize()?;
         prof_mark(4, &mut t0);
@@ -167,7 +174,7 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Resu
 /// `kvs[i]` (1, kvh, len_i, 256), with one device round trip for the batch. Each row equals its `attend` call.
 pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) -> Result<Tensor> {
     let (b, h, s, d) = q.dims4()?;
-    if b != kvs.len() || d != HEAD_DIM || s > CPU_MAX_ROWS {
+    if b != kvs.len() || !hd_supported(d) || s > CPU_MAX_ROWS {
         candle_core::bail!("titan host kv: unsupported batched q {:?} over {} caches", q.shape(), kvs.len());
     }
     let longest = kvs.iter().map(|(k, _)| k.dim(2)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
@@ -178,10 +185,10 @@ pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) 
         candle_core::bail!("titan host kv: q not on the CPU");
     };
     let qd = &qc.as_slice::<f32>()?[ql.start_offset()..];
-    let per = h * s * HEAD_DIM;
+    let per = h * s * d;
     for (i, (k, v)) in kvs.iter().enumerate() {
         let (kb, kvh, kv_len, kd) = k.dims4()?;
-        if kb != 1 || kd != HEAD_DIM || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
+        if kb != 1 || kd != d || h % kvh != 0 || kv_len < s || v.dims4()? != k.dims4()? {
             candle_core::bail!("titan host kv: unsupported cache {:?} for batch row {i}", k.shape());
         }
     }
@@ -199,7 +206,7 @@ pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) 
     })?;
     drop(caches);
     drop(qg);
-    Tensor::from_vec(outs.concat(), (b, h, s, HEAD_DIM), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
+    Tensor::from_vec(outs.concat(), (b, h, s, d), &Device::Cpu)?.to_device(q.device())?.to_dtype(q.dtype())
 }
 
 /// `run` of host queries `q` (h, s, 256) over the host F8E4M3 cache `k`, `v` (1, kvh, kv_len, 256).
@@ -236,10 +243,10 @@ impl<'a> HostCache<'a> {
         let (Storage::Cpu(kc), Storage::Cpu(vc)) = (&*self.kg, &*self.vg) else {
             candle_core::bail!("titan host kv: K / V not on the CPU");
         };
-        let (_, kvh, kv_len, _) = self.k.dims4()?;
+        let (_, kvh, kv_len, hd) = self.k.dims4()?;
         let k = as_bytes(&kc.as_slice::<float8::F8E4M3>()?[self.k.layout().start_offset()..]);
         let v = as_bytes(&vc.as_slice::<float8::F8E4M3>()?[self.v.layout().start_offset()..]);
-        let sh = Shape { h, kvh, s, kv_len, k_hs: self.k.stride()[1], v_hs: self.v.stride()[1], scale };
+        let sh = Shape { h, kvh, s, kv_len, hd, k_hs: self.k.stride()[1], v_hs: self.v.stride()[1], scale };
         Ok(Job::new(q, k, v, sh))
     }
 }
@@ -255,15 +262,21 @@ struct Shape {
     kvh: usize,
     s: usize,
     kv_len: usize,
+    hd: usize,
     k_hs: usize,
     v_hs: usize,
     scale: f32,
 }
 
+impl Shape {
+    /// Per-query online-softmax slot: the un-normalised o (`hd` floats) then its (max, sum).
+    fn stride(&self) -> usize {
+        self.hd + 2
+    }
+}
+
 /// One unit's online-softmax state per query it covers: un-normalised o, then (max, sum).
 struct Partial(Vec<f32>);
-
-const STRIDE: usize = HEAD_DIM + 2;
 /// Keys dequantised per block (32 KiB of f32 K, reused from L1 by every query of the group).
 const BK: usize = 32;
 /// Queries sharing each K/V load in the scores and P.V microkernels.
@@ -334,24 +347,25 @@ fn run_jobs(jobs: &[Job]) -> Vec<Vec<f32>> {
 fn merge(job: &Job, parts: &[Partial]) -> Vec<f32> {
     let (sh, chunks, per, ns) = (&job.sh, job.chunks, job.per, job.spans.len());
     let spans = &job.spans;
+    let (hd, stride) = (sh.hd, sh.stride());
     let nq = sh.h / sh.kvh * sh.s;
-    let mut out = vec![0f32; sh.h * sh.s * HEAD_DIM];
-    out.par_chunks_mut(nq * HEAD_DIM).enumerate().for_each(|(g, out)| {
+    let mut out = vec![0f32; sh.h * sh.s * hd];
+    out.par_chunks_mut(nq * hd).enumerate().for_each(|(g, out)| {
         for qi in 0..nq {
             let s = qi / per;
-            let at = (qi - spans[s].0) * STRIDE;
+            let at = (qi - spans[s].0) * stride;
             let ps = || (0..chunks).map(|c| &parts[(g * chunks + c) * ns + s].0);
-            let m = ps().map(|p| p[at + HEAD_DIM]).fold(f32::NEG_INFINITY, f32::max);
-            let o = &mut out[qi * HEAD_DIM..][..HEAD_DIM];
+            let m = ps().map(|p| p[at + hd]).fold(f32::NEG_INFINITY, f32::max);
+            let o = &mut out[qi * hd..][..hd];
             let mut l = 0f32;
             for p in ps() {
-                let pm = p[at + HEAD_DIM];
+                let pm = p[at + hd];
                 if pm == f32::NEG_INFINITY {
                     continue;
                 }
                 let w = (pm - m).exp();
-                l += w * p[at + HEAD_DIM + 1];
-                for (o, a) in o.iter_mut().zip(&p[at..at + HEAD_DIM]) {
+                l += w * p[at + hd + 1];
+                for (o, a) in o.iter_mut().zip(&p[at..at + hd]) {
                     *o += w * a;
                 }
             }
@@ -368,26 +382,27 @@ fn merge(job: &Job, parts: &[Partial]) -> Vec<f32> {
 fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize, (qa, qb): (usize, usize)) -> Partial {
     let n_rep = sh.h / sh.kvh;
     let nq = qb - qa;
+    let (hd, stride) = (sh.hd, sh.stride());
     let past = sh.kv_len - sh.s;
     let b = (a + KEY_CHUNK).min(sh.kv_len);
-    let mut part = vec![0f32; nq * STRIDE];
+    let mut part = vec![0f32; nq * stride];
     let mut m = vec![f32::NEG_INFINITY; nq];
     let mut l = vec![0f32; nq];
-    let mut kb = vec![0f32; BK * HEAD_DIM];
-    let mut vb = vec![0f32; BK * HEAD_DIM];
+    let mut kb = vec![0f32; BK * hd];
+    let mut vb = vec![0f32; BK * hd];
     let mut sc = vec![0f32; nq * BK];
     let mut alpha = vec![0f32; nq];
     let mut vis = vec![0usize; nq];
     let qrow = |i: usize| {
         let qi = qa + i;
-        &q[((g * n_rep + qi / sh.s) * sh.s + qi % sh.s) * HEAD_DIM..][..HEAD_DIM]
+        &q[((g * n_rep + qi / sh.s) * sh.s + qi % sh.s) * hd..][..hd]
     };
     let mut j0 = a;
     while j0 < b {
         let n = BK.min(b - j0);
         for j in 0..n {
-            dequant(&k[g * sh.k_hs + (j0 + j) * HEAD_DIM..][..HEAD_DIM], &mut kb[j * HEAD_DIM..][..HEAD_DIM]);
-            dequant(&v[g * sh.v_hs + (j0 + j) * HEAD_DIM..][..HEAD_DIM], &mut vb[j * HEAD_DIM..][..HEAD_DIM]);
+            dequant(&k[g * sh.k_hs + (j0 + j) * hd..][..hd], &mut kb[j * hd..][..hd], hd);
+            dequant(&v[g * sh.v_hs + (j0 + j) * hd..][..hd], &mut vb[j * hd..][..hd], hd);
         }
         for i in 0..nq {
             vis[i] = (past + (qa + i) % sh.s + 1).saturating_sub(j0).min(n);
@@ -396,7 +411,7 @@ fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize, (qa, qb):
             let t = QB.min(nq - i0);
             let n_any = vis[i0..i0 + t].iter().copied().max().unwrap_or(0);
             let qs: [&[f32]; QB] = std::array::from_fn(|r| qrow(i0 + r.min(t - 1)));
-            scores(&qs[..t], &kb, n_any, sh.scale, &mut sc[i0 * BK..][..t * BK]);
+            scores(&qs[..t], &kb, n_any, sh.scale, &mut sc[i0 * BK..][..t * BK], hd);
         }
         for i in 0..nq {
             let vis = vis[i];
@@ -415,42 +430,42 @@ fn unit(q: &[f32], k: &[u8], v: &[u8], sh: &Shape, g: usize, a: usize, (qa, qb):
         for i0 in (0..nq).step_by(QB) {
             let t = QB.min(nq - i0);
             if vis[i0..i0 + t].iter().any(|&n| n > 0) {
-                let acc = &mut part[i0 * STRIDE..][..t * STRIDE];
-                pv(acc, &alpha[i0..i0 + t], &vis[i0..i0 + t], &sc[i0 * BK..][..t * BK], &vb);
+                let acc = &mut part[i0 * stride..][..t * stride];
+                pv(acc, &alpha[i0..i0 + t], &vis[i0..i0 + t], &sc[i0 * BK..][..t * BK], &vb, hd, stride);
             }
         }
         j0 += n;
     }
     for i in 0..nq {
-        part[i * STRIDE + HEAD_DIM] = m[i];
-        part[i * STRIDE + HEAD_DIM + 1] = l[i];
+        part[i * stride + hd] = m[i];
+        part[i * stride + hd + 1] = l[i];
     }
     Partial(part)
 }
 
-fn dequant(src: &[u8], dst: &mut [f32]) {
+fn dequant(src: &[u8], dst: &mut [f32], hd: usize) {
     #[cfg(target_arch = "x86_64")]
     if simd() {
-        unsafe { avx::dequant(src.as_ptr(), dst.as_mut_ptr()) };
+        unsafe { avx::dequant(src.as_ptr(), dst.as_mut_ptr(), hd) };
         return;
     }
     static LUT: LazyLock<[f32; 256]> = LazyLock::new(|| std::array::from_fn(|b| float8::F8E4M3::from_bits(b as u8).to_f32()));
-    for (d, &b) in dst.iter_mut().zip(&src[..HEAD_DIM]) {
+    for (d, &b) in dst.iter_mut().zip(&src[..hd]) {
         *d = LUT[b as usize];
     }
 }
 
-/// `out[r * BK + j] = scale * qs[r] . kb[j]` for the first `n` rows of the block `kb`.
-fn scores(qs: &[&[f32]], kb: &[f32], n: usize, scale: f32, out: &mut [f32]) {
+/// `out[r * BK + j] = scale * qs[r] . kb[j]` for the first `n` rows of the block `kb` (`hd`-wide keys).
+fn scores(qs: &[&[f32]], kb: &[f32], n: usize, scale: f32, out: &mut [f32], hd: usize) {
     #[cfg(target_arch = "x86_64")]
     if simd() {
         let qp: [*const f32; QB] = std::array::from_fn(|r| qs[r.min(qs.len() - 1)].as_ptr());
-        unsafe { avx::scores(qp, qs.len(), kb.as_ptr(), n, scale, out.as_mut_ptr()) };
+        unsafe { avx::scores(qp, qs.len(), kb.as_ptr(), n, scale, out.as_mut_ptr(), hd) };
         return;
     }
     for (r, q) in qs.iter().enumerate() {
         for j in 0..n {
-            out[r * BK + j] = scale * q.iter().zip(&kb[j * HEAD_DIM..][..HEAD_DIM]).map(|(a, b)| a * b).sum::<f32>();
+            out[r * BK + j] = scale * q.iter().zip(&kb[j * hd..][..hd]).map(|(a, b)| a * b).sum::<f32>();
         }
     }
 }
@@ -469,20 +484,20 @@ fn exp_sub_sum(p: &mut [f32], m: f32) -> f32 {
     s
 }
 
-/// Per query `r`: `acc_r = alpha[r] * acc_r + sum_{j < vis[r]} p_r[j] * vb[j]` (accumulators `STRIDE` apart,
+/// Per query `r`: `acc_r = alpha[r] * acc_r + sum_{j < vis[r]} p_r[j] * vb[j]` (accumulators `stride` apart,
 /// weights `BK` apart).
-fn pv(acc: &mut [f32], alpha: &[f32], vis: &[usize], p: &[f32], vb: &[f32]) {
+fn pv(acc: &mut [f32], alpha: &[f32], vis: &[usize], p: &[f32], vb: &[f32], hd: usize, stride: usize) {
     #[cfg(target_arch = "x86_64")]
     if simd() {
-        unsafe { avx::pv(acc.as_mut_ptr(), alpha, vis, p.as_ptr(), vb.as_ptr()) };
+        unsafe { avx::pv(acc.as_mut_ptr(), alpha, vis, p.as_ptr(), vb.as_ptr(), hd, stride) };
         return;
     }
     for (r, (&al, &n)) in alpha.iter().zip(vis).enumerate() {
-        for d in 0..HEAD_DIM {
-            let a = &mut acc[r * STRIDE + d];
+        for d in 0..hd {
+            let a = &mut acc[r * stride + d];
             let mut x = *a * al;
             for j in 0..n {
-                x += p[r * BK + j] * vb[j * HEAD_DIM + d];
+                x += p[r * BK + j] * vb[j * hd + d];
             }
             *a = x;
         }
@@ -503,16 +518,16 @@ fn simd() -> bool {
 mod avx {
     use std::arch::x86_64::*;
 
-    use super::{BK, E4M3_AS_F16_SCALE, HEAD_DIM, QB, STRIDE};
+    use super::{BK, E4M3_AS_F16_SCALE, QB};
 
-    /// 256 e4m3 bytes to f32: sign and the 7 exponent/mantissa bits shifted into an f16, converted, times 2^8
-    /// (exact for normals and subnormals; this cache never holds NaN).
+    /// `hd` e4m3 bytes to f32: sign and the 7 exponent/mantissa bits shifted into an f16, converted, times 2^8
+    /// (exact for normals and subnormals; this cache never holds NaN). `hd` is a multiple of 16.
     #[target_feature(enable = "avx2,f16c,fma")]
-    pub(super) unsafe fn dequant(src: *const u8, dst: *mut f32) {
+    pub(super) unsafe fn dequant(src: *const u8, dst: *mut f32, hd: usize) {
         let scale = _mm256_set1_ps(E4M3_AS_F16_SCALE);
         let sign = _mm256_set1_epi16(0x80);
         let mag = _mm256_set1_epi16(0x7f);
-        for i in (0..HEAD_DIM).step_by(16) {
+        for i in (0..hd).step_by(16) {
             let b = _mm256_cvtepu8_epi16(_mm_loadu_si128(src.add(i) as *const __m128i));
             let h = _mm256_or_si256(
                 _mm256_slli_epi16::<8>(_mm256_and_si256(b, sign)),
@@ -535,13 +550,13 @@ mod avx {
     /// `t` (<= QB) queries times four keys per pass: each k load feeds `t` FMAs and each q load four, one
     /// horizontal sum per (query, key).
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn scores(q: [*const f32; QB], t: usize, kb: *const f32, n: usize, scale: f32, out: *mut f32) {
+    pub(super) unsafe fn scores(q: [*const f32; QB], t: usize, kb: *const f32, n: usize, scale: f32, out: *mut f32, hd: usize) {
         let mut j = 0;
         while j + 4 <= n {
-            let k0 = kb.add(j * HEAD_DIM);
+            let k0 = kb.add(j * hd);
             let mut a = [[_mm256_setzero_ps(); 4]; QB];
-            for d in (0..HEAD_DIM).step_by(8) {
-                let kv: [__m256; 4] = std::array::from_fn(|u| _mm256_loadu_ps(k0.add(u * HEAD_DIM + d)));
+            for d in (0..hd).step_by(8) {
+                let kv: [__m256; 4] = std::array::from_fn(|u| _mm256_loadu_ps(k0.add(u * hd + d)));
                 for (r, a) in a.iter_mut().enumerate().take(t) {
                     let qv = _mm256_loadu_ps(q[r].add(d));
                     for (a, kv) in a.iter_mut().zip(&kv) {
@@ -557,10 +572,10 @@ mod avx {
             j += 4;
         }
         while j < n {
-            let k0 = kb.add(j * HEAD_DIM);
+            let k0 = kb.add(j * hd);
             for (r, q) in q.iter().enumerate().take(t) {
                 let mut a = _mm256_setzero_ps();
-                for d in (0..HEAD_DIM).step_by(8) {
+                for d in (0..hd).step_by(8) {
                     a = _mm256_fmadd_ps(_mm256_loadu_ps(q.add(d)), _mm256_loadu_ps(k0.add(d)), a);
                 }
                 *out.add(r * BK + j) = scale * hsum(a);
@@ -612,19 +627,19 @@ mod avx {
     /// `super::pv` 16 dims at a time held in registers over the block's keys: each v load feeds every query
     /// still within its `vis` keys.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn pv(acc: *mut f32, alpha: &[f32], vis: &[usize], p: *const f32, vb: *const f32) {
+    pub(super) unsafe fn pv(acc: *mut f32, alpha: &[f32], vis: &[usize], p: *const f32, vb: *const f32, hd: usize, stride: usize) {
         let t = alpha.len();
         let n = vis.iter().copied().max().unwrap_or(0);
-        for d in (0..HEAD_DIM).step_by(16) {
+        for d in (0..hd).step_by(16) {
             let mut r = [[_mm256_setzero_ps(); 2]; QB];
             for (q, r) in r.iter_mut().enumerate().take(t) {
                 let al = _mm256_set1_ps(alpha[q]);
                 for (u, r) in r.iter_mut().enumerate() {
-                    *r = _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(q * STRIDE + d + 8 * u)));
+                    *r = _mm256_mul_ps(al, _mm256_loadu_ps(acc.add(q * stride + d + 8 * u)));
                 }
             }
             for j in 0..n {
-                let row = vb.add(j * HEAD_DIM + d);
+                let row = vb.add(j * hd + d);
                 let v = [_mm256_loadu_ps(row), _mm256_loadu_ps(row.add(8))];
                 for (q, r) in r.iter_mut().enumerate().take(t) {
                     if j < vis[q] {
@@ -637,7 +652,7 @@ mod avx {
             }
             for (q, r) in r.iter().enumerate().take(t) {
                 for (u, r) in r.iter().enumerate() {
-                    _mm256_storeu_ps(acc.add(q * STRIDE + d + 8 * u), *r);
+                    _mm256_storeu_ps(acc.add(q * stride + d + 8 * u), *r);
                 }
             }
         }
@@ -650,43 +665,47 @@ mod tests {
 
     #[test]
     fn dequant_matches_float8() {
-        let src: Vec<u8> = (0..HEAD_DIM).map(|i| (i as u8).wrapping_mul(37)).filter(|b| b & 0x7f != 0x7f).cycle().take(HEAD_DIM).collect();
-        let mut got = [0f32; HEAD_DIM];
-        dequant(&src, &mut got);
-        for (b, g) in src.iter().zip(got) {
-            assert_eq!(float8::F8E4M3::from_bits(*b).to_f32(), g, "byte {b:#04x}");
+        for hd in SUPPORTED_HEAD_DIMS {
+            let src: Vec<u8> = (0..hd).map(|i| (i as u8).wrapping_mul(37)).filter(|b| b & 0x7f != 0x7f).cycle().take(hd).collect();
+            let mut got = vec![0f32; hd];
+            dequant(&src, &mut got, hd);
+            for (b, g) in src.iter().zip(got) {
+                assert_eq!(float8::F8E4M3::from_bits(*b).to_f32(), g, "hd {hd} byte {b:#04x}");
+            }
         }
     }
 
     #[test]
     fn matches_reference_attention() {
-        let (h, kvh, s, kv_len) = (6, 2, 3, 2500);
-        let mut seed = 1u32;
-        let mut rnd = || {
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
-        };
-        let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|_| rnd()).collect();
-        let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
-        let vf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
-        let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
-        let got = run(&q, as_bytes(&kf), as_bytes(&vf), &sh);
-        let n_rep = h / kvh;
-        for hd in 0..h {
-            let g = hd / n_rep;
-            for r in 0..s {
-                let lim = kv_len - s + r + 1;
-                let qv = &q[(hd * s + r) * HEAD_DIM..][..HEAD_DIM];
-                let sc: Vec<f64> = (0..lim)
-                    .map(|j| (0..HEAD_DIM).map(|d| qv[d] as f64 * kf[(g * kv_len + j) * HEAD_DIM + d].to_f64()).sum::<f64>() * 0.0625)
-                    .collect();
-                let m = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let w: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
-                let l: f64 = w.iter().sum();
-                for d in 0..HEAD_DIM {
-                    let want = (0..lim).map(|j| w[j] * vf[(g * kv_len + j) * HEAD_DIM + d].to_f64()).sum::<f64>() / l;
-                    let gotv = got[(hd * s + r) * HEAD_DIM + d] as f64;
-                    assert!((want - gotv).abs() < 1e-4, "head {hd} row {r} dim {d}: {gotv} vs {want}");
+        for hd in SUPPORTED_HEAD_DIMS {
+            let (h, kvh, s, kv_len) = (6, 2, 3, 2500);
+            let mut seed = 1u32;
+            let mut rnd = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            };
+            let q: Vec<f32> = (0..h * s * hd).map(|_| rnd()).collect();
+            let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * hd).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
+            let vf: Vec<float8::F8E4M3> = (0..kvh * kv_len * hd).map(|_| float8::F8E4M3::from_f32(4.0 * rnd())).collect();
+            let sh = Shape { h, kvh, s, kv_len, hd, k_hs: kv_len * hd, v_hs: kv_len * hd, scale: 0.0625 };
+            let got = run(&q, as_bytes(&kf), as_bytes(&vf), &sh);
+            let n_rep = h / kvh;
+            for head in 0..h {
+                let g = head / n_rep;
+                for r in 0..s {
+                    let lim = kv_len - s + r + 1;
+                    let qv = &q[(head * s + r) * hd..][..hd];
+                    let sc: Vec<f64> = (0..lim)
+                        .map(|j| (0..hd).map(|d| qv[d] as f64 * kf[(g * kv_len + j) * hd + d].to_f64()).sum::<f64>() * 0.0625)
+                        .collect();
+                    let m = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let w: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
+                    let l: f64 = w.iter().sum();
+                    for d in 0..hd {
+                        let want = (0..lim).map(|j| w[j] * vf[(g * kv_len + j) * hd + d].to_f64()).sum::<f64>() / l;
+                        let gotv = got[(head * s + r) * hd + d] as f64;
+                        assert!((want - gotv).abs() < 1e-4, "hd {hd} head {head} row {r} dim {d}: {gotv} vs {want}");
+                    }
                 }
             }
         }
@@ -703,7 +722,7 @@ mod tests {
         let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|i| float8::F8E4M3::from_bits((i % 113) as u8)).collect();
         for s in [1usize, 2] {
             let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
-            let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
+            let sh = Shape { h, kvh, s, kv_len, hd: HEAD_DIM, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
             let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             let t0 = std::time::Instant::now();
             for _ in 0..50 {
@@ -727,7 +746,7 @@ mod tests {
         let q2: Vec<f32> = (0..h * 2 * HEAD_DIM).map(|_| rnd()).collect();
         let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(rnd())).collect();
         let vf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|_| float8::F8E4M3::from_f32(rnd())).collect();
-        let sh2 = Shape { h, kvh, s: 2, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
+        let sh2 = Shape { h, kvh, s: 2, kv_len, hd: HEAD_DIM, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
         let two = run(&q2, as_bytes(&kf), as_bytes(&vf), &sh2);
         // row 0 of the 2-row call is a 1-row call one key shorter
         let q1: Vec<f32> = (0..h).flat_map(|hd| q2[(hd * 2) * HEAD_DIM..][..HEAD_DIM].to_vec()).collect();
@@ -744,7 +763,7 @@ mod tests {
         let kf: Vec<float8::F8E4M3> = (0..kvh * kv_len * HEAD_DIM).map(|i| float8::F8E4M3::from_bits((i % 113) as u8)).collect();
         for s in [1usize, 2] {
             let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
-            let sh = Shape { h, kvh, s, kv_len, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
+            let sh = Shape { h, kvh, s, kv_len, hd: HEAD_DIM, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
             let nq = h / kvh * s;
             let _ = unit(&q, as_bytes(&kf), as_bytes(&kf), &sh, 0, 0, (0, nq));
             let t0 = std::time::Instant::now();
@@ -775,7 +794,7 @@ mod tests {
                 (q, k, v)
             })
             .collect();
-        let shape = |n: usize| Shape { h, kvh, s: 2, kv_len: n, k_hs: n * HEAD_DIM, v_hs: n * HEAD_DIM, scale: 0.0625 };
+        let shape = |n: usize| Shape { h, kvh, s: 2, kv_len: n, hd: HEAD_DIM, k_hs: n * HEAD_DIM, v_hs: n * HEAD_DIM, scale: 0.0625 };
         for alone_pool in [&*SMALL_POOL, &*POOL] {
             for batch_pool in [&*SMALL_POOL, &*POOL] {
                 let alone: Vec<Vec<f32>> = data

@@ -134,6 +134,15 @@ impl SingleCache {
             self.all_data = Some(ad);
         };
 
+        // Host-RAM KV (TITAN_KV_HOST) stores F8E4M3 on the CPU; a buffer cloned in as BF16 (a batched
+        // template from clone_in_cache) must take the appended dtype/device before the slice_set. The
+        // appended prefix is what carries the real KV, so reconciling the whole buffer is lossless here.
+        if let Some(ad) = &self.all_data {
+            if ad.dtype() != src.dtype() || !ad.device().same_device(src.device()) {
+                self.all_data = Some(ad.to_dtype(src.dtype())?.to_device(src.device())?);
+            }
+        }
+
         // Expand kv cache
         if self.current_seq_len + seq_len > self.capacity_seq_len {
             let diff = self.current_seq_len + seq_len - self.capacity_seq_len;

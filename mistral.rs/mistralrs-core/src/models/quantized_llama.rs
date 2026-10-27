@@ -109,8 +109,12 @@ impl LayerWeights {
             }
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
+                // host-RAM F8E4M3 KV (TITAN_KV_HOST): append hands K/V back on the CPU, attention runs there
+                if k.device().is_cpu() {
+                    crate::titan_hostkv::attend(&q, &k, &v, &self.sdpa_params)?
+                } else {
+                    Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
+                }
             }
         };
 
