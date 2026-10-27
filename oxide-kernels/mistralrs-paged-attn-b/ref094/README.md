@@ -64,6 +64,15 @@ Three traps, each verified the hard way:
   output the generator discards — fix the mode and put `tools/` on `PATH`.
 - **`git checkout -- src/main.rs src/instances.rs`** after any run that prints `0 kernels`: the
   generator rewrites both files unconditionally.
+- **The snapshot's `libmistralrspagedattention.a` is malformed too** (`ar: malformed archive`: the
+  36 MB `flashinfer_decode` member is followed by a truncated tail). `build.rs` shells out to `ar t`,
+  so the gate build panics with `flashinfer_decode: not in …`. Rebuild the archive from the intact
+  objects, which are the ones `build.rs` selects by member stem anyway:
+
+  ```sh
+  cd $D && ar rcs libmrpb_rebuilt.a flashinfer_decode-6f99e1b253bc688f.o flashinfer_mla_decode-b7c320749ffdb505.o
+  cp libmrpb_rebuilt.a libmistralrspagedattention.a
+  ```
 
 The crate still gets no `titan-variants` spec: entry names are positional (`bd0..bdN`, numbered in
 reference order), so an axis product could only transcribe symbol order.
