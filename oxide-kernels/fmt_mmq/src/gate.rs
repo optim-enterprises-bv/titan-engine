@@ -509,7 +509,8 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     // FMT_MMQ_SMEM_X adds headroom while that size is measured.
     // The NVFP4 sram layout has stride 84 rather than 76, so its tile needs 128*(84-76)*4 more bytes.
     let smem = mmq_smem(j)
-        + if f == 5 { 128 * 8 * 4 } else { 0 }
+        // stride 84 instead of 76 over a 128-row tile, for both the int8 tile and its scale array
+        + if f == 5 { 128 * 8 * 4 * 2 } else { 0 }
         + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
     let stride_ch_y = nyb_ch * 36;
     let mmq_params = |dst: &Buf, tmp: &Buf| {
