@@ -1234,11 +1234,10 @@ mod kernels {
 
     /// `ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma`: the NVFP4 int8 dot.
     ///
-    /// NVFP4 needs one `ue4m3` scale per 16 values, but the only int8 MMA this crate has (and that is
-    /// proven against the reference) is m16n8k32. So each 32-value chunk is evaluated twice with half of
-    /// A zeroed: the first MMA keeps the low 16 values, the second the high 16, and each is scaled by its
-    /// own `ue4m3`. Identical arithmetic to the reference's m16n8k16 pair, in the same order, without
-    /// introducing a new instruction shape (the k16 form trapped with CUDA 719).
+    /// NVFP4 needs one `ue4m3` scale per 16 values; the proven int8 MMA here is m16n8k32, so each
+    /// 32-value chunk is evaluated twice with half of A zeroed and each half scaled by its own `ue4m3`.
+    /// A is loaded per k-step and the scales are read inline (no preloaded arrays) to keep register
+    /// pressure down -- the preloading version trapped with CUDA 719.
     unsafe fn vec_dot_q8_0_16<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
         let ntx = Jc::<J>::NTX;
         let rows_per_warp = 16 * ntx;
@@ -1248,33 +1247,6 @@ mod kernels {
         let y_qs = y.wrapping_add(4);
         let y_df = y as *const f32;
         let i0 = (ty() / ntx) * rows_per_warp;
-
-        let mut a = [[[0u32; 4]; 4]; 2];
-        let mut da = [[[0f32; 8]; 2]; 2];
-        let mut n = 0;
-        while n < Jc::<J>::NTX {
-            unroll!();
-            let mut kp = 0;
-            while kp < 4 {
-                unroll!();
-                let k0 = k00 + kp * 8;
-                a[n as usize][kp as usize] = ldmatrix_a(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
-                kp += 1;
-            }
-            let mut l = 0;
-            while l < 2 {
-                unroll!();
-                let i = i0 + n * 16 + c_i(2 * l);
-                let mut g = 0;
-                while g < 8 {
-                    unroll!();
-                    da[n as usize][l as usize][g as usize] = *x_df.offset((i * SRAM + (k00 + g * 4) / 4) as isize);
-                    g += 1;
-                }
-                l += 1;
-            }
-            n += 1;
-        }
 
         let mut j0 = 0;
         while j0 < J {
@@ -1289,8 +1261,8 @@ mod kernels {
                 let mut n = 0;
                 while n < Jc::<J>::NTX {
                     unroll!();
-                    let q = a[n as usize][kp as usize];
-                    // low 16 values, then high 16, each with its own scale
+                    let k0 = k00 + k01;
+                    let q = ldmatrix_a(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
                     let clo = mma_s8([q[0], q[1], 0, 0], b);
                     let chi = mma_s8([0, 0, q[2], q[3]], b);
                     let mut l = 0;
@@ -1298,10 +1270,11 @@ mod kernels {
                         unroll!();
                         let idx = ((j0 / 8 + n) * 4 + l) as usize;
                         let db = if l % 2 == 0 { db0 } else { db1 };
-                        let lo = da[n as usize][(l / 2) as usize][(2 * kp) as usize];
-                        let hi = da[n as usize][(l / 2) as usize][(2 * kp + 1) as usize];
-                        sum[idx] = fma(mul(lo, clo[l as usize] as f32), db, sum[idx]);
-                        sum[idx] = fma(mul(hi, chi[l as usize] as f32), db, sum[idx]);
+                        let ii = i0 + n * 16 + c_i(2 * (l / 2));
+                        let dlo = *x_df.offset((ii * SRAM + (k0) / 4) as isize);
+                        let dhi = *x_df.offset((ii * SRAM + (k0 + 4) / 4) as isize);
+                        sum[idx] = fma(mul(dlo, clo[l as usize] as f32), db, sum[idx]);
+                        sum[idx] = fma(mul(dhi, chi[l as usize] as f32), db, sum[idx]);
                         l += 1;
                     }
                     n += 1;
