@@ -1,36 +1,43 @@
 # NVFP4 int8 MMQ: open defect
 
-Status: **the tile loader is correct, the dot traps.** This note records what has been ruled out so the
-next attempt does not re-walk it.
+Status: **the trap is fixed; 217 bytes out of 169,161,784 still differ** (opt-in slot `--fmt=nvfp4q8`).
 
-## Symptom
+## Fixed: CUDA 719 trace/breakpoint trap
 
-`./target/release/fmt_mmq --fmt=nvfp4q8` (slot 5, opt-in) fails on the first launch with **CUDA 719**
-(`CUDA_ERROR_LAUNCH_FAILED`); `compute-sanitizer` reports `Trace/breakpoint trap` inside
-`nvfp4q8_mmq_j*_f*`. The reference side of the same case runs fine (`FMT_MMQ_SKIP_OX=1`: 444 launches,
-no trap).
+The dot stepped `j0 += 8` where the reference steps `j0 += Jc::<J>::JSTEP` (16 whenever `NTX == 2`, i.e.
+`J >= 48`). That made `idx = (j0/8 + n)*4 + l` reach **67 on a `sum[64]`**, so the Rust bounds check fired
+and the GPU codegen lowered the panic to `trap;` -- CUDA 719. With the step corrected the kernel runs
+end-to-end: `469 launches, 169,161,784 bytes compared`.
 
-## Ruled out, with the evidence
+This is why the earlier evidence looked contradictory: the generated SASS was instruction-identical to the
+reference (the trap was never in the MMA), the "proven" mma still appeared to trap (the bad step was still
+there), and shared-memory changes did nothing (never a memory-size problem). The earlier "the k16
+instruction traps" and "the scale index is causal" conclusions were both wrong for the same reason.
 
-| hypothesis | how it was excluded |
+## Fixed: rounding order
+
+The reference nests `k01` (one 16-value step) outermost, then `j0`, then `n`, with a single
+`sum += C*dA*dB` per 16-value group. Accumulating both halves of a 32-value chunk together is
+arithmetically equal but rounds differently.
+
+## What still differs (217 bytes)
+
+All remaining differences are in cases with `rate=256`, i.e. where the harness injects inf / nan /
+denormal / 3e38 activations, and every one is a low-byte ULP difference -- the arithmetic is right, the
+last bit is not. Ruled out with measurements:
+
+| tried | result |
 |---|---|
-| wrong reference revision / ABI | reference rebuilt from the pinned `acecd560` with `ref/nvcc_mmq_*.sh` flags plus `-DGGML_MMQ_FORCE_Q8`; its mangling matches every other slot, and the MXFP4 slot built the same way is **bit-identical** |
-| tile loader wrong | the same loader driven by the plain `vec_dot_q8_0::<J, 84>` **runs** (no trap, value mismatches only), so it produces sane tiles and does not fault |
-| `mma.m16n8k16.s8` not supported on cc 12.0 | `ptxas -arch=sm_120` compiles it (cubin produced), and the reference cubin uses `IMMA.16816.S8.S8` and executes on this GPU |
-| generated code differs from the reference | our PTX compiled with `ptxas` gives the identical instruction mix: `32 IMMA.16816.S8.S8`, `16 LDSM.16.M88.4` |
-| shared memory undersized | sized from llama.cpp's own formula `J*4 + I*sram_stride*4 + PAD(J*144, nthreads*4)` = 45,088 B for J=8; the harness requests 49,184 B, and +8 KB / +16 KB also trap |
-| the k16 instruction itself | a second dot was written using **only** proven pieces (`mma_s8` m16n8k32 twice with half of A zeroed, so the 16-value `ue4m3` scales apply exactly) — it still traps |
+| exact `div.rn.ftz` in the three scale paths (`amax/2688`, `amax_sub/6`, `1/row_scale`) | **worse**: 261 failing -> the reference is built with fast-math, so `div_approx` is the correct match |
+| exact `x * 0.5` instead of `div_approx(x, 2.0)` in `ue4m3` | neutral (217) |
+| shared y quantization kernel (`quantize_mmq_d4`) | innocent -- slot `mxfp4q8` passes bit-identically through it |
+| FTZ vs non-FTZ multiply | both reference kernels are `.FTZ`, same as ours |
+| the m16n8k16 MMA | legal for `sm_120`; ptxas emits `IMMA.16816.S8.S8` and the reference cubin runs it |
 
-## What that leaves
-
-The fault is inside this slot's kernel at run time, and it is not explained by the loader, the config,
-the reference, the instruction set, the generated code or the shared-memory size. The next step is
-instrumentation rather than reasoning: dump the k16 fragments (A registers, B register, dB, dA) from
-inside the kernel for one case and compare against the reference kernel's values for the same case, or
-build the dp4a variant (`ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a`, which uses the dp4a tile layout and
-avoids the MMA fragment path entirely).
+Remaining candidate: the `ue4m3` candidate search's error metric (`nv_err`) and tie-breaking, which can
+flip a near-tie scale by one step on 16-value sub-blocks.
 
 ## Nothing else depends on this
 
 The default run (`iq4_nl`, `mxfp4`, `nvfp4`, `iq4_xs`, `mxfp4q8`) is bit-identical:
-`1015 launches, 562,321,320 bytes, 0 failing`. Slot 5 is opt-in and cannot affect it.
+`1015 launches, 562,321,320 bytes, 0 failing`. Slot 5 (`nvfp4q8`) is opt-in and cannot affect it.

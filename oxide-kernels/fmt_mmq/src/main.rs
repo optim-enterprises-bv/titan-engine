@@ -140,6 +140,15 @@ mod kernels {
         unsafe { ptx_asm!("div.approx.ftz.f32 %0, %1, %2;", out("=f") r, in("f") a, in("f") b, options(register_only)); }
         r
     }
+    /// `a / b` exactly, FTZ [div.rn.ftz.f32]: the reference divides with `/` in the NVFP4 quantizer,
+    /// and `div_approx` shifts the `ue4m3` candidate search into a different near-tie.
+    #[inline(always)]
+    pub fn div_rn(a: f32, b: f32) -> f32 {
+        let mut r = 0f32;
+        unsafe { ptx_asm!("div.rn.ftz.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+
     /// fast-math `1.0f / a` [rcp.approx.ftz.f32].
     #[inline(always)]
     pub fn rcp_approx(a: f32) -> f32 {
@@ -1234,10 +1243,10 @@ mod kernels {
 
     /// `ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma`: the NVFP4 int8 dot.
     ///
-    /// NVFP4 needs one `ue4m3` scale per 16 values; the proven int8 MMA here is m16n8k32, so each
-    /// 32-value chunk is evaluated twice with half of A zeroed and each half scaled by its own `ue4m3`.
-    /// A is loaded per k-step and the scales are read inline (no preloaded arrays) to keep register
-    /// pressure down -- the preloading version trapped with CUDA 719.
+    /// Bit-identical to the reference, which means matching its exact loop nesting: `k01` (one 16-value
+    /// step) outermost, then `j0`, then `n`, with a single `sum += C*dA*dB` per 16-value group. Any other
+    /// nesting (j outer, or both halves of a 32-value chunk accumulated together) is arithmetically equal
+    /// but rounds differently, which shows up as 15% of bytes differing in the low byte.
     unsafe fn vec_dot_q8_0_16<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
         let ntx = Jc::<J>::NTX;
         let rows_per_warp = 16 * ntx;
@@ -1248,40 +1257,37 @@ mod kernels {
         let y_df = y as *const f32;
         let i0 = (ty() / ntx) * rows_per_warp;
 
-        let mut j0 = 0;
-        while j0 < J {
+        let mut k01 = 0;
+        while k01 < TILE_NE_K {
             unroll!();
-            let mut kp = 0;
-            while kp < 4 {
+            let k0 = k00 + k01;
+            let mut j0 = 0;
+            while j0 < J {
                 unroll!();
-                let k01 = kp * 8;
-                let b = load_b(y_qs.wrapping_offset((j0 * TILE_Y_K + k01) as isize), TILE_Y_K);
-                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 8) as isize);
-                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 8) as isize);
+                let b = load_b16(y_qs.wrapping_offset((j0 * TILE_Y_K + k01) as isize), TILE_Y_K);
+                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 32) as isize);
+                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 32) as isize);
                 let mut n = 0;
-                while n < Jc::<J>::NTX {
+                while n < ntx {
                     unroll!();
-                    let k0 = k00 + k01;
+                    // x4 load; its first pair is exactly the m16n8k16 A fragment for this 16-value step
                     let q = ldmatrix_a(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
-                    let clo = mma_s8([q[0], q[1], 0, 0], b);
-                    let chi = mma_s8([0, 0, q[2], q[3]], b);
+                    let c = mma_s8_16([q[0], q[1]], b);
                     let mut l = 0;
                     while l < 4 {
                         unroll!();
                         let idx = ((j0 / 8 + n) * 4 + l) as usize;
                         let db = if l % 2 == 0 { db0 } else { db1 };
                         let ii = i0 + n * 16 + c_i(2 * (l / 2));
-                        let dlo = *x_df.offset((ii * SRAM + (k0) / 4) as isize);
-                        let dhi = *x_df.offset((ii * SRAM + (k0 + 4) / 4) as isize);
-                        sum[idx] = fma(mul(dlo, clo[l as usize] as f32), db, sum[idx]);
-                        sum[idx] = fma(mul(dhi, chi[l as usize] as f32), db, sum[idx]);
+                        let da = *x_df.offset((ii * SRAM + k0 / 4) as isize);
+                        sum[idx] = fma(mul(da, c[l as usize] as f32), db, sum[idx]);
                         l += 1;
                     }
                     n += 1;
                 }
-                kp += 1;
+                j0 += Jc::<J>::JSTEP;
             }
-            j0 += 8;
+            k01 += 4;
         }
     }
 
