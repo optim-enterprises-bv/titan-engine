@@ -256,17 +256,17 @@ fn input(r: &mut Rng, it: usize, n: usize, rate: u64) -> (Vec<u8>, Vec<u8>) {
 
 pub struct M {
     pub quant: cu::CUmodule,
-    pub mmq: [cu::CUmodule; 5],
+    pub mmq: [cu::CUmodule; 6],
     pub ox: cu::CUmodule,
 }
 
-const FMT: [&str; 5] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8"];
-const GGML_TYPE: [u32; 5] = [20, 39, 40, 23, 39];
-const QK: [i32; 5] = [32, 32, 64, 256, 32];
-const BYTES: [usize; 5] = [18, 17, 36, 136, 17];
+const FMT: [&str; 6] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8", "nvfp4q8"];
+const GGML_TYPE: [u32; 6] = [20, 39, 40, 23, 39, 40];
+const QK: [i32; 6] = [32, 32, 64, 256, 32, 64];
+const BYTES: [usize; 6] = [18, 17, 36, 136, 17, 36];
 /// values per activation block (block_q8_1_mmq / block_fp4_mmq)
-// index 4 is MXFP4 through the int8 (q8_1) path: 128-value activation blocks, not the 256-value fp4 ones
-const NEB: [i64; 5] = [128, 256, 256, 128, 128];
+// indices 4 and 5 are the int8 (q8_1) paths: 128-value activation blocks, not the 256-value fp4 ones
+const NEB: [i64; 6] = [128, 256, 256, 128, 128, 128];
 const TY: [&str; 3] = ["f32", "f16", "bf16"];
 
 // ---------------------------------------------------------------------------------------------
@@ -307,7 +307,7 @@ fn quant_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, it: usize, c: &QCase,
                 p.put(x.0).put(idp).put(y.0).put(c.ne00).put(s01).put(s02).put(s03).put(ne0).put(c.ne1 as i32).put(c.ne2 as i32).put(0i32);
                 p
             };
-            let (rname, oname, grid, block) = if f == 0 || f == 4 {
+            let (rname, oname, grid, block) = if f == 0 || f == 4 || f == 5 {
                 (
                     "_Z17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii".to_string(),
                     format!("iq4_nl_quantize_mmq_d4_{}", TY[it]),
@@ -380,7 +380,7 @@ pub fn mmq_pick_j(ncols: i64, fallback: bool) -> i32 {
 fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * BYTES[f]);
     for _ in 0..n {
-        match if f == 4 { 1 } else { f } {
+        match if f == 4 { 1 } else if f == 5 { 2 } else { f } {
             0 => {
                 let d = if r.next() % rate == 0 {
                     [0u16, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x7bff][(r.next() % 8) as usize]
@@ -421,7 +421,7 @@ fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
 fn y_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 144);
     for _ in 0..n {
-        match if f == 4 { 0 } else { f } {
+        match if f == 4 || f == 5 { 0 } else { f } {
             0 | 3 => {
                 for _ in 0..4 {
                     let d = acts(r, 1, rate, true)[0].abs() / 127.0;
@@ -482,6 +482,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         .map(|_| if r.next() % rate == 0 { [0.0f32, 1e-40, f32::INFINITY, 1e30][(r.next() % 4) as usize] } else { acts(r, 1, 1 << 40, false)[0].abs() / 2688.0 })
         .collect();
     let ys = Buf::up(&kdiff::as_bytes(&ysv));
+    // only the fp4-activation instances carry a y_scale; the int8 path (slots 4, 5) has q8_1 activations
     let ysp = if f == 2 && c.yscale { ys.0 } else { 0u64 };
     let stride_col_dst = c.nrows + (c.pad_row % 2);
     let stride_ch_dst = stride_col_dst * c.ncols;
@@ -506,7 +507,10 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     let one = fastdiv_values(1);
     // The int8 (Q8_1) MXFP4 tile is larger than the block-scaled one this formula was derived for;
     // FMT_MMQ_SMEM_X adds headroom while that size is measured.
-    let smem = mmq_smem(j) + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
+    // The NVFP4 sram layout has stride 84 rather than 76, so its tile needs 128*(84-76)*4 more bytes.
+    let smem = mmq_smem(j)
+        + if f == 5 { 128 * 8 * 4 } else { 0 }
+        + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
     let stride_ch_y = nyb_ch * 36;
     let mmq_params = |dst: &Buf, tmp: &Buf| {
         let mut p = Params::default();
@@ -735,6 +739,7 @@ fn modules() -> M {
             load(&format!("{dir}/ref/mmq_nvfp4.cubin")),
             load(&format!("{dir}/ref/mmq_iq4_xs.cubin")),
             load(&format!("{dir}/ref/mmq_mxfp4_q8.cubin")),
+            load(&format!("{dir}/ref/mmq_nvfp4_q8.cubin")),
         ],
         ox: load(&format!("{dir}/fmt_mmq.ptx")),
     }
@@ -833,6 +838,8 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     let allow_bs = std::env::var("FMT_MMQ_BLOCKSCALED").is_ok();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
+        // slot 5 (NVFP4 int8) needs the m16n8k16 dot with 16-value scales, see the note in main.rs;
+        // until that exists it must not take the default run down.
         None => vec![0, 1, 2, 3, 4],
     }
     .into_iter()
