@@ -529,7 +529,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     // `nexperts_compact` is the reference's 14th parameter; the oxide entry takes 13, so the packed
     // buffer differs by one int between the two sides for this slot (a mismatched size is rejected by
     // cuLaunchKernel with 701).
-    let fix_params = |dst: &Buf, tmp: &Buf, for_ref: bool| {
+    let fix_params = |dst: &Buf, tmp: &Buf, _for_ref: bool| {
         let mut p = Params::default();
         p.put(0u64).put(0u64).put(dst.0).put(tmp.0);
         p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
@@ -537,29 +537,14 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         p.put(fd_ch[0]).put(fd_ch[1]).put(fd_ch[2]).put(stride_ch_dst);
         p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
-        if f == 4 && for_ref {
-            p.put(0i32);
-        }
         p
     };
     let fb = fallback as u32;
     let ty = GGML_TYPE[f];
-    // The int8 MXFP4 reference (index 4) is compiled from a llama.cpp revision whose templates carry
-    // an extra `ggml_prec` argument, which shifts the parameter slot numbers in the mangled name.
-    let (rname, rfix) = if f == 4 {
-        (
-            format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EL9ggml_prec40EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_i"),
-            format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EL9ggml_prec40EEvPKiS3_PfS4_5uint3iiiS5_iS5_iS5_i"),
-        )
-    } else {
-        (
-            format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_"),
-            format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_"),
-        )
-    };
-    if std::env::var("FMT_MMQ_DEBUG").is_ok() {
-        println!("  launch main f={f} J={j} fb={fb} grid={nblocks} smem={smem}");
-    }
+    // The reference for this slot is built from the same pinned llama.cpp revision (acecd560) with the
+    // crate's own ref/nvcc_*.sh command line, so it carries the same mangling as every other format.
+    let rname = format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_");
+    let rfix = format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_");
     if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
         launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
     }
@@ -848,9 +833,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     let allow_bs = std::env::var("FMT_MMQ_BLOCKSCALED").is_ok();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
-        // index 4 (MXFP4 through the int8 path) is opt-in: its MMQ launch still faults with CUDA 700
-        // in this harness, so it must not take the default run down. Use --fmt=mxfp4q8 to try it.
-        None => vec![0, 1, 2, 3],
+        None => vec![0, 1, 2, 3, 4],
     }
     .into_iter()
     .filter(|&f| {

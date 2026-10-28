@@ -17,7 +17,7 @@ gate is staging them (see "Artifacts" below).
 | `mistralrs-core-cuda` | 5,840 calls, 85,026,856 bytes, 0 failing |
 | `mmvq-rows` | 810 launches, 2,362,720 bytes, ten formats |
 | `mmq-rows` | 144 cases, 13,271,040 bytes (via `RUN_MMQ_ROWS=1` in `mistralrs-quant-c`) |
-| `fmt_mmq` (default) | 555 launches, 410,694,920 bytes, 0 failing; mxfp4/nvfp4 skipped with the reason printed |
+| `fmt_mmq` (default) | **1,015 launches, 562,321,320 bytes, 0 failing** -- iq4_nl, iq4_xs, and MXFP4 through the int8 path (mxfp4q8), which runs on cc 12.0 |
 | `fmt_mmq --fmt=iq4_nl` | 330 launches, 198,296,952 bytes, 0 failing |
 | `fmt_mmq --fmt=iq4_xs` | 230 launches, 208,754,192 bytes, 0 failing |
 | `candle-quantized` | 5,350 launches, 14,086,960 bytes, 0 failing |
@@ -41,7 +41,7 @@ gate is staging them (see "Artifacts" below).
 
 | crate | status |
 |---|---|
-| `fmt_mmq --fmt=mxfp4|nvfp4` | **Requires sm_120a hardware.** The MMQ kernels for these two formats are written with block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4.block_scale`), which ptxas rejects for `.target sm_120` and which takes CUDA 715 at run time on cc 12.0. The reference cannot be rebuilt for plain sm_120 either: llama.cpp gates the same instruction on the Blackwell arch, so every image of it is sm_120a (145/145 in the PrismML bundle). Neither side of the comparison can execute here. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches, and IQ4_NL/IQ4_XS MMQ pass 555 launches in the same crate. |
+| `fmt_mmq --fmt=mxfp4|nvfp4` (block-scaled instances) | **Requires sm_120a hardware.** The MMQ kernels for these two formats are written with block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4.block_scale`), which ptxas rejects for `.target sm_120` and which takes CUDA 715 at run time on cc 12.0. The reference cannot be rebuilt for plain sm_120 either: llama.cpp gates the same instruction on the Blackwell arch, so every image of it is sm_120a (145/145 in the PrismML bundle). Neither side of the comparison can execute here. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches, and IQ4_NL/IQ4_XS MMQ pass 555 launches in the same crate. |
 
 ## Artifacts: what has to be staged, and the traps
 

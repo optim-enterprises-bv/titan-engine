@@ -10,6 +10,15 @@
 //!   data layout: `ggml_cuda_mmq_load_tiles_iq4_nl` + `ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<D4>`
 //!   (m16n8k32 s8 MMA, `sum = fma.ftz(mul.ftz(dA, (float) C), dB, sum)`) on activations from
 //!   `quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>` (block_q8_1_mmq, 128 values / 144 bytes).
+//! - MXFP4, `mxfp4q8` slot: the same int8 path llama.cpp takes off-Blackwell
+//!   (`mmq_type_traits<..., GGML_TYPE_MXFP4>` `#else` branch): weights ride the int8 MMA through
+//!   `kvalues_mxfp4` with `e8m0(e)*0.5` per 32-value block, activations q8_1, and the config is the
+//!   **ampere** one (`get_config` returns it for `prec != Q4`). Runs on cc 12.0, where the
+//!   block-scaled MMA of the default MXFP4 instance is an illegal instruction. Its reference MUST be
+//!   built from the pinned revision with this crate's own command line, i.e.
+//!   `ref/nvcc_mmq_mxfp4.sh` at acecd560 plus `-DGGML_MMQ_FORCE_Q8`; building it from a newer checkout
+//!   instead gives a `ggml_prec` ABI (different mangling, a 14th fixup parameter, an out-of-bounds read)
+//!   and 1-3 ULP differences that look like a kernel bug but are not.
 //! - MXFP4 / NVFP4: mmq-config-blackwell.cuh (same thread / tile / J sets, SRAM layout FP4 = stride
 //!   76, K_vram 512), native FP4: `ggml_cuda_mmq_load_tiles_{mxfp4_fp4,nvfp4_nvfp4}` +
 //!   `ggml_cuda_mmq_vec_dot_fp4_fp4_mma` (`mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X
