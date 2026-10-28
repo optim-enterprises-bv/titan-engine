@@ -37,6 +37,10 @@ Two fixes made it visible:
    it is a newer revision whose `mul_mat_q` carries an extra `ggml_prec` template argument, so the symbol
    the gate looks for is absent (CUDA 500). Build from the pinned tree; borrow only headers.
 
+   The shipped `ref/nvcc_mmq_{mxfp4,nvfp4}.sh` are **historical** and do not run here: they hardcode
+   `-ccbin=/usr/bin/g++-15` (not installed; use `/usr/bin/g++`) and compile from `$HOME/ai/llama.cpp`,
+   which has no `template-instances/`. Use the command above instead.
+
 ## Where it stands
 
 | format | result |
