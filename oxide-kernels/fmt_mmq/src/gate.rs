@@ -214,16 +214,17 @@ fn input(r: &mut Rng, it: usize, n: usize, rate: u64) -> (Vec<u8>, Vec<u8>) {
 
 pub struct M {
     pub quant: cu::CUmodule,
-    pub mmq: [cu::CUmodule; 4],
+    pub mmq: [cu::CUmodule; 5],
     pub ox: cu::CUmodule,
 }
 
-const FMT: [&str; 4] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs"];
-const GGML_TYPE: [u32; 4] = [20, 39, 40, 23];
-const QK: [i32; 4] = [32, 32, 64, 256];
-const BYTES: [usize; 4] = [18, 17, 36, 136];
+const FMT: [&str; 5] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8"];
+const GGML_TYPE: [u32; 5] = [20, 39, 40, 23, 39];
+const QK: [i32; 5] = [32, 32, 64, 256, 32];
+const BYTES: [usize; 5] = [18, 17, 36, 136, 17];
 /// values per activation block (block_q8_1_mmq / block_fp4_mmq)
-const NEB: [i64; 4] = [128, 256, 256, 128];
+// index 4 is MXFP4 through the int8 (q8_1) path: 128-value activation blocks, not the 256-value fp4 ones
+const NEB: [i64; 5] = [128, 256, 256, 128, 128];
 const TY: [&str; 3] = ["f32", "f16", "bf16"];
 
 // ---------------------------------------------------------------------------------------------
@@ -264,7 +265,7 @@ fn quant_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, it: usize, c: &QCase,
                 p.put(x.0).put(idp).put(y.0).put(c.ne00).put(s01).put(s02).put(s03).put(ne0).put(c.ne1 as i32).put(c.ne2 as i32).put(0i32);
                 p
             };
-            let (rname, oname, grid, block) = if f == 0 {
+            let (rname, oname, grid, block) = if f == 0 || f == 4 {
                 (
                     "_Z17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii".to_string(),
                     format!("iq4_nl_quantize_mmq_d4_{}", TY[it]),
@@ -337,7 +338,7 @@ pub fn mmq_pick_j(ncols: i64, fallback: bool) -> i32 {
 fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * BYTES[f]);
     for _ in 0..n {
-        match f {
+        match if f == 4 { 1 } else { f } {
             0 => {
                 let d = if r.next() % rate == 0 {
                     [0u16, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x7bff][(r.next() % 8) as usize]
@@ -378,7 +379,7 @@ fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
 fn y_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 144);
     for _ in 0..n {
-        match f {
+        match if f == 4 { 0 } else { f } {
             0 | 3 => {
                 for _ in 0..4 {
                     let d = acts(r, 1, rate, true)[0].abs() / 127.0;
@@ -457,7 +458,9 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     let fd_ntx = fastdiv_values(ntx as u64);
     let fd_ch = fastdiv_values(c.nch as u64);
     let one = fastdiv_values(1);
-    let smem = mmq_smem(j);
+    // The int8 (Q8_1) MXFP4 tile is larger than the block-scaled one this formula was derived for;
+    // FMT_MMQ_SMEM_X adds headroom while that size is measured.
+    let smem = mmq_smem(j) + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
     let stride_ch_y = nyb_ch * 36;
     let mmq_params = |dst: &Buf, tmp: &Buf| {
         let mut p = Params::default();
@@ -481,13 +484,32 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     };
     let fb = fallback as u32;
     let ty = GGML_TYPE[f];
-    let rname = format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_");
-    let rfix = format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_");
-    launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
-    launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
+    // The int8 MXFP4 reference (index 4) is compiled from a llama.cpp revision whose templates carry
+    // an extra `ggml_prec` argument, which shifts the parameter slot numbers in the mangled name.
+    let (rname, rfix) = if f == 4 {
+        (
+            format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EL9ggml_prec40EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_i"),
+            format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EL9ggml_prec40EEvPKiS3_PfS4_5uint3iiiS5_iS5_iS5_i"),
+        )
+    } else {
+        (
+            format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_"),
+            format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_"),
+        )
+    };
+    if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
+        launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
+    }
+    if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
+        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
+    }
     if fixup_needed {
-        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
-        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}")), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+        if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
+            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
+        }
+        if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
+            launch_ox(func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}")), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+        }
     }
     let (ra, rb) = (da.down(), db.down());
     let label = format!(
@@ -623,6 +645,7 @@ fn modules() -> M {
             load(&format!("{dir}/ref/mmq_mxfp4.cubin")),
             load(&format!("{dir}/ref/mmq_nvfp4.cubin")),
             load(&format!("{dir}/ref/mmq_iq4_xs.cubin")),
+            load(&format!("{dir}/ref/mmq_mxfp4_q8.cubin")),
         ],
         ox: load(&format!("{dir}/fmt_mmq.ptx")),
     }
@@ -639,6 +662,8 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     let allow_bs = std::env::var("FMT_MMQ_BLOCKSCALED").is_ok();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
+        // index 4 (MXFP4 through the int8 path) is opt-in: its MMQ launch still faults with CUDA 700
+        // in this harness, so it must not take the default run down. Use --fmt=mxfp4q8 to try it.
         None => vec![0, 1, 2, 3],
     }
     .into_iter()
