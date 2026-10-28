@@ -34,15 +34,14 @@ gate is staging them (see "Artifacts" below).
 | `ptq1_0` | quantize pt x2, fwht x6 + fused x4, mmvq pt x12, quantize mmq x2, mmq x16 + fixup x16 |
 | `flash-decode` | PASS |
 | `mmvq-moe` | 3,840 comparisons, 33,782,400 output words (135 MB), 0 differ -- against Titan's own deployed kernels (section C) |
-| `candle-mmq` | 7 of 10 types (q4_0 q4_1 q5_0 q5_1 q8_0 q3_k q4_k): 408 launcher calls and 806,248,232 bytes of dst each, 0 failing; q2_k/q5_k/q6_k blocked (below) |
+| `candle-mmq` | **10 of 10 types**: 408 launcher calls and 806,248,232 bytes of dst each, 0 failing. q2_k/q5_k/q6_k needed the reference recompiled for sm_120 -- see `candle-mmq/REFERENCE.md` |
 | `titan-doorbell` | 400 layers, 1599 missed rows (reported, not silent) |
 
 ## Not runnable here, with the reason
 
 | crate | status |
 |---|---|
-| `candle-mmq` q2_k, q5_k, q6_k | The reference `libmoe.a` is sm_120a in all 15 members and those three instances take CUDA 715; an illegal-instruction fault poisons the context, so the default run splits the work one process per type and reports them blocked. No PTX exists for them (candle compiles to SASS only) and no non-`a` image of the archive is on the box. |
-| `fmt_mmq --fmt=mxfp4|nvfp4` | Block-scaled MMA, `.target sm_120a` only. The driver loads the module but the instruction is illegal on cc 12.0. Every reference image of these kernels is sm_120a too (145/145 in the PrismML bundle), so there is no runnable oracle either. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches. |
+| `fmt_mmq --fmt=mxfp4|nvfp4` | **Requires sm_120a hardware.** The MMQ kernels for these two formats are written with block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4.block_scale`), which ptxas rejects for `.target sm_120` and which takes CUDA 715 at run time on cc 12.0. The reference cannot be rebuilt for plain sm_120 either: llama.cpp gates the same instruction on the Blackwell arch, so every image of it is sm_120a (145/145 in the PrismML bundle). Neither side of the comparison can execute here. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches, and IQ4_NL/IQ4_XS MMQ pass 555 launches in the same crate. |
 
 ## Artifacts: what has to be staged, and the traps
 
