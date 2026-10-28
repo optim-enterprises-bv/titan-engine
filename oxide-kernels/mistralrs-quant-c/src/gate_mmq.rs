@@ -2,7 +2,8 @@
 //! fused GLU f32 quantizers) and launch_mmq_gguf_<type> / launch_mmq_gguf_<type>_moe, the REAL C
 //! launchers against the Rust twins on the same inputs, same context and stream. Compares every
 //! byte of dst / vy and of the stream-k tmp_fixup buffer (both pre-filled with the same pattern).
-use crate::gate::{Buf, G, Rng, encode, sync};
+use crate::gate::{Buf, G, Rng, check, encode, sync};
+use cuda_core::sys;
 use crate::launch as rs;
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -495,7 +496,144 @@ fn glu_typed_case(g: &mut G, layout: usize, type_x: i32, k: usize, s01: usize, n
     g.t.cmp("mmq_quantize_glu_t", &label, &y0, &outs[0], &outs[1]);
 }
 
+
+// ---------------------------------------------------------------- mmq_rows (oxide, prefill rows)
+/// `mmq_rows_<q>_nc<n>` claims to equal the MMQ x8 stream-k tile plus its fixup, byte for byte. The
+/// reference here is this crate's own Rust MMQ launcher -- already proven identical to the C launcher
+/// and to the nvcc kernel by the `mmq_*` families above -- driven with the same geometry the real
+/// launcher uses (mistralrs-quant/src/gguf/mmq_rows.rs): total = ceil(nrows/128) * bpn k blocks,
+/// `grid` from the occupancy rule, and the segment count from the stream-k block map.
+const MMQ_Y_ROWS: usize = 128;
+const ROWS_PER_BLOCK: usize = 32;
+const TILE_EFFICIENCY_PERCENT: usize = 90;
+const KB_PER_STAGE_MMQ_ROWS: usize = 2;
+
+fn kstart_us(b: usize, total: usize, grid: usize) -> usize {
+    b * total / grid
+}
+
+fn block_of_us(kbc: usize, total: usize, grid: usize) -> usize {
+    let mut b = kbc * grid / total;
+    while b + 1 < grid && kstart_us(b + 1, total, grid) <= kbc {
+        b += 1;
+    }
+    while b > 0 && kstart_us(b, total, grid) > kbc {
+        b -= 1;
+    }
+    b
+}
+
+fn max_segments_us(nty: usize, bpn: usize, grid: usize) -> usize {
+    let total = nty * bpn;
+    (0..nty).map(|t| block_of_us(t * bpn + bpn - 1, total, grid) - block_of_us(t * bpn, total, grid) + 1).max().unwrap_or(1)
+}
+
+/// The oxide PTX, loaded next to the crate that owns the launcher.
+fn rows_module() -> sys::CUmodule {
+    let path = std::env::var("MMQ_ROWS_PTX")
+        .unwrap_or(format!("{}/../mmq-rows/mmq_rows.ptx", env!("CARGO_MANIFEST_DIR")));
+    let c = std::ffi::CString::new(path.clone()).unwrap();
+    let mut m: sys::CUmodule = std::ptr::null_mut();
+    unsafe { check(sys::cuModuleLoad(&mut m, c.as_ptr()), &format!("cuModuleLoad {path}")) };
+    m
+}
+
+fn rows_fn(m: sys::CUmodule, name: &str) -> sys::CUfunction {
+    let c = std::ffi::CString::new(name).unwrap();
+    let mut f: sys::CUfunction = std::ptr::null_mut();
+    unsafe { check(sys::cuModuleGetFunction(&mut f, m, c.as_ptr()), &format!("cuModuleGetFunction {name}")) };
+    f
+}
+
+fn mmq_rows_case(g: &mut G, m: sys::CUmodule, q: &QType, k: usize, nrows: usize, ncols: usize, nsm: i32, smpbo: i64, type_dst: i32, sk: usize) {
+    let stream = g.s(sk);
+    let label = format!("mmq_rows_{} k={k} rows={nrows} cols={ncols} dst={type_dst}", q.name);
+    let bpn = k / q.qk;
+    let x = weights(&mut g.rng, q, nrows * bpn);
+    let yb = activations(g, q, k, ncols, false, stream);
+    let xb = Buf::new(&x);
+    let es = if type_dst == 1 || type_dst == 30 { 2 } else { 4 };
+    let dst0 = g.rng.bytes(nrows * ncols * es);
+    let fix0 = g.rng.bytes(nsm.max(1) as usize * 128 * 128 * 4);
+
+    // reference: the MMQ launcher (Rust side), ncols columns, same strided dst
+    let dref = Buf::new(&dst0);
+    let fixr = Buf::new(&fix0);
+    unsafe {
+        (q.dense.1)(fixr.p(), xb.p(), yb.p(), dref.p(), k as i64, nrows as i64, ncols as i64, bpn as i64,
+                    nrows as i64, 1200, nsm, smpbo, 32, type_dst, stream)
+    };
+    sync(&label);
+    let want = dref.read();
+
+    // oxide rows kernel, same tile/stream-k decomposition
+    let nty = nrows.div_ceil(MMQ_Y_ROWS);
+    let waves = nty.div_ceil(nsm.max(1) as usize);
+    let grid = if 100 * nty / (nsm.max(1) as usize * waves) >= TILE_EFFICIENCY_PERCENT { nty } else { nsm.max(1) as usize };
+    let segs = max_segments_us(nty, bpn, grid);
+    if segs > 32 {
+        println!("  skip {label}: {segs} segments > 32");
+        return;
+    }
+    // dynamic shared = [segment][column][lane] partials, then each warp's KB_PER_STAGE staged rows
+    // (see mmq_rows' `part`/`sa` addressing); under-sizing this is an illegal shared access.
+    let row_words = if q.name == "q4_k" { 37 } else { 45 };
+    let smem = segs * ROWS_PER_BLOCK * (ncols + KB_PER_STAGE_MMQ_ROWS * row_words) * 4;
+    let f = rows_fn(m, &format!("mmq_rows_{}_nc{ncols}", q.name));
+    let ox = Buf::new(&vec![0u8; nrows * ncols * es]);
+    let mut vals: Vec<[u8; 8]> = vec![
+        xb.ptr.to_le_bytes(),
+        yb.ptr.to_le_bytes(),
+        ox.ptr.to_le_bytes(),
+        (nrows as u64).to_le_bytes(),
+        (bpn as u64).to_le_bytes(),
+        (bpn as u64).to_le_bytes(),
+        (ncols as u64).to_le_bytes(),
+        ((nty * bpn) as u64).to_le_bytes(),
+        (grid as u64).to_le_bytes(),
+        (type_dst as u64).to_le_bytes(),
+    ];
+    let mut ptrs: Vec<*mut c_void> = vals.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
+    unsafe {
+        check(sys::cuLaunchKernel(f, nrows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1, 32, segs as u32, 1,
+                                  smem as u32, stream as *mut sys::CUstream_st, ptrs.as_mut_ptr(), std::ptr::null_mut()), &label)
+    };
+    sync(&label);
+    let got = ox.read();
+    g.t.calls("mmq_rows", 1);
+    g.t.cmp("mmq_rows", &label, &dst0, &want, &got);
+}
+
+/// RUN_MMQ_ROWS=1: gate the oxide prefill rows kernel instead of the usual families.
+pub fn run_mmq_rows(g: &mut G) {
+    let m = rows_module();
+    let qs = qtypes();
+    // (format, k, nrows): the shapes mistral.rs routes here are ncols <= TITAN_MMQ_ROWS and nrows >= 4096
+    let shapes: [(&str, usize, usize); 6] = [
+        ("q4_k", 5120, 5120),
+        ("q4_k", 5120, 17408),
+        ("q4_k", 2048, 4096),
+        ("q5_k", 5120, 5120),
+        ("q5_k", 2048, 8192),
+        ("q5_k", 5120, 6144),
+    ];
+    let mut sk = 0usize;
+    for (qn, k, nrows) in shapes {
+        let q = qs.iter().find(|q| q.name == qn).unwrap();
+        for ncols in 1..=8usize {
+            for &type_dst in &[0i32, 1, 30] {
+                sk += 1;
+                mmq_rows_case(g, m, q, k, nrows, ncols, NSM_REAL, SMPBO_REAL, type_dst, sk);
+            }
+        }
+    }
+}
+
 pub fn run(g: &mut G, only: &Option<Vec<String>>, run: &mut HashSet<String>) {
+    if std::env::var("RUN_MMQ_ROWS").is_ok() {
+        run_mmq_rows(g);
+        return;
+    }
     let want = |f: &str| only.as_ref().is_none_or(|o| o.iter().any(|n| n == f));
     let quick = std::env::var("MRQC_QUICK").is_ok();
     let mut sk = 0usize;

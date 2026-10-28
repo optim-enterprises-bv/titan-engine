@@ -783,6 +783,25 @@ pub fn run() -> i32 {
     let mut g = G { rng: Rng(0x3317_9A1D_C0DE), t: Tally::default(), stream: stream_owner.cu_stream() as *mut c_void, self_test: std::env::var("MRQC_SELF").is_ok() };
     let mut run: HashSet<String> = HashSet::new();
 
+    if std::env::var("RUN_MMQ_ROWS").is_ok() {
+        // separate mode: the oxide prefill rows kernel vs the MMQ x8 tile + fixup. Does not touch the
+        // reference-cubin families below, so report its own tally and stop.
+        crate::gate_mmq::run_mmq_rows(&mut g);
+        for (fam, (calls, fails, wrote)) in &g.t.fam {
+            println!("  {fam}: {calls} launcher calls, {fails} failing cases (reference changed its output in {wrote})");
+        }
+        for f in g.t.failures.iter().take(40) {
+            println!("  FAIL {f}");
+        }
+        let ok = g.t.failures.is_empty();
+        println!(
+            "mistralrs-quant-c mmq_rows: {} calls, {} bytes compared, {} failing -> {}",
+            g.t.calls, g.t.bytes, g.t.failures.len(),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        return if ok { 0 } else { 1 };
+    }
+
     if want("mmvq") {
         mmvq_suite(&mut g);
     }
