@@ -1250,12 +1250,16 @@ mod kernels {
         let mut n = 0;
         while n < Jc::<J>::NTX {
             unroll!();
-            let mut st = 0;
-            while st < 8 {
+            // llama.cpp loads A in pairs: `((tile_A_8 *) A[n])[k01/8]`, i.e. one x4 ldmatrix fills two
+            // consecutive k16 fragments. Reuse the proven x4 loader and split it.
+            let mut kp = 0;
+            while kp < 4 {
                 unroll!();
-                let k0 = k00 + st * 4;
-                a[n as usize][st as usize] = ldmatrix_a16(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
-                st += 1;
+                let k0 = k00 + kp * 8;
+                let q = ldmatrix_a(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
+                a[n as usize][(2 * kp) as usize] = [q[0], q[1]];
+                a[n as usize][(2 * kp + 1) as usize] = [q[2], q[3]];
+                kp += 1;
             }
             let mut l = 0;
             while l < 2 {
