@@ -100,6 +100,7 @@ pub static mut OX_LAUNCHES: usize = 0;
 
 /// Launch from a packed parameter buffer (CU_LAUNCH_PARAM_BUFFER_POINTER), then synchronize.
 pub fn launch(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), smem: u32, p: &Params) {
+    if std::env::var("FMT_MMQ_DEBUG").is_ok() { println!("   REF launch grid={grid:?} block={block:?} smem={smem}"); }
     unsafe {
         if smem > 48 * 1024 {
             ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32));
@@ -120,6 +121,7 @@ pub fn launch(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), 
     }
 }
 fn launch_ox(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), smem: u32, p: &Params) {
+    if std::env::var("FMT_MMQ_DEBUG").is_ok() { println!("   OX  launch grid={grid:?} block={block:?} smem={smem}"); }
     unsafe { OX_LAUNCHES += 1 };
     launch(f, grid, block, smem, p);
 }
@@ -637,7 +639,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         let d = ta.iter().zip(&tb).filter(|(x, y)| x != y).count();
         println!("  tmp-after-main f={f} J={j} fb={fb}: {d} of {} bytes differ", ta.len());
     }
-    if fixup_needed {
+    if fixup_needed && std::env::var("FMT_MMQ_SKIP_FIX").is_err() {
         if std::env::var("FMT_MMQ_DEBUG").is_ok() {
             println!("  launch fixup f={f} J={j} fb={fb} grid=({nblocks},4,1) block=(32,4,1)");
         }
@@ -677,7 +679,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         "{oxfmt} mmq J={j} fb={fallback} nrows={} k={} ncols={} nch={} grid={nblocks} fixup={fixup_needed} yscale={} rate={rate}",
         c.nrows, c.k, c.ncols, c.nch, ysp != 0
     );
-    if ra != rb {
+    if ra != rb && std::env::var("FMT_MMQ_SKIP_REF").is_err() {
         // rule 31: is the reference itself deterministic here?
         let dc = Buf::up(&fill);
         let tmp_c = Buf::zeros((nblocks * j as u32 * 128) as usize * 4);
