@@ -884,13 +884,12 @@ mod kernels {
     /// `mxfp4` crate uses the other convention, so this one is kept local to the Q8 tile loader.
     #[inline(always)]
     fn e8m0_mmq(e: u32) -> f32 {
-        // E8M0 NaN (0xFF) -> NaN, as the intrinsic returns it; the plain shift gives +inf there and
-        // scores worse against the reference (215 vs 188 failing cases).
         match e & 0xFF {
             0xFF => f32::NAN,
             x => f32::from_bits(x << 23),
         }
     }
+
 
     /// MXFP4 through the **int8** path: llama.cpp's non-Blackwell MXFP4 MMQ.
     ///
@@ -903,8 +902,10 @@ mod kernels {
         const QK: i32 = 32;
         /// block_mxfp4: one e8m0 byte then 16 nibble bytes
         const BYTES: i32 = 17;
-        /// 8 blocks of 32 values fill one 256-value tile iteration (measured: 16 scores worse,
-        /// 216 vs 188 differing comparisons)
+        /// 8 blocks of 32 values per tile iteration. NOTE: mmq-config-blackwell.cuh gives MXFP4
+        /// `MMQ_ITER_K_FP4` = 512 (16 blocks) even on the Q8 path, but this loader fills 8 blocks, so
+        /// setting 16 here measures worse (216 vs 185). Matching the reference needs the FP4-layout
+        /// loader (16 blocks per iteration), not just this constant.
         const BPI: i32 = 8;
         /// q8_1 activation blocks, not the 256-value fp4 ones
         const NEB: i32 = 128;

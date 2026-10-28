@@ -428,7 +428,11 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     let j = mmq_pick_j(c.ncols as i64, fallback);
     let bpn = c.k / QK[f];
     let stride_row_x = bpn + c.pad_row;
-    let x = Buf::up(&x_blocks(r, f, (stride_row_x * c.nrows + 64) as usize, rate));
+    // The int8 MXFP4 reference may run a 512-value K iteration (16 blocks/row), so give it a generous
+    // tail: with only 64 blocks of slack it reads past the allocation into freshly-mapped garbage, which
+    // is why it disagreed with itself on exactly the stream-k cases.
+    let tail = if f == 4 { 64 + 32 * c.nrows as usize } else { 64 };
+    let x = Buf::up(&x_blocks(r, f, (stride_row_x * c.nrows + tail as i32) as usize, rate));
     let kp = (c.k as i64 + 511) / 512 * 512;
     let nyb_ch = (kp / NEB[f]) as i32 * c.ncols; // activation blocks per channel
     let y = Buf::up(&y_blocks(r, f, (nyb_ch * c.nch + 128) as usize, rate));
