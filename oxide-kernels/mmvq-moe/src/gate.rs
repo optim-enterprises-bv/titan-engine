@@ -717,11 +717,13 @@ pub fn run() -> bool {
         // local build's sm_120a image writes nothing for the moe kernel and faults with CUDA 700 for
         // the b1 one), so the sections announce the skip instead of reporting phantom mismatches.
         gate_moe_llama(&m, &mut t, &sh, &mut r);
+        // Section C compares against Titan's own deployed kernels (the deployed PTX), not llama.cpp,
+        // so it does not need a working llama.cpp Blackwell image and always runs.
+        gate_service(&m, &mut t, &mut sens, &sh, &mut r);
         if std::env::var("MMVQ_MOE_REF").is_ok() {
             gate_b1_llama(&m, &mut t, &sh, &mut r);
-            gate_service(&m, &mut t, &mut sens, &sh, &mut r);
         } else {
-            println!("  skip sections B and C: no llama.cpp sm_120 image on this box runs the b1/mmvq kernels (they write nothing or fault with CUDA 700); MMVQ_MOE_REF=1 forces them");
+            println!("  skip section B: no llama.cpp sm_120 image on this box runs the b1 kernels (they write nothing or fault with CUDA 700); MMVQ_MOE_REF=1 forces it");
         }
     }
     println!("\n== gate summary ({:.1}s)", t0.elapsed().as_secs_f64());

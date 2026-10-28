@@ -33,15 +33,16 @@ gate is staging them (see "Artifacts" below).
 | `q1_0` | 1,098 launches: dequantize x3, mmvq x27, quantize x6, mmq x16 + fixup x16 |
 | `ptq1_0` | quantize pt x2, fwht x6 + fused x4, mmvq pt x12, quantize mmq x2, mmq x16 + fixup x16 |
 | `flash-decode` | PASS |
+| `mmvq-moe` | 3,840 comparisons, 33,782,400 output words (135 MB), 0 differ -- against Titan's own deployed kernels (section C) |
+| `candle-mmq` | 7 of 10 types (q4_0 q4_1 q5_0 q5_1 q8_0 q3_k q4_k): 408 launcher calls and 806,248,232 bytes of dst each, 0 failing; q2_k/q5_k/q6_k blocked (below) |
 | `titan-doorbell` | 400 layers, 1599 missed rows (reported, not silent) |
 
 ## Not runnable here, with the reason
 
 | crate | status |
 |---|---|
-| `fmt_mmq --fmt=mxfp4|nvfp4` | **blocked by hardware.** These kernels use block-scaled MMA, which needs `.target sm_120a`; the module loads but takes CUDA 715 (illegal instruction) on cc 12.0. The default run skips them with that sentence printed and passes the other two formats. |
-| `mmvq-moe` | **BLOCKED, 0 comparisons.** Every cross-check needs a llama.cpp moe/mmvq image that both loads and produces output on sm_120. b10934's sm_120 image launches and writes nothing; the local build's sm_120a image writes nothing for the MoE kernel and faults with CUDA 700 for the b1 one. The gate prints `MMVQ-MOE GATE: BLOCKED` and exits non-zero rather than reporting phantom mismatches. |
-| `candle-mmq` | **BLOCKED.** The reference `libmoe.a` is sm_120a code in all 15 members and its first q2_k instance takes CUDA 715; an illegal-instruction fault poisons the context, so nothing can be compared. Exits 2 with that reason (skipping case-by-case was tried — every later allocation fails with 715 too). |
+| `candle-mmq` q2_k, q5_k, q6_k | The reference `libmoe.a` is sm_120a in all 15 members and those three instances take CUDA 715; an illegal-instruction fault poisons the context, so the default run splits the work one process per type and reports them blocked. No PTX exists for them (candle compiles to SASS only) and no non-`a` image of the archive is on the box. |
+| `fmt_mmq --fmt=mxfp4|nvfp4` | Block-scaled MMA, `.target sm_120a` only. The driver loads the module but the instruction is illegal on cc 12.0. Every reference image of these kernels is sm_120a too (145/145 in the PrismML bundle), so there is no runnable oracle either. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches. |
 
 ## Artifacts: what has to be staged, and the traps
 
