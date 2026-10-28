@@ -473,13 +473,27 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
         p
     };
-    let fix_params = |dst: &Buf, tmp: &Buf| {
+    // The int8 MXFP4 reference's fixup takes 14 parameters:
+    //   (ids_dst, expert_bounds, dst, tmp_last_tile, uint3 blocks_per_ne00, nrows_x, ncols_dst,
+    //    stride_col_dst, uint3 nchannels_y, stride_channel_dst, uint3 nsamples_y, stride_sample_dst,
+    //    uint3 ntx, nexperts_compact)
+    // The cubins for the other slots come from a revision whose fixup had extra arguments, so this
+    // slot needs its own packing -- feeding the older layout puts an int where a pointer belongs and
+    // the kernel dereferences 0.
+    // `nexperts_compact` is the reference's 14th parameter; the oxide entry takes 13, so the packed
+    // buffer differs by one int between the two sides for this slot (a mismatched size is rejected by
+    // cuLaunchKernel with 701).
+    let fix_params = |dst: &Buf, tmp: &Buf, for_ref: bool| {
         let mut p = Params::default();
         p.put(0u64).put(0u64).put(dst.0).put(tmp.0);
         p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
         p.put(c.nrows).put(c.ncols).put(stride_col_dst);
-        p.put(fd_ch[0]).put(fd_ch[1]).put(fd_ch[2]).put(stride_ch_dst).put(one[0]).put(one[1]).put(one[2]).put(0i32);
+        p.put(fd_ch[0]).put(fd_ch[1]).put(fd_ch[2]).put(stride_ch_dst);
+        p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
+        if f == 4 && for_ref {
+            p.put(0i32);
+        }
         p
     };
     let fb = fallback as u32;
@@ -497,6 +511,9 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
             format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_"),
         )
     };
+    if std::env::var("FMT_MMQ_DEBUG").is_ok() {
+        println!("  launch main f={f} J={j} fb={fb} grid={nblocks} smem={smem}");
+    }
     if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
         launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
     }
@@ -504,14 +521,37 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
     }
     if fixup_needed {
+        if std::env::var("FMT_MMQ_DEBUG").is_ok() {
+            println!("  launch fixup f={f} J={j} fb={fb} grid=({nblocks},4,1) block=(32,4,1)");
+        }
+        let fy: u32 = std::env::var("FMT_MMQ_FIXBLK").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
-            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
+            launch(func(m.mmq[f], &rfix), (nblocks, fy, 1), (32, fy, 1), 0, &fix_params(&da, &tmp_a, true));
         }
         if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
-            launch_ox(func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}")), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+            let fx = func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}"));
+            if std::env::var("FMT_MMQ_DEBUG").is_ok() {
+                let mut v: i32 = 0;
+                unsafe {
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS, fx);
+                    print!("    oxide fixup regs={v}");
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fx);
+                    print!(" shared={v}");
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fx);
+                    println!(" local={v}");
+                }
+            }
+            launch_ox(fx, (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b, false));
         }
     }
     let (ra, rb) = (da.down(), db.down());
+    if std::env::var("FMT_MMQ_VALUES").is_ok() {
+        if let Some(p) = ra.chunks_exact(4).zip(rb.chunks_exact(4)).position(|(x, y)| x != y) {
+            let f4 = |v: &[u8]| f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let (a, b) = (&ra[p * 4..p * 4 + 4], &rb[p * 4..p * 4 + 4]);
+            println!("  VALUES word {p}: ref {:e} ({:#010x})  oxide {:e} ({:#010x})", f4(a), f4(a).to_bits(), f4(b), f4(b).to_bits());
+        }
+    }
     let label = format!(
         "{oxfmt} mmq J={j} fb={fallback} nrows={} k={} ncols={} nch={} grid={nblocks} fixup={fixup_needed} yscale={} rate={rate}",
         c.nrows, c.k, c.ncols, c.nch, ysp != 0
@@ -522,7 +562,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         let tmp_c = Buf::zeros((nblocks * j as u32 * 128) as usize * 4);
         launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&dc, &tmp_c));
         if fixup_needed {
-            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&dc, &tmp_c));
+            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&dc, &tmp_c, true));
         }
         if dc.down() != ra {
             println!("  note: reference disagrees with itself for {label}");
@@ -586,7 +626,7 @@ fn moe_mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, nrows: i32, k: i32,
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
         p
     };
-    let fix_params = |dst: &Buf, tmp: &Buf| {
+    let fix_params = |dst: &Buf, tmp: &Buf, _for_ref: bool| {
         let mut p = Params::default();
         p.put(idb.0).put(eb.0).put(dst.0).put(tmp.0);
         p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
@@ -602,8 +642,8 @@ fn moe_mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, nrows: i32, k: i32,
     launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
     launch_ox(func(m.ox, &format!("{}_mmq_j{j}_f{fb}", FMT[f])), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
     if fixup_needed {
-        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
-        launch_ox(func(m.ox, &format!("{}_mmq_fixup_j{j}_f{fb}", FMT[f])), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a, true));
+        launch_ox(func(m.ox, &format!("{}_mmq_fixup_j{j}_f{fb}", FMT[f])), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b, false));
     }
     let label = format!(
         "{} moe-mmq J={j} fb={fallback} nrows={nrows} k={k} experts={ne} total={total} ncols_max={ncols_max} grid={nblocks} fixup={fixup_needed} rate={rate}",

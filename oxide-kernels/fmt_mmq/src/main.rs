@@ -56,6 +56,15 @@ mod kernels {
     }
     /// `mul.ftz.f32` without `.rn`, as the reference PTX writes it (only where nothing can fuse).
     #[inline(always)]
+    /// `mul.rn.f32` without flush-to-zero: the halved e8m0 scale of a small exponent is a denormal,
+    /// and the reference keeps it (the crates's other muls are FTZ, which zeroes it).
+    #[inline(always)]
+    pub fn mul_nofz(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("mul.rn.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+
     pub fn mulf(a: f32, b: f32) -> f32 {
         let r: f32;
         unsafe { ptx_asm!("mul.ftz.f32 %0, %1, %2; //\t\x0b\x0c\r\n", out("=f") r, in("f") a, in("f") b, options(register_only)); }
@@ -869,6 +878,18 @@ mod kernels {
     }
 
 
+
+    /// `ggml_cuda_e8m0_to_fp32` as the **mmq** loader sees it: through `__nv_cvt_e8m0_to_bf16raw`,
+    /// where exponent 0 lands on bf16 zero (not 2^-127) and 0xFF on NaN. The dequantizer path in the
+    /// `mxfp4` crate uses the other convention, so this one is kept local to the Q8 tile loader.
+    #[inline(always)]
+    fn e8m0_mmq(e: u32) -> f32 {
+        match e & 0xFF {
+            0xFF => f32::NAN,
+            x => f32::from_bits(x << 23),
+        }
+    }
+
     /// MXFP4 through the **int8** path: llama.cpp's non-Blackwell MXFP4 MMQ.
     ///
     /// The weights are already integers once scaled (e2m1 values 0,1,2,3,4,6,8,12 doubled), so the
@@ -920,7 +941,7 @@ mod kernels {
                     i = if i < i_max { i } else { i_max };
                 }
                 let b = xblock(x, Self::BYTES, kbx0, i, stride, kbxd);
-                *x_df.offset((i * SRAM + kbxd) as isize) = mulf(e8m0(ldg_u8(b)), 0.5);
+                *x_df.offset((i * SRAM + kbxd) as isize) = mul_nofz(e8m0_mmq(ldg_u8(b)), 0.5);
                 i0 += 4 * NWARPS;
             }
         }
