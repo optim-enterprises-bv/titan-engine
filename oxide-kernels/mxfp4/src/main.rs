@@ -145,7 +145,14 @@ mod kernels {
         // `ggml_cuda_e8m0_to_fp32`: E8M0 byte -> f32 is the exponent field, except that 0 is 2^-127
         // (0x00400000), not zero. The instruction the crate used to call is rejected by this driver's
         // JIT (CUDA error 218 invalid PTX), which made the entire module unloadable.
-        if e == 0 { f32::from_bits(0x0040_0000) } else { f32::from_bits(((e as u32) & 0xFF) << 23) }
+        // E8M0 0xFF is NaN (that is what __nv_cvt_e8m0_to_bf16raw returns for it), not +inf -- with
+        // +inf every zero code becomes NaN and every non-zero code becomes +-inf, which is exactly
+        // how this diverged from the reference.
+        match e {
+            0 => f32::from_bits(0x0040_0000),
+            0xFF => f32::NAN,
+            _ => f32::from_bits(((e as u32) & 0xFF) << 23),
+        }
     }
 
     #[inline(always)]

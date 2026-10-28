@@ -136,6 +136,24 @@ fn compare(t: &mut Tally, label: &str, a: &[Vec<u8>], b: &[Vec<u8>]) {
                 }
             }
         }
+        // GATE_DUMP=1: print the first differing f32 values of this buffer with their indices.
+        if std::env::var("GATE_DUMP").is_ok() && x.len() % 4 == 0 {
+            let mut shown = 0;
+            for i in (0..x.len()).step_by(4) {
+                if x[i..i + 4] == y[i..i + 4] || shown >= 6 {
+                    continue;
+                }
+                let (p, q) = (
+                    f32::from_le_bytes([x[i], x[i + 1], x[i + 2], x[i + 3]]),
+                    f32::from_le_bytes([y[i], y[i + 1], y[i + 2], y[i + 3]]),
+                );
+                println!("    [{label}] word {i:6}: ref {:+e} ({:#010x})  oxide {:+e} ({:#010x})", p, p.to_bits(), q, q.to_bits());
+                shown += 1;
+            }
+            if shown > 0 {
+                return;
+            }
+        }
     }
     t.record(label, &d);
 }
@@ -267,6 +285,32 @@ fn deq_case(m: &Mods, t: &mut Tally, r: &mut Rng, k: usize, nvals: usize, rate: 
     compare(t, &format!("{} k={nvals}", DEQ_OX[k]), &a, &b);
 }
 
+/// MXFP4_PROBE=1: one crafted block through both kernels, printing the outputs side by side.
+/// Layout: e at byte 0, then 16 nibble bytes. With e = 255 the scale is +inf, which turns any
+/// zero code into NaN and every non-zero code into +-inf -- that separates "read the wrong nibble"
+/// from "computed the product differently" at a glance.
+fn probe_block(m: &Mods) {
+    let mut x = vec![0u8; BB];
+    x[0] = 255; // e = 0xFF -> d = +inf
+    for j in 0..16 {
+        x[1 + j] = ((j as u8) << 4) | 0x0f; // low nibble = 15 (-12), high nibble = j
+    }
+    let y0 = vec![0u8; 256 * 4];
+    let mut p = Params::default();
+    p.put(0u64).put(0u64);
+    let slots = vec![(0usize, Some(0usize)), (8, Some(1))];
+    let bufs = vec![x, y0];
+    let a = launch(func(m.convert, DEQ_REF[0]), (1, 1, 1), (32, 1, 1), &p, &slots, &bufs, &[1]);
+    let b = launch(func(m.oxide, DEQ_OX[0]), (1, 1, 1), (32, 1, 1), &p, &slots, &bufs, &[1]);
+    let (ra, rb) = (&a[0], &b[0]);
+    println!("  i   ref            oxide");
+    for i in 0..8 {
+        let f = |v: &[u8], i: usize| f32::from_le_bytes([v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]]);
+        let (p, q) = (f(ra, i), f(rb, i));
+        println!("  {i:2}  {:+e} ({:#010x})  {:+e} ({:#010x}){}", p, p.to_bits(), q, q.to_bits(), if p.to_bits() != q.to_bits() { "   <-- DIFF" } else { "" });
+    }
+}
+
 pub fn run_gate() -> bool {
     let dir = env!("CARGO_MANIFEST_DIR");
     let _ctx = kdiff::cuda_core::CudaContext::new(0).expect("cuda context");
@@ -285,6 +329,10 @@ pub fn run_gate() -> bool {
         convert: load(&format!("{dir}/{REF_CONVERT}")),
         oxide: load(&format!("{dir}/{OXIDE}")),
     };
+    if std::env::var("MXFP4_PROBE").is_ok() {
+        probe_block(&m);
+        return true;
+    }
     let mut t = Tally::default();
     let mut r = Rng(0x0DD5_EED5_1234_5678);
 
