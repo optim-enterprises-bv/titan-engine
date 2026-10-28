@@ -13,8 +13,10 @@
 //! - MXFP4, `mxfp4q8` slot: the same int8 path llama.cpp takes off-Blackwell
 //!   (`mmq_type_traits<..., GGML_TYPE_MXFP4>` `#else` branch): weights ride the int8 MMA through
 //!   `kvalues_mxfp4` with `e8m0(e)*0.5` per 32-value block, activations q8_1, and the config is the
-//!   **ampere** one (`get_config` returns it for `prec != Q4`). Runs on cc 12.0, where the
-//!   block-scaled MMA of the default MXFP4 instance is an illegal instruction. Its reference MUST be
+//!   **ampere** one (`get_config` returns it for `prec != Q4`). This is the int8 fallback llama.cpp takes
+//!   off-Blackwell; the block-scaled MMA does run on this card too (both slots are gated, see
+//!   BLOCK-SCALED.md -- the CUDA 715 that once looked like an illegal instruction came from a reference
+//!   cubin built on another machine). Its reference MUST be
 //!   built from the pinned revision with this crate's own command line, i.e.
 //!   `ref/nvcc_mmq_mxfp4.sh` at acecd560 plus `-DGGML_MMQ_FORCE_Q8`; building it from a newer checkout
 //!   instead gives a `ggml_prec` ABI (different mangling, a 14th fixup parameter, an out-of-bounds read)

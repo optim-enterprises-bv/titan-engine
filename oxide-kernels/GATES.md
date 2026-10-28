@@ -39,9 +39,11 @@ gate is staging them (see "Artifacts" below).
 
 ## Not runnable here, with the reason
 
-Nothing. Every gate crate in this tree runs on this box; the block-scaled MXFP4/NVFP4 instances were the
-last ones believed impossible and they pass now (see `fmt_mmq/BLOCK-SCALED.md` -- the CUDA 715 was the
-reference cubin, not the GPU).
+**Nothing is blocked by the GPU.** The block-scaled MXFP4/NVFP4 instances were the last ones believed
+impossible and they pass now (see `fmt_mmq/BLOCK-SCALED.md` -- the CUDA 715 was the reference cubin, not the
+card). The only things that still do not run are listed under *Open* below and none of them is hardware: the
+`indexed_moe` sections of `titan-kernels-oxide` are missing their reference artifacts, and `nvfp4q8` runs but
+its values differ.
 
 ## Open, not passing
 
@@ -69,3 +71,8 @@ zero kernels.
 - Per-format crates build the mmvq symbol as `<type, ncols_dst, has_fusion, has_gate, small_k,
   halve_iters>`; the only reference that executes on sm_120 is the PrismML one, which has that
   6-param form. The pinned b10934 cubin has the 5-param name but its kernel writes nothing.
+- **Block-scaled references must be rebuilt locally.** `fmt_mmq/ref/mmq_{mxfp4,nvfp4}.cubin` as shipped were
+  built elsewhere with `-ccbin=/usr/bin/g++-15` (not installed here) and their SASS does not execute under this
+  driver: CUDA 715, which looked like the GPU refusing `mma.kind::mxf4nvf4.block_scale`. Rebuild from the pinned
+  `acecd560` sources with `/usr/bin/g++` - recipe in `fmt_mmq/BLOCK-SCALED.md`. The instruction itself runs here;
+  prove that with a probe kernel before concluding anything about the hardware.

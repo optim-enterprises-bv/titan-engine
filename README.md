@@ -148,6 +148,27 @@ the flash-decode kernel and the doorbell. The PTX is committed, so building the 
 libraries and headers (cuBLAS, NVRTC, driver), but no nvcc. Rebuilding the kernels themselves needs cuda-oxide; see
 `cuda-oxide-fast/README.md`. Ported kernels are checked against llama.cpp's output bits by the benchmark's kernel tier.
 
+### Kernel verification
+Each ported kernel has a gate crate that runs the same entry on the same inputs twice - once from the reference
+(llama.cpp `acecd560`, or the PrismML sm_120 build where the pinned one does not execute) and once from the
+cuda-oxide module - then compares the outputs byte for byte. The tally is `oxide-kernels/GATES.md`: **28 crates
+pass, and nothing in the tree is blocked by the GPU.**
+
+Headline numbers on this box (RTX 5080 Laptop, cc 12.0):
+
+| gate | evidence |
+|---|---|
+| `fmt_mmq` (default) | 1,753 launches, 910,060,092 bytes compared, 0 failing - iq4_nl, iq4_xs, MXFP4 and NVFP4 through both the block-scaled MMA and the int8 path |
+| `mistralrs-quant-c` | 20,120 calls, 9,436,413,576 bytes |
+| `mistralrs-paged-attn-a` | 2,538 calls, 5,436,402,887 bytes |
+| `titan-kernels-oxide` | 20,184,168 outputs / 32,774,352 CPU-twin rows |
+| `candle-mmq` | 10 of 10 quant types |
+
+MXFP4 and NVFP4 block-scaled MMQ were long recorded as "requires sm_120a hardware" on this card. They are not:
+the CUDA 715 came from a reference cubin built on another machine, and both formats are bit-identical once it is
+rebuilt here - see `oxide-kernels/fmt_mmq/BLOCK-SCALED.md`. Porting traps worth knowing before writing a kernel
+are collected in `oxide-kernels/PORTING.md`.
+
 ## Supported models
 
 Measured in this release:

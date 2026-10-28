@@ -204,6 +204,38 @@ Never run `pkill -f <pattern>` or `pgrep -f`: the pattern matches your own shell
     `% blocks_per_iter` (it only moves kbc inside a tile). Mirror the SASS anyway, but mutate something that changes values
     (rounding mode, a `<` tie-break turned `<=`, the scale row, a dropped y_scale, a fixup that overwrites).
 
+50. **A reference built on another machine can masquerade as a hardware limit.** MXFP4/NVFP4 block-scaled MMQ
+    "failed" with CUDA 715 (illegal instruction) for weeks and was recorded as "requires sm_120a hardware, cc 12.0
+    cannot execute it". It was the *reference* cubin: `ref/mmq_{mxfp4,nvfp4}.cubin` came from a build with
+    `-ccbin=/usr/bin/g++-15`, which is not installed here, and that SASS does not execute under this driver.
+    Rebuilt locally from the pinned source and both formats pass bit-identically. Before blaming the GPU, prove the
+    instruction in isolation (a two-line probe kernel: assemble with `ptxas -arch=sm_120a`, load with
+    `cuModuleLoadData`, launch) and prove the reference runs *alone*. Both block-scaled forms (`OMMA...E8` and
+    `OMMA...UE4M3.4X`) execute here, including with 256 threads, `bar.sync`, 16 in a loop, and invalid scale
+    encodings. Recipe: `fmt_mmq/BLOCK-SCALED.md`.
+
+51. **Every gate `SKIP_*` flag has to cover every launch site.** `FMT_MMQ_SKIP_REF` skipped the main reference
+    launch but not the "is the reference deterministic" re-launch further down, so isolating the oxide kernel still
+    died on the reference - and each attempt to test our side looked like our side faulting. Grep for every
+    `m.mmq[` / `m.ox` use before trusting a one-sided run.
+
+52. **A Rust bounds check in device code is a `trap;` instruction, i.e. CUDA 719 / "trace/breakpoint trap".**
+    A dot that stepped `j0 += 8` where the reference steps `j0 += Jc::<J>::JSTEP` (16 when `NTX == 2`, which is
+    `J >= 48`) pushed `idx = (j0/8 + n)*4 + l` to 67 on a `sum[64]`, the panic path lowered to `trap;`, and every
+    launch died. Symptom to remember: the SASS looks ordinary, `compute-sanitizer` points at the kernel without a
+    useful offset, and the failure is `J >= 48` only. Check the per-thread array sizes and the loop step before
+    suspecting an instruction.
+
+53. **Derive the scale strides from the tile macros, do not carry them over by hand.** `MMQ_TILE_Y_K =
+    NE_K + NE_K/QI8_1`; with `NE_K = 32` and `Y_K = 36` that gives `QI8_1 = 8`, so the q8_1 activation scale steps
+    every 8 ints (32 values) - not every 32 ints. Writing `k01 / 32` collapsed all four scales of a chunk onto the
+    first one and made every NVFP4 int8 matmul ~40% wrong while still looking plausible.
+
+54. **Special fp4 scale codes are not symmetric.** ue4m3: `0x7F` and `0xFF` both decode to 0. e8m0: `0x00` is
+    `0.0` in the MMQ tile loader (but `2^-127` in the dequantizer) and `0xFF` is **NaN**, not `+inf` - mapping it to
+    infinity caused 272 wrong dequant blocks. If a reference disagrees on a handful of blocks, dump both sides' f32
+    words for one case before touching the kernel.
+
 ## Status
 
 | Module | Entries | Status |

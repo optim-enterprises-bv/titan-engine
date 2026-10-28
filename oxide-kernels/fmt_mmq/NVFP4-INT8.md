@@ -62,8 +62,9 @@ the median error is 1 ULP but the tail is three orders of magnitude larger.
 
 ## Nothing else depends on this
 
-The default run (`iq4_nl`, `mxfp4`, `nvfp4`, `iq4_xs`, `mxfp4q8`) is bit-identical:
-`1015 launches, 562,321,320 bytes, 0 failing`. Slot 5 (`nvfp4q8`) is opt-in and cannot affect it.
+The default run (all seven slots, including block-scaled `mxfp4`/`nvfp4`) is bit-identical:
+`1753 launches, 910,060,092 bytes compared, 0 failing`. The `nvfp4q8` slot below is opt-in and cannot
+affect it.
 
 ## Gate knobs added for this work
 
