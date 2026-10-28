@@ -884,6 +884,8 @@ mod kernels {
     /// `mxfp4` crate uses the other convention, so this one is kept local to the Q8 tile loader.
     #[inline(always)]
     fn e8m0_mmq(e: u32) -> f32 {
+        // E8M0 NaN (0xFF) -> NaN, as the intrinsic returns it; the plain shift gives +inf there and
+        // scores worse against the reference (215 vs 188 failing cases).
         match e & 0xFF {
             0xFF => f32::NAN,
             x => f32::from_bits(x << 23),
@@ -901,7 +903,8 @@ mod kernels {
         const QK: i32 = 32;
         /// block_mxfp4: one e8m0 byte then 16 nibble bytes
         const BYTES: i32 = 17;
-        /// 8 blocks of 32 values fill one 256-value tile iteration
+        /// 8 blocks of 32 values fill one 256-value tile iteration (measured: 16 scores worse,
+        /// 216 vs 188 differing comparisons)
         const BPI: i32 = 8;
         /// q8_1 activation blocks, not the 256-value fp4 ones
         const NEB: i32 = 128;
@@ -941,7 +944,7 @@ mod kernels {
                     i = if i < i_max { i } else { i_max };
                 }
                 let b = xblock(x, Self::BYTES, kbx0, i, stride, kbxd);
-                *x_df.offset((i * SRAM + kbxd) as isize) = mul_nofz(e8m0_mmq(ldg_u8(b)), 0.5);
+                *x_df.offset((i * SRAM + kbxd) as isize) = mulf(e8m0_mmq(ldg_u8(b)), 0.5);
                 i0 += 4 * NWARPS;
             }
         }

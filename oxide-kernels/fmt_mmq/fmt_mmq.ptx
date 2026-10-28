@@ -52173,7 +52173,7 @@ $L__BB19_18:                            // %bb2.i98
 	selp.f32 	%r299, 0f7FC00000, %r3196, %p10;
 	mov.b32 	%r300, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r298, %r299, %r300; //	
+	mul.ftz.f32 %r298, %r299, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+19200], %r298;
@@ -52187,7 +52187,7 @@ $L__BB19_18:                            // %bb2.i98
 	shl.b32 	%r3198, %r3197, 23;
 	selp.f32 	%r303, 0f7FC00000, %r3198, %p11;
 	// begin inline asm
-	mul.rn.f32 %r302, %r303, %r300; //	
+	mul.ftz.f32 %r302, %r303, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd58+19200], %r302;
@@ -52201,7 +52201,7 @@ $L__BB19_18:                            // %bb2.i98
 	shl.b32 	%r3200, %r3199, 23;
 	selp.f32 	%r306, 0f7FC00000, %r3200, %p12;
 	// begin inline asm
-	mul.rn.f32 %r305, %r306, %r300; //	
+	mul.ftz.f32 %r305, %r306, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd60+19200], %r305;
@@ -52215,7 +52215,7 @@ $L__BB19_18:                            // %bb2.i98
 	shl.b32 	%r3202, %r3201, 23;
 	selp.f32 	%r309, 0f7FC00000, %r3202, %p13;
 	// begin inline asm
-	mul.rn.f32 %r308, %r309, %r300; //	
+	mul.ftz.f32 %r308, %r309, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd62+19200], %r308;
@@ -60315,7 +60315,7 @@ $L__BB19_156:                           // %bb2.i175
 	selp.f32 	%r3569, 0f7FC00000, %r6466, %p106;
 	mov.b32 	%r3570, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r3568, %r3569, %r3570; //	
+	mul.ftz.f32 %r3568, %r3569, %r3570; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd99+19200], %r3568;
@@ -60329,7 +60329,7 @@ $L__BB19_156:                           // %bb2.i175
 	shl.b32 	%r6468, %r6467, 23;
 	selp.f32 	%r3573, 0f7FC00000, %r6468, %p107;
 	// begin inline asm
-	mul.rn.f32 %r3572, %r3573, %r3570; //	
+	mul.ftz.f32 %r3572, %r3573, %r3570; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd101+19200], %r3572;
@@ -60343,7 +60343,7 @@ $L__BB19_156:                           // %bb2.i175
 	shl.b32 	%r6470, %r6469, 23;
 	selp.f32 	%r3576, 0f7FC00000, %r6470, %p108;
 	// begin inline asm
-	mul.rn.f32 %r3575, %r3576, %r3570; //	
+	mul.ftz.f32 %r3575, %r3576, %r3570; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd103+19200], %r3575;
@@ -60357,7 +60357,7 @@ $L__BB19_156:                           // %bb2.i175
 	shl.b32 	%r6472, %r6471, 23;
 	selp.f32 	%r3579, 0f7FC00000, %r6472, %p109;
 	// begin inline asm
-	mul.rn.f32 %r3578, %r3579, %r3570; //	
+	mul.ftz.f32 %r3578, %r3579, %r3570; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd105+19200], %r3578;
@@ -85997,7 +85997,7 @@ $L__BB31_18:                            // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r2290, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+12864], %r244;
@@ -86011,7 +86011,7 @@ $L__BB31_18:                            // %bb2.i98
 	shl.b32 	%r2292, %r2291, 23;
 	selp.f32 	%r249, 0f7FC00000, %r2292, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+22592], %r248;
@@ -86025,7 +86025,7 @@ $L__BB31_18:                            // %bb2.i98
 	shl.b32 	%r2294, %r2293, 23;
 	selp.f32 	%r252, 0f7FC00000, %r2294, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+32320], %r251;
@@ -86039,7 +86039,7 @@ $L__BB31_18:                            // %bb2.i98
 	shl.b32 	%r2296, %r2295, 23;
 	selp.f32 	%r255, 0f7FC00000, %r2296, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+42048], %r254;
@@ -91715,7 +91715,7 @@ $L__BB31_108:                           // %bb2.i175
 	selp.f32 	%r2663, 0f7FC00000, %r4708, %p32;
 	mov.b32 	%r2664, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r2662, %r2663, %r2664; //	
+	mul.ftz.f32 %r2662, %r2663, %r2664; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+12864], %r2662;
@@ -91729,7 +91729,7 @@ $L__BB31_108:                           // %bb2.i175
 	shl.b32 	%r4710, %r4709, 23;
 	selp.f32 	%r2667, 0f7FC00000, %r4710, %p33;
 	// begin inline asm
-	mul.rn.f32 %r2666, %r2667, %r2664; //	
+	mul.ftz.f32 %r2666, %r2667, %r2664; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+22592], %r2666;
@@ -91743,7 +91743,7 @@ $L__BB31_108:                           // %bb2.i175
 	shl.b32 	%r4712, %r4711, 23;
 	selp.f32 	%r2670, 0f7FC00000, %r4712, %p34;
 	// begin inline asm
-	mul.rn.f32 %r2669, %r2670, %r2664; //	
+	mul.ftz.f32 %r2669, %r2670, %r2664; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+32320], %r2669;
@@ -91757,7 +91757,7 @@ $L__BB31_108:                           // %bb2.i175
 	shl.b32 	%r4714, %r4713, 23;
 	selp.f32 	%r2673, 0f7FC00000, %r4714, %p35;
 	// begin inline asm
-	mul.rn.f32 %r2672, %r2673, %r2664; //	
+	mul.ftz.f32 %r2672, %r2673, %r2664; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+42048], %r2672;
@@ -97213,7 +97213,7 @@ $L__BB32_18:                            // %bb2.i98
 	selp.f32 	%r290, 0f7FC00000, %r1497, %p10;
 	mov.b32 	%r291, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r289, %r290, %r291; //	
+	mul.ftz.f32 %r289, %r290, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+5504], %r289;
@@ -97227,7 +97227,7 @@ $L__BB32_18:                            // %bb2.i98
 	shl.b32 	%r1499, %r1498, 23;
 	selp.f32 	%r294, 0f7FC00000, %r1499, %p11;
 	// begin inline asm
-	mul.rn.f32 %r293, %r294, %r291; //	
+	mul.ftz.f32 %r293, %r294, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd58+5504], %r293;
@@ -97241,7 +97241,7 @@ $L__BB32_18:                            // %bb2.i98
 	shl.b32 	%r1501, %r1500, 23;
 	selp.f32 	%r297, 0f7FC00000, %r1501, %p12;
 	// begin inline asm
-	mul.rn.f32 %r296, %r297, %r291; //	
+	mul.ftz.f32 %r296, %r297, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd60+5504], %r296;
@@ -97255,7 +97255,7 @@ $L__BB32_18:                            // %bb2.i98
 	shl.b32 	%r1503, %r1502, 23;
 	selp.f32 	%r300, 0f7FC00000, %r1503, %p13;
 	// begin inline asm
-	mul.rn.f32 %r299, %r300, %r291; //	
+	mul.ftz.f32 %r299, %r300, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd62+5504], %r299;
@@ -100475,7 +100475,7 @@ $L__BB32_60:                            // %bb2.i175
 	selp.f32 	%r1754, 0f7FC00000, %r2961, %p47;
 	mov.b32 	%r1755, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1753, %r1754, %r1755; //	
+	mul.ftz.f32 %r1753, %r1754, %r1755; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd99+5504], %r1753;
@@ -100489,7 +100489,7 @@ $L__BB32_60:                            // %bb2.i175
 	shl.b32 	%r2963, %r2962, 23;
 	selp.f32 	%r1758, 0f7FC00000, %r2963, %p48;
 	// begin inline asm
-	mul.rn.f32 %r1757, %r1758, %r1755; //	
+	mul.ftz.f32 %r1757, %r1758, %r1755; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd101+5504], %r1757;
@@ -100503,7 +100503,7 @@ $L__BB32_60:                            // %bb2.i175
 	shl.b32 	%r2965, %r2964, 23;
 	selp.f32 	%r1761, 0f7FC00000, %r2965, %p49;
 	// begin inline asm
-	mul.rn.f32 %r1760, %r1761, %r1755; //	
+	mul.ftz.f32 %r1760, %r1761, %r1755; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd103+5504], %r1760;
@@ -100517,7 +100517,7 @@ $L__BB32_60:                            // %bb2.i175
 	shl.b32 	%r2967, %r2966, 23;
 	selp.f32 	%r1764, 0f7FC00000, %r2967, %p50;
 	// begin inline asm
-	mul.rn.f32 %r1763, %r1764, %r1755; //	
+	mul.ftz.f32 %r1763, %r1764, %r1755; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd105+5504], %r1763;
@@ -103935,7 +103935,7 @@ $L__BB33_18:                            // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r2004, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+9728], %r244;
@@ -103949,7 +103949,7 @@ $L__BB33_18:                            // %bb2.i98
 	shl.b32 	%r2006, %r2005, 23;
 	selp.f32 	%r249, 0f7FC00000, %r2006, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+19456], %r248;
@@ -103963,7 +103963,7 @@ $L__BB33_18:                            // %bb2.i98
 	shl.b32 	%r2008, %r2007, 23;
 	selp.f32 	%r252, 0f7FC00000, %r2008, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+29184], %r251;
@@ -103977,7 +103977,7 @@ $L__BB33_18:                            // %bb2.i98
 	shl.b32 	%r2010, %r2009, 23;
 	selp.f32 	%r255, 0f7FC00000, %r2010, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+38912], %r254;
@@ -108823,7 +108823,7 @@ $L__BB33_92:                            // %bb2.i175
 	selp.f32 	%r2339, 0f7FC00000, %r4098, %p30;
 	mov.b32 	%r2340, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r2338, %r2339, %r2340; //	
+	mul.ftz.f32 %r2338, %r2339, %r2340; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+9728], %r2338;
@@ -108837,7 +108837,7 @@ $L__BB33_92:                            // %bb2.i175
 	shl.b32 	%r4100, %r4099, 23;
 	selp.f32 	%r2343, 0f7FC00000, %r4100, %p31;
 	// begin inline asm
-	mul.rn.f32 %r2342, %r2343, %r2340; //	
+	mul.ftz.f32 %r2342, %r2343, %r2340; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+19456], %r2342;
@@ -108851,7 +108851,7 @@ $L__BB33_92:                            // %bb2.i175
 	shl.b32 	%r4102, %r4101, 23;
 	selp.f32 	%r2346, 0f7FC00000, %r4102, %p32;
 	// begin inline asm
-	mul.rn.f32 %r2345, %r2346, %r2340; //	
+	mul.ftz.f32 %r2345, %r2346, %r2340; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+29184], %r2345;
@@ -108865,7 +108865,7 @@ $L__BB33_92:                            // %bb2.i175
 	shl.b32 	%r4104, %r4103, 23;
 	selp.f32 	%r2349, 0f7FC00000, %r4104, %p33;
 	// begin inline asm
-	mul.rn.f32 %r2348, %r2349, %r2340; //	
+	mul.ftz.f32 %r2348, %r2349, %r2340; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+38912], %r2348;
@@ -189232,7 +189232,7 @@ $L__BB57_18:                            // %bb2.i98
 	selp.f32 	%r242, 0f7FC00000, %r1133, %p10;
 	mov.b32 	%r243, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r241, %r242, %r243; //	
+	mul.ftz.f32 %r241, %r242, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+3392], %r241;
@@ -189246,7 +189246,7 @@ $L__BB57_18:                            // %bb2.i98
 	shl.b32 	%r1135, %r1134, 23;
 	selp.f32 	%r246, 0f7FC00000, %r1135, %p11;
 	// begin inline asm
-	mul.rn.f32 %r245, %r246, %r243; //	
+	mul.ftz.f32 %r245, %r246, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+13120], %r245;
@@ -189260,7 +189260,7 @@ $L__BB57_18:                            // %bb2.i98
 	shl.b32 	%r1137, %r1136, 23;
 	selp.f32 	%r249, 0f7FC00000, %r1137, %p12;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r243; //	
+	mul.ftz.f32 %r248, %r249, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+22848], %r248;
@@ -189274,7 +189274,7 @@ $L__BB57_18:                            // %bb2.i98
 	shl.b32 	%r1139, %r1138, 23;
 	selp.f32 	%r252, 0f7FC00000, %r1139, %p13;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r243; //	
+	mul.ftz.f32 %r251, %r252, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+32576], %r251;
@@ -191607,7 +191607,7 @@ $L__BB57_44:                            // %bb2.i175
 	selp.f32 	%r1345, 0f7FC00000, %r2236, %p25;
 	mov.b32 	%r1346, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1344, %r1345, %r1346; //	
+	mul.ftz.f32 %r1344, %r1345, %r1346; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+3392], %r1344;
@@ -191621,7 +191621,7 @@ $L__BB57_44:                            // %bb2.i175
 	shl.b32 	%r2238, %r2237, 23;
 	selp.f32 	%r1349, 0f7FC00000, %r2238, %p26;
 	// begin inline asm
-	mul.rn.f32 %r1348, %r1349, %r1346; //	
+	mul.ftz.f32 %r1348, %r1349, %r1346; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+13120], %r1348;
@@ -191635,7 +191635,7 @@ $L__BB57_44:                            // %bb2.i175
 	shl.b32 	%r2240, %r2239, 23;
 	selp.f32 	%r1352, 0f7FC00000, %r2240, %p27;
 	// begin inline asm
-	mul.rn.f32 %r1351, %r1352, %r1346; //	
+	mul.ftz.f32 %r1351, %r1352, %r1346; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+22848], %r1351;
@@ -191649,7 +191649,7 @@ $L__BB57_44:                            // %bb2.i175
 	shl.b32 	%r2242, %r2241, 23;
 	selp.f32 	%r1355, 0f7FC00000, %r2242, %p28;
 	// begin inline asm
-	mul.rn.f32 %r1354, %r1355, %r1346; //	
+	mul.ftz.f32 %r1354, %r1355, %r1346; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+32576], %r1354;
@@ -198137,7 +198137,7 @@ $L__BB59_18:                            // %bb2.i98
 	selp.f32 	%r242, 0f7FC00000, %r1449, %p10;
 	mov.b32 	%r243, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r241, %r242, %r243; //	
+	mul.ftz.f32 %r241, %r242, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+5504], %r241;
@@ -198151,7 +198151,7 @@ $L__BB59_18:                            // %bb2.i98
 	shl.b32 	%r1451, %r1450, 23;
 	selp.f32 	%r246, 0f7FC00000, %r1451, %p11;
 	// begin inline asm
-	mul.rn.f32 %r245, %r246, %r243; //	
+	mul.ftz.f32 %r245, %r246, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+15232], %r245;
@@ -198165,7 +198165,7 @@ $L__BB59_18:                            // %bb2.i98
 	shl.b32 	%r1453, %r1452, 23;
 	selp.f32 	%r249, 0f7FC00000, %r1453, %p12;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r243; //	
+	mul.ftz.f32 %r248, %r249, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+24960], %r248;
@@ -198179,7 +198179,7 @@ $L__BB59_18:                            // %bb2.i98
 	shl.b32 	%r1455, %r1454, 23;
 	selp.f32 	%r252, 0f7FC00000, %r1455, %p13;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r243; //	
+	mul.ftz.f32 %r251, %r252, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+34688], %r251;
@@ -201368,7 +201368,7 @@ $L__BB59_60:                            // %bb2.i175
 	selp.f32 	%r1701, 0f7FC00000, %r2908, %p29;
 	mov.b32 	%r1702, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1700, %r1701, %r1702; //	
+	mul.ftz.f32 %r1700, %r1701, %r1702; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+5504], %r1700;
@@ -201382,7 +201382,7 @@ $L__BB59_60:                            // %bb2.i175
 	shl.b32 	%r2910, %r2909, 23;
 	selp.f32 	%r1705, 0f7FC00000, %r2910, %p30;
 	// begin inline asm
-	mul.rn.f32 %r1704, %r1705, %r1702; //	
+	mul.ftz.f32 %r1704, %r1705, %r1702; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+15232], %r1704;
@@ -201396,7 +201396,7 @@ $L__BB59_60:                            // %bb2.i175
 	shl.b32 	%r2912, %r2911, 23;
 	selp.f32 	%r1708, 0f7FC00000, %r2912, %p31;
 	// begin inline asm
-	mul.rn.f32 %r1707, %r1708, %r1702; //	
+	mul.ftz.f32 %r1707, %r1708, %r1702; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+24960], %r1707;
@@ -201410,7 +201410,7 @@ $L__BB59_60:                            // %bb2.i175
 	shl.b32 	%r2914, %r2913, 23;
 	selp.f32 	%r1711, 0f7FC00000, %r2914, %p32;
 	// begin inline asm
-	mul.rn.f32 %r1710, %r1711, %r1702; //	
+	mul.ftz.f32 %r1710, %r1711, %r1702; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+34688], %r1710;
@@ -234396,7 +234396,7 @@ $L__BB66_18:                            // %bb2.i98
 	selp.f32 	%r242, 0f7FC00000, %r975, %p10;
 	mov.b32 	%r243, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r241, %r242, %r243; //	
+	mul.ftz.f32 %r241, %r242, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+2336], %r241;
@@ -234410,7 +234410,7 @@ $L__BB66_18:                            // %bb2.i98
 	shl.b32 	%r977, %r976, 23;
 	selp.f32 	%r246, 0f7FC00000, %r977, %p11;
 	// begin inline asm
-	mul.rn.f32 %r245, %r246, %r243; //	
+	mul.ftz.f32 %r245, %r246, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+12064], %r245;
@@ -234424,7 +234424,7 @@ $L__BB66_18:                            // %bb2.i98
 	shl.b32 	%r979, %r978, 23;
 	selp.f32 	%r249, 0f7FC00000, %r979, %p12;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r243; //	
+	mul.ftz.f32 %r248, %r249, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+21792], %r248;
@@ -234438,7 +234438,7 @@ $L__BB66_18:                            // %bb2.i98
 	shl.b32 	%r981, %r980, 23;
 	selp.f32 	%r252, 0f7FC00000, %r981, %p13;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r243; //	
+	mul.ftz.f32 %r251, %r252, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+31520], %r251;
@@ -236343,7 +236343,7 @@ $L__BB66_36:                            // %bb2.i175
 	selp.f32 	%r1167, 0f7FC00000, %r1900, %p23;
 	mov.b32 	%r1168, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1166, %r1167, %r1168; //	
+	mul.ftz.f32 %r1166, %r1167, %r1168; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+2336], %r1166;
@@ -236357,7 +236357,7 @@ $L__BB66_36:                            // %bb2.i175
 	shl.b32 	%r1902, %r1901, 23;
 	selp.f32 	%r1171, 0f7FC00000, %r1902, %p24;
 	// begin inline asm
-	mul.rn.f32 %r1170, %r1171, %r1168; //	
+	mul.ftz.f32 %r1170, %r1171, %r1168; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+12064], %r1170;
@@ -236371,7 +236371,7 @@ $L__BB66_36:                            // %bb2.i175
 	shl.b32 	%r1904, %r1903, 23;
 	selp.f32 	%r1174, 0f7FC00000, %r1904, %p25;
 	// begin inline asm
-	mul.rn.f32 %r1173, %r1174, %r1168; //	
+	mul.ftz.f32 %r1173, %r1174, %r1168; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+21792], %r1173;
@@ -236385,7 +236385,7 @@ $L__BB66_36:                            // %bb2.i175
 	shl.b32 	%r1906, %r1905, 23;
 	selp.f32 	%r1177, 0f7FC00000, %r1906, %p26;
 	// begin inline asm
-	mul.rn.f32 %r1176, %r1177, %r1168; //	
+	mul.ftz.f32 %r1176, %r1177, %r1168; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+31520], %r1176;
@@ -248490,7 +248490,7 @@ $L__BB70_18:                            // %bb2.i98
 	selp.f32 	%r290, 0f7FC00000, %r1181, %p10;
 	mov.b32 	%r291, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r289, %r290, %r291; //	
+	mul.ftz.f32 %r289, %r290, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+3392], %r289;
@@ -248504,7 +248504,7 @@ $L__BB70_18:                            // %bb2.i98
 	shl.b32 	%r1183, %r1182, 23;
 	selp.f32 	%r294, 0f7FC00000, %r1183, %p11;
 	// begin inline asm
-	mul.rn.f32 %r293, %r294, %r291; //	
+	mul.ftz.f32 %r293, %r294, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd58+3392], %r293;
@@ -248518,7 +248518,7 @@ $L__BB70_18:                            // %bb2.i98
 	shl.b32 	%r1185, %r1184, 23;
 	selp.f32 	%r297, 0f7FC00000, %r1185, %p12;
 	// begin inline asm
-	mul.rn.f32 %r296, %r297, %r291; //	
+	mul.ftz.f32 %r296, %r297, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd60+3392], %r296;
@@ -248532,7 +248532,7 @@ $L__BB70_18:                            // %bb2.i98
 	shl.b32 	%r1187, %r1186, 23;
 	selp.f32 	%r300, 0f7FC00000, %r1187, %p13;
 	// begin inline asm
-	mul.rn.f32 %r299, %r300, %r291; //	
+	mul.ftz.f32 %r299, %r300, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd62+3392], %r299;
@@ -250908,7 +250908,7 @@ $L__BB70_44:                            // %bb2.i175
 	selp.f32 	%r1418, 0f7FC00000, %r2309, %p35;
 	mov.b32 	%r1419, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1417, %r1418, %r1419; //	
+	mul.ftz.f32 %r1417, %r1418, %r1419; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd99+3392], %r1417;
@@ -250922,7 +250922,7 @@ $L__BB70_44:                            // %bb2.i175
 	shl.b32 	%r2311, %r2310, 23;
 	selp.f32 	%r1422, 0f7FC00000, %r2311, %p36;
 	// begin inline asm
-	mul.rn.f32 %r1421, %r1422, %r1419; //	
+	mul.ftz.f32 %r1421, %r1422, %r1419; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd101+3392], %r1421;
@@ -250936,7 +250936,7 @@ $L__BB70_44:                            // %bb2.i175
 	shl.b32 	%r2313, %r2312, 23;
 	selp.f32 	%r1425, 0f7FC00000, %r2313, %p37;
 	// begin inline asm
-	mul.rn.f32 %r1424, %r1425, %r1419; //	
+	mul.ftz.f32 %r1424, %r1425, %r1419; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd103+3392], %r1424;
@@ -250950,7 +250950,7 @@ $L__BB70_44:                            // %bb2.i175
 	shl.b32 	%r2315, %r2314, 23;
 	selp.f32 	%r1428, 0f7FC00000, %r2315, %p38;
 	// begin inline asm
-	mul.rn.f32 %r1427, %r1428, %r1419; //	
+	mul.ftz.f32 %r1427, %r1428, %r1419; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd105+3392], %r1427;
@@ -291949,7 +291949,7 @@ $L__BB84_18:                            // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r1720, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+7616], %r244;
@@ -291963,7 +291963,7 @@ $L__BB84_18:                            // %bb2.i98
 	shl.b32 	%r1722, %r1721, 23;
 	selp.f32 	%r249, 0f7FC00000, %r1722, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+17344], %r248;
@@ -291977,7 +291977,7 @@ $L__BB84_18:                            // %bb2.i98
 	shl.b32 	%r1724, %r1723, 23;
 	selp.f32 	%r252, 0f7FC00000, %r1724, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+27072], %r251;
@@ -291991,7 +291991,7 @@ $L__BB84_18:                            // %bb2.i98
 	shl.b32 	%r1726, %r1725, 23;
 	selp.f32 	%r255, 0f7FC00000, %r1726, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+36800], %r254;
@@ -296017,7 +296017,7 @@ $L__BB84_76:                            // %bb2.i175
 	selp.f32 	%r2017, 0f7FC00000, %r3492, %p28;
 	mov.b32 	%r2018, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r2016, %r2017, %r2018; //	
+	mul.ftz.f32 %r2016, %r2017, %r2018; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+7616], %r2016;
@@ -296031,7 +296031,7 @@ $L__BB84_76:                            // %bb2.i175
 	shl.b32 	%r3494, %r3493, 23;
 	selp.f32 	%r2021, 0f7FC00000, %r3494, %p29;
 	// begin inline asm
-	mul.rn.f32 %r2020, %r2021, %r2018; //	
+	mul.ftz.f32 %r2020, %r2021, %r2018; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+17344], %r2020;
@@ -296045,7 +296045,7 @@ $L__BB84_76:                            // %bb2.i175
 	shl.b32 	%r3496, %r3495, 23;
 	selp.f32 	%r2024, 0f7FC00000, %r3496, %p30;
 	// begin inline asm
-	mul.rn.f32 %r2023, %r2024, %r2018; //	
+	mul.ftz.f32 %r2023, %r2024, %r2018; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+27072], %r2023;
@@ -296059,7 +296059,7 @@ $L__BB84_76:                            // %bb2.i175
 	shl.b32 	%r3498, %r3497, 23;
 	selp.f32 	%r2027, 0f7FC00000, %r3498, %p31;
 	// begin inline asm
-	mul.rn.f32 %r2026, %r2027, %r2018; //	
+	mul.ftz.f32 %r2026, %r2027, %r2018; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+36800], %r2026;
@@ -348322,7 +348322,7 @@ $L__BB96_18:                            // %bb2.i98
 	selp.f32 	%r290, 0f7FC00000, %r1023, %p10;
 	mov.b32 	%r291, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r289, %r290, %r291; //	
+	mul.ftz.f32 %r289, %r290, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+2336], %r289;
@@ -348336,7 +348336,7 @@ $L__BB96_18:                            // %bb2.i98
 	shl.b32 	%r1025, %r1024, 23;
 	selp.f32 	%r294, 0f7FC00000, %r1025, %p11;
 	// begin inline asm
-	mul.rn.f32 %r293, %r294, %r291; //	
+	mul.ftz.f32 %r293, %r294, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd58+2336], %r293;
@@ -348350,7 +348350,7 @@ $L__BB96_18:                            // %bb2.i98
 	shl.b32 	%r1027, %r1026, 23;
 	selp.f32 	%r297, 0f7FC00000, %r1027, %p12;
 	// begin inline asm
-	mul.rn.f32 %r296, %r297, %r291; //	
+	mul.ftz.f32 %r296, %r297, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd60+2336], %r296;
@@ -348364,7 +348364,7 @@ $L__BB96_18:                            // %bb2.i98
 	shl.b32 	%r1029, %r1028, 23;
 	selp.f32 	%r300, 0f7FC00000, %r1029, %p13;
 	// begin inline asm
-	mul.rn.f32 %r299, %r300, %r291; //	
+	mul.ftz.f32 %r299, %r300, %r291; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd62+2336], %r299;
@@ -350318,7 +350318,7 @@ $L__BB96_36:                            // %bb2.i175
 	selp.f32 	%r1250, 0f7FC00000, %r1983, %p29;
 	mov.b32 	%r1251, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1249, %r1250, %r1251; //	
+	mul.ftz.f32 %r1249, %r1250, %r1251; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd99+2336], %r1249;
@@ -350332,7 +350332,7 @@ $L__BB96_36:                            // %bb2.i175
 	shl.b32 	%r1985, %r1984, 23;
 	selp.f32 	%r1254, 0f7FC00000, %r1985, %p30;
 	// begin inline asm
-	mul.rn.f32 %r1253, %r1254, %r1251; //	
+	mul.ftz.f32 %r1253, %r1254, %r1251; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd101+2336], %r1253;
@@ -350346,7 +350346,7 @@ $L__BB96_36:                            // %bb2.i175
 	shl.b32 	%r1987, %r1986, 23;
 	selp.f32 	%r1257, 0f7FC00000, %r1987, %p31;
 	// begin inline asm
-	mul.rn.f32 %r1256, %r1257, %r1251; //	
+	mul.ftz.f32 %r1256, %r1257, %r1251; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd103+2336], %r1256;
@@ -350360,7 +350360,7 @@ $L__BB96_36:                            // %bb2.i175
 	shl.b32 	%r1989, %r1988, 23;
 	selp.f32 	%r1260, 0f7FC00000, %r1989, %p32;
 	// begin inline asm
-	mul.rn.f32 %r1259, %r1260, %r1251; //	
+	mul.ftz.f32 %r1259, %r1260, %r1251; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd105+2336], %r1259;
@@ -369695,7 +369695,7 @@ $L__BB102_18:                           // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r3142, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+19200], %r244;
@@ -369709,7 +369709,7 @@ $L__BB102_18:                           // %bb2.i98
 	shl.b32 	%r3144, %r3143, 23;
 	selp.f32 	%r249, 0f7FC00000, %r3144, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+28928], %r248;
@@ -369723,7 +369723,7 @@ $L__BB102_18:                           // %bb2.i98
 	shl.b32 	%r3146, %r3145, 23;
 	selp.f32 	%r252, 0f7FC00000, %r3146, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+38656], %r251;
@@ -369737,7 +369737,7 @@ $L__BB102_18:                           // %bb2.i98
 	shl.b32 	%r3148, %r3147, 23;
 	selp.f32 	%r255, 0f7FC00000, %r3148, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+48384], %r254;
@@ -377873,7 +377873,7 @@ $L__BB102_156:                          // %bb2.i175
 	selp.f32 	%r3629, 0f7FC00000, %r6526, %p38;
 	mov.b32 	%r3630, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r3628, %r3629, %r3630; //	
+	mul.ftz.f32 %r3628, %r3629, %r3630; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+19200], %r3628;
@@ -377887,7 +377887,7 @@ $L__BB102_156:                          // %bb2.i175
 	shl.b32 	%r6528, %r6527, 23;
 	selp.f32 	%r3633, 0f7FC00000, %r6528, %p39;
 	// begin inline asm
-	mul.rn.f32 %r3632, %r3633, %r3630; //	
+	mul.ftz.f32 %r3632, %r3633, %r3630; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+28928], %r3632;
@@ -377901,7 +377901,7 @@ $L__BB102_156:                          // %bb2.i175
 	shl.b32 	%r6530, %r6529, 23;
 	selp.f32 	%r3636, 0f7FC00000, %r6530, %p40;
 	// begin inline asm
-	mul.rn.f32 %r3635, %r3636, %r3630; //	
+	mul.ftz.f32 %r3635, %r3636, %r3630; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+38656], %r3635;
@@ -377915,7 +377915,7 @@ $L__BB102_156:                          // %bb2.i175
 	shl.b32 	%r6532, %r6531, 23;
 	selp.f32 	%r3639, 0f7FC00000, %r6532, %p41;
 	// begin inline asm
-	mul.rn.f32 %r3638, %r3639, %r3630; //	
+	mul.ftz.f32 %r3638, %r3639, %r3630; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+48384], %r3638;
@@ -441596,7 +441596,7 @@ $L__BB116_18:                           // %bb2.i98
 	selp.f32 	%r299, 0f7FC00000, %r2058, %p10;
 	mov.b32 	%r300, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r298, %r299, %r300; //	
+	mul.ftz.f32 %r298, %r299, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+9728], %r298;
@@ -441610,7 +441610,7 @@ $L__BB116_18:                           // %bb2.i98
 	shl.b32 	%r2060, %r2059, 23;
 	selp.f32 	%r303, 0f7FC00000, %r2060, %p11;
 	// begin inline asm
-	mul.rn.f32 %r302, %r303, %r300; //	
+	mul.ftz.f32 %r302, %r303, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd58+9728], %r302;
@@ -441624,7 +441624,7 @@ $L__BB116_18:                           // %bb2.i98
 	shl.b32 	%r2062, %r2061, 23;
 	selp.f32 	%r306, 0f7FC00000, %r2062, %p12;
 	// begin inline asm
-	mul.rn.f32 %r305, %r306, %r300; //	
+	mul.ftz.f32 %r305, %r306, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd60+9728], %r305;
@@ -441638,7 +441638,7 @@ $L__BB116_18:                           // %bb2.i98
 	shl.b32 	%r2064, %r2063, 23;
 	selp.f32 	%r309, 0f7FC00000, %r2064, %p13;
 	// begin inline asm
-	mul.rn.f32 %r308, %r309, %r300; //	
+	mul.ftz.f32 %r308, %r309, %r300; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd62+9728], %r308;
@@ -446496,7 +446496,7 @@ $L__BB116_92:                           // %bb2.i175
 	selp.f32 	%r2359, 0f7FC00000, %r4118, %p66;
 	mov.b32 	%r2360, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r2358, %r2359, %r2360; //	
+	mul.ftz.f32 %r2358, %r2359, %r2360; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd99+9728], %r2358;
@@ -446510,7 +446510,7 @@ $L__BB116_92:                           // %bb2.i175
 	shl.b32 	%r4120, %r4119, 23;
 	selp.f32 	%r2363, 0f7FC00000, %r4120, %p67;
 	// begin inline asm
-	mul.rn.f32 %r2362, %r2363, %r2360; //	
+	mul.ftz.f32 %r2362, %r2363, %r2360; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd101+9728], %r2362;
@@ -446524,7 +446524,7 @@ $L__BB116_92:                           // %bb2.i175
 	shl.b32 	%r4122, %r4121, 23;
 	selp.f32 	%r2366, 0f7FC00000, %r4122, %p68;
 	// begin inline asm
-	mul.rn.f32 %r2365, %r2366, %r2360; //	
+	mul.ftz.f32 %r2365, %r2366, %r2360; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd103+9728], %r2365;
@@ -446538,7 +446538,7 @@ $L__BB116_92:                           // %bb2.i175
 	shl.b32 	%r4124, %r4123, 23;
 	selp.f32 	%r2369, 0f7FC00000, %r4124, %p69;
 	// begin inline asm
-	mul.rn.f32 %r2368, %r2369, %r2360; //	
+	mul.ftz.f32 %r2368, %r2369, %r2360; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd105+9728], %r2368;
@@ -456617,7 +456617,7 @@ $L__BB118_18:                           // %bb2.i98
 	selp.f32 	%r242, 0f7FC00000, %r1607, %p10;
 	mov.b32 	%r243, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r241, %r242, %r243; //	
+	mul.ftz.f32 %r241, %r242, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+6560], %r241;
@@ -456631,7 +456631,7 @@ $L__BB118_18:                           // %bb2.i98
 	shl.b32 	%r1609, %r1608, 23;
 	selp.f32 	%r246, 0f7FC00000, %r1609, %p11;
 	// begin inline asm
-	mul.rn.f32 %r245, %r246, %r243; //	
+	mul.ftz.f32 %r245, %r246, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+16288], %r245;
@@ -456645,7 +456645,7 @@ $L__BB118_18:                           // %bb2.i98
 	shl.b32 	%r1611, %r1610, 23;
 	selp.f32 	%r249, 0f7FC00000, %r1611, %p12;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r243; //	
+	mul.ftz.f32 %r248, %r249, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+26016], %r248;
@@ -456659,7 +456659,7 @@ $L__BB118_18:                           // %bb2.i98
 	shl.b32 	%r1613, %r1612, 23;
 	selp.f32 	%r252, 0f7FC00000, %r1613, %p13;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r243; //	
+	mul.ftz.f32 %r251, %r252, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+35744], %r251;
@@ -460276,7 +460276,7 @@ $L__BB118_68:                           // %bb2.i175
 	selp.f32 	%r1879, 0f7FC00000, %r3244, %p31;
 	mov.b32 	%r1880, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1878, %r1879, %r1880; //	
+	mul.ftz.f32 %r1878, %r1879, %r1880; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+6560], %r1878;
@@ -460290,7 +460290,7 @@ $L__BB118_68:                           // %bb2.i175
 	shl.b32 	%r3246, %r3245, 23;
 	selp.f32 	%r1883, 0f7FC00000, %r3246, %p32;
 	// begin inline asm
-	mul.rn.f32 %r1882, %r1883, %r1880; //	
+	mul.ftz.f32 %r1882, %r1883, %r1880; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+16288], %r1882;
@@ -460304,7 +460304,7 @@ $L__BB118_68:                           // %bb2.i175
 	shl.b32 	%r3248, %r3247, 23;
 	selp.f32 	%r1886, 0f7FC00000, %r3248, %p33;
 	// begin inline asm
-	mul.rn.f32 %r1885, %r1886, %r1880; //	
+	mul.ftz.f32 %r1885, %r1886, %r1880; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+26016], %r1885;
@@ -460318,7 +460318,7 @@ $L__BB118_68:                           // %bb2.i175
 	shl.b32 	%r3250, %r3249, 23;
 	selp.f32 	%r1889, 0f7FC00000, %r3250, %p34;
 	// begin inline asm
-	mul.rn.f32 %r1888, %r1889, %r1880; //	
+	mul.ftz.f32 %r1888, %r1889, %r1880; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+35744], %r1888;
@@ -528950,7 +528950,7 @@ $L__BB134_18:                           // %bb2.i98
 	selp.f32 	%r242, 0f7FC00000, %r1291, %p10;
 	mov.b32 	%r243, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r241, %r242, %r243; //	
+	mul.ftz.f32 %r241, %r242, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+4448], %r241;
@@ -528964,7 +528964,7 @@ $L__BB134_18:                           // %bb2.i98
 	shl.b32 	%r1293, %r1292, 23;
 	selp.f32 	%r246, 0f7FC00000, %r1293, %p11;
 	// begin inline asm
-	mul.rn.f32 %r245, %r246, %r243; //	
+	mul.ftz.f32 %r245, %r246, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+14176], %r245;
@@ -528978,7 +528978,7 @@ $L__BB134_18:                           // %bb2.i98
 	shl.b32 	%r1295, %r1294, 23;
 	selp.f32 	%r249, 0f7FC00000, %r1295, %p12;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r243; //	
+	mul.ftz.f32 %r248, %r249, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+23904], %r248;
@@ -528992,7 +528992,7 @@ $L__BB134_18:                           // %bb2.i98
 	shl.b32 	%r1297, %r1296, 23;
 	selp.f32 	%r252, 0f7FC00000, %r1297, %p13;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r243; //	
+	mul.ftz.f32 %r251, %r252, %r243; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+33632], %r251;
@@ -531753,7 +531753,7 @@ $L__BB134_52:                           // %bb2.i175
 	selp.f32 	%r1523, 0f7FC00000, %r2572, %p27;
 	mov.b32 	%r1524, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r1522, %r1523, %r1524; //	
+	mul.ftz.f32 %r1522, %r1523, %r1524; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+4448], %r1522;
@@ -531767,7 +531767,7 @@ $L__BB134_52:                           // %bb2.i175
 	shl.b32 	%r2574, %r2573, 23;
 	selp.f32 	%r1527, 0f7FC00000, %r2574, %p28;
 	// begin inline asm
-	mul.rn.f32 %r1526, %r1527, %r1524; //	
+	mul.ftz.f32 %r1526, %r1527, %r1524; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+14176], %r1526;
@@ -531781,7 +531781,7 @@ $L__BB134_52:                           // %bb2.i175
 	shl.b32 	%r2576, %r2575, 23;
 	selp.f32 	%r1530, 0f7FC00000, %r2576, %p29;
 	// begin inline asm
-	mul.rn.f32 %r1529, %r1530, %r1524; //	
+	mul.ftz.f32 %r1529, %r1530, %r1524; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+23904], %r1529;
@@ -531795,7 +531795,7 @@ $L__BB134_52:                           // %bb2.i175
 	shl.b32 	%r2578, %r2577, 23;
 	selp.f32 	%r1533, 0f7FC00000, %r2578, %p30;
 	// begin inline asm
-	mul.rn.f32 %r1532, %r1533, %r1524; //	
+	mul.ftz.f32 %r1532, %r1533, %r1524; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+33632], %r1532;
@@ -591293,7 +591293,7 @@ $L__BB148_18:                           // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r2574, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+14976], %r244;
@@ -591307,7 +591307,7 @@ $L__BB148_18:                           // %bb2.i98
 	shl.b32 	%r2576, %r2575, 23;
 	selp.f32 	%r249, 0f7FC00000, %r2576, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+24704], %r248;
@@ -591321,7 +591321,7 @@ $L__BB148_18:                           // %bb2.i98
 	shl.b32 	%r2578, %r2577, 23;
 	selp.f32 	%r252, 0f7FC00000, %r2578, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+34432], %r251;
@@ -591335,7 +591335,7 @@ $L__BB148_18:                           // %bb2.i98
 	shl.b32 	%r2580, %r2579, 23;
 	selp.f32 	%r255, 0f7FC00000, %r2580, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+44160], %r254;
@@ -597831,7 +597831,7 @@ $L__BB148_124:                          // %bb2.i175
 	selp.f32 	%r2985, 0f7FC00000, %r5314, %p34;
 	mov.b32 	%r2986, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r2984, %r2985, %r2986; //	
+	mul.ftz.f32 %r2984, %r2985, %r2986; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+14976], %r2984;
@@ -597845,7 +597845,7 @@ $L__BB148_124:                          // %bb2.i175
 	shl.b32 	%r5316, %r5315, 23;
 	selp.f32 	%r2989, 0f7FC00000, %r5316, %p35;
 	// begin inline asm
-	mul.rn.f32 %r2988, %r2989, %r2986; //	
+	mul.ftz.f32 %r2988, %r2989, %r2986; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+24704], %r2988;
@@ -597859,7 +597859,7 @@ $L__BB148_124:                          // %bb2.i175
 	shl.b32 	%r5318, %r5317, 23;
 	selp.f32 	%r2992, 0f7FC00000, %r5318, %p36;
 	// begin inline asm
-	mul.rn.f32 %r2991, %r2992, %r2986; //	
+	mul.ftz.f32 %r2991, %r2992, %r2986; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+34432], %r2991;
@@ -597873,7 +597873,7 @@ $L__BB148_124:                          // %bb2.i175
 	shl.b32 	%r5320, %r5319, 23;
 	selp.f32 	%r2995, 0f7FC00000, %r5320, %p37;
 	// begin inline asm
-	mul.rn.f32 %r2994, %r2995, %r2986; //	
+	mul.ftz.f32 %r2994, %r2995, %r2986; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+44160], %r2994;
@@ -639114,7 +639114,7 @@ $L__BB165_18:                           // %bb2.i98
 	selp.f32 	%r245, 0f7FC00000, %r2858, %p10;
 	mov.b32 	%r246, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r244, %r245, %r246; //	
+	mul.ftz.f32 %r244, %r245, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+17088], %r244;
@@ -639128,7 +639128,7 @@ $L__BB165_18:                           // %bb2.i98
 	shl.b32 	%r2860, %r2859, 23;
 	selp.f32 	%r249, 0f7FC00000, %r2860, %p11;
 	// begin inline asm
-	mul.rn.f32 %r248, %r249, %r246; //	
+	mul.ftz.f32 %r248, %r249, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+26816], %r248;
@@ -639142,7 +639142,7 @@ $L__BB165_18:                           // %bb2.i98
 	shl.b32 	%r2862, %r2861, 23;
 	selp.f32 	%r252, 0f7FC00000, %r2862, %p12;
 	// begin inline asm
-	mul.rn.f32 %r251, %r252, %r246; //	
+	mul.ftz.f32 %r251, %r252, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+36544], %r251;
@@ -639156,7 +639156,7 @@ $L__BB165_18:                           // %bb2.i98
 	shl.b32 	%r2864, %r2863, 23;
 	selp.f32 	%r255, 0f7FC00000, %r2864, %p13;
 	// begin inline asm
-	mul.rn.f32 %r254, %r255, %r246; //	
+	mul.ftz.f32 %r254, %r255, %r246; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd56+46272], %r254;
@@ -646472,7 +646472,7 @@ $L__BB165_140:                          // %bb2.i175
 	selp.f32 	%r3307, 0f7FC00000, %r5920, %p36;
 	mov.b32 	%r3308, 1056964608;
 	// begin inline asm
-	mul.rn.f32 %r3306, %r3307, %r3308; //	
+	mul.ftz.f32 %r3306, %r3307, %r3308; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+17088], %r3306;
@@ -646486,7 +646486,7 @@ $L__BB165_140:                          // %bb2.i175
 	shl.b32 	%r5922, %r5921, 23;
 	selp.f32 	%r3311, 0f7FC00000, %r5922, %p37;
 	// begin inline asm
-	mul.rn.f32 %r3310, %r3311, %r3308; //	
+	mul.ftz.f32 %r3310, %r3311, %r3308; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+26816], %r3310;
@@ -646500,7 +646500,7 @@ $L__BB165_140:                          // %bb2.i175
 	shl.b32 	%r5924, %r5923, 23;
 	selp.f32 	%r3314, 0f7FC00000, %r5924, %p38;
 	// begin inline asm
-	mul.rn.f32 %r3313, %r3314, %r3308; //	
+	mul.ftz.f32 %r3313, %r3314, %r3308; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+36544], %r3313;
@@ -646514,7 +646514,7 @@ $L__BB165_140:                          // %bb2.i175
 	shl.b32 	%r5926, %r5925, 23;
 	selp.f32 	%r3317, 0f7FC00000, %r5926, %p39;
 	// begin inline asm
-	mul.rn.f32 %r3316, %r3317, %r3308; //	
+	mul.ftz.f32 %r3316, %r3317, %r3308; //	
 
 	// end inline asm
 	st.shared.b32 	[%rd96+46272], %r3316;
