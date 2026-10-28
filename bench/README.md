@@ -186,3 +186,20 @@ on the chart), but don't base a deploy decision on it: rerun.
 | `lib/svcconf.py` | reads the service unit |
 | `lib/report.py` | summary, history line and markdown |
 | `lib/mkhtml.py` | the chart page |
+
+## Ad-hoc A/B harness (repo root)
+
+For one-knob questions (an env var, a warps count, a chunk size) use the root scripts rather than the standing
+suite - a full window takes ten minutes and needs the GPU to itself:
+
+| script | what it does |
+|---|---|
+| `decode-once.py` | one decode measurement per invocation: starts nothing, expects a server, hashes the reply text so two arms can be proven to produce the same output (`sha=...` in the line) |
+| `bench-lib.sh` | shared helpers, including `bench_stop_prod` / `bench_start_prod` - **every gate or A/B stops `titan-swap` first**, because the GPU is shared |
+| `ab-*.sh` | one file per knob: writes raw runs to `release/bench/*.jsonl` and prints the per-setting median |
+
+Rules that make the numbers mean anything: one process per knob value (a single process cannot change an env var
+mid-run), at least three repetitions when the spread matters, and a long-continuation prompt. Cross-restart spread is
+about +-8% because MTP acceptance depends on content, so a single-rep A/B on this box is a coin flip.
+
+Set `TITAN_BIN` to point the scripts at a specific binary (default `/usr/local/bin/mistralrs`).

@@ -1,8 +1,9 @@
 # Block-scaled MXFP4/NVFP4 MMQ: not blocked by the GPU
 
-Status: **both formats execute and match on every case but one irregular fallback shape each** (which our
-side leaves partly zeroed). This file records why the earlier "requires sm_120a hardware, impossible on
-cc 12.0" conclusion was wrong, and what actually had to change.
+Status: **both formats are in the default gate and bit-identical** (`mxfp4` 278 launches / 161,149,676 bytes,
+`nvfp4` 472 / 162,441,984, 0 failing each; the whole default run is 1,753 launches / 910,060,092 bytes). This
+file records why the earlier "requires sm_120a hardware, impossible on cc 12.0" conclusion was wrong, and what
+actually had to change.
 
 ## The instruction was never the problem
 
