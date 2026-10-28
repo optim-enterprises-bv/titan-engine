@@ -691,9 +691,91 @@ fn modules() -> M {
     }
 }
 
+
+/// FMT_MMQ_PROBE=1: read the reference's e8m0 -> float mapping straight out of the kernel.
+///
+/// One tile: 128 rows of 128 values (4 mxfp4 blocks each), every code = 1 (kvalues value 1), and the
+/// activation tile is exactly 1.0 everywhere (d = 1/127, q = 127). Then the output for a row is
+/// `sum over blocks of d_w(e) * 32`, so each `e` variant reports its scale directly and the twin and the
+/// reference can be compared value by value instead of through aggregate mismatch counts.
+fn probe_scales(m: &M) {
+    const K: usize = 256; // one MMQ_ITER_K
+    const ROWS: usize = 128;
+    const COLS: usize = 8;
+    let j = 8i32;
+    let bpn = (K / 32) as u32; // 8 blocks of 32 values per row
+    // x: every block { e, qs = 0x11 } -> 32 values of kvalues[1] = 1
+    let mut xs = vec![0u8; ROWS * K / 32 * 17];
+    for blk in 0..xs.len() / 17 {
+        xs[blk * 17 + 1..blk * 17 + 17].fill(0x11);
+    }
+    // y: one q8_1_mmq block of 128 values per column: four scales 1/127 and qs = 127
+    let mut ys = vec![0u8; COLS * 2 * 144];
+    for c in 0..COLS {
+        for blk in 0..2 {
+        let base = c * 2 * 144 + blk * 144;
+        for sub in 0..4 {
+            let d = 1.0f32 / 127.0;
+            ys[base + sub * 4..base + sub * 4 + 4].copy_from_slice(&d.to_le_bytes());
+        }
+        ys[base + 16..base + 144].fill(127u8);
+        }
+    }
+    let x = Buf::up(&xs);
+    let y = Buf::up(&ys);
+    let fd_bpn = fastdiv_values(bpn as u64);
+    let one = fastdiv_values(1);
+    let ntxv = fastdiv_values(((COLS as i32 + j - 1) / j) as u64);
+    let smem = mmq_smem(j);
+    println!("  probe: K={K} rows={ROWS} cols={COLS} J={j} bpn={bpn} smem={smem}");
+    println!("  {:>4}  {:>14}  {:>14}", "e", "ref", "oxide");
+    for e in [0x00u8, 0x01, 0x40, 0x7F, 0x80, 0xFE, 0xFF] {
+        for blk in 0..xs.len() / 17 {
+            xs[blk * 17] = e;
+        }
+        let xb = Buf::up(&xs);
+        let params = |dst: &Buf, tmp: &Buf| {
+            let mut p = Params::default();
+            p.put(xb.0).put(y.0).put(0u64).put(0u64).put(dst.0).put(tmp.0).put(0u64);
+            p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
+            p.put(ROWS as i32).put(COLS as i32).put(bpn as i32).put(COLS as i32).put(ROWS as i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(one[0]).put(one[1]).put(one[2]).put(0i32).put(0i32).put(0i32);
+            p.put(ntxv[0]).put(ntxv[1]).put(ntxv[2]);
+            p
+        };
+        let (da, db) = (Buf::up(&vec![0u8; ROWS * COLS * 4]), Buf::up(&vec![0u8; ROWS * COLS * 4]));
+        let (ta, tb) = (Buf::up(&vec![0u8; 1 << 22]), Buf::up(&vec![0u8; 1 << 22]));
+        launch(func(m.mmq[4], "_Z9mul_mat_qIL9ggml_type39ELi8ELb0EL9ggml_prec40EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_i"), (1, 1, 1), (32, 8, 1), smem, &params(&da, &ta));
+        launch_ox(func(m.ox, "mxfp4q8_mmq_j8_f0"), (1, 1, 1), (32, 8, 1), smem, &params(&db, &tb));
+        // stream-k leaves the reduction to the fixup kernel
+        let fparams = |dst: &Buf, tmp: &Buf, for_ref: bool| {
+            let mut p = Params::default();
+            p.put(0u64).put(0u64).put(dst.0).put(tmp.0);
+            p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
+            p.put(ROWS as i32).put(COLS as i32).put(ROWS as i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
+            p.put(ntxv[0]).put(ntxv[1]).put(ntxv[2]);
+            if for_ref {
+                p.put(0i32);
+            }
+            p
+        };
+        launch(func(m.mmq[4], "_Z24mul_mat_q_stream_k_fixupIL9ggml_type39ELi8ELb0EL9ggml_prec40EEvPKiS3_PfS4_5uint3iiiS5_iS5_iS5_i"), (1, 4, 1), (32, 4, 1), 0, &fparams(&da, &ta, true));
+        launch_ox(func(m.ox, "mxfp4q8_mmq_fixup_j8_f0"), (1, 4, 1), (32, 4, 1), 0, &fparams(&db, &tb, false));
+        let (ra, rb) = (da.down(), db.down());
+        let f = |v: &[u8]| f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        println!("  {e:#04x}  {:>14}  {:>14}", format!("{:e}", f(&ra)), format!("{:e}", f(&rb)));
+    }
+}
+
 pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     ctx();
     let m = modules();
+    if std::env::var("FMT_MMQ_PROBE").is_ok() {
+        probe_scales(&m);
+        return true;
+    }
     let mut t = Tally::default();
     let mut r = Rng(0xF4_17_A5_7A_11_0C_E5_EDu64);
     // Formats 2 and 3 (mxfp4, nvfp4) use block-scaled MMA, which needs .target sm_120a; the module
