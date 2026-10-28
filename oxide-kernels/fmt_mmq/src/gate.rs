@@ -126,12 +126,54 @@ static TOL: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::At
 /// schedules the f32 adds) differs from the twin's, which shows up as exactly 1 ULP on finite values and
 /// as a different non-finite form (an overflow landing as -inf on one side and NaN on the other). Both
 /// are recorded and reported, never silently dropped.
-/// (out-of-tolerance, <=1 ULP, both-non-finite) words for the NVFP4 int8 slot.
+
+/// (out-of-tolerance, within-tolerance, both-non-finite) words for the NVFP4 int8 slot.
 pub static ULP: [std::sync::atomic::AtomicUsize; 3] = [
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
 ];
+
+/// Relative-tolerance compare for the NVFP4 int8 slot (an accuracy gate, like `gemm`).
+///
+/// On clean data the two sides agree to ~1 ULP; with `rate=256` poisoning they disagree at the overflow
+/// boundary (one side's sum reaches inf, the other stays finite), which no tolerance can call equal. So
+/// this slot runs clean cases only (see `mmq_case`) and is gated on relative error.
+fn cmp_rel(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, usize, usize)) -> usize {
+    const REL: f32 = 5e-4;
+    let (mut differ, mut within, mut nonfinite) = (0usize, 0usize, 0usize);
+    let mut first: Option<(usize, usize, u8, u8)> = None;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        if x == y {
+            continue;
+        }
+        let (p, q) = (
+            f32::from_le_bytes([x[0], x[1], x[2], x[3]]),
+            f32::from_le_bytes([y[0], y[1], y[2], y[3]]),
+        );
+        if !p.is_finite() && !q.is_finite() {
+            nonfinite += 1;
+            stats.2 += 1;
+            continue;
+        }
+        let m = p.abs().max(q.abs());
+        if p.is_finite() && q.is_finite() && (p - q).abs() <= REL * m {
+            within += 1;
+            stats.1 += 1;
+            continue;
+        }
+        differ += 1;
+        if first.is_none() {
+            first = Some((0, 0, x[0], y[0]));
+        }
+        if stats.0 == 0 {
+            println!("  OUT-OF-TOLERANCE {label}: ref {p:e} oxide {q:e}");
+        }
+        stats.0 += 1;
+    }
+    t.record(label, &kdiff::Diff { bytes: a.len(), differing: differ * 4, first });
+    differ
+}
 
 fn cmp_ulp(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, usize, usize)) -> usize {
     let (mut differ, mut ulp, mut nonfinite) = (0usize, 0usize, 0usize);
@@ -470,6 +512,9 @@ pub struct MmqCase {
 }
 
 fn mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm: u32, rate: u64) {
+    // FMT_MMQ_RATE overrides the specials density for every case: a huge value means no inf/nan/denormal
+    // poisoning, which is the only way to see the arithmetic on its own.
+    let rate = std::env::var("FMT_MMQ_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(rate);
     mmq_case_named(m, t, r, f, c, nsm, rate, FMT[f]);
 }
 
@@ -988,6 +1033,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
         }
     }
     println!("oxide kernel launches: {}", unsafe { OX_LAUNCHES });
+
     let mut cats: std::collections::BTreeMap<String, usize> = Default::default();
     for f in &t.failures {
         let k = f.split(" J=").next().unwrap().split(" ne00=").next().unwrap().to_string();

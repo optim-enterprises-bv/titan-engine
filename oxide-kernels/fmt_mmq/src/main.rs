@@ -1265,8 +1265,8 @@ mod kernels {
             while j0 < J {
                 unroll!();
                 let b = load_b16(y_qs.wrapping_offset((j0 * TILE_Y_K + k01) as isize), TILE_Y_K);
-                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 32) as isize);
-                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 32) as isize);
+                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 8) as isize);
+                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 8) as isize);
                 let mut n = 0;
                 while n < ntx {
                     unroll!();
