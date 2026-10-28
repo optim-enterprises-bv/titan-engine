@@ -1,0 +1,28 @@
+# GPTQ Marlin repack, with and without a permutation.
+
+[kernel]
+begin = "    // GENERATED KERNELS BEGIN"
+end = "    // GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/marlin-kernels/src/main.rs"
+name_template = "gptq_marlin_repack_{bits.value}_{perm.pname}"
+entry = '''    #[kernel] pub unsafe fn {name}(w: *const u32, perm: *const u32, out: *mut u32, size_k: i32, size_n: i32) {{ marlin_repack::<{bits.value}, {perm.pval}, false>(w, perm, out, size_k, size_n) }}'''
+
+[[axis]]
+name = "bits"
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8
+
+[[axis]]
+name = "perm"
+
+[[axis.value]]
+pname = "perm"
+pval = "true"
+
+[[axis.value]]
+pname = "noperm"
+pval = "false"

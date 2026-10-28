@@ -7,7 +7,7 @@
 set -eu
 CTX="${1:-16384}"
 shift || true
-BIN=/home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs
+BIN=${TITAN_BIN:-/usr/local/bin/mistralrs}
 # A directory with ONLY the gguf in it: ~/models also holds the HF
 # generation_config.json whose top_k is -1, which the mistral.rs parser rejects
 # ("invalid value: integer -1, expected usize").

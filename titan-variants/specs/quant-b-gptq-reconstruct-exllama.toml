@@ -1,0 +1,23 @@
+# GPTQ exllama-layout weight reconstruct.
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "reconstruct_exllama_{b.value}bit"
+entry = '''    #[kernel] pub unsafe fn {name}(bq: *const u32, perm: *const i32, qz: *const u32, sc: *const u16, size_k: i32, size_n: i32, groups: i32, out: *mut u16) {{ reconstruct_exllama::<{b.value}>(bq, perm, qz, sc, size_k, size_n, groups, out) }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8

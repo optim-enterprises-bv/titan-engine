@@ -1,0 +1,59 @@
+[kernel]
+begin = "// GENERATED flash_attn_sinks kernels BEGIN"
+end = "// GENERATED FA END"
+target = "../../oxide-kernels/mistralrs-paged-attn-a/src/main.rs"
+name_template = "fas_{dt.name}_{fa.head}"
+entry = '''    #[kernel] pub unsafe fn {name}(q: *const u8, k: *const u8, v: *const u8, o: *mut u8, sk: *const f32, sc: f32, ql: i32, kl: i32, nh: i32, nkv: i32, w: i32) {{ flash_attn_sinks::<{dt.ty}, {fa.head}, {fa.bc}, {fa.ept}, false>(q as _, k as _, v as _, o as _, sk, core::ptr::null(), core::ptr::null(), sc, ql, kl, nh, nkv, w) }}'''
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "fa"
+
+[[axis.value]]
+head = 64
+bc = 64
+ept = 2
+
+[[axis.value]]
+head = 80
+bc = 32
+ept = 3
+
+[[axis.value]]
+head = 96
+bc = 32
+ept = 3
+
+[[axis.value]]
+head = 112
+bc = 32
+ept = 4
+
+[[axis.value]]
+head = 128
+bc = 32
+ept = 4
+
+[[axis.value]]
+head = 192
+bc = 16
+ept = 6
+
+[[axis.value]]
+head = 256
+bc = 16
+ept = 8

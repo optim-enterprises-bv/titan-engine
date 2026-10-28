@@ -1,0 +1,106 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-c/src/main.rs"
+name_template = "mmvq_gguf_{fmt.name}_{dt.name}_plain_cuda{n.value}"
+entry = '''    #[kernel] pub unsafe fn {name}(vx: *const u8, vy: *const u8, dst: *mut {dt.cty}, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32) {{ mmvq::<{fmt.idx}, {n.value}, {dt.dty}>(vx, vy, {dt.cast}, ncols_x, nrows_x, stride_col_y, stride_col_dst) }}'''
+
+[[axis]]
+name = "fmt"
+
+[[axis.value]]
+name = "q4_0"
+idx = 0
+
+[[axis.value]]
+name = "q4_1"
+idx = 1
+
+[[axis.value]]
+name = "q5_0"
+idx = 2
+
+[[axis.value]]
+name = "q5_1"
+idx = 3
+
+[[axis.value]]
+name = "q8_0"
+idx = 4
+
+[[axis.value]]
+name = "q2_k"
+idx = 5
+
+[[axis.value]]
+name = "q3_k"
+idx = 6
+
+[[axis.value]]
+name = "q4_k"
+idx = 7
+
+[[axis.value]]
+name = "q5_k"
+idx = 8
+
+[[axis.value]]
+name = "q6_k"
+idx = 9
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "bf16"
+cty = "u16"
+dty = "B"
+cast = '''dst as *mut B'''
+castq = '''q_dst as *mut B'''
+castk = '''k_dst as *mut B'''
+castv = '''v_dst as *mut B'''
+
+[[axis.value]]
+name = "f16"
+cty = "u16"
+dty = "H"
+cast = '''dst as *mut H'''
+castq = '''q_dst as *mut H'''
+castk = '''k_dst as *mut H'''
+castv = '''v_dst as *mut H'''
+
+[[axis.value]]
+name = "f32"
+cty = "f32"
+dty = "f32"
+cast = '''dst'''
+castq = '''q_dst'''
+castk = '''k_dst'''
+castv = '''v_dst'''
+
+[[axis]]
+name = "n"
+
+[[axis.value]]
+value = 1
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 5
+
+[[axis.value]]
+value = 6
+
+[[axis.value]]
+value = 7
+
+[[axis.value]]
+value = 8

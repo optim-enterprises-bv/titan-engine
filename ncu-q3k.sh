@@ -1,4 +1,6 @@
 #!/bin/bash
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO/bench-lib.sh"
 # Q3_K kernel counters, run as root (GPU perf counters are admin-only on this box).
 # Decides: DRAM-transaction bound (misaligned 16-bit reads) vs ALU/issue bound.
 set -u
@@ -17,13 +19,13 @@ sudo -n env TITAN_MTP=0 TITAN_GDN_DIRECT=1 \
   --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size \
   --launch-count 24 --kill yes \
   -f -o /tmp/ncu-q3k \
-  /home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs serve \
+  ${TITAN_BIN:-/usr/local/bin/mistralrs} serve \
   -p 1234 --no-ui --paged-attn off --max-seq-len 8192 --format gguf \
   -m /home/dingo/src/titan-engine/models-optim -f optim-Q3_K_M.gguf -n 0:64 \
   > /tmp/ncu-q3k.log 2>&1 &
 NPID=$!
 for i in $(seq 1 60); do sleep 3; ss -tln | grep -q ':1234' && break; done
-cd /tmp && python3 decode-once.py 8 >/dev/null 2>&1; python3 decode-once.py 12 >/dev/null 2>&1
+cd /tmp && python3 "$REPO/decode-once.py" 8 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 12 >/dev/null 2>&1
 for i in $(seq 1 40); do sleep 5; [ -f /tmp/ncu-q3k.ncu-repz ] && break; done
 pkill -f "mistralrs ser[v]e" 2>/dev/null
 sudo -n "$NCU" --import /tmp/ncu-q3k.ncu-repz --csv --page raw > /tmp/ncu-q3k.csv 2>/dev/null

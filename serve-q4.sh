@@ -15,7 +15,7 @@
 set -eu
 CTX="${1:-262144}"
 shift || true
-BIN="${TITAN_BIN:-/home/dingo/src/titan-engine/mistral.rs/target/release/mistralrs}"
+BIN="${TITAN_BIN:-${TITAN_BIN:-/usr/local/bin/mistralrs}}"
 MODELS=/home/dingo/src/titan-engine/models-q4fit
 FILE="${TITAN_FILE:-Qwen3.8-27B-DevSecOps-QLoRA-abliterated-Q4_K_M-fit.gguf}"
 export TITAN_MTP="${TITAN_MTP:-1}"

@@ -1,0 +1,17 @@
+# GPTQ alt-layout half GEMM (4 and 8 bit only).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "gemm_half_q_half_alt_{b.value}bit"
+entry = '''    #[kernel] pub unsafe fn {name}(vec: *const u32, mat: *const u32, mul_out: *mut u16, sc: *const u16, zeros: *const u32, g_idx: *const i32, batch: i32, height: i32, width: i32) {{ gptq_alt::<{b.value}>(vec, mat, mul_out, sc, zeros, g_idx, batch, height, width) }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8

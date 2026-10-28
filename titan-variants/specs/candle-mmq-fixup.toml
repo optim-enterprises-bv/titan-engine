@@ -1,0 +1,64 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN (gen_kernels.py)"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/candle-mmq/src/main.rs"
+name_template = "mmq_fixup_qk{qk.value}_x{x.value}_nc{nc.value}"
+args = "dst: *mut f32, tmp_last_tile: *const f32, ncols_x: i32, nrows_x: i32, ncols_dst: i32, stride_col_dst: u64, ncols_max: i32"
+call = "(dst, tmp_last_tile, ncols_x, nrows_x, ncols_dst, stride_col_dst, ncols_max)"
+entry = '''    #[kernel] #[launch_bounds(256, 1)] pub unsafe fn {name}({args}) {{ unsafe {{ stream_k_fixup::<{qk.value}, {x.value}, {nc.b}>{call} }} }}'''
+
+[[axis]]
+name = "qk"
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 256
+
+[[axis]]
+name = "x"
+
+[[axis.value]]
+value = 8
+
+[[axis.value]]
+value = 16
+
+[[axis.value]]
+value = 24
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 40
+
+[[axis.value]]
+value = 48
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 80
+
+[[axis.value]]
+value = 96
+
+[[axis.value]]
+value = 112
+
+[[axis.value]]
+value = 128
+
+[[axis]]
+name = "nc"
+
+[[axis.value]]
+value = 0
+b = "false"
+
+[[axis.value]]
+value = 1
+b = "true"

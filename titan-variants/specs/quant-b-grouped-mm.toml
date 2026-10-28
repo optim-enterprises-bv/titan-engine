@@ -1,0 +1,20 @@
+# Grouped GEMM, three tile-size tunings (large / medium / small).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "grouped_mm_2x_{c.name}"
+entry = '''    #[kernel] pub unsafe fn {name}(a: *const *const u16, b: *const *const u16, d: *const *mut u16, ps: *const i32, pc: i32, lda: *const i64, ldb: *const i64, ldd: *const i64) {{ grouped_mm(a, b, d, ps, pc, lda, ldb, ldd) }}'''
+
+[[axis]]
+name = "c"
+
+[[axis.value]]
+name = "large"
+
+[[axis.value]]
+name = "medium"
+
+[[axis.value]]
+name = "small"

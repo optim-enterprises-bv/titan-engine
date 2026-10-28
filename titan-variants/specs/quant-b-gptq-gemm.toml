@@ -1,0 +1,50 @@
+# GPTQ GEMM: bits x the m-block count (m1..m8 are separate template instances).
+
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/mistralrs-quant-b/src/main.rs"
+name_template = "gptq_gemm_{b.value}bit_m{mc.value}"
+entry = '''    #[kernel] pub unsafe fn {name}(a: *const u16, bq: *const u32, qz: *const u32, sc: *const u16, c: *mut u16, m: i32, n: i32, kk: i32, groups: i32, perm: *const i32) {{ gptq_gemm::<{b.value}, {mc.value}>(a, bq, qz, sc, c, m, n, kk, groups, perm) }}'''
+
+[[axis]]
+name = "b"
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 8
+
+[[axis]]
+name = "mc"
+
+[[axis.value]]
+value = 1
+
+[[axis.value]]
+value = 2
+
+[[axis.value]]
+value = 3
+
+[[axis.value]]
+value = 4
+
+[[axis.value]]
+value = 5
+
+[[axis.value]]
+value = 6
+
+[[axis.value]]
+value = 7
+
+[[axis.value]]
+value = 8

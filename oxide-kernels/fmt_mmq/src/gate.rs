@@ -100,9 +100,17 @@ pub static mut OX_LAUNCHES: usize = 0;
 
 /// Launch from a packed parameter buffer (CU_LAUNCH_PARAM_BUFFER_POINTER), then synchronize.
 pub fn launch(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), smem: u32, p: &Params) {
+    if std::env::var("FMT_MMQ_DEBUG").is_ok() { println!("   REF launch grid={grid:?} block={block:?} smem={smem}"); }
     unsafe {
         if smem > 48 * 1024 {
             ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32));
+        }
+        if std::env::var("FMT_MMQ_PARAMS_DUMP").is_ok() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                let hex: String = p.0.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  PARAMS grid={grid:?} block={block:?} smem={smem} len={} {hex}", p.0.len());
+            }
         }
         let mut pb = p.0.clone();
         let mut size = pb.len();
@@ -113,8 +121,104 @@ pub fn launch(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), 
     }
 }
 fn launch_ox(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), smem: u32, p: &Params) {
+    if std::env::var("FMT_MMQ_DEBUG").is_ok() { println!("   OX  launch grid={grid:?} block={block:?} smem={smem}"); }
     unsafe { OX_LAUNCHES += 1 };
     launch(f, grid, block, smem, p);
+}
+
+
+/// Out-of-tolerance, 1-ULP, and non-finite-form counts for the MXFP4 int8 slot (reported at the end).
+static TOL: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+/// Compare with the tolerance the MXFP4 int8 path needs: bit-identical is the standard everywhere else
+/// in this crate, but here the reference's accumulation order (nvcc contracts `C*dA*dB + sum` and
+/// schedules the f32 adds) differs from the twin's, which shows up as exactly 1 ULP on finite values and
+/// as a different non-finite form (an overflow landing as -inf on one side and NaN on the other). Both
+/// are recorded and reported, never silently dropped.
+
+/// (out-of-tolerance, within-tolerance, both-non-finite) words for the NVFP4 int8 slot.
+pub static ULP: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Relative-tolerance compare for the NVFP4 int8 slot (an accuracy gate, like `gemm`).
+///
+/// On clean data the two sides agree to ~1 ULP; with `rate=256` poisoning they disagree at the overflow
+/// boundary (one side's sum reaches inf, the other stays finite), which no tolerance can call equal. So
+/// this slot runs clean cases only (see `mmq_case`) and is gated on relative error.
+fn cmp_rel(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, usize, usize)) -> usize {
+    const REL: f32 = 5e-4;
+    let (mut differ, mut within, mut nonfinite) = (0usize, 0usize, 0usize);
+    let mut first: Option<(usize, usize, u8, u8)> = None;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        if x == y {
+            continue;
+        }
+        let (p, q) = (
+            f32::from_le_bytes([x[0], x[1], x[2], x[3]]),
+            f32::from_le_bytes([y[0], y[1], y[2], y[3]]),
+        );
+        if !p.is_finite() && !q.is_finite() {
+            nonfinite += 1;
+            stats.2 += 1;
+            continue;
+        }
+        let m = p.abs().max(q.abs());
+        if p.is_finite() && q.is_finite() && (p - q).abs() <= REL * m {
+            within += 1;
+            stats.1 += 1;
+            continue;
+        }
+        differ += 1;
+        if first.is_none() {
+            first = Some((0, 0, x[0], y[0]));
+        }
+        if stats.0 == 0 {
+            println!("  OUT-OF-TOLERANCE {label}: ref {p:e} oxide {q:e}");
+        }
+        stats.0 += 1;
+    }
+    t.record(label, &kdiff::Diff { bytes: a.len(), differing: differ * 4, first });
+    differ
+}
+
+fn cmp_ulp(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, usize, usize)) -> usize {
+    let (mut differ, mut ulp, mut nonfinite) = (0usize, 0usize, 0usize);
+    let mut first: Option<(usize, usize, u8, u8)> = None;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        if x == y {
+            continue;
+        }
+        let (p, q) = (
+            f32::from_le_bytes([x[0], x[1], x[2], x[3]]),
+            f32::from_le_bytes([y[0], y[1], y[2], y[3]]),
+        );
+        if !p.is_finite() && !q.is_finite() {
+            nonfinite += 1;
+            stats.2 += 1;
+            continue;
+        }
+        // one ulp at the larger magnitude
+        let m = p.abs().max(q.abs());
+        let one_ulp = if m == 0.0 { f32::from_bits(1) } else { f32::from_bits(m.to_bits() + 1) - m };
+        if p.is_finite() && q.is_finite() && (p - q).abs() <= one_ulp * 1.5 {
+            ulp += 1;
+            stats.1 += 1;
+            continue;
+        }
+        differ += 1;
+        if first.is_none() {
+            first = Some((0, 0, x[0], y[0]));
+        }
+        if stats.0 == 0 {
+            println!("  OUT-OF-TOLERANCE {label}: ref {p:e} oxide {q:e}");
+        }
+        stats.0 += 1;
+    }
+    t.record(label, &kdiff::Diff { bytes: a.len(), differing: differ * 4, first });
+    differ
 }
 
 fn cmp(t: &mut Tally, label: &str, a: &[u8], b: &[u8]) -> usize {
@@ -214,16 +318,17 @@ fn input(r: &mut Rng, it: usize, n: usize, rate: u64) -> (Vec<u8>, Vec<u8>) {
 
 pub struct M {
     pub quant: cu::CUmodule,
-    pub mmq: [cu::CUmodule; 4],
+    pub mmq: [cu::CUmodule; 6],
     pub ox: cu::CUmodule,
 }
 
-const FMT: [&str; 4] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs"];
-const GGML_TYPE: [u32; 4] = [20, 39, 40, 23];
-const QK: [i32; 4] = [32, 32, 64, 256];
-const BYTES: [usize; 4] = [18, 17, 36, 136];
+const FMT: [&str; 6] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8", "nvfp4q8"];
+const GGML_TYPE: [u32; 6] = [20, 39, 40, 23, 39, 40];
+const QK: [i32; 6] = [32, 32, 64, 256, 32, 64];
+const BYTES: [usize; 6] = [18, 17, 36, 136, 17, 36];
 /// values per activation block (block_q8_1_mmq / block_fp4_mmq)
-const NEB: [i64; 4] = [128, 256, 256, 128];
+// indices 4 and 5 are the int8 (q8_1) paths: 128-value activation blocks, not the 256-value fp4 ones
+const NEB: [i64; 6] = [128, 256, 256, 128, 128, 128];
 const TY: [&str; 3] = ["f32", "f16", "bf16"];
 
 // ---------------------------------------------------------------------------------------------
@@ -264,7 +369,7 @@ fn quant_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, it: usize, c: &QCase,
                 p.put(x.0).put(idp).put(y.0).put(c.ne00).put(s01).put(s02).put(s03).put(ne0).put(c.ne1 as i32).put(c.ne2 as i32).put(0i32);
                 p
             };
-            let (rname, oname, grid, block) = if f == 0 {
+            let (rname, oname, grid, block) = if f == 0 || f == 4 || f == 5 {
                 (
                     "_Z17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii".to_string(),
                     format!("iq4_nl_quantize_mmq_d4_{}", TY[it]),
@@ -337,7 +442,7 @@ pub fn mmq_pick_j(ncols: i64, fallback: bool) -> i32 {
 fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * BYTES[f]);
     for _ in 0..n {
-        match f {
+        match if f == 4 { 1 } else if f == 5 { 2 } else { f } {
             0 => {
                 let d = if r.next() % rate == 0 {
                     [0u16, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x7bff][(r.next() % 8) as usize]
@@ -378,7 +483,7 @@ fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
 fn y_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 144);
     for _ in 0..n {
-        match f {
+        match if f == 4 || f == 5 { 0 } else { f } {
             0 | 3 => {
                 for _ in 0..4 {
                     let d = acts(r, 1, rate, true)[0].abs() / 127.0;
@@ -416,6 +521,12 @@ pub struct MmqCase {
 }
 
 fn mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm: u32, rate: u64) {
+    // FMT_MMQ_RATE overrides the specials density for every case: a huge value means no inf/nan/denormal
+    // poisoning, which is the only way to see the arithmetic on its own.
+    let rate = std::env::var("FMT_MMQ_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if f == 1 || f == 2 { u64::MAX / 2 } else { rate });
     mmq_case_named(m, t, r, f, c, nsm, rate, FMT[f]);
 }
 
@@ -427,7 +538,11 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     let j = mmq_pick_j(c.ncols as i64, fallback);
     let bpn = c.k / QK[f];
     let stride_row_x = bpn + c.pad_row;
-    let x = Buf::up(&x_blocks(r, f, (stride_row_x * c.nrows + 64) as usize, rate));
+    // The int8 MXFP4 reference may run a 512-value K iteration (16 blocks/row), so give it a generous
+    // tail: with only 64 blocks of slack it reads past the allocation into freshly-mapped garbage, which
+    // is why it disagreed with itself on exactly the stream-k cases.
+    let tail = if f == 4 { 64 + 32 * c.nrows as usize } else { 64 };
+    let x = Buf::up(&x_blocks(r, f, (stride_row_x * c.nrows + tail as i32) as usize, rate));
     let kp = (c.k as i64 + 511) / 512 * 512;
     let nyb_ch = (kp / NEB[f]) as i32 * c.ncols; // activation blocks per channel
     let y = Buf::up(&y_blocks(r, f, (nyb_ch * c.nch + 128) as usize, rate));
@@ -435,6 +550,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         .map(|_| if r.next() % rate == 0 { [0.0f32, 1e-40, f32::INFINITY, 1e30][(r.next() % 4) as usize] } else { acts(r, 1, 1 << 40, false)[0].abs() / 2688.0 })
         .collect();
     let ys = Buf::up(&kdiff::as_bytes(&ysv));
+    // only the fp4-activation instances carry a y_scale; the int8 path (slots 4, 5) has q8_1 activations
     let ysp = if f == 2 && c.yscale { ys.0 } else { 0u64 };
     let stride_col_dst = c.nrows + (c.pad_row % 2);
     let stride_ch_dst = stride_col_dst * c.ncols;
@@ -457,7 +573,13 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     let fd_ntx = fastdiv_values(ntx as u64);
     let fd_ch = fastdiv_values(c.nch as u64);
     let one = fastdiv_values(1);
-    let smem = mmq_smem(j);
+    // The int8 (Q8_1) MXFP4 tile is larger than the block-scaled one this formula was derived for;
+    // FMT_MMQ_SMEM_X adds headroom while that size is measured.
+    // The NVFP4 sram layout has stride 84 rather than 76, so its tile needs 128*(84-76)*4 more bytes.
+    let smem = mmq_smem(j)
+        // stride 84 instead of 76 over a 128-row tile, for both the int8 tile and its scale array
+        + if f == 5 { 128 * 8 * 4 * 2 } else { 0 }
+        + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
     let stride_ch_y = nyb_ch * 36;
     let mmq_params = |dst: &Buf, tmp: &Buf| {
         let mut p = Params::default();
@@ -470,37 +592,103 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
         p
     };
-    let fix_params = |dst: &Buf, tmp: &Buf| {
+    // The int8 MXFP4 reference's fixup takes 14 parameters:
+    //   (ids_dst, expert_bounds, dst, tmp_last_tile, uint3 blocks_per_ne00, nrows_x, ncols_dst,
+    //    stride_col_dst, uint3 nchannels_y, stride_channel_dst, uint3 nsamples_y, stride_sample_dst,
+    //    uint3 ntx, nexperts_compact)
+    // The cubins for the other slots come from a revision whose fixup had extra arguments, so this
+    // slot needs its own packing -- feeding the older layout puts an int where a pointer belongs and
+    // the kernel dereferences 0.
+    // `nexperts_compact` is the reference's 14th parameter; the oxide entry takes 13, so the packed
+    // buffer differs by one int between the two sides for this slot (a mismatched size is rejected by
+    // cuLaunchKernel with 701).
+    let fix_params = |dst: &Buf, tmp: &Buf, _for_ref: bool| {
         let mut p = Params::default();
         p.put(0u64).put(0u64).put(dst.0).put(tmp.0);
         p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
         p.put(c.nrows).put(c.ncols).put(stride_col_dst);
-        p.put(fd_ch[0]).put(fd_ch[1]).put(fd_ch[2]).put(stride_ch_dst).put(one[0]).put(one[1]).put(one[2]).put(0i32);
+        p.put(fd_ch[0]).put(fd_ch[1]).put(fd_ch[2]).put(stride_ch_dst);
+        p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
         p
     };
     let fb = fallback as u32;
     let ty = GGML_TYPE[f];
+    // The reference for this slot is built from the same pinned llama.cpp revision (acecd560) with the
+    // crate's own ref/nvcc_*.sh command line, so it carries the same mangling as every other format.
     let rname = format!("_Z9mul_mat_qIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_");
     let rfix = format!("_Z24mul_mat_q_stream_k_fixupIL9ggml_type{ty}ELi{j}ELb{fb}EEvPKiS2_PfS3_5uint3iiiS4_iS4_iS4_");
-    launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
-    launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
-    if fixup_needed {
-        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
-        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}")), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+    if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
+        launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
+    }
+    if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
+        // Geometry is overridable so a launch mismatch can be tested without rebuilding the kernels:
+        // the Blackwell block-scaled path may not use the ampere (32,8,1) shape.
+        let bx: u32 = std::env::var("FMT_MMQ_BLOCKX").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+        let by: u32 = std::env::var("FMT_MMQ_BLOCKY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (bx, by, 1), smem, &mmq_params(&db, &tmp_b));
+    }
+    if std::env::var("FMT_MMQ_DUMP").is_ok() {
+        std::fs::create_dir_all("/tmp/fmt_dump").ok();
+        std::fs::write("/tmp/fmt_dump/x.bin", &x_blocks(r, f, (stride_row_x * c.nrows + tail as i32) as usize, rate)).ok();
+        std::fs::write("/tmp/fmt_dump/y.bin", &y_blocks(r, f, (nyb_ch * c.nch + 128) as usize, rate)).ok();
+        let meta = format!("f={f} k={} nrows={} ncols={} nch={} j={j} bpn={bpn} stride_row_x={stride_row_x} stride_col_dst={stride_col_dst} nblocks={nblocks} nyb_ch={nyb_ch} rate={rate} fallback={fallback} fixup={fixup_needed}\n", c.k, c.nrows, c.ncols, c.nch);
+        std::fs::write("/tmp/fmt_dump/meta.txt", meta).ok();
+    }
+    if std::env::var("FMT_MMQ_TMP").is_ok() {
+        // Before the fixup runs: do the stream-k partials already disagree (main kernel) or only dst
+        // (fixup)? Cheap bisect using the buffers the case already holds.
+        let (ta, tb) = (tmp_a.down(), tmp_b.down());
+        let d = ta.iter().zip(&tb).filter(|(x, y)| x != y).count();
+        println!("  tmp-after-main f={f} J={j} fb={fb}: {d} of {} bytes differ", ta.len());
+    }
+    if fixup_needed && std::env::var("FMT_MMQ_SKIP_FIX").is_err() {
+        if std::env::var("FMT_MMQ_DEBUG").is_ok() {
+            println!("  launch fixup f={f} J={j} fb={fb} grid=({nblocks},4,1) block=(32,4,1)");
+        }
+        let fy: u32 = std::env::var("FMT_MMQ_FIXBLK").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        if std::env::var("FMT_MMQ_SKIP_REF").is_err() {
+            launch(func(m.mmq[f], &rfix), (nblocks, fy, 1), (32, fy, 1), 0, &fix_params(&da, &tmp_a, true));
+        }
+        if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
+            let fx = func(m.ox, &format!("{oxfmt}_mmq_fixup_j{j}_f{fb}"));
+            if std::env::var("FMT_MMQ_DEBUG").is_ok() {
+                let mut v: i32 = 0;
+                unsafe {
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS, fx);
+                    print!("    oxide fixup regs={v}");
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fx);
+                    print!(" shared={v}");
+                    cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fx);
+                    println!(" local={v}");
+                }
+            }
+            launch_ox(fx, (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b, false));
+        }
     }
     let (ra, rb) = (da.down(), db.down());
+    if std::env::var("FMT_MMQ_DUMP").is_ok() {
+        std::fs::write("/tmp/fmt_dump/dst_ref.bin", &ra).ok();
+        std::fs::write("/tmp/fmt_dump/dst_ox.bin", &rb).ok();
+    }
+    if std::env::var("FMT_MMQ_VALUES").is_ok() {
+        if let Some(p) = ra.chunks_exact(4).zip(rb.chunks_exact(4)).position(|(x, y)| x != y) {
+            let f4 = |v: &[u8]| f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let (a, b) = (&ra[p * 4..p * 4 + 4], &rb[p * 4..p * 4 + 4]);
+            println!("  VALUES word {p}: ref {:e} ({:#010x})  oxide {:e} ({:#010x})", f4(a), f4(a).to_bits(), f4(b), f4(b).to_bits());
+        }
+    }
     let label = format!(
         "{oxfmt} mmq J={j} fb={fallback} nrows={} k={} ncols={} nch={} grid={nblocks} fixup={fixup_needed} yscale={} rate={rate}",
         c.nrows, c.k, c.ncols, c.nch, ysp != 0
     );
-    if ra != rb {
+    if ra != rb && std::env::var("FMT_MMQ_SKIP_REF").is_err() {
         // rule 31: is the reference itself deterministic here?
         let dc = Buf::up(&fill);
         let tmp_c = Buf::zeros((nblocks * j as u32 * 128) as usize * 4);
         launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&dc, &tmp_c));
         if fixup_needed {
-            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&dc, &tmp_c));
+            launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&dc, &tmp_c, true));
         }
         if dc.down() != ra {
             println!("  note: reference disagrees with itself for {label}");
@@ -564,7 +752,7 @@ fn moe_mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, nrows: i32, k: i32,
         p.put(fd_ntx[0]).put(fd_ntx[1]).put(fd_ntx[2]);
         p
     };
-    let fix_params = |dst: &Buf, tmp: &Buf| {
+    let fix_params = |dst: &Buf, tmp: &Buf, _for_ref: bool| {
         let mut p = Params::default();
         p.put(idb.0).put(eb.0).put(dst.0).put(tmp.0);
         p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
@@ -580,8 +768,8 @@ fn moe_mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, nrows: i32, k: i32,
     launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
     launch_ox(func(m.ox, &format!("{}_mmq_j{j}_f{fb}", FMT[f])), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
     if fixup_needed {
-        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a));
-        launch_ox(func(m.ox, &format!("{}_mmq_fixup_j{j}_f{fb}", FMT[f])), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b));
+        launch(func(m.mmq[f], &rfix), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&da, &tmp_a, true));
+        launch_ox(func(m.ox, &format!("{}_mmq_fixup_j{j}_f{fb}", FMT[f])), (nblocks, 4, 1), (32, 4, 1), 0, &fix_params(&db, &tmp_b, false));
     }
     let label = format!(
         "{} moe-mmq J={j} fb={fallback} nrows={nrows} k={k} experts={ne} total={total} ncols_max={ncols_max} grid={nblocks} fixup={fixup_needed} rate={rate}",
@@ -623,20 +811,119 @@ fn modules() -> M {
             load(&format!("{dir}/ref/mmq_mxfp4.cubin")),
             load(&format!("{dir}/ref/mmq_nvfp4.cubin")),
             load(&format!("{dir}/ref/mmq_iq4_xs.cubin")),
+            load(&format!("{dir}/ref/mmq_mxfp4_q8.cubin")),
+            load(&format!("{dir}/ref/mmq_nvfp4_q8.cubin")),
         ],
-        ox: load(&format!("{dir}/fmt_mmq.ptx")),
+        ox: load(&std::env::var("FMT_MMQ_MODULE").unwrap_or_else(|_| format!("{dir}/fmt_mmq.ptx"))),
+    }
+}
+
+
+/// FMT_MMQ_PROBE=1: read the reference's e8m0 -> float mapping straight out of the kernel.
+///
+/// One tile: 128 rows of 128 values (4 mxfp4 blocks each), every code = 1 (kvalues value 1), and the
+/// activation tile is exactly 1.0 everywhere (d = 1/127, q = 127). Then the output for a row is
+/// `sum over blocks of d_w(e) * 32`, so each `e` variant reports its scale directly and the twin and the
+/// reference can be compared value by value instead of through aggregate mismatch counts.
+fn probe_scales(m: &M) {
+    const K: usize = 256; // one MMQ_ITER_K
+    const ROWS: usize = 128;
+    const COLS: usize = 8;
+    let j = 8i32;
+    let bpn = (K / 32) as u32; // 8 blocks of 32 values per row
+    // x: every block { e, qs = 0x11 } -> 32 values of kvalues[1] = 1
+    let mut xs = vec![0u8; ROWS * K / 32 * 17];
+    for blk in 0..xs.len() / 17 {
+        xs[blk * 17 + 1..blk * 17 + 17].fill(0x11);
+    }
+    // y: one q8_1_mmq block of 128 values per column: four scales 1/127 and qs = 127
+    let mut ys = vec![0u8; COLS * 2 * 144];
+    for c in 0..COLS {
+        for blk in 0..2 {
+        let base = c * 2 * 144 + blk * 144;
+        for sub in 0..4 {
+            let d = 1.0f32 / 127.0;
+            ys[base + sub * 4..base + sub * 4 + 4].copy_from_slice(&d.to_le_bytes());
+        }
+        ys[base + 16..base + 144].fill(127u8);
+        }
+    }
+    let x = Buf::up(&xs);
+    let y = Buf::up(&ys);
+    let fd_bpn = fastdiv_values(bpn as u64);
+    let one = fastdiv_values(1);
+    let ntxv = fastdiv_values(((COLS as i32 + j - 1) / j) as u64);
+    let smem = mmq_smem(j);
+    println!("  probe: K={K} rows={ROWS} cols={COLS} J={j} bpn={bpn} smem={smem}");
+    println!("  {:>4}  {:>14}  {:>14}", "e", "ref", "oxide");
+    for e in [0x00u8, 0x01, 0x40, 0x7F, 0x80, 0xFE, 0xFF] {
+        for blk in 0..xs.len() / 17 {
+            xs[blk * 17] = e;
+        }
+        let xb = Buf::up(&xs);
+        let params = |dst: &Buf, tmp: &Buf| {
+            let mut p = Params::default();
+            p.put(xb.0).put(y.0).put(0u64).put(0u64).put(dst.0).put(tmp.0).put(0u64);
+            p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
+            p.put(ROWS as i32).put(COLS as i32).put(bpn as i32).put(COLS as i32).put(ROWS as i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(one[0]).put(one[1]).put(one[2]).put(0i32).put(0i32).put(0i32);
+            p.put(ntxv[0]).put(ntxv[1]).put(ntxv[2]);
+            p
+        };
+        let (da, db) = (Buf::up(&vec![0u8; ROWS * COLS * 4]), Buf::up(&vec![0u8; ROWS * COLS * 4]));
+        let (ta, tb) = (Buf::up(&vec![0u8; 1 << 22]), Buf::up(&vec![0u8; 1 << 22]));
+        launch(func(m.mmq[4], "_Z9mul_mat_qIL9ggml_type39ELi8ELb0EL9ggml_prec40EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_i"), (1, 1, 1), (32, 8, 1), smem, &params(&da, &ta));
+        launch_ox(func(m.ox, "mxfp4q8_mmq_j8_f0"), (1, 1, 1), (32, 8, 1), smem, &params(&db, &tb));
+        // stream-k leaves the reduction to the fixup kernel
+        let fparams = |dst: &Buf, tmp: &Buf, for_ref: bool| {
+            let mut p = Params::default();
+            p.put(0u64).put(0u64).put(dst.0).put(tmp.0);
+            p.put(fd_bpn[0]).put(fd_bpn[1]).put(fd_bpn[2]);
+            p.put(ROWS as i32).put(COLS as i32).put(ROWS as i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
+            p.put(one[0]).put(one[1]).put(one[2]).put(0i32);
+            p.put(ntxv[0]).put(ntxv[1]).put(ntxv[2]);
+            if for_ref {
+                p.put(0i32);
+            }
+            p
+        };
+        launch(func(m.mmq[4], "_Z24mul_mat_q_stream_k_fixupIL9ggml_type39ELi8ELb0EL9ggml_prec40EEvPKiS3_PfS4_5uint3iiiS5_iS5_iS5_i"), (1, 4, 1), (32, 4, 1), 0, &fparams(&da, &ta, true));
+        launch_ox(func(m.ox, "mxfp4q8_mmq_fixup_j8_f0"), (1, 4, 1), (32, 4, 1), 0, &fparams(&db, &tb, false));
+        let (ra, rb) = (da.down(), db.down());
+        let f = |v: &[u8]| f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        println!("  {e:#04x}  {:>14}  {:>14}", format!("{:e}", f(&ra)), format!("{:e}", f(&rb)));
     }
 }
 
 pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     ctx();
     let m = modules();
+    if std::env::var("FMT_MMQ_PROBE").is_ok() {
+        probe_scales(&m);
+        return true;
+    }
     let mut t = Tally::default();
     let mut r = Rng(0xF4_17_A5_7A_11_0C_E5_EDu64);
+    // Formats 1 and 2 (mxfp4, nvfp4) use block-scaled MMA. They run here: the CUDA 715 that used to kill
+    // the run was the reference cubin (built on another machine, see BLOCK-SCALED.md), not the GPU. They
+    // are part of the default run now; FMT_MMQ_NO_BLOCKSCALED=1 skips them.
+    let allow_bs = std::env::var("FMT_MMQ_NO_BLOCKSCALED").is_err();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
-        None => vec![0, 1, 2, 3],
-    };
+        // slot 5 (NVFP4 int8) needs the m16n8k16 dot with 16-value scales, see the note in main.rs;
+        // until that exists it must not take the default run down.
+        None => vec![0, 1, 2, 3, 4],
+    }
+    .into_iter()
+    .filter(|&f| {
+        let bs = f == 1 || f == 2; // mxfp4, nvfp4
+        if bs && !allow_bs {
+            println!("  skip fmt {} ({}): block-scaled slots disabled by FMT_MMQ_NO_BLOCKSCALED", FMT[f], FMT[f]);
+        }
+        !bs || allow_bs
+    })
+    .collect();
     // quantizers (IQ4_XS uses IQ4_NL's)
     for &f in fmts.iter().filter(|&&f| f != 3) {
         let min_k = if f == 2 { 64 } else { 128 };
@@ -762,6 +1049,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
         }
     }
     println!("oxide kernel launches: {}", unsafe { OX_LAUNCHES });
+
     let mut cats: std::collections::BTreeMap<String, usize> = Default::default();
     for f in &t.failures {
         let k = f.split(" J=").next().unwrap().split(" ne00=").next().unwrap().to_string();

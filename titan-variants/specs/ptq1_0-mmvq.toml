@@ -1,0 +1,52 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/ptq1_0/src/main.rs"
+name_template = "ptq1_0_mmvq_pt_{v.mid}c{n.value}{v.suf}"
+entry = '''    #[kernel] {n.lb} pub unsafe fn {name}({v.params}) {{ mmvq_pt::<{n.value}, {v.glu}, {v.ty}>({v.args}) }}'''
+
+[[axis]]
+name = "n"
+
+[[axis.value]]
+value = 1
+lb = "#[launch_bounds(128, 4)]"
+
+[[axis.value]]
+value = 2
+lb = "#[launch_bounds(128, 4)]"
+
+[[axis.value]]
+value = 3
+lb = "#[launch_bounds(128, 3)]"
+
+[[axis.value]]
+value = 4
+lb = "#[launch_bounds(128, 3)]"
+
+[[axis]]
+name = "v"
+
+[[axis.value]]
+mid = ""
+suf = ""
+ty = "f32"
+glu = "false"
+params = '''vx: *const u8, vy: *const u8, x_bias: *const f32, gate: *const u8, gate_bias: *const f32, _x_scale: u64, _gate_scale: u64, glu_op: u32, _pad: u32, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_row_x: i32, stride_col_y: i32, stride_col_dst: i32, rows_per_cta: i32, bpr_mp: u32, bpr_l: u32, _bpr_d: u32'''
+args = '''vx, vy, x_bias, gate, gate_bias, glu_op, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_mp, bpr_l'''
+
+[[axis.value]]
+mid = ""
+suf = "_bf16"
+ty = "B"
+glu = "false"
+params = '''vx: *const u8, vy: *const u8, x_bias: *const f32, gate: *const u8, gate_bias: *const f32, _x_scale: u64, _gate_scale: u64, glu_op: u32, _pad: u32, dst: *mut u16, ncols_x: i32, nrows_x: i32, stride_row_x: i32, stride_col_y: i32, stride_col_dst: i32, rows_per_cta: i32, bpr_mp: u32, bpr_l: u32, _bpr_d: u32'''
+args = '''vx, vy, x_bias, gate, gate_bias, glu_op, dst as *mut B, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_mp, bpr_l'''
+
+[[axis.value]]
+mid = "glu_"
+suf = ""
+ty = "f32"
+glu = "true"
+params = '''vx: *const u8, vy: *const u8, x_bias: *const f32, gate: *const u8, gate_bias: *const f32, _x_scale: u64, _gate_scale: u64, glu_op: u32, _pad: u32, dst: *mut f32, ncols_x: i32, nrows_x: i32, stride_row_x: i32, stride_col_y: i32, stride_col_dst: i32, rows_per_cta: i32, bpr_mp: u32, bpr_l: u32, _bpr_d: u32'''
+args = '''vx, vy, x_bias, gate, gate_bias, glu_op, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_mp, bpr_l'''

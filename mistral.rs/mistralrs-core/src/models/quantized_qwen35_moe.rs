@@ -1893,14 +1893,16 @@ fn lin_rows_as(w: &Arc<dyn QuantMethod>, x: &Tensor, narrow: bool) -> Result<Ten
     let k = x.dim(D::Minus1)?;
     let rows = x.elem_count() / k;
     if rows == 1 {
-        // TITAN_Q3K_ROWS=1 (default off): a single decode row for Q3_K goes through our own
-        // cuda-oxide rows kernel instead of the nvcc twin. The rows kernel is gated
-        // bit-identical to nvcc's batch-1 `mmvq_gguf_*_plain_cuda1`, and it is the copy we can
-        // rebuild and tune here (the nvcc twin runs Q3_K at ~370 GB/s against ~660 for Q4_K).
-        // Measured: bit-identical output, no throughput change (27.3 both ways), so it stays
-        // opt-in - the unrolled, branchless kernel below is kept as the base for real work.
+        // A single decode row for Q3_K goes through our own cuda-oxide rows kernel instead of the
+        // nvcc twin. The rows kernel is gated bit-identical to nvcc's batch-1
+        // `mmvq_gguf_*_plain_cuda1`, and it is the copy we can rebuild and tune here (the nvcc twin
+        // runs Q3_K at ~370 GB/s against ~660 for Q4_K).
+        // One decision for one knob: `titan_cfg::q3k_rows_enabled` (explicit TITAN_Q3K_ROWS wins,
+        // else the measured route row for this device). This site used to default it off while
+        // fast_mmvq defaulted it on; the 2026-10-27 A/B measured +0..3% (within noise at 1k keys,
+        // +3% at 8.2k), so the row says on and both sites now agree.
         #[cfg(feature = "cuda")]
-        if mistralrs_quant::titan_cfg::var("TITAN_Q3K_ROWS").is_ok_and(|v| v == "1") {
+        if mistralrs_quant::titan_cfg::q3k_rows_enabled(&x.device()) {
             if let Some(q) = w.get_qtensor() {
                 if q.dtype() == GgmlDType::Q3K && !w.has_bias() && mistralrs_quant::mmvq_rows::supports(&q, x) {
                     if let Some(xn) = narrow_matvec(x) {

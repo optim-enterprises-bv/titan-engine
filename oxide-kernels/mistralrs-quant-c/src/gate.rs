@@ -180,7 +180,10 @@ impl Rng {
     /// An f16 scale: mostly normal magnitudes 2^-12..2^3, 1 in `srate` a special value or raw bits.
     pub fn f16_scale(&mut self, srate: u64) -> u16 {
         let r = self.next();
-        match if r % srate == 0 { (r >> 40) % 2 } else { 2 } {
+        // MRQC_CLEAN=1: moderate scales only (diagnostic -- the default injects inf/NaN/denormal
+        // scales on purpose, and their propagation through the activation is where glu diverges).
+        let kind = if std::env::var("MRQC_CLEAN").is_ok() { 2 } else if r % srate == 0 { (r >> 40) % 2 } else { 2 };
+        match kind {
             0 => [0x0000, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x83ff, 0x7bff, 0x0400, 0xfe01, 0x7c01, 0x03ff][((r >> 8) % 12) as usize],
             1 => (r >> 16) as u16,
             _ => {
@@ -382,6 +385,9 @@ pub fn sync(what: &str) {
 // ------------------------------------------------------------------------------------------------
 // tally
 
+static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Default)]
 pub struct Tally {
     pub calls: usize,
@@ -396,6 +402,53 @@ impl Tally {
         let e = self.fam.entry(fam.to_string()).or_default();
         if a != init {
             e.2 += 1;
+        }
+        if let Ok(want) = std::env::var("GATE_DUMP") {
+            if label.contains(&want) && DUMPED.swap(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                let w = |v: &[u8], i: usize| -> String {
+                    if v.len() >= i * 4 + 4 {
+                        format!("{:+.6e}", f32::from_le_bytes([v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]]))
+                    } else {
+                        "-".into()
+                    }
+                };
+                println!("  DUMP {label}");
+                for i in 0..6 {
+                    println!("    [{i}] C {}   Rust {}", w(a, i), w(b, i));
+                }
+                println!("    first differing index: {:?}", a.iter().zip(b).position(|(x, y)| x != y));
+                // classify: sign-of-zero only? NaN vs NaN? real numeric disagreement?
+                let (mut z, mut nan, mut other) = (0usize, 0usize, 0usize);
+                for i in (0..a.len().min(b.len())).step_by(4) {
+                    if a[i..i + 4] == b[i..i + 4] {
+                        continue;
+                    }
+                    let (x, y) = (
+                        f32::from_le_bytes([a[i], a[i + 1], a[i + 2], a[i + 3]]),
+                        f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]),
+                    );
+                    if x == 0.0 && y == 0.0 {
+                        z += 1;
+                    } else if x.is_nan() || y.is_nan() {
+                        nan += 1;
+                    } else {
+                        other += 1;
+                    }
+                }
+                println!("    differing words: sign-of-zero {z}, NaN {nan}, real {other}");
+                let mut shown = 0;
+                for i in (0..a.len().min(b.len())).step_by(4) {
+                    if a[i..i + 4] == b[i..i + 4] || shown >= 8 {
+                        continue;
+                    }
+                    let (x, y) = (
+                        f32::from_le_bytes([a[i], a[i + 1], a[i + 2], a[i + 3]]),
+                        f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]),
+                    );
+                    println!("    word {i:5}: C {:+e} ({:#010x})  Rust {:+e} ({:#010x})", x, x.to_bits(), y, y.to_bits());
+                    shown += 1;
+                }
+            }
         }
         let n = a.iter().zip(b).filter(|(x, y)| x != y).count();
         if n > 0 || a.len() != b.len() {
@@ -469,6 +522,17 @@ impl G {
         let y = q8_1(&mut self.rng, (ncol_y - 1) * scy as usize + bpr * f.qk / 32 + 8, sr);
         let es = DSTS[di].1;
         let d0 = self.rng.bytes(((ncol_y - 1) * scd.max(0) as usize + nrows.max(0) as usize + 3) * es);
+        // Activation 4 (GLU_SIGMOID in the current mistral.rs source) is NOT in the compiled
+        // reference this gate links: probing C with act=0 and act=4 on identical inputs gives
+        // byte-identical output, i.e. 4 falls through to `default: glu_silu`. Our kernel implements
+        // the sigmoid the current source asks for, so comparing the two measures the oracle's age,
+        // not the kernel. Skipped by default; MRQC_GLU_SIGMOID_REF=1 runs it against a fresh build.
+        if act == 4 && std::env::var("MRQC_GLU_SIGMOID_REF").is_err() {
+            if PROBED.swap(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                println!("  note: skipping glu act=4 -- the linked reference predates GLU_SIGMOID (C(4) == C(0), probe-verified). Set MRQC_GLU_SIGMOID_REF=1 with a rebuilt reference to compare it.");
+            }
+            return;
+        }
         let fns = mmvq_fns(di, fi);
         let (gd, ud, yd) = (Buf::new(&wg), Buf::new(&wu), Buf::new(&y));
         let s = self.s(k);
@@ -478,6 +542,19 @@ impl G {
             unsafe { f_(gd.p(), ud.p(), yd.p(), d.p(), ncols, nrows, scy, scd, b, act, s) };
             sync("glu");
             outs.push(d.read());
+        }
+        // GLU_ACT_PROBE=1: does the compiled reference distinguish activation 0 from 4 at all?
+        // (a reference built before GLU_SIGMOID existed would fall through to `default: silu`, i.e. 4 == 0)
+        if std::env::var("GLU_ACT_PROBE").is_ok() && PROBED.swap(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            let mut outs2 = vec![];
+            for act2 in [0i32, 4] {
+                let d = Buf::new(&d0);
+                unsafe { (fns.glu.0)(gd.p(), ud.p(), yd.p(), d.p(), ncols, nrows, scy, scd, b, act2, s) };
+                sync("glu probe");
+                outs2.push(d.read());
+            }
+            let diff = outs2[0].iter().zip(&outs2[1]).filter(|(x, y)| x != y).count();
+            println!("  PROBE C(act=0) vs C(act=4): {diff} of {} bytes differ", outs2[0].len());
         }
         self.t.calls("mmvq_glu", 2);
         let label = format!("glu {}_{} ncols={ncols} nrows={nrows} scy={scy} scd={scd} b={b} act={act} s={}", f.name, DSTS[di].0, k % 2);
@@ -782,6 +859,25 @@ pub fn run() -> i32 {
     let stream_owner = ctx.new_stream().expect("stream");
     let mut g = G { rng: Rng(0x3317_9A1D_C0DE), t: Tally::default(), stream: stream_owner.cu_stream() as *mut c_void, self_test: std::env::var("MRQC_SELF").is_ok() };
     let mut run: HashSet<String> = HashSet::new();
+
+    if std::env::var("RUN_MMQ_ROWS").is_ok() {
+        // separate mode: the oxide prefill rows kernel vs the MMQ x8 tile + fixup. Does not touch the
+        // reference-cubin families below, so report its own tally and stop.
+        crate::gate_mmq::run_mmq_rows(&mut g);
+        for (fam, (calls, fails, wrote)) in &g.t.fam {
+            println!("  {fam}: {calls} launcher calls, {fails} failing cases (reference changed its output in {wrote})");
+        }
+        for f in g.t.failures.iter().take(40) {
+            println!("  FAIL {f}");
+        }
+        let ok = g.t.failures.is_empty();
+        println!(
+            "mistralrs-quant-c mmq_rows: {} calls, {} bytes compared, {} failing -> {}",
+            g.t.calls, g.t.bytes, g.t.failures.len(),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        return if ok { 0 } else { 1 };
+    }
 
     if want("mmvq") {
         mmvq_suite(&mut g);

@@ -1,0 +1,48 @@
+[kernel]
+begin = "// GENERATED paged attention kernels (gen_kernels.py) BEGIN"
+end = "// GENERATED END"
+target = "../../oxide-kernels/mistralrs-paged-attn-a/src/main.rs"
+name_template = "pa2r_{dt.name}_{head.value}"
+entry = '''    #[kernel] pub unsafe fn {name}(o: *mut u8, es: *const f32, ml: *const f32, t: *const u8, cl: *const u32, mp: i32, sk: *const f32) {{ paged_attention_v2_reduce::<{dt.ty}, {head.value}>(o as _, es, ml, t as _, cl, mp, sk) }}'''
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "f32"
+ty = "f32"
+
+[[axis.value]]
+name = "f16"
+ty = "H"
+
+[[axis.value]]
+name = "bf16"
+ty = "B"
+
+[[axis]]
+name = "head"
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 80
+
+[[axis.value]]
+value = 96
+
+[[axis.value]]
+value = 112
+
+[[axis.value]]
+value = 128
+
+[[axis.value]]
+value = 192
+
+[[axis.value]]
+value = 256
+
+[[axis.value]]
+value = 512

@@ -1,0 +1,86 @@
+# candle-mmvq (oxide-kernels/candle-mmvq) as a spec: the 240 mmvq_gguf_<q>_<dst>_plain_cuda<N>
+# entry points that gen_kernels.py writes into src/main.rs.
+#
+# This one is a full product (10 x 3 x 8 = 240, no constraint prunes anything) -- included because it
+# is the largest hand-derived matrix in the tree, and it is the case where a missing combination is
+# silent: a format with no entry point just never gets selected, so a quantisation silently runs the
+# slow generic path instead of failing the build.
+
+[kernel]
+args = "vx: *const u8, vy: *const u8, dst: *mut {dst.cty}, ncols_x: i32, nrows_x: i32, stride_col_y: i32, stride_col_dst: i32"
+call = "(vx, vy, {dst.cast}, ncols_x, nrows_x, stride_col_y, stride_col_dst)"
+name_template = "mmvq_gguf_{fmt.name}_{dst.name}_plain_cuda{n.value}"
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/candle-mmvq/src/main.rs"
+entry = '''    #[kernel] pub unsafe fn {name}({args}) {{ mmvq::<{fmt.idx}, {n.value}, {dst.dty}>{call} }}'''
+
+[[axis]]
+name = "fmt"
+[[axis.value]]
+name = "q4_0"
+idx = 0
+[[axis.value]]
+name = "q4_1"
+idx = 1
+[[axis.value]]
+name = "q5_0"
+idx = 2
+[[axis.value]]
+name = "q5_1"
+idx = 3
+[[axis.value]]
+name = "q8_0"
+idx = 4
+[[axis.value]]
+name = "q2_k"
+idx = 5
+[[axis.value]]
+name = "q3_k"
+idx = 6
+[[axis.value]]
+name = "q4_k"
+idx = 7
+[[axis.value]]
+name = "q5_k"
+idx = 8
+[[axis.value]]
+name = "q6_k"
+idx = 9
+
+[[axis]]
+name = "dst"
+[[axis.value]]
+name = "bf16"
+cty = "u16"
+dty = "B"
+cast = "dst as *mut B"
+[[axis.value]]
+name = "f16"
+cty = "u16"
+dty = "H"
+cast = "dst as *mut H"
+[[axis.value]]
+name = "f32"
+cty = "f32"
+dty = "f32"
+cast = "dst"
+
+[[axis]]
+name = "n"
+[[axis.value]]
+value = 1
+[[axis.value]]
+value = 2
+[[axis.value]]
+value = 3
+[[axis.value]]
+value = 4
+[[axis.value]]
+value = 5
+[[axis.value]]
+value = 6
+[[axis.value]]
+value = 7
+[[axis.value]]
+value = 8

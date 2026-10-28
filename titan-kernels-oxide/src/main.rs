@@ -886,7 +886,7 @@ fn main() {
 
     // Quantizer gate against candle's quantize_q8_1 (the one the stock GGUF path runs).
     {
-        let candle = ctx.load_module_from_ptx_src(&std::fs::read_to_string(&refs[1].1).unwrap()).expect("candle ptx");
+        let candle = ctx.load_module_from_file(&refs[1].1).expect("candle reference (ptx or cubin)");
         let mut qbytes = 0usize;
         let mut qbad = 0usize;
         for &(rows, k) in &[(1usize, 2048usize), (7, 768), (3, 2048), (64, 768)] {
@@ -951,12 +951,18 @@ fn main() {
     }
 
     for (label, ref_path, suffix) in &refs {
-    let reference = ctx.load_module_from_ptx_src(&std::fs::read_to_string(ref_path).unwrap()).expect("reference ptx");
+    let reference = ctx.load_module_from_file(ref_path).expect("reference (ptx or cubin)");
     println!("== reference: {label}");
     for c in &cases {
         let kernel_ox = format!("{}{}", c.kernel_ox, suffix);
         let expert_bytes = c.n * (c.k / 256) * c.fmt.block_bytes();
         let bytes = match &c.file {
+            // The extracted tensors are build artifacts of a machine that is gone; a missing one
+            // falls back to the adversarial generator instead of aborting the gate, and says so.
+            Some(f) if !std::path::Path::new(&f).exists() => {
+                println!("  (no {}: adversarial weights for {})", f, c.tensor);
+                adversarial_weights(c.fmt, 16 * expert_bytes / c.fmt.block_bytes(), c.k as u64 * 1_000_003 + c.fmt.block_bytes() as u64)
+            }
             Some(f) => {
                 use std::io::Read;
                 let mut v = Vec::new();
@@ -1133,9 +1139,28 @@ fn main() {
         }
     }
     }
+    // The llama.cpp per-format gate is bit-matched against llama.cpp *acecd56*'s own
+    // `mul_mat_vec_q<type, 1, false, false, false>`. A different llama.cpp build loads and runs, but
+    // its ABI/float program differs, so comparing against it would report every output as a mismatch
+    // -- noise, not a regression. Skip loudly instead of lying in either direction.
+    let mut skipped: Vec<&str> = Vec::new();
     for spec in llama_specs() {
         if only.as_deref().is_none_or(|o| o == spec.name) {
-            all_ok &= llama_gate(&spec, &ctx, &stream, &oxide, &mut per_fmt, &mut total, &mut cpu_total);
+            let forced_off = std::env::var("TITAN_GATE_LLAMA_REF").map(|v| v == "0").unwrap_or(false);
+            match (forced_off, llama_ref_path(&spec)) {
+                (false, Some(_)) => {
+                    all_ok &= llama_gate(&spec, &ctx, &stream, &oxide, &mut per_fmt, &mut total, &mut cpu_total);
+                }
+                _ => {
+                    println!(
+                        "== {} gate: SKIPPED -- no reference cubin (expected oxide-kernels/reference/llama/\
+                         mmvq-sm120.cubin, or {}/ref/mmvq.cubin; mine one with \
+                         titan-kernels-oxide/scripts/mine-mmvq-ref.py). TITAN_GATE_LLAMA_REF=0 forces the skip.",
+                        spec.name, spec.name
+                    );
+                    skipped.push(spec.name);
+                }
+            }
         }
     }
     for (k, v) in &per_fmt {
@@ -1146,7 +1171,19 @@ fn main() {
         }
     }
     println!("{total} outputs compared, {cpu_total} CPU-twin rows");
-    println!("{}", if all_ok { "KERNEL GATE: PASS (bit-identical, Q4_K + Q5_K + Q6_K + Q1_0 + IQ4_NL + MXFP4 + NVFP4, permuted slots)" } else { "KERNEL GATE: FAIL" });
+    if !skipped.is_empty() {
+        println!("SKIPPED sections: {} (no llama.cpp acecd56 reference build here)", skipped.join(", "));
+    }
+    println!(
+        "{}",
+        if all_ok && skipped.is_empty() {
+            "KERNEL GATE: PASS (bit-identical, Q4_K + Q5_K + Q6_K + Q1_0 + IQ4_NL + MXFP4 + NVFP4, permuted slots)"
+        } else if all_ok {
+            "KERNEL GATE: PASS for what ran (skipped sections listed above)"
+        } else {
+            "KERNEL GATE: FAIL"
+        }
+    );
     std::process::exit(if all_ok { 0 } else { 1 });
 }
 
@@ -1160,13 +1197,49 @@ fn fastdiv_values(d: u32) -> [u32; 3] {
 }
 
 /// Launch from a packed parameter buffer (CU_LAUNCH_PARAM_BUFFER_POINTER) on the null stream.
-unsafe fn launch_packed(f: cuda_core::sys::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), params: &mut Vec<u8>) {
+unsafe fn launch_packed(f: cuda_core::sys::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), params: &mut Vec<u8>, stream: cuda_core::sys::CUstream) {
     use cuda_core::sys as cu;
     let mut size = params.len();
     let mut extra: [*mut c_void; 5] =
         [1 as *mut c_void, params.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];
+
+    // llama.cpp's mmvq kernels call `ggml_cuda_pdl_sync()` (cudaGridDependencySynchronize) before
+    // reading their activations. A plain cuLaunchKernel leaves that dependency unsatisfied, and on
+    // SM120 the kernel then completes without writing anything -- every output reads back as zero.
+    // Launching with PROGRAMMATIC_STREAM_SERIALIZATION satisfies it. GATE_PDL=0 restores the plain
+    // launch for comparison.
+    if std::env::var("GATE_PDL").map_or(true, |v| v != "0") {
+        // CUlaunchAttribute must be at least 8-byte aligned or the driver rejects the config.
+        #[repr(align(16))]
+        struct AttrBuf([u8; 64]);
+        let mut attr_owned = AttrBuf([0u8; 64]);
+        let attr = attr_owned.0.as_mut_ptr();
+        (attr as *mut u32)
+            .write(cu::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION);
+        (attr.add(8) as *mut u32).write(1);
+        let cfg = cu::CUlaunchConfig_st {
+            gridDimX: grid.0,
+            gridDimY: grid.1,
+            gridDimZ: grid.2,
+            blockDimX: block.0,
+            blockDimY: block.1,
+            blockDimZ: block.2,
+            sharedMemBytes: 0,
+            hStream: stream,
+            attrs: attr as *mut _,
+            numAttrs: 1,
+        };
+        let r = cu::cuLaunchKernelEx(&cfg, f, extra.as_mut_ptr(), std::ptr::null_mut());
+        if r == cu::cudaError_enum_CUDA_SUCCESS {
+            return;
+        }
+        if std::env::var("GATE_PDL").is_ok() {
+            println!("   [dbg] launchEx(pdl) rejected: rc={:?}", r);
+        }
+    }
+
     let r = unsafe {
-        cu::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr())
+        cu::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, stream, std::ptr::null_mut(), extra.as_mut_ptr())
     };
     assert_eq!(r, cu::cudaError_enum_CUDA_SUCCESS, "launch");
 }
@@ -1177,6 +1250,25 @@ fn put<T: Copy>(b: &mut Vec<u8>, v: T) {
         b.push(0);
     }
     b.extend_from_slice(unsafe { std::slice::from_raw_parts(&v as *const T as *const u8, std::mem::size_of::<T>()) });
+}
+
+/// Where this spec's `mul_mat_vec_q` reference cubin lives: a per-spec `ref/mmvq.cubin` if
+/// someone staged one (that is how a different rev is tested), else the shared vendored
+/// `reference/llama/mmvq-sm120.cubin`.
+fn llama_ref_path(spec: &LlamaSpec) -> Option<String> {
+    let here = concat!(env!("CARGO_MANIFEST_DIR"), "/../oxide-kernels");
+    let home = std::env::var("HOME").unwrap_or_default();
+    for root in [here.to_string(), format!("{home}/titan-engine/oxide-kernels")] {
+        let per_spec = format!("{root}/{}/ref/mmvq.cubin", spec.name);
+        if std::path::Path::new(&per_spec).exists() {
+            return Some(per_spec);
+        }
+        let shared = format!("{root}/reference/llama/mmvq-sm120.cubin");
+        if std::path::Path::new(&shared).exists() {
+            return Some(shared);
+        }
+    }
+    None
 }
 
 /// A GGML format whose only CUDA float program is llama.cpp's `mul_mat_vec_q`.
@@ -1214,19 +1306,33 @@ fn llama_specs() -> Vec<LlamaSpec> {
     ]
 }
 
-/// Expert GEMV gate for a llama.cpp-kernel format. Reference: llama.cpp acecd56's own
+/// Expert GEMV gate for a llama.cpp-kernel format. Reference: llama.cpp's own
 /// `mul_mat_vec_q<type, 1, false, false, false>` (the MUL_MAT_ID decode kernel: channel = task,
-/// `ids` = experts), from the nvcc rebuild in oxide-kernels/<name>/ref/mmvq.cubin (SASS identical
-/// to libggml-cuda.so), launched once per token. Oxide reads permuted slots through the slot map.
+/// `ids` = experts), launched once per token; oxide reads permuted slots through the slot map.
+///
+/// The upstream kernel at the pin in NOTICE.md (acecd560, tag b10934) does not execute from an
+/// external harness on sm_120 -- it loads, resolves, launches, and writes nothing (Blackwell needs
+/// the PDL wait that upstream only got later). The vendored reference is the PrismML fork's sm_120
+/// build of the same kernel, which does run and is bit-identical to oxide. Two template signatures
+/// are accepted: <type, ncols_dst, has_fusion, small_k, halve_iters> and the newer form with an
+/// extra has_gate bool; the runtime parameter list is identical.
 /// The CPU twin (scalar and AVX2) is checked against the oxide GPU output.
 fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::CudaStream>, oxide: &Arc<CudaModule>,
               per_fmt: &mut std::collections::BTreeMap<String, [usize; 4]>, total: &mut usize, cpu_total: &mut usize) -> bool {
     use cuda_core::sys as cu;
     let home = std::env::var("HOME").unwrap();
-    let cubin = format!("{home}/titan-engine/oxide-kernels/{}/ref/mmvq.cubin", spec.name);
+    let cubin = llama_ref_path(spec).unwrap_or_else(|| panic!("no reference cubin for {}", spec.name));
+    if std::env::var("GATE_DEBUG").is_ok() {
+        println!("== {} gate: reference cubin {cubin}", spec.name);
+    }
     let reference = ctx.load_module_from_file(&cubin).unwrap_or_else(|e| panic!("{cubin}: {e:?}"));
     let rf_fn = reference
+        // Two signatures are in the wild for this kernel: <type, ncols_dst, has_fusion, small_k,
+        // halve_iters> (the acecd560 form, 4 bools) and the newer form that inserts has_gate (5
+        // bools, as built by the PrismML fork / unsloth mixed builds). Try both; the runtime
+        // parameter list is the same either way.
         .load_function(&format!("_Z13mul_mat_vec_qIL9ggml_type{}ELi1ELb0ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj", spec.ggml_type))
+        .or_else(|_| reference.load_function(&format!("_Z13mul_mat_vec_qIL9ggml_type{}ELi1ELb0ELb0ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj", spec.ggml_type)))
         .expect("reference mul_mat_vec_q<type, 1>");
     let rf = unsafe { rf_fn.cu_function() };
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/data");
@@ -1244,6 +1350,12 @@ fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::
     for c in &cases {
         let expert_bytes = c.n * (c.k / qk) * bb;
         let bytes = match &c.file {
+            // Same fallback as the indexed-MoE gate: the extracted tensors are artifacts of a
+            // machine that is gone, so a missing one is reported and the adversarial generator runs.
+            Some(f) if !std::path::Path::new(&f).exists() => {
+                println!("  (no {}: adversarial weights for {})", f, c.tensor);
+                adversarial_weights(fmt, 12 * c.n * c.k / qk, c.k as u64 * 7_000_003 + c.n as u64)
+            }
             Some(f) => {
                 use std::io::Read;
                 let mut v = Vec::new();
@@ -1323,7 +1435,7 @@ fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::
                             put(&mut p, v);
                         }
                         assert_eq!(p.len(), 160);
-                        launch_packed(rf, (c.n as u32, topk as u32, 1), (32, 4, 1), &mut p);
+                        launch_packed(rf, (c.n as u32, topk as u32, 1), (32, 4, 1), &mut p, stream.cu_stream());
                     }
                     assert_eq!(cu::cuCtxSynchronize(), cu::cudaError_enum_CUDA_SUCCESS);
                     let (mut pwo, mut wl) = (w_ox.cu_deviceptr(), slotted.len() as u64);
@@ -1339,6 +1451,12 @@ fn llama_gate(spec: &LlamaSpec, ctx: &Arc<CudaContext>, stream: &Arc<cuda_core::
                 }
                 stream.synchronize().unwrap();
                 let (a, b) = (out_ref.to_host_vec(stream).unwrap(), out_ox.to_host_vec(stream).unwrap());
+                if std::env::var("GATE_DEBUG").is_ok() {
+                    let nzr = a.iter().filter(|v| **v != 0.0).count();
+                    let nzo = b.iter().filter(|v| **v != 0.0).count();
+                    println!("   [dbg] {} batch={batch} topk={topk} input_dim1={input_dim1} seed={seed}: ref_nz={nzr}/{} ox_nz={nzo}/{} ref[0..4]={:?} ox[0..4]={:?}",
+                        c.tensor, a.len(), b.len(), &a[..4.min(a.len())], &b[..4.min(b.len())]);
+                }
                 let diff = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
                 let nonzero = a.iter().filter(|v| **v != 0.0).count();
                 let nan = a.iter().filter(|v| v.is_nan()).count();

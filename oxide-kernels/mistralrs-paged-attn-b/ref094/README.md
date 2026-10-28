@@ -35,3 +35,65 @@ from the same place. Both are untracked artefacts in `~/titan-engine/oxide-kerne
 | copy_blocks_kernel.cu | `copy_blocks_u8` | crate a |
 | gather_kv_cache_kernel.cu | `if (batch_id >= num_seqs) return;` | crate a |
 | pagedattention.cuh, cuda_compat.h | host-side attribute check only; SASS of every other object unchanged | none needed |
+
+## Recovering the cubins to re-run the generator (no nvcc needed)
+
+`reference/mistralrs-paged-attn-094/` and `tools/` are gitignored, so a fresh checkout cannot
+regenerate this crate's region on its own. Both are in the restore snapshot, and regenerating is a
+byte-for-byte regression check on all 891 entries:
+
+```sh
+R=/home/dingo/restore/home/dingo/titan-engine/oxide-kernels
+mkdir -p oxide-kernels/reference/mistralrs-paged-attn-094 oxide-kernels/tools
+cp $R/reference/mistralrs-paged-attn-094/*.cubin oxide-kernels/reference/mistralrs-paged-attn-094/
+cp $R/tools/{cuobjdump,nvdisasm} oxide-kernels/tools/ && chmod +x oxide-kernels/tools/*
+# the snapshot's flashinfer_decode.cubin is 92 MB of ZEROS -- use the compiled object instead:
+cp oxide-kernels/reference/mistralrs-paged-attn-094/flashinfer_decode-6f99e1b253bc688f.o \
+   oxide-kernels/reference/mistralrs-paged-attn-094/flashinfer_decode.cubin
+export PATH=$PWD/oxide-kernels/tools:$PATH      # cuobjdump shells out to nvdisasm by name
+cd oxide-kernels/mistralrs-paged-attn-b && python3 gen_kernels.py   # -> 891 kernels, 1770 instances
+cd ../.. && git diff --stat oxide-kernels/mistralrs-paged-attn-b    # must be empty
+```
+
+Three traps, each verified the hard way:
+
+- **A hollow `flashinfer_decode.cubin`** (correct size, all zeros) makes `cuobjdump` answer "does not
+  contain device code"; the generator then finds no `Function :` lines and emits **zero** kernels,
+  which is a 6,198-line deletion of the committed region. The `.o` beside it carries the same fatbin.
+- **`nvdisasm` restored without the exec bit** surfaces only as `nvdisasm: Permission denied` inside
+  output the generator discards — fix the mode and put `tools/` on `PATH`.
+- **`git checkout -- src/main.rs src/instances.rs`** after any run that prints `0 kernels`: the
+  generator rewrites both files unconditionally.
+- **The snapshot's `libmistralrspagedattention.a` is malformed too** (`ar: malformed archive`: the
+  36 MB `flashinfer_decode` member is followed by a truncated tail). `build.rs` shells out to `ar t`,
+  so the gate build panics with `flashinfer_decode: not in …`. Rebuild the archive from the intact
+  objects, which are the ones `build.rs` selects by member stem anyway:
+
+  ```sh
+  cd $D && ar rcs libmrpb_rebuilt.a flashinfer_decode-6f99e1b253bc688f.o flashinfer_mla_decode-b7c320749ffdb505.o
+  cp libmrpb_rebuilt.a libmistralrspagedattention.a
+  ```
+
+## The numeric gate, and what it needs
+
+With the above staged, `./target/release/mistralrs-paged-attn-b` passes against the nvcc reference:
+
+```
+family mla 142 | reshape 222 | gather 190 | decode 4320 | edges 240 | errors 28 | kernels 3468   calls
+8610 launcher calls, 1783951316 bytes compared, 0 failing -> PASS
+coverage: 883 of 883 reachable reference instances launched through their Rust twins (1770 total)
+```
+
+`load_ref()` reads `flashinfer_decode.cubin` / `flashinfer_mla_decode.cubin` from **this repo's**
+`oxide-kernels/reference/...` (via `CARGO_MANIFEST_DIR`), not the deployed tree, and it loads them as
+CUDA images — so the `.o` stand-in that satisfies `cuobjdump` fails here with
+`CUDA_ERROR_INVALID_IMAGE (200)`. Use the real image instead, which `cuobjdump -xelf all` regenerates
+from the object, and which lists the same 1752 functions so the generator is unaffected:
+
+```sh
+cuobjdump -xelf all flashinfer_decode-6f99e1b253bc688f.o     # -> ....1.sm_120a.cubin
+cp flashinfer_decode-6f99e1b253bc688f.1.sm_120a.cubin flashinfer_decode.cubin
+```
+
+The crate still gets no `titan-variants` spec: entry names are positional (`bd0..bdN`, numbered in
+reference order), so an axis product could only transcribe symbol order.

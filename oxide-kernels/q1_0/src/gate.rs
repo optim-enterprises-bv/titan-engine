@@ -12,7 +12,7 @@ const OXIDE: &str = "q1_0.ptx";
 
 fn mmvq_ref_name(nc: usize, small_k: bool) -> String {
     format!(
-        "_Z13mul_mat_vec_qIL9ggml_type41ELi{nc}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+        "_Z13mul_mat_vec_qIL9ggml_type41ELi{nc}ELb0ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
         small_k as u32
     )
 }
@@ -25,6 +25,36 @@ const DEQ_REF: [&str; 3] = [
     "_Z16dequantize_blockILi128ELi1EXadL_ZN49_INTERNAL_2558161a_10_convert_cu_2d51afdf_250482415dequantize_q1_0EPKvliR6float2EE13__nv_bfloat16EvS2_PT2_lll5uint3lll",
 ];
 const DEQ_OX: [&str; 3] = ["q1_0_dequant_f32", "q1_0_dequant_f16", "q1_0_dequant_bf16"];
+
+/// Resolve the reference `dequantize_block<128, 1, &dequantize_q1_0>` entry for destination type `k`.
+///
+/// The mangled name embeds an internal-linkage hash of the translation unit it was compiled in
+/// (`_ZN49_INTERNAL_2558161a_10_convert_cu_...`), so a cubin built from any other tree carries the
+/// same kernel under a different hash. Scan the cubin's string table for the signature instead of
+/// pinning one hash, and fall back to the pinned name when nothing matches.
+fn deq_ref_name(k: usize) -> String {
+    const DEST: [&str; 3] = ["EEfEv", "EE6__halfEv", "EE13__nv_bfloat16Ev"];
+    let raw = std::fs::read(REF_CONVERT).unwrap_or_default();
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i + 23 < raw.len() {
+        if raw[i..].starts_with(b"_Z16dequantize_block") {
+            let mut j = i;
+            while j < raw.len() && (raw[j].is_ascii_alphanumeric() || b"_$.".contains(&raw[j])) {
+                j += 1;
+            }
+            let name = String::from_utf8_lossy(&raw[i..j]).into_owned();
+            if name.contains("dequantize_q1_0") && name.contains("Li128ELi1E") && name.contains(DEST[k]) {
+                found = Some(name);
+                break;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    found.unwrap_or_else(|| DEQ_REF[k].to_string())
+}
 
 /// llama.cpp `init_fastdiv_values`: <mp, L, d>.
 pub fn fastdiv_values(d: u64) -> [u32; 3] {
@@ -267,7 +297,7 @@ fn deq_case(m: &Mods, t: &mut Tally, r: &mut Rng, k: usize, ne: [i64; 4], s: [i6
     let (gy, gz) = gyz.unwrap_or((ne[1].min(65535) as u32, ne0203.min(65535) as u32));
     let grid = (((ne[0] + 511) / 512) as u32, gy, gz);
     let bufs = vec![x, y];
-    let a = launch(func(m.convert, DEQ_REF[k]), grid, (256, 1, 1), &p, &slots, &bufs, &[1]);
+    let a = launch(func(m.convert, &deq_ref_name(k)), grid, (256, 1, 1), &p, &slots, &bufs, &[1]);
     let b = launch(func(m.oxide, DEQ_OX[k]), grid, (256, 1, 1), &p, &slots, &bufs, &[1]);
     compare(t, &format!("{} ne={ne:?} s={s:?} grid={grid:?}", DEQ_OX[k]), &a, &b);
 }

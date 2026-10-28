@@ -1,0 +1,98 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN (gen_kernels.py)"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/candle-mmq/src/main.rs"
+name_template = "mmq_{type.name}_x{x.value}_nc{nc.value}"
+args = "x: *const u8, y: *const i32, dst: *mut f32, tmp_fixup: *mut f32, ncols_x: i32, nrows_x: i32, ncols_dst: i32, stride_row_x: i32, ncols_y: i32, stride_col_dst: i32, ncols_max: i32"
+call = "(x, y, dst, tmp_fixup, ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, ncols_max)"
+entry = '''    #[kernel] #[launch_bounds(256, 1)] pub unsafe fn {name}({args}) {{ unsafe {{ mul_mat_q::<{type.const}, {x.value}, {nc.b}>{call} }} }}'''
+
+[[axis]]
+name = "type"
+
+[[axis.value]]
+name = "q4_0"
+const = "Q4_0"
+
+[[axis.value]]
+name = "q4_1"
+const = "Q4_1"
+
+[[axis.value]]
+name = "q5_0"
+const = "Q5_0"
+
+[[axis.value]]
+name = "q5_1"
+const = "Q5_1"
+
+[[axis.value]]
+name = "q8_0"
+const = "Q8_0"
+
+[[axis.value]]
+name = "q2_k"
+const = "Q2_K"
+
+[[axis.value]]
+name = "q3_k"
+const = "Q3_K"
+
+[[axis.value]]
+name = "q4_k"
+const = "Q4_K"
+
+[[axis.value]]
+name = "q5_k"
+const = "Q5_K"
+
+[[axis.value]]
+name = "q6_k"
+const = "Q6_K"
+
+[[axis]]
+name = "x"
+
+[[axis.value]]
+value = 8
+
+[[axis.value]]
+value = 16
+
+[[axis.value]]
+value = 24
+
+[[axis.value]]
+value = 32
+
+[[axis.value]]
+value = 40
+
+[[axis.value]]
+value = 48
+
+[[axis.value]]
+value = 64
+
+[[axis.value]]
+value = 80
+
+[[axis.value]]
+value = 96
+
+[[axis.value]]
+value = 112
+
+[[axis.value]]
+value = 128
+
+[[axis]]
+name = "nc"
+
+[[axis.value]]
+value = 0
+b = "false"
+
+[[axis.value]]
+value = 1
+b = "true"

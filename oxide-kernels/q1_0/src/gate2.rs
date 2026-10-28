@@ -278,7 +278,7 @@ fn mmvq_half_case(m: &M, t: &mut Tally, r: &mut Rng, nc: usize, small_k: bool, h
     };
     let grid = (nrows.div_ceil(rpb), 1, 1);
     let rname = format!(
-        "_Z13mul_mat_vec_qIL9ggml_type41ELi{nc}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+        "_Z13mul_mat_vec_qIL9ggml_type41ELi{nc}ELb0ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
         small_k as u32
     );
     launch(func(m.mmvq, &rname), grid, (32, nwarps, 1), 0, &params(&dref));

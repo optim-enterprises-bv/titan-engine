@@ -56,3 +56,4 @@ release/bench/state/
 # NVIDIA proprietary tools used locally for SASS inspection: never commit
 oxide-kernels/tools/
 *.so.*
+*.cubin.orig

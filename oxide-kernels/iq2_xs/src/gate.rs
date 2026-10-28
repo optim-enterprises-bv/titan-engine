@@ -12,7 +12,7 @@ const OXIDE: &str = "iq2_xs.cubin";
 
 fn mmvq_ref_name(nc: usize, small_k: bool) -> String {
     format!(
-        "_Z13mul_mat_vec_qIL9ggml_type17ELi{nc}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+        "_Z13mul_mat_vec_qIL9ggml_type17ELi{nc}ELb0ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
         small_k as u32
     )
 }

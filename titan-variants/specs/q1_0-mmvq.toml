@@ -1,0 +1,78 @@
+[kernel]
+begin = "// GENERATED KERNELS BEGIN"
+end = "// GENERATED KERNELS END"
+target = "../../oxide-kernels/q1_0/src/main.rs"
+name_template = "q1_0_mmvq_{k.name}{dt.suf}"
+entry = '''    #[kernel] pub unsafe fn {name}({dt.params}) {{ mmvq::<{k.n}, {k.sk}, {dt.ty}>({dt.args}) }}'''
+
+[[axis]]
+name = "dt"
+
+[[axis.value]]
+name = "f32"
+suf = ""
+ty = "f32"
+params = '''vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, _ids_stride: u32'''
+args = '''vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst'''
+
+[[axis.value]]
+name = "u16_f16"
+suf = "_f16"
+ty = "H"
+params = '''vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut u16, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, _ids_stride: u32'''
+args = '''vx, vy, ids, dst as *mut H, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst'''
+
+[[axis.value]]
+name = "u16_bf16"
+suf = "_bf16"
+ty = "B"
+params = '''vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut u16, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, _ids_stride: u32'''
+args = '''vx, vy, ids, dst as *mut B, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst'''
+
+[[axis]]
+name = "k"
+
+[[axis.value]]
+n = 1
+sk = "true"
+name = "1_small_k"
+
+[[axis.value]]
+n = 1
+sk = "false"
+name = "1"
+
+[[axis.value]]
+n = 2
+sk = "false"
+name = "2"
+
+[[axis.value]]
+n = 3
+sk = "false"
+name = "3"
+
+[[axis.value]]
+n = 4
+sk = "false"
+name = "4"
+
+[[axis.value]]
+n = 5
+sk = "false"
+name = "5"
+
+[[axis.value]]
+n = 6
+sk = "false"
+name = "6"
+
+[[axis.value]]
+n = 7
+sk = "false"
+name = "7"
+
+[[axis.value]]
+n = 8
+sk = "false"
+name = "8"

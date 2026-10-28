@@ -710,6 +710,25 @@ fn preprocess_gemma4_tool_messages(messages: &mut Vec<IndexMap<String, MessageCo
 }
 
 #[allow(clippy::too_many_arguments)]
+/// HF chat templates call `dict.get(key, default)` with two args, which minijinja's pycompat rejects
+/// ("too many arguments"). Serve `get` on a map here (returning the default, or undefined, when absent)
+/// and defer every other method to pycompat.
+fn unknown_method_with_map_get(
+    state: &minijinja::State,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> std::result::Result<Value, minijinja::Error> {
+    if method == "get" && (1..=2).contains(&args.len()) && value.kind() == minijinja::value::ValueKind::Map {
+        let got = value.get_item(&args[0])?;
+        if got.is_undefined() {
+            return Ok(args.get(1).cloned().unwrap_or(Value::UNDEFINED));
+        }
+        return Ok(got);
+    }
+    minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
+}
+
 pub fn apply_chat_template_to(
     mut messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
@@ -723,8 +742,8 @@ pub fn apply_chat_template_to(
 ) -> Result<String> {
     let mut env = Environment::new();
 
-    // enable python methods such as .strip()
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    // enable python methods such as .strip(), plus two-arg dict.get(key, default)
+    env.set_unknown_method_callback(unknown_method_with_map_get);
 
     // https://github.com/huggingface/transformers/blob/76a33a10923ccc1074917f6b6a1e719e626b7dc9/src/transformers/tokenization_utils_base.py#L1842
     env.set_lstrip_blocks(true);
@@ -1115,6 +1134,28 @@ mod tests {
         .unwrap();
 
         assert!(rendered.starts_with("high"));
+    }
+
+    #[test]
+    fn two_arg_dict_get_returns_value_or_default() {
+        // HF templates (e.g. Nanbeige) use `messages[0].get('role', '')`; minijinja's pycompat rejects
+        // the two-arg form, so apply_chat_template_to installs a map-aware `get`.
+        let template = ChatTemplateValue(Either::Left(
+            "{{ messages[0].get('role', 'none') }}|{{ messages[0].get('missing', 'dflt') }}".to_string(),
+        ));
+        let rendered = apply_chat_template_to(
+            vec![user_text_message("hello")],
+            false,
+            None,
+            None,
+            &template,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rendered, "user|dflt");
     }
 
     #[test]

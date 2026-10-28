@@ -13,7 +13,7 @@ const OXIDE: &str = "iq3_s.ptx";
 
 fn mmvq_ref_name(nc: usize, small_k: bool) -> String {
     format!(
-        "_Z13mul_mat_vec_qIL9ggml_type21ELi{nc}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+        "_Z13mul_mat_vec_qIL9ggml_type21ELi{nc}ELb0ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
         small_k as u32
     )
 }
@@ -287,9 +287,14 @@ fn cpu_oracle(m: &Mods, t: &mut Tally, r: &mut Rng) {
     let nb = 4096usize;
     let x = x_blocks(r, nb, u64::MAX);
     let deq: unsafe extern "C" fn(*const u8, *mut f32, i64) = unsafe {
-        let lib = std::ffi::CString::new(LIBGGML_BASE).unwrap();
+        // LIBGGML_BASE is written with a leading ~, which dlopen does not expand -- resolve it here
+        // against $HOME (or GGML_BASE_LIB when the llama.cpp build lives elsewhere).
+        let path = std::env::var("GGML_BASE_LIB").unwrap_or_else(|_| {
+            LIBGGML_BASE.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+        });
+        let lib = std::ffi::CString::new(path.clone()).unwrap();
         let h = dlopen(lib.as_ptr(), 2 /* RTLD_NOW */);
-        assert!(!h.is_null(), "dlopen {LIBGGML_BASE}");
+        assert!(!h.is_null(), "dlopen {path} (GGML_BASE_LIB overrides)");
         let sym = std::ffi::CString::new("dequantize_row_iq3_s").unwrap();
         let f = dlsym(h, sym.as_ptr());
         assert!(!f.is_null(), "dlsym dequantize_row_iq3_s");
