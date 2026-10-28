@@ -43,6 +43,13 @@ gate is staging them (see "Artifacts" below).
 |---|---|
 | `fmt_mmq --fmt=mxfp4|nvfp4` (block-scaled instances) | **Requires sm_120a hardware.** The MMQ kernels for these two formats are written with block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4.block_scale`), which ptxas rejects for `.target sm_120` and which takes CUDA 715 at run time on cc 12.0. The reference cannot be rebuilt for plain sm_120 either: llama.cpp gates the same instruction on the Blackwell arch, so every image of it is sm_120a (145/145 in the PrismML bundle). Neither side of the comparison can execute here. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches, and IQ4_NL/IQ4_XS MMQ pass 555 launches in the same crate. |
 
+## Open, not passing
+
+| crate | status |
+|---|---|
+| `fmt_mmq --fmt=nvfp4q8` (opt-in) | **Runs, 217 bytes of 169,161,784 differ** -- all in `rate=256` cases (the harness injects inf / nan / denormal / 3e38 activations), all <=1 ULP. The CUDA 719 trap it used to die on was `j0 += 8` instead of `j0 += Jc::<J>::JSTEP`, overflowing `sum[64]` into a Rust bounds check whose panic lowers to `trap;`. Arithmetic now matches the reference's nesting; see `fmt_mmq/NVFP4-INT8.md` for what is ruled out (exact `div.rn` made it *worse*: the reference is fast-math). |
+| `titan-kernels-oxide`, `indexed_moe` sections | **Needs `m0/ref/indexed_moe.ptx`, `m1/ref/indexed_moe.ptx` and the `data/` tensors**, none of which exist any more. The rest of that gate passes: 20,184,168 outputs / 32,774,352 CPU-twin rows. |
+
 ## Artifacts: what has to be staged, and the traps
 
 `reference/` and `*/ref/` are gitignored, and the restore snapshot at
