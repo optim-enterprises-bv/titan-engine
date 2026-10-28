@@ -710,6 +710,36 @@ mod kernels {
 
     /// tile<16,8,int> via ldmatrix.sync.aligned.m8n8.x4.b16 (generic address, as the reference).
     #[inline(always)]
+
+    /// m16n8k16 A fragment: 16 rows x 16 int8 -> 2 registers (lanes 0..15 supply the row addresses).
+    unsafe fn ldmatrix_a16(xs0: *const i32, stride: i32) -> [u32; 2] {
+        let lane = tx();
+        let p = xs0.wrapping_offset(((lane % 16) * stride) as isize);
+        let (a0, a1): (u32, u32);
+        ptx_asm!(
+            "ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];",
+            out("=r") a0, out("=r") a1,
+            in("l") p as u64,
+        );
+        [a0, a1]
+    }
+    /// m16n8k16 B fragment: 8 rows x 16 int8 -> 1 register.
+    unsafe fn load_b16(xs0: *const i32, stride: i32) -> u32 {
+        let lane = tx();
+        let base = (lane / 4) * stride + lane % 4;
+        *xs0.offset(base as isize) as u32
+    }
+    unsafe fn mma_s8_16(a: [u32; 2], b: u32) -> [i32; 4] {
+        let (d0, d1, d2, d3): (i32, i32, i32, i32);
+        ptx_asm!(
+            "{ .reg .s32 z; mov.s32 z, 0; mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {z, z, z, z}; }",
+            out("=r") d0, out("=r") d1, out("=r") d2, out("=r") d3,
+            in("r") a[0], in("r") a[1], in("r") b,
+            options(register_only),
+        );
+        [d0, d1, d2, d3]
+    }
+
     unsafe fn ldmatrix_a(xs0: *const i32, stride: i32) -> [u32; 4] {
         let lane = tx();
         let p = xs0.wrapping_offset(((lane % 16) * stride + (lane / 16) * 4) as isize);
@@ -910,10 +940,9 @@ mod kernels {
 
     /// NVFP4 through the **int8** path (llama.cpp `load_tiles_nvfp4` Q8 branch).
     ///
-    /// STATUS: the tile loader is right but the dot is not. llama.cpp pairs this loader with
-    /// `vec_dot_q8_0_16_q8_1_mma` -- an m16n8k16 MMA with one `ue4m3` scale per 16 values
-    /// (`sum += C * x_df[i*sram + k0/4] * dB`) -- not the m16n8k32 / `k0/8` dot that MXFP4 and IQ4_NL use.
-    /// Until that dot exists here this slot is opt-in (`--fmt=nvfp4q8`) and reports mismatches.
+    /// llama.cpp pairs this loader with `vec_dot_q8_0_16_q8_1_mma` -- an m16n8k16 MMA with one `ue4m3`
+    /// scale per 16 values (`sum += C * x_df[i*sram + k0/4] * dB`) -- not the m16n8k32 / `k0/8` dot that
+    /// MXFP4 and IQ4_NL use, so it gets its own [`vec_dot_q8_0_16`].
     ///
     /// Same idea as [`Mxfp4Q8`] -- weights ride the int8 MMA through `kvalues_mxfp4` -- but a
     /// block_nvfp4 is 64 values with four `ue4m3` sub-block scales, so 4 blocks fill one 256-value
@@ -964,7 +993,7 @@ mod kernels {
         }
         #[inline(always)]
         unsafe fn vec_dot<const J: i32>(sum: &mut [f32; 64], k00: i32) {
-            vec_dot_q8_0::<J, 84>(sum, k00)
+            vec_dot_q8_0_16::<J, 84>(sum, k00)
         }
     }
 
@@ -1202,6 +1231,78 @@ mod kernels {
     /// ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<.., MMQ_Q8_1_DS_LAYOUT_D4> (NVIDIA branch):
     /// `sum += (dA * (float) C) * dB` as mul.ftz + fma.ftz.
     #[inline(always)]
+
+    /// `ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma`: the NVFP4 int8 dot. Same int8 MMA as
+    /// [`vec_dot_q8_0`] but halved along k (m16n8k16) because a `ue4m3` scale covers 16 values, so the
+    /// x scale index is `k0/4` rather than `k0/QI8_0`. Activations stay q8_1 (one scale per 32 values).
+    unsafe fn vec_dot_q8_0_16<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
+        let ntx = Jc::<J>::NTX;
+        let rows_per_warp = 16 * ntx;
+        let y = smem().wrapping_add(J as usize).wrapping_offset(((ty() % ntx) * (8 * TILE_Y_K)) as isize) as *const i32;
+        let x_qs = smem().wrapping_add((J + Jc::<J>::YPAD) as usize) as *const i32;
+        let x_df = x_qs.wrapping_add(2 * TILE_NE_K as usize) as *const f32;
+        let y_qs = y.wrapping_add(4);
+        let y_df = y as *const f32;
+        let i0 = (ty() / ntx) * rows_per_warp;
+
+        let mut a = [[[0u32; 2]; 8]; 2];
+        let mut da = [[[0f32; 8]; 2]; 2];
+        let mut n = 0;
+        while n < Jc::<J>::NTX {
+            unroll!();
+            let mut st = 0;
+            while st < 8 {
+                unroll!();
+                let k0 = k00 + st * 4;
+                a[n as usize][st as usize] = ldmatrix_a16(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
+                st += 1;
+            }
+            let mut l = 0;
+            while l < 2 {
+                unroll!();
+                let i = i0 + n * 16 + c_i(2 * l);
+                let mut st = 0;
+                while st < 8 {
+                    unroll!();
+                    let k0 = k00 + st * 4;
+                    da[n as usize][l as usize][st as usize] = *x_df.offset((i * SRAM + k0 / 4) as isize);
+                    st += 1;
+                }
+                l += 1;
+            }
+            n += 1;
+        }
+
+        let mut j0 = 0;
+        while j0 < J {
+            unroll!();
+            let mut st = 0;
+            while st < 8 {
+                unroll!();
+                let k01 = st * 4;
+                let b = load_b16(y_qs.wrapping_offset((j0 * TILE_Y_K + k01) as isize), TILE_Y_K);
+                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 8) as isize);
+                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 8) as isize);
+                let mut n = 0;
+                while n < Jc::<J>::NTX {
+                    unroll!();
+                    let c = mma_s8_16(a[n as usize][st as usize], b);
+                    let mut l = 0;
+                    while l < 4 {
+                        unroll!();
+                        let idx = ((j0 / 8 + n) * 4 + l) as usize;
+                        let db = if l % 2 == 0 { db0 } else { db1 };
+                        sum[idx] = fma(mul(da[n as usize][(l / 2) as usize][st as usize], c[l as usize] as f32), db, sum[idx]);
+                        l += 1;
+                    }
+                    n += 1;
+                }
+                st += 1;
+            }
+            j0 += 8;
+        }
+    }
+
     unsafe fn vec_dot_q8_0<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
         let ntx = Jc::<J>::NTX;
         let rows_per_warp = 16 * ntx;
