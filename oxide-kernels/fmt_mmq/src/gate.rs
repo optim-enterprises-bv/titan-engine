@@ -104,6 +104,13 @@ pub fn launch(f: cu::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), 
         if smem > 48 * 1024 {
             ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32));
         }
+        if std::env::var("FMT_MMQ_PARAMS_DUMP").is_ok() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                let hex: String = p.0.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  PARAMS grid={grid:?} block={block:?} smem={smem} len={} {hex}", p.0.len());
+            }
+        }
         let mut pb = p.0.clone();
         let mut size = pb.len();
         let mut extra: [*mut c_void; 5] =
@@ -610,7 +617,11 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
         launch(func(m.mmq[f], &rname), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&da, &tmp_a));
     }
     if std::env::var("FMT_MMQ_SKIP_OX").is_err() {
-        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (32, 8, 1), smem, &mmq_params(&db, &tmp_b));
+        // Geometry is overridable so a launch mismatch can be tested without rebuilding the kernels:
+        // the Blackwell block-scaled path may not use the ampere (32,8,1) shape.
+        let bx: u32 = std::env::var("FMT_MMQ_BLOCKX").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+        let by: u32 = std::env::var("FMT_MMQ_BLOCKY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        launch_ox(func(m.ox, &format!("{oxfmt}_mmq_j{j}_f{fb}")), (nblocks, 1, 1), (bx, by, 1), smem, &mmq_params(&db, &tmp_b));
     }
     if std::env::var("FMT_MMQ_DUMP").is_ok() {
         std::fs::create_dir_all("/tmp/fmt_dump").ok();
