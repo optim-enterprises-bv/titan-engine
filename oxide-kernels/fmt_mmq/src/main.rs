@@ -185,10 +185,13 @@ mod kernels {
     /// `ggml_cuda_e8m0_to_fp32` (CUDART >= 12.8): cvt.rn.bf16x2.ue8m0x2, bf16 -> f32 (exact).
     #[inline(always)]
     pub fn e8m0(e: u32) -> f32 {
-        let r: u32;
-        let h = e as u16;
-        unsafe { ptx_asm!("cvt.rn.bf16x2.ue8m0x2 %0, %1;", out("=r") r, in("h") h, options(register_only)); }
-        f32::from_bits((r & 0xFFFF) << 16)
+        // `cvt.rn.bf16x2.ue8m0x2` is rejected by this driver's JIT (CUDA error 218 invalid PTX),
+        // which made the whole module unloadable. E8M0 -> f32 is exactly the exponent field, and the
+        // instruction's own result (bf16 = e << 7, then << 16) is e << 23, so these are the same bits.
+        // `ggml_cuda_e8m0_to_fp32`: E8M0 byte -> f32 is the exponent field, except that 0 is 2^-127
+        // (0x00400000), not zero. The instruction the crate used to call is rejected by this driver's
+        // JIT (CUDA error 218 invalid PTX), which made the entire module unloadable.
+        if e == 0 { f32::from_bits(0x0040_0000) } else { f32::from_bits(((e as u32) & 0xFF) << 23) }
     }
     /// cvt.rn.satfinite.e2m1x2.f32: the byte {hi nibble = hi, lo nibble = lo}.
     #[inline(always)]
