@@ -126,8 +126,16 @@ static TOL: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::At
 /// schedules the f32 adds) differs from the twin's, which shows up as exactly 1 ULP on finite values and
 /// as a different non-finite form (an overflow landing as -inf on one side and NaN on the other). Both
 /// are recorded and reported, never silently dropped.
+/// (out-of-tolerance, <=1 ULP, both-non-finite) words for the NVFP4 int8 slot.
+pub static ULP: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
 fn cmp_ulp(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, usize, usize)) -> usize {
     let (mut differ, mut ulp, mut nonfinite) = (0usize, 0usize, 0usize);
+    let mut first: Option<(usize, usize, u8, u8)> = None;
     for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
         if x == y {
             continue;
@@ -150,12 +158,15 @@ fn cmp_ulp(t: &mut Tally, label: &str, a: &[u8], b: &[u8], stats: &mut (usize, u
             continue;
         }
         differ += 1;
+        if first.is_none() {
+            first = Some((0, 0, x[0], y[0]));
+        }
         if stats.0 == 0 {
             println!("  OUT-OF-TOLERANCE {label}: ref {p:e} oxide {q:e}");
         }
         stats.0 += 1;
     }
-    t.record(label, &kdiff::Diff { bytes: a.len(), differing: differ * 4, first: None });
+    t.record(label, &kdiff::Diff { bytes: a.len(), differing: differ * 4, first });
     differ
 }
 
@@ -742,7 +753,7 @@ fn modules() -> M {
             load(&format!("{dir}/ref/mmq_mxfp4_q8.cubin")),
             load(&format!("{dir}/ref/mmq_nvfp4_q8.cubin")),
         ],
-        ox: load(&format!("{dir}/fmt_mmq.ptx")),
+        ox: load(&std::env::var("FMT_MMQ_MODULE").unwrap_or_else(|_| format!("{dir}/fmt_mmq.ptx"))),
     }
 }
 

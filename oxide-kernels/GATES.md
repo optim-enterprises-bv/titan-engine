@@ -47,7 +47,8 @@ gate is staging them (see "Artifacts" below).
 
 | crate | status |
 |---|---|
-| `fmt_mmq --fmt=nvfp4q8` (opt-in) | **Runs, 217 bytes of 169,161,784 differ** -- all in `rate=256` cases (the harness injects inf / nan / denormal / 3e38 activations), all <=1 ULP. The CUDA 719 trap it used to die on was `j0 += 8` instead of `j0 += Jc::<J>::JSTEP`, overflowing `sum[64]` into a Rust bounds check whose panic lowers to `trap;`. Arithmetic now matches the reference's nesting; see `fmt_mmq/NVFP4-INT8.md` for what is ruled out (exact `div.rn` made it *worse*: the reference is fast-math). |
+| `fmt_mmq --fmt=nvfp4q8` (opt-in) | **Runs, but the values are wrong** -- `ref -2.317e3` vs `oxide -1.358e3` on a dumped case; the ULP-classified comparison gives 34,673,786 words out-of-tolerance and 0 within 1 ULP. The CUDA 719 trap it used to die on was `j0 += 8` instead of `j0 += Jc::<J>::JSTEP`, overflowing `sum[64]` into a Rust bounds check whose panic lowers to `trap;` -- that is fixed. Arithmetic now matches the reference's nesting; see `fmt_mmq/NVFP4-INT8.md` for the long list of things measured and excluded (exact `div.rn` made it worse: the reference is fast-math). Remaining suspect: the k16 fragment lane mapping. |
+| block-scaled `fmt_mmq --fmt=mxfp4\|nvfp4` | **Proven hardware, both sides.** Not only our kernel: the reference built by nvcc 13.4 for `sm_120a` faults with CUDA **715** on this card too, and so does our PTX loaded as a real `sm_120a` cubin (`FMT_MMQ_MODULE`). cc 12.0 consumer Blackwell cannot execute `mma.sync.aligned.kind::mxf4nvf4.block_scale`. |
 | `titan-kernels-oxide`, `indexed_moe` sections | **Needs `m0/ref/indexed_moe.ptx`, `m1/ref/indexed_moe.ptx` and the `data/` tensors**, none of which exist any more. The rest of that gate passes: 20,184,168 outputs / 32,774,352 CPU-twin rows. |
 
 ## Artifacts: what has to be staged, and the traps

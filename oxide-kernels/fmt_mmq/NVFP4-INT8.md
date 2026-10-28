@@ -20,22 +20,29 @@ The reference nests `k01` (one 16-value step) outermost, then `j0`, then `n`, wi
 `sum += C*dA*dB` per 16-value group. Accumulating both halves of a 32-value chunk together is
 arithmetically equal but rounds differently.
 
-## What still differs (217 bytes)
+## What still differs (real, not noise)
 
-All remaining differences are in cases with `rate=256`, i.e. where the harness injects inf / nan /
-denormal / 3e38 activations, and every one is a low-byte ULP difference -- the arithmetic is right, the
-last bit is not. Ruled out with measurements:
+The outputs differ **materially**, not at ULP level: a `FMT_MMQ_DUMP`-instrumented case gives `ref
+-2.317e3` against `oxide -1.358e3`, and the ULP-classified comparison counts **34,673,786 words
+out-of-tolerance, 0 within 1 ULP** (1,861,705 both-non-finite). An earlier note in this file claimed
+"217 bytes, <=1 ULP"; that was wrong -- the 217 was a *label* count, and the surviving differences are
+real arithmetic errors in the NVFP4 dot/loader for some shapes.
+
+Ruled out with measurements:
 
 | tried | result |
 |---|---|
-| exact `div.rn.ftz` in the three scale paths (`amax/2688`, `amax_sub/6`, `1/row_scale`) | **worse**: 261 failing -> the reference is built with fast-math, so `div_approx` is the correct match |
-| exact `x * 0.5` instead of `div_approx(x, 2.0)` in `ue4m3` | neutral (217) |
+| exact `div.rn.ftz` in the three scale paths (`amax/2688`, `amax_sub/6`, `1/row_scale`) | **worse**: 261 labels -> the reference is built fast-math, so `div_approx` is the correct match |
+| exact `x * 0.5` instead of `div_approx(x, 2.0)` in `ue4m3` | neutral |
 | shared y quantization kernel (`quantize_mmq_d4`) | innocent -- slot `mxfp4q8` passes bit-identically through it |
 | FTZ vs non-FTZ multiply | both reference kernels are `.FTZ`, same as ours |
 | the m16n8k16 MMA | legal for `sm_120`; ptxas emits `IMMA.16816.S8.S8` and the reference cubin runs it |
+| reference error metric / candidate search (`nv_err` vs `nvfp4_native_scale_error`) | line-for-line identical: `2.0f*scale`, `|v| - |dq|*2s`, offsets `{0,-1,+1,-2,+2}`, `0.5f/s`, strict `<` |
+| `ue4m3` decode | identical to `ggml_cuda_ue4m3_to_fp32` (NaN codes 0x7F/0xFF -> 0, e4m3->f16->f32, halve) |
+| driver JIT vs a real `sm_120a` cubin (`FMT_MMQ_MODULE=<cubin>`) | identical failure, so the loader path is not the variable |
 
-Remaining candidate: the `ue4m3` candidate search's error metric (`nv_err`) and tie-breaking, which can
-flip a near-tie scale by one step on 16-value sub-blocks.
+Next: the k16 fragment lane mapping -- our `load_b16`/`ldmatrix_a` pair against the reference's
+`tile<16,4>` loads for `mma.m16n8k16`, one case at a time.
 
 ## Nothing else depends on this
 
