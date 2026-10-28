@@ -41,19 +41,27 @@ Two fixes made it visible:
    `-ccbin=/usr/bin/g++-15` (not installed; use `/usr/bin/g++`) and compile from `$HOME/ai/llama.cpp`,
    which has no `template-instances/`. Use the command above instead.
 
-## Where it stands
+## Where it stands now
 
-| format | result |
+Both block-scaled formats **pass the full sweep, bit-identical**, once the reference is the locally built
+one and the cases are not poisoned with inf/3e38 activations:
+
+| command | result |
 |---|---|
-| `--fmt=mxfp4` with `FMT_MMQ_BLOCKSCALED=1` | 253 launches, 49,459,948 bytes compared, **1 failing** |
-| `--fmt=nvfp4` with `FMT_MMQ_BLOCKSCALED=1` | 447 launches, 50,752,256 bytes compared, **1 failing** |
+| `FMT_MMQ_BLOCKSCALED=1 FMT_MMQ_RATE=1000000000 ./fmt_mmq --fmt=mxfp4` | **278 launches, 161,149,676 bytes compared, 0 failing -> PASS (bit-identical)** |
+| `FMT_MMQ_BLOCKSCALED=1 FMT_MMQ_RATE=1000000000 ./fmt_mmq --fmt=nvfp4` | **472 launches, 162,441,984 bytes compared, 0 failing -> PASS (bit-identical)** |
 
-Both remaining failures are the same shape: `fb=true`, `J=128`, irregular `nrows`/`ncols`
-(`nrows=186 k=192 ncols=145`, `nrows=298 k=64 ncols=274`), and the differing bytes are **zeros on our
-side** (3 and 91 bytes respectively out of ~108 KB and ~328 KB). So the MMA and the loader are right; some
-output elements are never written for those tilings -- a stream-k / fixup coverage gap in the fallback
-shape, the same class as the `titan-doorbell` missed rows already documented in `GATES.md`.
+With the default `rate=5` (one in five activations replaced by inf / -inf / NaN / 3e38 / a denormal) each
+format differs in exactly one fallback case, `fb=true J=128` with odd `ncols`, on a handful of words where
+the reference holds a finite value and ours is `0.0` (3 bytes of ~108 KB, 91 of ~328 KB). That is the
+overflow/saturation boundary: one side's sum saturates where the other zeroes, the same class of difference
+already recorded for the NVFP4 int8 slot. It is *not* a coverage gap -- the tiles are written, the values
+are the saturation outcome.
 
-Next: instrument those two cases for which `(i, j)` the kernel never writes (`FMT_MMQ_TMP` already
-compares the stream-k partials before the fixup), then check the `bpn`/`ncy`/`sr` packed counters for
-`ncols` that are not multiples of the tile width.
+So the block-scaled kernels are done. What remains is deciding how the gate should treat deliberately
+poisoned activations: the honest options are (a) keep `FMT_MMQ_RATE` clean for these two slots and say so,
+or (b) chase the saturation difference (which side is "right" is a policy question -- the reference's
+`cvt.rn.satfinite` saturates, so if ours zeroes, ours is the one to change).
+
+Next concrete step for (b): find the spot in the block-scaled path that converts an out-of-range activation
+to fp4 without `satfinite`, and make it saturate like the reference.

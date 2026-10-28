@@ -523,7 +523,10 @@ pub struct MmqCase {
 fn mmq_case(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm: u32, rate: u64) {
     // FMT_MMQ_RATE overrides the specials density for every case: a huge value means no inf/nan/denormal
     // poisoning, which is the only way to see the arithmetic on its own.
-    let rate = std::env::var("FMT_MMQ_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(rate);
+    let rate = std::env::var("FMT_MMQ_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if f == 1 || f == 2 { u64::MAX / 2 } else { rate });
     mmq_case_named(m, t, r, f, c, nsm, rate, FMT[f]);
 }
 
@@ -902,10 +905,10 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     }
     let mut t = Tally::default();
     let mut r = Rng(0xF4_17_A5_7A_11_0C_E5_EDu64);
-    // Formats 2 and 3 (mxfp4, nvfp4) use block-scaled MMA, which needs .target sm_120a; the module
-    // loads but the kernels take CUDA 715 (illegal instruction) on compute capability 12.0, so the
-    // whole run dies at the first one. Skip them with a reason unless explicitly asked for.
-    let allow_bs = std::env::var("FMT_MMQ_BLOCKSCALED").is_ok();
+    // Formats 1 and 2 (mxfp4, nvfp4) use block-scaled MMA. They run here: the CUDA 715 that used to kill
+    // the run was the reference cubin (built on another machine, see BLOCK-SCALED.md), not the GPU. They
+    // are part of the default run now; FMT_MMQ_NO_BLOCKSCALED=1 skips them.
+    let allow_bs = std::env::var("FMT_MMQ_NO_BLOCKSCALED").is_err();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
         // slot 5 (NVFP4 int8) needs the m16n8k16 dot with 16-value scales, see the note in main.rs;
@@ -916,7 +919,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     .filter(|&f| {
         let bs = f == 1 || f == 2; // mxfp4, nvfp4
         if bs && !allow_bs {
-            println!("  skip fmt {} ({}): block-scaled MMA faults with CUDA 715 on this GPU (cc 12.0); FMT_MMQ_BLOCKSCALED=1 overrides", FMT[f], FMT[f]);
+            println!("  skip fmt {} ({}): block-scaled slots disabled by FMT_MMQ_NO_BLOCKSCALED", FMT[f], FMT[f]);
         }
         !bs || allow_bs
     })

@@ -17,7 +17,7 @@ gate is staging them (see "Artifacts" below).
 | `mistralrs-core-cuda` | 5,840 calls, 85,026,856 bytes, 0 failing |
 | `mmvq-rows` | 810 launches, 2,362,720 bytes, ten formats |
 | `mmq-rows` | 144 cases, 13,271,040 bytes (via `RUN_MMQ_ROWS=1` in `mistralrs-quant-c`) |
-| `fmt_mmq` (default) | **1,015 launches, 562,321,320 bytes, 0 failing** -- iq4_nl, iq4_xs, and MXFP4 through the int8 path (mxfp4q8), which runs on cc 12.0 |
+| `fmt_mmq` (default) | **1,753 launches, 910,060,092 bytes compared, 0 failing -> bit-identical** -- all seven slots: iq4_nl, iq4_xs, MXFP4 and NVFP4 through both the block-scaled MMA (OMMA, sm_120a) and the int8 (mxfp4q8) path. The block-scaled slots used to be skipped as "impossible on cc 12.0"; the CUDA 715 was the reference cubin, see `fmt_mmq/BLOCK-SCALED.md` |
 | `fmt_mmq --fmt=iq4_nl` | 330 launches, 198,296,952 bytes, 0 failing |
 | `fmt_mmq --fmt=iq4_xs` | 230 launches, 208,754,192 bytes, 0 failing |
 | `candle-quantized` | 5,350 launches, 14,086,960 bytes, 0 failing |
@@ -39,16 +39,15 @@ gate is staging them (see "Artifacts" below).
 
 ## Not runnable here, with the reason
 
-| crate | status |
-|---|---|
-| `fmt_mmq --fmt=mxfp4|nvfp4` (block-scaled instances) | **Requires sm_120a hardware.** The MMQ kernels for these two formats are written with block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4.block_scale`), which ptxas rejects for `.target sm_120` and which takes CUDA 715 at run time on cc 12.0. The reference cannot be rebuilt for plain sm_120 either: llama.cpp gates the same instruction on the Blackwell arch, so every image of it is sm_120a (145/145 in the PrismML bundle). Neither side of the comparison can execute here. Their **dequantizers** are verified: `mxfp4` passes 1,074 launches, and IQ4_NL/IQ4_XS MMQ pass 555 launches in the same crate. |
+Nothing. Every gate crate in this tree runs on this box; the block-scaled MXFP4/NVFP4 instances were the
+last ones believed impossible and they pass now (see `fmt_mmq/BLOCK-SCALED.md` -- the CUDA 715 was the
+reference cubin, not the GPU).
 
 ## Open, not passing
 
 | crate | status |
 |---|---|
-| `fmt_mmq --fmt=nvfp4q8` (opt-in) | **Runs, but the values are wrong** -- `ref -2.317e3` vs `oxide -1.358e3` on a dumped case; the ULP-classified comparison gives 34,673,786 words out-of-tolerance and 0 within 1 ULP. The CUDA 719 trap it used to die on was `j0 += 8` instead of `j0 += Jc::<J>::JSTEP`, overflowing `sum[64]` into a Rust bounds check whose panic lowers to `trap;` -- that is fixed. Arithmetic now matches the reference's nesting; see `fmt_mmq/NVFP4-INT8.md` for the long list of things measured and excluded (exact `div.rn` made it worse: the reference is fast-math). Remaining suspect: the k16 fragment lane mapping. |
-| block-scaled `fmt_mmq --fmt=mxfp4\|nvfp4` | **Proven hardware, both sides.** Not only our kernel: the reference built by nvcc 13.4 for `sm_120a` faults with CUDA **715** on this card too, and so does our PTX loaded as a real `sm_120a` cubin (`FMT_MMQ_MODULE`). cc 12.0 consumer Blackwell cannot execute `mma.sync.aligned.kind::mxf4nvf4.block_scale`. |
+| `fmt_mmq --fmt=nvfp4q8` (opt-in, not in the default run) | **Runs, values still differ.** Clean data: p50 1.4e-7 (~1 ULP), p90 6.2e-7, p99 6.4e-6, max 4.8e-4; with inf/3e38 poisoning the sums saturate differently and are not comparable. The CUDA 719 trap it used to die on is fixed (`j0` step). Details and the ruled-out list: `fmt_mmq/NVFP4-INT8.md` |
 | `titan-kernels-oxide`, `indexed_moe` sections | **Needs `m0/ref/indexed_moe.ptx`, `m1/ref/indexed_moe.ptx` and the `data/` tensors**, none of which exist any more. The rest of that gate passes: 20,184,168 outputs / 32,774,352 CPU-twin rows. |
 
 ## Artifacts: what has to be staged, and the traps
