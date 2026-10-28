@@ -28,19 +28,20 @@ gate is staging them (see "Artifacts" below).
 | `iq2_xxs` `iq2_xs` `iq2_s` `iq3_xxs` `iq4_nl` | 1,074 launches, 2,909,304 bytes each, 0 failing |
 | `nvfp4` | 1,074 launches, 3,413,112 bytes, 0 failing |
 | `mxfp4` | 1,074 launches, 2,909,304 bytes, 0 failing |
+| `iq3_s` | 1,085 launches, 15,608,544 bytes, 0 failing |
+| `iq4_xs` | 1,157 launches, 15,612,608 bytes, 0 failing |
+| `q1_0` | 1,098 launches: dequantize x3, mmvq x27, quantize x6, mmq x16 + fixup x16 |
 | `ptq1_0` | quantize pt x2, fwht x6 + fused x4, mmvq pt x12, quantize mmq x2, mmq x16 + fixup x16 |
 | `flash-decode` | PASS |
 | `titan-doorbell` | 400 layers, 1599 missed rows (reported, not silent) |
 
 ## Not runnable here, with the reason
 
-| crate | needs |
+| crate | status |
 |---|---|
-| `iq3_s`, `iq4_xs` | `~/ai/llama.cpp/build/bin/libggml-base.so` — a full llama.cpp build for the CPU cross-check. Absent. |
-| `q1_0` | a `dequantize_block<128,1,...>` whose internal-linkage suffix (`_ZN49_INTERNAL_...`) no available cubin carries. |
-| `mmvq-moe` | `mr-mmvqmoe/.../titan_kernels_oxide.ptx` (an old-tree PTX); `OLD_PTX=` overrides it, but no copy exists. |
-| `fmt_mmq --fmt=mxfp4|nvfp4` | These kernels use block-scaled MMA, which needs `.target sm_120a`; the module loads but takes **CUDA 715 (illegal instruction)** on cc 12.0. |
-| `candle-mmq` | The **reference** `libmoe.a` faults with 715 on its first q2_k launch on this GPU — not our side. |
+| `fmt_mmq --fmt=mxfp4|nvfp4` | **blocked by hardware.** These kernels use block-scaled MMA, which needs `.target sm_120a`; the module loads but takes CUDA 715 (illegal instruction) on cc 12.0. The default run skips them with that sentence printed and passes the other two formats. |
+| `mmvq-moe` | **BLOCKED, 0 comparisons.** Every cross-check needs a llama.cpp moe/mmvq image that both loads and produces output on sm_120. b10934's sm_120 image launches and writes nothing; the local build's sm_120a image writes nothing for the MoE kernel and faults with CUDA 700 for the b1 one. The gate prints `MMVQ-MOE GATE: BLOCKED` and exits non-zero rather than reporting phantom mismatches. |
+| `candle-mmq` | **BLOCKED.** The reference `libmoe.a` is sm_120a code in all 15 members and its first q2_k instance takes CUDA 715; an illegal-instruction fault poisons the context, so nothing can be compared. Exits 2 with that reason (skipping case-by-case was tried — every later allocation fails with 715 too). |
 
 ## Artifacts: what has to be staged, and the traps
 

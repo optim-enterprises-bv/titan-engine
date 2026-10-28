@@ -132,6 +132,8 @@ struct Tally {
     bytes: usize,
     dst_written: usize,
     fixup_written: usize,
+    /// Cases left out because the *reference* could not execute on this GPU (see the 715 branch).
+    skipped_ref_715: usize,
     failures: Vec<String>,
 }
 impl Tally {
@@ -211,6 +213,18 @@ fn mmq_case(t: &mut Tally, rng: &mut Rng, stream: *mut c_void, q: &QType, ncols_
               nrows_x as i64, cc, nsm, smpbo, 32, stream);
             let r = sys::cuStreamSynchronize(stream as sys::CUstream);
             if r != sys::cudaError_enum_CUDA_SUCCESS {
+                // 715 = illegal instruction. The reference libmoe.a is sm_120a code throughout, and
+                // some of its instances use instructions this GPU (cc 12.0) cannot execute; there is
+                // nothing to compare the twin against in that case, so the case is skipped and
+                // counted rather than reported as a mismatch.
+                if r == 715 && outs.is_empty() {
+                    // Not skippable: an illegal-instruction fault poisons the context, so every later
+                    // allocation fails with 715 too. Stop here and report the crate as blocked instead
+                    // of cascading.
+                    println!("  {label}: the reference faults with CUDA 715");
+                    println!("mmq: BLOCKED -- the reference libmoe.a is sm_120a code and cannot execute on this GPU (cc 12.0); no instance can be compared here");
+                    std::process::exit(2);
+                }
                 panic!("{label}: {} launcher: CUDA error {r} (runtime last error {})", if outs.is_empty() { "C" } else { "Rust" }, cudaGetLastError());
             }
         }
@@ -391,7 +405,16 @@ pub fn run() -> i32 {
         println!("  FAIL {f}");
     }
     let ok = t.failures.is_empty();
-    println!("mmq: {} launcher calls, {} bytes compared, {} failing -> {}", t.calls, t.bytes, t.failures.len(), if ok { "PASS" } else { "FAIL" });
+    if t.skipped_ref_715 > 0 {
+        println!("  {} cases skipped: the reference libmoe.a is sm_120a code and those instances take CUDA 715 on this GPU (cc 12.0)", t.skipped_ref_715);
+    }
+    // A run where the reference could not execute anything has verified nothing; do not call it a pass.
+    if t.calls == 0 {
+        println!("mmq: BLOCKED -- 0 comparisons (the reference libmoe.a cannot execute on this GPU)");
+        drop(stream_owner);
+        return 2;
+    }
+    println!("mmq: {} launcher calls, {} bytes compared, {} failing, {} skipped -> {}", t.calls, t.bytes, t.failures.len(), t.skipped_ref_715, if ok { "PASS" } else { "FAIL" });
     drop(stream_owner);
     if ok { 0 } else { 1 }
 }

@@ -256,7 +256,15 @@ pub fn load(path: &str) -> cu::CUmodule {
     m
 }
 
-pub fn func(m: cu::CUmodule, name: &str) -> cu::CUfunction {
+/// Like `func`, but returns None when the module does not export `name`.
+pub fn func_opt(m: cu::CUmodule, name: &str) -> Option<cu::CUfunction> {
+    let mut f: cu::CUfunction = std::ptr::null_mut();
+    let c = std::ffi::CString::new(name).ok()?;
+    let r = unsafe { cu::cuModuleGetFunction(&mut f, m, c.as_ptr()) };
+    (r == cu::cudaError_enum_CUDA_SUCCESS).then_some(f)
+}
+
+fn func(m: cu::CUmodule, name: &str) -> cu::CUfunction {
     let mut f: cu::CUfunction = std::ptr::null_mut();
     let c = std::ffi::CString::new(name).unwrap();
     let r = unsafe { cu::cuModuleGetFunction(&mut f, m, c.as_ptr()) };
@@ -488,6 +496,7 @@ fn gate_moe_llama(m: &Mods, t: &mut Tally, sh: &Shape, r: &mut Rng) {
     let f_ref = func(m.llama, &moe_ref_name(fmt.ggml()));
     let f_ox = func(m.ox, &format!("{}_moe_mmvq_llama", fmt.name()));
     let label = format!("A {:?} llama mul_mat_vec_q_moe", fmt);
+    let mut first = true;
     for batch in 1..=8usize {
         for &(topk, d1) in &CONFIGS {
             let dim1 = if d1 == 1 { 1 } else { topk as u32 };
@@ -517,6 +526,17 @@ fn gate_moe_llama(m: &Mods, t: &mut Tally, sh: &Shape, r: &mut Rng) {
             let (a, b) = (out_ref.down(), out_ox.down());
             let bad = diff_words(&a, &b);
             let untouched = a.chunks_exact(4).filter(|w| *w == [0xA5; 4]).count();
+            if first {
+                first = false;
+                // Every llama.cpp Blackwell image on this box (b10934's sm_120, the local build's
+                // sm_120a) launches this kernel and writes nothing: the whole destination stays
+                // sentinel. There is no oracle to compare against, and continuing only produces
+                // noise plus a later CUDA 700, so say so once and leave the section.
+                if untouched == a.len() / 4 {
+                    println!("  skip section A: the llama.cpp reference wrote nothing (all {} words still sentinel) -- no usable sm_120 oracle for mul_mat_vec_q_moe on this GPU", a.len() / 4);
+                    return;
+                }
+            }
             t.rec(&label, a.len() / 4, bad);
             if bad > 0 || untouched > 0 {
                 println!("  MISMATCH {label} k={k} n={n} b={batch} topk={topk} dim1={dim1} mode={:?}: {bad} words differ, {untouched} untouched", sh.mode);
@@ -600,7 +620,16 @@ fn gate_service(m: &Mods, t: &mut Tally, sens: &mut std::collections::BTreeMap<S
     let w = Buf::up(&sb);
     let map_d = Buf::up(&as_bytes(&map));
     let (old_name, warp_rows) = fmt.old_kernel(k);
-    let f_old = func(m.old, &old_name);
+    // The deployed-PTX oracle predates the mul_mat_vec_q_moe ABI: no titan_kernels_oxide.ptx on this
+    // box exports the symbol, so this section has nothing to compare against. Say so and skip it
+    // instead of panicking; the llama.cpp cross-check in gate_vs_llama still runs.
+    let f_old = match func_opt(m.old, &old_name) {
+        Some(f) => f,
+        None => {
+            println!("  skip deployed-oracle section for {fmt:?} k={k} n={n}: {old_name} is not in the deployed PTX (pre-refactor ABI; no build of it exists here)");
+            return;
+        }
+    };
     let f_moe = func(m.ox, &format!("{}_moe_mmvq", fmt.name()));
     let b1_name = format!("{}_moe_b1{}", fmt.name(), if fmt.small_k(k) { "_sk" } else { "" });
     let f_b1 = func(m.ox, &b1_name);
@@ -683,9 +712,17 @@ pub fn run() -> bool {
             continue;
         }
         println!("{:?} k={} n={} experts={} {} {:?}", sh.fmt, sh.k, sh.n, sh.experts, sh.file.as_deref().map(|f| f.rsplit('/').next().unwrap()).unwrap_or("synthetic"), sh.mode);
+        // Every cross-check in this crate needs a llama.cpp moe/mmvq image that both loads and
+        // produces output on sm_120. None does on this box (b10934's sm_120 image writes nothing; the
+        // local build's sm_120a image writes nothing for the moe kernel and faults with CUDA 700 for
+        // the b1 one), so the sections announce the skip instead of reporting phantom mismatches.
         gate_moe_llama(&m, &mut t, &sh, &mut r);
-        gate_b1_llama(&m, &mut t, &sh, &mut r);
-        gate_service(&m, &mut t, &mut sens, &sh, &mut r);
+        if std::env::var("MMVQ_MOE_REF").is_ok() {
+            gate_b1_llama(&m, &mut t, &sh, &mut r);
+            gate_service(&m, &mut t, &mut sens, &sh, &mut r);
+        } else {
+            println!("  skip sections B and C: no llama.cpp sm_120 image on this box runs the b1/mmvq kernels (they write nothing or fault with CUDA 700); MMVQ_MOE_REF=1 forces them");
+        }
     }
     println!("\n== gate summary ({:.1}s)", t0.elapsed().as_secs_f64());
     let mut launches = 0;
@@ -703,14 +740,27 @@ pub fn run() -> bool {
     for (key, [tot, bad]) in &sens {
         println!("{key}: {bad} / {tot}");
     }
+    let ref_alive = std::env::var("MMVQ_MOE_REF").is_ok();
     for must in ["Q6K k=512 Normal", "IQ4NL k=2048 Normal"] {
         let bad = sens.get(must).map(|v| v[1]).unwrap_or(0);
         if only.is_none() && bad == 0 {
-            println!("SENSITIVITY FAIL: {must} shows no difference");
-            sens_ok = false;
+            if ref_alive {
+                println!("SENSITIVITY FAIL: {must} shows no difference");
+                sens_ok = false;
+            } else {
+                // Section C needs the same dead reference, so an empty sensitivity table means
+                // "not measured here", not "the kernels are indistinguishable".
+                println!("SENSITIVITY SKIP: {must} unmeasured (sections B and C skipped: no runnable llama.cpp sm_120 reference)");
+            }
         }
     }
     let ok = t.ok && sens_ok;
+    if launches == 0 {
+        // Nothing was compared. That is not a pass: every section needs a llama.cpp sm_120 image
+        // that runs, and none does here.
+        println!("MMVQ-MOE GATE: BLOCKED -- 0 comparisons (no runnable llama.cpp sm_120 reference for this crate)");
+        return false;
+    }
     println!("{}", if ok { "MMVQ-MOE GATE: PASS" } else { "MMVQ-MOE GATE: FAIL" });
     ok
 }
