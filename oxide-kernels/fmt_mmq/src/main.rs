@@ -1199,6 +1199,73 @@ mod kernels {
         }
     }
 
+unsafe fn vec_dot_q8_0_sep<const J: i32>(sum: &mut [f32; 64], k00: i32) {
+        let ntx = Jc::<J>::NTX;
+        let rows_per_warp = 16 * ntx;
+        let y = smem().wrapping_add(J as usize).wrapping_offset(((ty() % ntx) * (8 * TILE_Y_K)) as isize) as *const i32;
+        let x_qs = smem().wrapping_add((J + Jc::<J>::YPAD) as usize) as *const i32;
+        let x_df = x_qs.wrapping_add(2 * TILE_NE_K as usize) as *const f32;
+        let y_qs = y.wrapping_add(4);
+        let y_df = y as *const f32;
+        let i0 = (ty() / ntx) * rows_per_warp;
+
+        let mut a = [[[0u32; 4]; 4]; 2];
+        let mut da = [[[0f32; 4]; 2]; 2];
+        let mut n = 0;
+        while n < Jc::<J>::NTX {
+            unroll!();
+            let mut k01 = 0;
+            while k01 < TILE_NE_K {
+                unroll!();
+                let k0 = k00 + k01;
+                a[n as usize][(k01 / 8) as usize] = ldmatrix_a(x_qs.wrapping_offset(((i0 + n * 16) * SRAM + k0) as isize), SRAM);
+                k01 += 8;
+            }
+            let mut l = 0;
+            while l < 2 {
+                unroll!();
+                let i = i0 + n * 16 + c_i(2 * l);
+                let mut k01 = 0;
+                while k01 < TILE_NE_K {
+                    unroll!();
+                    let k0 = k00 + k01;
+                    da[n as usize][l as usize][(k01 / 8) as usize] = *x_df.offset((i * SRAM + k0 / 8) as isize);
+                    k01 += 8;
+                }
+                l += 1;
+            }
+            n += 1;
+        }
+
+        let mut j0 = 0;
+        while j0 < J {
+            unroll!();
+            let mut k01 = 0;
+            while k01 < TILE_NE_K {
+                unroll!();
+                let b = load_b(y_qs.wrapping_offset((j0 * TILE_Y_K + k01) as isize), TILE_Y_K);
+                let db0 = *y_df.offset(((j0 + c_j(0)) * TILE_Y_K + k01 / 8) as isize);
+                let db1 = *y_df.offset(((j0 + c_j(1)) * TILE_Y_K + k01 / 8) as isize);
+                let mut n = 0;
+                while n < Jc::<J>::NTX {
+                    unroll!();
+                    let c = mma_s8(a[n as usize][(k01 / 8) as usize], b);
+                    let mut l = 0;
+                    while l < 4 {
+                        unroll!();
+                        let idx = ((j0 / 8 + n) * 4 + l) as usize;
+                        let db = if l % 2 == 0 { db0 } else { db1 };
+                        sum[idx] = add(mul(mul(da[n as usize][(l / 2) as usize][(k01 / 8) as usize], c[l as usize] as f32), db), sum[idx]);
+                        l += 1;
+                    }
+                    n += 1;
+                }
+                k01 += 8;
+            }
+            j0 += Jc::<J>::JSTEP;
+        }
+    }
+
     /// ggml_cuda_mmq_vec_dot_fp4_fp4_mma: per 64-value fragment one block-scaled m16n8k64 MMA with
     /// zero C, then `sum += C` (add.ftz). A scale: row lane/4 + (lane%2)*8 of the 16-row tile;
     /// B scale: column lane/4.
