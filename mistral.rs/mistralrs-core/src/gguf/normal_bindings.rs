@@ -90,6 +90,12 @@ fn bind_root_tensors(
             "model.embedding_norm.weight",
             "token_embd_norm.weight",
         ),
+        NormalLoaderType::Lfm3 => bind(
+            archive,
+            bindings,
+            "model.embedding_norm.weight",
+            "output_norm.weight",
+        ),
         _ if archive.contains_tensor("output_norm.weight") => {
             bindings.insert(
                 "model.norm.weight",
@@ -133,7 +139,7 @@ fn bind_block_tensor(
     }
     let target = match role {
         "attn_norm" => Some(match loader {
-            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => {
+            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => {
                 format!("{p}.operator_norm.{suffix}")
             }
             _ => format!("{p}.input_layernorm.{suffix}"),
@@ -141,18 +147,20 @@ fn bind_block_tensor(
         "ffn_norm" => Some(match loader {
             NormalLoaderType::Gemma2 => format!("{p}.pre_feedforward_layernorm.{suffix}"),
             NormalLoaderType::GLM4 => format!("{p}.post_attention_layernorm.{suffix}"),
-            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => {
+            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => {
                 format!("{p}.ffn_norm.{suffix}")
             }
             _ => format!("{p}.post_attention_layernorm.{suffix}"),
         }),
         "post_attention_norm" => Some(match loader {
             NormalLoaderType::GLM4 => format!("{p}.post_self_attn_layernorm.{suffix}"),
+            NormalLoaderType::Lfm3 => format!("{p}.post_attention_norm.{suffix}"),
             _ => format!("{p}.post_attention_layernorm.{suffix}"),
         }),
         "post_ffw_norm" => Some(match loader {
             NormalLoaderType::Gemma2 => format!("{p}.post_feedforward_layernorm.{suffix}"),
             NormalLoaderType::GLM4 => format!("{p}.post_mlp_layernorm.{suffix}"),
+            NormalLoaderType::Lfm3 => format!("{p}.post_ffw_norm.{suffix}"),
             _ => return Ok(()),
         }),
         "attn_q" if !matches!(loader, NormalLoaderType::Phi3) => {
@@ -170,7 +178,12 @@ fn bind_block_tensor(
         "attn_qkv" if matches!(loader, NormalLoaderType::Spark2_5) => {
             Some(format!("{p}.self_attn.q_k_v_proj.{suffix}"))
         }
-        "attn_gate" if matches!(loader, NormalLoaderType::Spark2_5) => {
+        "attn_gate"
+            if matches!(
+                loader,
+                NormalLoaderType::Spark2_5 | NormalLoaderType::Lfm3
+            ) =>
+        {
             Some(format!("{p}.self_attn.g_proj.{suffix}"))
         }
         "attn_output" => Some(format!(
@@ -179,7 +192,7 @@ fn bind_block_tensor(
                 "dense"
             } else if matches!(
                 loader,
-                NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Spark2_5
+                NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 | NormalLoaderType::Spark2_5
             ) {
                 "out_proj"
             } else {
@@ -225,7 +238,7 @@ fn bind_block_tensor(
         }
         "ffn_gate_inp_shexp" => Some(format!("{p}.mlp.shared_expert_gate.{suffix}")),
         "exp_probs_b" => Some(match loader {
-            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => {
+            NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => {
                 format!("{p}.feed_forward.expert_bias")
             }
             _ => format!("{p}.mlp.gate.e_score_correction_bias"),
@@ -747,7 +760,7 @@ fn dense_mlp_target(
             "down" => "down_proj",
             _ => return None,
         },
-        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => match projection {
+        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => match projection {
             "gate" => "w1",
             "up" => "w3",
             "down" => "w2",
@@ -760,7 +773,7 @@ fn dense_mlp_target(
             _ => unreachable!(),
         },
     };
-    let module = if matches!(loader, NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe) {
+    let module = if matches!(loader, NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3) {
         "feed_forward"
     } else {
         "mlp"
@@ -777,7 +790,7 @@ fn router_target(loader: &NormalLoaderType, p: &str, suffix: &str) -> String {
             format!("{p}.block_sparse_moe.router.layer.{suffix}")
         }
         NormalLoaderType::HunYuanMoEV1 => format!("{p}.mlp.gate.wg.{suffix}"),
-        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => {
+        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => {
             format!("{p}.feed_forward.gate.{suffix}")
         }
         NormalLoaderType::GptOss => format!("{p}.mlp.router.{suffix}"),
@@ -788,7 +801,7 @@ fn router_target(loader: &NormalLoaderType, p: &str, suffix: &str) -> String {
 fn expert_target(loader: &NormalLoaderType, p: &str, projection: &str, suffix: &str) -> String {
     let module = match loader {
         NormalLoaderType::Phi3_5MoE | NormalLoaderType::Mixtral => "block_sparse_moe",
-        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe => "feed_forward",
+        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 => "feed_forward",
         _ => "mlp",
     };
     format!("{p}.{module}.experts.{projection}_proj.{suffix}")
@@ -812,7 +825,7 @@ fn shared_expert_target(
 fn q_norm_name(loader: &NormalLoaderType) -> &'static str {
     match loader {
         NormalLoaderType::HunYuanDenseV1 | NormalLoaderType::HunYuanMoEV1 => "query_layernorm",
-        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Phi2 => {
+        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 | NormalLoaderType::Phi2 => {
             "q_layernorm"
         }
         _ => "q_norm",
@@ -822,7 +835,7 @@ fn q_norm_name(loader: &NormalLoaderType) -> &'static str {
 fn k_norm_name(loader: &NormalLoaderType) -> &'static str {
     match loader {
         NormalLoaderType::HunYuanDenseV1 | NormalLoaderType::HunYuanMoEV1 => "key_layernorm",
-        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Phi2 => {
+        NormalLoaderType::Lfm2 | NormalLoaderType::Lfm2Moe | NormalLoaderType::Lfm3 | NormalLoaderType::Phi2 => {
             "k_layernorm"
         }
         _ => "k_norm",

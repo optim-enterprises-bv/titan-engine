@@ -1,8 +1,8 @@
 use crate::NormalLoaderType;
 use std::{error::Error, fmt, str::FromStr};
 
-pub(crate) const NORMAL_LOADER_TYPE_COUNT: usize = 27;
-pub(crate) const CANONICAL_GGUF_ARCHITECTURE_COUNT: usize = 27;
+pub(crate) const NORMAL_LOADER_TYPE_COUNT: usize = 28;
+pub(crate) const CANONICAL_GGUF_ARCHITECTURE_COUNT: usize = 28;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CanonicalGgufArchitecture {
@@ -32,6 +32,7 @@ pub(crate) enum CanonicalGgufArchitecture {
     HunYuanMoe,
     Lfm2,
     Lfm2Moe,
+    Lfm3,
     Spark25,
 }
 
@@ -64,6 +65,7 @@ impl CanonicalGgufArchitecture {
             Self::HunYuanMoe => "hunyuan-moe",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2moe",
+            Self::Lfm3 => "lfm3",
             Self::Spark25 => "spark2_5",
         }
     }
@@ -106,6 +108,7 @@ impl FromStr for CanonicalGgufArchitecture {
             "hunyuan-moe" => Ok(Self::HunYuanMoe),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2moe" => Ok(Self::Lfm2Moe),
+            "lfm3" => Ok(Self::Lfm3),
             "spark2_5" => Ok(Self::Spark25),
             _ => Err(NormalGgufRegistryError::UnknownArchitecture(
                 value.to_string(),
@@ -415,6 +418,7 @@ const QWEN35_MOE_TENSORS: &[&str] = &[
 ];
 const QWEN35_TENSORS: &[&str] = &[".ssm_a", ".ssm_conv1d.", ".ssm_alpha.", ".ssm_beta."];
 const SHORTCONV_TENSORS: &[&str] = &[".shortconv.conv.", ".shortconv.in_proj."];
+const LFM3_TENSORS: &[&str] = &[".shortconv.conv.", ".shortconv.in_proj.", ".attn_gate."];
 const SPARK2_5_TENSORS: &[&str] = &[".attn_qkv.", ".attn_gate."];
 
 const GLM_MROPE_UNSUPPORTED: &[&str] = &["{arch}.rope.dimension_sections"];
@@ -450,6 +454,7 @@ const HUNYUAN_DENSE_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::HunYuanDe
 const HUNYUAN_MOE_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::HunYuanMoEV1];
 const LFM2_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::Lfm2];
 const LFM2_MOE_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::Lfm2Moe];
+const LFM3_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::Lfm3];
 const SPARK2_5_LOADERS: &[NormalLoaderType] = &[NormalLoaderType::Spark2_5];
 
 pub(crate) const GGUF_SCHEMAS: &[GgufSchema; CANONICAL_GGUF_ARCHITECTURE_COUNT] = &[
@@ -662,6 +667,14 @@ pub(crate) const GGUF_SCHEMAS: &[GgufSchema; CANONICAL_GGUF_ARCHITECTURE_COUNT] 
         unsupported_metadata: NO_REQUIREMENTS,
     },
     GgufSchema {
+        architecture: CanonicalGgufArchitecture::Lfm3,
+        compatible_loaders: LFM3_LOADERS,
+        rope_pairing: RopePairing::HalfSplit,
+        required_metadata: LFM2_METADATA,
+        required_tensors: LFM3_TENSORS,
+        unsupported_metadata: NO_REQUIREMENTS,
+    },
+    GgufSchema {
         architecture: CanonicalGgufArchitecture::Spark25,
         compatible_loaders: SPARK2_5_LOADERS,
         rope_pairing: RopePairing::HalfSplit,
@@ -869,6 +882,15 @@ pub(crate) const NORMAL_MODEL_ADAPTERS: &[NativeModelAdapter; NORMAL_LOADER_TYPE
         layouts: &[
             GgufLayout::Direct,
             GgufLayout::StackedExperts,
+            GgufLayout::PerLayerInventory,
+            GgufLayout::SqueezedShortConv,
+        ],
+    },
+    NativeModelAdapter {
+        loader: NormalLoaderType::Lfm3,
+        architectures: &[CanonicalGgufArchitecture::Lfm3],
+        layouts: &[
+            GgufLayout::Direct,
             GgufLayout::PerLayerInventory,
             GgufLayout::SqueezedShortConv,
         ],

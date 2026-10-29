@@ -3181,6 +3181,44 @@ impl RotaryEmbedding {
             is_gpt_neox,
         })
     }
+
+    /// LFM3 partial RoPE: keep the frequency progression of the full head but
+    /// rotate only the first `turned_pairs` pairs `(i, i + head_dim/2)`; the
+    /// remaining pairs get an angle of zero, so they pass through unrotated.
+    /// (The `new_partial` above instead rotates a smaller head.)
+    pub fn new_partial_tail(
+        base: f32,
+        head_dim: usize,
+        max_position_embeddings: usize,
+        device: &Device,
+        is_gpt_neox: bool,
+        dtype: DType,
+        turned_pairs: usize,
+    ) -> Result<Self> {
+        let pairs = head_dim / 2;
+        let inv_freq: Vec<_> = (0..pairs)
+            .map(|i| {
+                if i < turned_pairs {
+                    1f32 / base.powf((2 * i) as f32 / head_dim as f32)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
+        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_position_embeddings, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        Ok(Self {
+            cos,
+            sin,
+            is_gpt_neox,
+        })
+    }
 }
 
 /// GPT-OSS style rotary embedding with YARN scaling support.

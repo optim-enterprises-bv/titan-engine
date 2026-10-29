@@ -194,17 +194,17 @@ impl GdnPendingTransitionPool {
             &self.device,
             self.spec,
         )?;
-        resized.conv_input.slice_set(&self.conv_input, 0, 0)?;
-        resized.key_banks.slice_set(&self.key_banks, 1, 0)?;
-        resized.delta.slice_set(&self.delta, 0, 0)?;
-        resized.decay.slice_set(&self.decay, 0, 0)?;
-        resized.metadata.slice_set(&self.metadata, 1, 0)?;
+        resized.conv_input.slice_set(&self.conv_input.contiguous()?, 0, 0)?;
+        resized.key_banks.slice_set(&self.key_banks.contiguous()?, 1, 0)?;
+        resized.delta.slice_set(&self.delta.contiguous()?, 0, 0)?;
+        resized.decay.slice_set(&self.decay.contiguous()?, 0, 0)?;
+        resized.metadata.slice_set(&self.metadata.contiguous()?, 1, 0)?;
         resized
             .conv_applied_epochs
-            .slice_set(&self.conv_applied_epochs, 0, 0)?;
+            .slice_set(&self.conv_applied_epochs.contiguous()?, 0, 0)?;
         resized
             .recurrent_applied_epochs
-            .slice_set(&self.recurrent_applied_epochs, 0, 0)?;
+            .slice_set(&self.recurrent_applied_epochs.contiguous()?, 0, 0)?;
         Ok(resized)
     }
 

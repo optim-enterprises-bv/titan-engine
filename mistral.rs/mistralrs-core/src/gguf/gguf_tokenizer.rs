@@ -61,6 +61,12 @@ const SPARK2_5_REGEXES: &[&str] = &[
 const GPT4O_REGEX: &str = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const TEKKEN_REGEX: &str = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const GGML_TOKEN_TYPE_NORMAL: i32 = 1;
+/// `USER_DEFINED` (4): ordinary vocabulary entries that happen to be written as tags.
+/// llama.cpp counts these as normal (`is_normal()` is NORMAL or USER_DEFINED), so LFM3's
+/// `<function=`, `</function>` and friends stay generatable; marking them special puts the
+/// SPECIAL_TOKEN_MARKER in front of their bytes and constrained decoding then rejects the
+/// token the model was trained to emit.
+const GGML_TOKEN_TYPE_USER_DEFINED: i32 = 4;
 const GGML_TOKEN_TYPE_BYTE: i32 = 6;
 const SENTENCEPIECE_UNDERLINE: &str = "\u{2581}";
 
@@ -240,7 +246,10 @@ pub(crate) fn convert_gguf_metadata_to_hf_tokenizer(
     let mut special = Vec::new();
     if token_types.len() == props.tokens.len() {
         for (i, ty) in token_types.iter().enumerate() {
-            if *ty != GGML_TOKEN_TYPE_NORMAL && *ty != GGML_TOKEN_TYPE_BYTE {
+            if *ty != GGML_TOKEN_TYPE_NORMAL
+                && *ty != GGML_TOKEN_TYPE_BYTE
+                && *ty != GGML_TOKEN_TYPE_USER_DEFINED
+            {
                 special.push(AddedToken::from(props.tokens[i].clone(), true));
             }
         }
