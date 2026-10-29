@@ -555,10 +555,19 @@ impl Model {
         let mapper = normal_loading_metadata.mapper;
         let vb_m = vb.pp("model");
         let dtype = vb_m.dtype();
+        // Spark's HF checkpoint names the table `model.embedding`; the GGUF
+        // conversion emits `embed_tokens`. Accept whichever this file carries
+        // instead of forcing a rename on the merged weights.
+        let embed_key = if crate::layers::contains_tensor_or_weight_source(&vb_m, "embedding.weight")
+        {
+            "embedding"
+        } else {
+            "embed_tokens"
+        };
         let embed_tokens = embedding(
             cfg.vocab_size,
             cfg.hidden_size,
-            mapper.set_nm_device(vb_m.pp("embed_tokens"), normal_loading_metadata.loading_isq),
+            mapper.set_nm_device(vb_m.pp(embed_key), normal_loading_metadata.loading_isq),
             &cfg.quantization_config,
         )?;
 

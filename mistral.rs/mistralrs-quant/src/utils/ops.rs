@@ -3351,7 +3351,10 @@ pub fn fused_split_glu(
         candle_core::bail!("fused split GLU expected last dimension {expected}");
     }
 
-    #[cfg(feature = "cuda")]
+    // titan oxide build: the split-GLU kernel is nvcc-only. Without this guard the
+    // stub aborts the whole process (fused_split_glu_bf16 is nvcc-only), so fall
+    // through to narrow + fused_glu, which has its own oxide fallback.
+    #[cfg(all(feature = "cuda", not(feature = "oxide")))]
     if input.device().is_cuda() && matches!(input.dtype(), DType::F16 | DType::BF16 | DType::F32) {
         return input.contiguous()?.apply_op1_no_bwd(&FusedSplitGlu {
             split_size,
