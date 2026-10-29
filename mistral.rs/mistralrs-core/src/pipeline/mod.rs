@@ -70,7 +70,7 @@ pub use loaders::{
     EmbeddingModuleType, FluxLoader, GLM4Loader, GLM4MoeLiteLoader, GLM4MoeLoader, Gemma2Loader,
     Gemma3Loader, Gemma3nLoader, Gemma4Loader, GemmaLoader, GptOssLoader, GraniteMoeHybridLoader,
     HunYuanDenseV1Loader, HunYuanMoEV1Loader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, Lfm2Loader, Lfm2VlLoader, LlamaLoader, Loader, LocalModelPaths,
+    LLaVANextLoader, Lfm2Loader, Lfm2VlLoader, Lfm3Loader, LlamaLoader, Loader, LocalModelPaths,
     MiniCpmOLoader, Mistral3Loader, MistralLoader, MixtralLoader, ModelKind, ModelPaths,
     MultimodalLoaderType, MultimodalModel, MultimodalModelLoader, MuseGlimmerLoader,
     NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader, Phi2Loader,

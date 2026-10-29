@@ -315,19 +315,19 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
 }
 
 impl ModelWeights {
-    pub fn forward(
+    /// Embed `x` and run every layer, appending this pass's K/V to the cache; returns the last layer's
+    /// hidden states (before the final norm). Shared by the whole-prompt pass and each prefill chunk.
+    fn run_stack(
         &self,
         x: &Tensor,
         start_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<&(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask(
             x,
             metadata
-                .as_ref()
                 .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
                 .unwrap_or(cache as &dyn PastKvLenCache),
             self.dtype,
@@ -335,7 +335,6 @@ impl ModelWeights {
         )?;
         // PagedAttention prompt chunking
         let mask = if metadata
-            .as_ref()
             .map(|(_, meta)| meta.is_first_prompt_chunk)
             .unwrap_or(true)
         {
@@ -360,9 +359,7 @@ impl ModelWeights {
                 &mask.get(x.device()),
                 start_offsets,
                 &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                metadata.map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
             )?;
             let x = (attn + residual)?;
 
@@ -373,6 +370,51 @@ impl ModelWeights {
             let x = (x + residual)?;
             layer_in = x;
         }
+        Ok(layer_in)
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        start_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        let seq_len = x.dim(1)?;
+        // Unpaged prompt passes longer than TITAN_PREFILL_CHUNK run as consecutive chunks, each continuing
+        // the KV cache of the one before (causal RoPE/attention start at the chunk's offset). Bounds the
+        // pass's activations, which otherwise grow with the prompt and OOM a near-full card. Only when every
+        // requested logit lies in the last chunk, which holds for a normal prompt (logits at the final token).
+        let c = crate::models::quantized_qwen35_moe::prefill_chunk_size();
+        let last_start = if seq_len > c && c > 0 { ((seq_len - 1) / c) * c } else { 0 };
+        let chunked = metadata.is_none()
+            && c > 0
+            && seq_len > c
+            && context_lens.iter().all(|(start, _)| *start >= last_start);
+
+        let layer_in = if chunked {
+            let mut start = 0;
+            let mut last = None;
+            while start < seq_len {
+                let len = c.min(seq_len - start);
+                let chunk = x.narrow(1, start, len)?;
+                let offs: Vec<usize> = start_offsets.iter().map(|o| o + start).collect();
+                let hidden = self.run_stack(&chunk, &offs, None)?;
+                if start == last_start {
+                    last = Some(hidden);
+                }
+                start += len;
+            }
+            last.expect("last prefill chunk produces hidden states")
+        } else {
+            self.run_stack(x, start_offsets, metadata.as_ref())?
+        };
+
+        let context_lens = if chunked {
+            context_lens.iter().map(|(start, len)| (start - last_start, *len)).collect()
+        } else {
+            context_lens
+        };
         let layer_in = layer_in.to_device(&self.device)?;
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;

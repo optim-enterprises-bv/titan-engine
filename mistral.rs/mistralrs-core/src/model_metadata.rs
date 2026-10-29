@@ -192,6 +192,14 @@ impl NormalLoaderType {
                     ex!("LiquidAI/LFM2-8B-A1B", "LFM2"),
                 ],
             },
+            Self::Lfm3 => ArchMetadata {
+                families: &["LFM3"],
+                modalities: m,
+                examples: &[
+                    ex!("LiquidAI/LFM3-1.7B", "LFM3"),
+                    ex!("LiquidAI/LFM3-1.7B-GGUF", "LFM3"),
+                ],
+            },
             Self::Spark2_5 => ArchMetadata {
                 families: &["Spark-X2.5"],
                 modalities: m,
@@ -389,6 +397,7 @@ impl NormalLoaderType {
     pub fn config_arch(&self) -> &'static str {
         match self {
             Self::Mistral => "MistralForCausalLM",
+            Self::Lfm3 => "Lfm3ForCausalLM",
             Self::Gemma => "GemmaForCausalLM",
             Self::Mixtral => "MixtralForCausalLM",
             Self::Llama => "LlamaForCausalLM",

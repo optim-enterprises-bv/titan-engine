@@ -228,6 +228,8 @@ pub enum NormalLoaderType {
     Lfm2,
     #[serde(rename = "lfm2_moe")]
     Lfm2Moe,
+    #[serde(rename = "lfm3")]
+    Lfm3,
     #[serde(rename = "spark2_5")]
     Spark2_5,
 }
@@ -262,6 +264,7 @@ impl NormalLoaderType {
             Self::Qwen3_5 => "Qwen3_5ForCausalLM",
             Self::Lfm2 => "Lfm2ForCausalLM",
             Self::Lfm2Moe => "Lfm2MoeForCausalLM",
+            Self::Lfm3 => "Lfm3ForCausalLM",
             Self::Spark2_5 => "Spark2_5ForCausalLM",
         }
     }
@@ -294,6 +297,7 @@ impl NormalLoaderType {
             Self::Qwen3_5 => "qwen3_5_text",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2_moe",
+            Self::Lfm3 => "lfm3",
             Self::Spark2_5 => "spark2_5",
         }
     }
@@ -363,6 +367,7 @@ impl FromStr for NormalLoaderType {
             "qwen3next" => Ok(Self::Qwen3Next),
             "qwen3_5" => Ok(Self::Qwen3_5),
             "lfm2" => Ok(Self::Lfm2),
+            "lfm3" => Ok(Self::Lfm3),
             "lfm2_moe" => Ok(Self::Lfm2Moe),
             "spark2_5" => Ok(Self::Spark2_5),
             a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`, `hunyuanv1dense`, `hunyuanv1moe`, `qwen3next`, `qwen3_5`, `lfm2`, `lfm2_moe`, `spark2_5`.")),
@@ -398,6 +403,7 @@ impl Display for NormalLoaderType {
             Self::Qwen3Next => write!(f, "qwen3next"),
             Self::Qwen3_5 => write!(f, "qwen3_5"),
             Self::Lfm2 => write!(f, "lfm2"),
+            Self::Lfm3 => write!(f, "lfm3"),
             Self::Lfm2Moe => write!(f, "lfm2_moe"),
             Self::Spark2_5 => write!(f, "spark2_5"),
         }
@@ -462,6 +468,7 @@ impl AutoNormalLoader {
             NormalLoaderType::Qwen3_5 => Ok(Box::new(Qwen3_5TextLoader)),
             NormalLoaderType::Lfm2 => Ok(Box::new(Lfm2Loader)),
             NormalLoaderType::Lfm2Moe => Ok(Box::new(Lfm2Loader)),
+            NormalLoaderType::Lfm3 => Ok(Box::new(Lfm3Loader)),
             NormalLoaderType::Spark2_5 => Ok(Box::new(Spark2_5Loader)),
         }
     }
@@ -6615,6 +6622,243 @@ impl DeviceMappedModelLoader for Lfm2Loader {
 
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let cfg: crate::models::lfm2::Config = serde_json::from_str(config)?;
+        let head_dim = cfg.head_dim();
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: None,
+            k_head_dim: head_dim,
+            v_head_dim: head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+}
+
+
+pub struct Lfm3Loader;
+
+impl NormalModelLoader for Lfm3Loader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+
+        Ok(Box::new(models::lfm3::Model::new(
+            &cfg,
+            vb,
+            self.is_gptx_for(config, &normal_loading_metadata)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        anyhow::bail!("LFM3 does not support X-LoRA")
+    }
+
+    fn is_gptx(&self, _config: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+
+    fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+impl IsqModelLoader for Lfm3Loader {
+    fn promoted_isq_predicates(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"^model\.embed_tokens\.weight$")?,
+            Regex::new(r"^lm_head\.(weight|bias)$")?,
+        ])
+    }
+
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.out_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.conv\.in_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.conv\.out_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.w1\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.w2\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.w3\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w1\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w2\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w3\.(weight|bias)$")?,
+            Regex::new(
+                r"layers\.(\d+)\.feed_forward\.experts\.(gate_proj|up_proj|down_proj)\.weight$",
+            )?,
+        ])
+    }
+
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+
+    fn isq_layer_regexes_moqe(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w1\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w2\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.feed_forward\.experts\.(\d+)\.w3\.(weight|bias)$")?,
+            Regex::new(
+                r"layers\.(\d+)\.feed_forward\.experts\.(gate_proj|up_proj|down_proj)\.weight$",
+            )?,
+        ])
+    }
+
+    fn immediate_isq_predicates_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes_moqe(config)
+    }
+}
+
+impl DeviceMappedModelLoader for Lfm3Loader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _quantization: Option<&super::AutoDeviceMapQuantization<'_>>,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+        let tied = cfg.tie_word_embeddings();
+        let (embed_tokens_pack_factor, lm_head_pack_factor) = super::language_model_pack_factors(
+            _quantization,
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            tied,
+            dtype,
+            weight_pack_factor,
+        )?;
+        let embed_tokens = cfg.hidden_size * cfg.vocab_size / embed_tokens_pack_factor;
+        let lm_head = if tied {
+            0
+        } else {
+            cfg.hidden_size * cfg.vocab_size / lm_head_pack_factor
+        };
+        let norm = cfg.hidden_size;
+        Ok((embed_tokens + lm_head + norm) * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+        let head_dim = cfg.head_dim();
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size();
+        let mut sizes = Vec::with_capacity(cfg.num_hidden_layers);
+
+        for (layer_idx, layer_type) in cfg.layer_types().into_iter().enumerate() {
+            let operator_norm = hidden;
+            let ffn_norm = hidden;
+            let feed_forward = match cfg.feed_forward_type(layer_idx) {
+                crate::models::lfm3::FeedForwardType::Dense => {
+                    3 * hidden * intermediate / weight_pack_factor
+                }
+                crate::models::lfm3::FeedForwardType::Moe => {
+                    let gate = hidden * cfg.num_experts;
+                    let expert_bias = if cfg.use_expert_bias {
+                        cfg.num_experts
+                    } else {
+                        0
+                    };
+                    let experts = 3 * cfg.num_experts * hidden * cfg.moe_intermediate_size
+                        / weight_pack_factor;
+                    gate + expert_bias + experts
+                }
+            };
+            let operator = match layer_type {
+                crate::models::lfm3::LayerType::Attention
+                | crate::models::lfm3::LayerType::SlidingAttention => {
+                    let q_dim = cfg.num_attention_heads * head_dim;
+                    let kv_dim = cfg.num_key_value_heads * head_dim;
+                    let projections = (hidden * q_dim + hidden * kv_dim * 2 + q_dim * hidden)
+                        / weight_pack_factor;
+                    projections + 2 * head_dim
+                }
+                crate::models::lfm3::LayerType::Conv => {
+                    let projections = (hidden * 3 * hidden + hidden * hidden) / weight_pack_factor;
+                    let conv = hidden * cfg.conv_l_cache;
+                    let bias = if cfg.conv_bias { 5 * hidden } else { 0 };
+                    projections + conv + bias
+                }
+            };
+
+            sizes
+                .push((operator_norm + ffn_norm + operator + feed_forward) * dtype.size_in_bytes());
+        }
+
+        Ok(sizes)
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
+        Ok(cfg.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::lfm3::Config = serde_json::from_str(config)?;
         let head_dim = cfg.head_dim();
         let cfg = ModelConfigMetadata {
             max_seq_len: cfg.max_position_embeddings,

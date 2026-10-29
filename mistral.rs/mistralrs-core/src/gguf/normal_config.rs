@@ -46,7 +46,7 @@ pub(crate) struct NormalConfigBuilder {
     build: BuilderFn,
 }
 
-pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 27] = &[
+pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 28] = &[
     NormalConfigBuilder {
         loader: NormalLoaderType::Mistral,
         build: build_mistral,
@@ -150,6 +150,10 @@ pub(crate) const NORMAL_CONFIG_BUILDERS: &[NormalConfigBuilder; 27] = &[
     NormalConfigBuilder {
         loader: NormalLoaderType::Lfm2Moe,
         build: build_lfm2_moe,
+    },
+    NormalConfigBuilder {
+        loader: NormalLoaderType::Lfm3,
+        build: build_lfm3,
     },
     NormalConfigBuilder {
         loader: NormalLoaderType::Spark2_5,
@@ -1977,6 +1981,75 @@ fn build_spark2_5(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
     Ok(JsonValue::Object(config))
 }
 
+/// LFM3 = LFM2's conv/attention hybrid with per-head output gates, partial RoPE on
+/// the global layers, sliding-window attention on five of them and sandwich norms.
+/// The conv half and the per-layer KV-head array parse exactly as LFM2's do.
+fn build_lfm3(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
+    let JsonValue::Object(mut config) = build_lfm_impl(metadata, false, true)? else {
+        return build_lfm_impl(metadata, false, true);
+    };
+    let num_hidden_layers = transformer_block_count(metadata)?;
+    let kv_heads = metadata
+        .per_layer_usize("attention.head_count_kv", num_hidden_layers)?
+        .ok_or_else(|| {
+            NormalConfigSynthesisError::new(format!(
+                "Standalone LFM3 config requires `{}`",
+                metadata.key("attention.head_count_kv")
+            ))
+        })?;
+    let pattern = metadata.sliding_pattern(num_hidden_layers)?;
+    let hidden_size = metadata.required_uniform_usize("embedding_length")?;
+    let num_attention_heads = metadata.required_uniform_usize("attention.head_count")?;
+    let head_dim = metadata
+        .optional_usize("attention.key_length")?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let sliding_window = metadata.optional_usize("attention.sliding_window")?;
+    let layer_types: Vec<&str> = (0..num_hidden_layers)
+        .map(|layer| {
+            if kv_heads[layer] == 0 || metadata.layer_has_tensor(layer, ".shortconv.") {
+                "conv"
+            } else if pattern
+                .as_ref()
+                .map(|is_sliding| is_sliding[layer])
+                .unwrap_or(false)
+            {
+                "sliding_attention"
+            } else {
+                "full_attention"
+            }
+        })
+        .collect();
+    // Global layers turn only half of each head (the published LFM3 recipe); SWA layers turn all of it.
+    let rope_theta_full = metadata.rope_theta(None)?;
+    let rope_theta_swa = metadata
+        .optional_f64("rope.freq_base_swa")?
+        .unwrap_or(rope_theta_full);
+    let full_partial = metadata
+        .optional_f64("rope.partial_rotary_factor")?
+        .unwrap_or(0.5);
+    config.insert("model_type".into(), json!("lfm3"));
+    config.insert("architectures".into(), json!(vec!["Lfm3ForCausalLM"]));
+    config.insert("head_dim".into(), json!(head_dim));
+    config.insert("sliding_window".into(), json!(sliding_window));
+    config.insert(
+        "rope_parameters".into(),
+        json!({
+            "full_attention": {
+                "rope_theta": rope_theta_full,
+                "rope_type": "default",
+                "partial_rotary_factor": full_partial,
+            },
+            "sliding_attention": {
+                "rope_theta": rope_theta_swa,
+                "rope_type": "default",
+                "partial_rotary_factor": 1.0,
+            },
+        }),
+    );
+    config.insert("layer_types".into(), json!(layer_types));
+    Ok(JsonValue::Object(config))
+}
+
 fn build_lfm2(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
     build_lfm(metadata, false)
 }
@@ -1986,7 +2059,19 @@ fn build_lfm2_moe(metadata: &MetadataView<'_>) -> SynthesisResult<JsonValue> {
 }
 
 fn build_lfm(metadata: &MetadataView<'_>, is_moe: bool) -> SynthesisResult<JsonValue> {
-    reject_unsupported_rope_scaling(metadata, "LFM2")?;
+    build_lfm_impl(metadata, is_moe, false)
+}
+
+/// LFM3 keeps two RoPE bases in its metadata (`rope.freq_base` and
+/// `rope.freq_base_swa`), which the shared LFM2 scaling check rejects.
+fn build_lfm_impl(
+    metadata: &MetadataView<'_>,
+    is_moe: bool,
+    is_lfm3: bool,
+) -> SynthesisResult<JsonValue> {
+    if !is_lfm3 {
+        reject_unsupported_rope_scaling(metadata, "LFM2")?;
+    }
     let hidden_size = metadata.required_uniform_usize("embedding_length")?;
     let num_hidden_layers = transformer_block_count(metadata)?;
     let num_attention_heads = metadata.required_uniform_usize("attention.head_count")?;

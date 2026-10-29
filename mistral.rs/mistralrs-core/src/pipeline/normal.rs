@@ -11,7 +11,7 @@ use super::{
 use super::{
     AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, GLM4MoeLiteLoader,
     GLM4MoeLoader, Gemma2Loader, GemmaLoader, GptOssLoader, GraniteMoeHybridLoader,
-    HunYuanDenseV1Loader, HunYuanMoEV1Loader, Lfm2Loader, LlamaLoader, MistralLoader,
+    HunYuanDenseV1Loader, HunYuanMoEV1Loader, Lfm2Loader, Lfm3Loader, LlamaLoader, MistralLoader,
     MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader, Qwen2Loader,
     Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, Qwen3_5TextLoader, SmolLm3Loader,
     Spark2_5Loader, Starcoder2Loader,
@@ -509,6 +509,7 @@ impl NormalLoaderBuilder {
         )?;
         let loader: Box<dyn NormalModelLoader> = match loader_tp {
             Some(NormalLoaderType::Mistral) => Box::new(MistralLoader),
+            Some(NormalLoaderType::Lfm3) => Box::new(Lfm3Loader),
             Some(NormalLoaderType::Gemma) => Box::new(GemmaLoader),
             Some(NormalLoaderType::Llama) => Box::new(LlamaLoader),
             Some(NormalLoaderType::Mixtral) => Box::new(MixtralLoader),
