@@ -163,7 +163,7 @@ const FLASH_PREFILL_REP: usize = 8;
 // CausalMasker builds both (rows, past + rows) masks on the host, ~0.3 s per 9k-token prompt
 fn host_masks() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_SPARK_HOST_MASK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_SPARK_HOST_MASK", false))
 }
 
 /// The causal and the sliding-window additive prompt masks, (rows, past + rows), built on `device`: the same
@@ -200,12 +200,12 @@ fn mask_for_keys(mask: &Tensor, kv_len: usize) -> Result<Tensor> {
 
 fn flash_swa_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_SPARK_FLASH_SWA").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_SPARK_FLASH_SWA", true))
 }
 
 fn banded_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_SPARK_BANDED").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_SPARK_BANDED", true))
 }
 
 struct Attention {

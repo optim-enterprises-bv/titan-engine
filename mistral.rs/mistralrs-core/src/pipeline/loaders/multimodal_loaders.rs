@@ -8656,7 +8656,7 @@ impl DeviceMappedModelLoader for Gemma4Loader {
 
     /// Under `--dtype f32` the cache is F16 (`TITAN_G4_KV16`, default on; gemma4/text.rs `kv16`).
     fn kv_cache_dtype(&self, _config: &str, dtype: DType) -> Result<DType> {
-        let kv16 = mistralrs_quant::titan_cfg::var("TITAN_G4_KV16").map_or(true, |v| v != "0");
+        let kv16 = mistralrs_quant::titan_cfg::flag("TITAN_G4_KV16", true);
         Ok(if dtype == DType::F32 && kv16 { DType::F16 } else { dtype })
     }
 

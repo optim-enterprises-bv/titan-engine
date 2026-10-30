@@ -36,7 +36,7 @@ const E4M3_AS_F16_SCALE: f32 = 256.0;
 pub(crate) fn enabled() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_KV_HOST").is_ok_and(|v| v == "1");
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_KV_HOST", false);
         if on {
             tracing::info!(
                 "titan kv: host-RAM F8E4M3 KV cache, CPU attention up to {CPU_MAX_ROWS} rows, {} keys per prompt tile",
@@ -113,7 +113,7 @@ pub(crate) fn prewarm(kv_len: usize) {
 /// `TITAN_HOSTKV_PROF=1`: per-phase wall time of decode host attentions, logged every `PROF_EVERY` calls.
 pub(crate) fn prof_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_HOSTKV_PROF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_HOSTKV_PROF", false))
 }
 
 const PROF_EVERY: u64 = 2048;

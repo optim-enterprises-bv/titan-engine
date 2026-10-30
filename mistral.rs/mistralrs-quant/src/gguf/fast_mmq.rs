@@ -805,7 +805,7 @@ pub fn llama_fmt_plain(w: &QTensor, xs: &Tensor) -> Result<Option<Tensor>> {
     let Some(f) = llama_mmq(w.dtype()) else {
         return Ok(None);
     };
-    if crate::titan_cfg::var_os("TITAN_LLAMA_MMQ").is_some_and(|v| v == "0") {
+    if !crate::titan_cfg::flag("TITAN_LLAMA_MMQ", true) {
         return Ok(None);
     }
     let Device::Cuda(dev) = w.device() else {

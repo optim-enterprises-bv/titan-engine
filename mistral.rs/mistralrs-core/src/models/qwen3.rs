@@ -54,7 +54,7 @@ const MLP_ROWS: usize = 4096;
 /// also follow `TITAN_ATTN_FLASH_PREFILL` / `_MIN` (prompts under 1024 keys stay eager, exact as before).
 fn flash_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_QWEN3_FLASH").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_QWEN3_FLASH", true))
 }
 
 /// The additive causal prompt mask (rows, past + rows) built on `device` (key j of row i visible iff j <= past + i,

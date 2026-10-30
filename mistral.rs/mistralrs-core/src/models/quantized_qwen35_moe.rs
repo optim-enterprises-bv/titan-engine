@@ -1538,7 +1538,7 @@ mod cuda_pool {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = dev {
             use candle_core::cuda_backend::cudarc::driver::sys;
-            if !mistralrs_quant::titan_cfg::var("TITAN_PREFILL_MEMLOG").is_ok_and(|v| v == "1") {
+            if !mistralrs_quant::titan_cfg::flag("TITAN_PREFILL_MEMLOG", false) {
                 return Ok(());
             }
             let stream = d.cuda_stream();
@@ -1581,7 +1581,7 @@ fn lookahead_depth() -> usize {
 /// with the MTP stats (the syncs slow everything down; for relative costs only).
 fn mtp_prof_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_MTP_PROF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_MTP_PROF", false))
 }
 
 
@@ -1722,11 +1722,11 @@ const VERIFY_MMQ_MAX_ROWS: usize = 64;
 /// not depend on how many rows share the launch, and 8 rows cost ~1.5x one where the rows kernels cost ~5x.
 fn verify_mmq() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_VERIFY_MMQ").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_VERIFY_MMQ", true))
 }
 
 fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
-    if mistralrs_quant::titan_cfg::var("TITAN_DENSE_BF16_MATVEC").is_ok_and(|v| v == "0") {
+    if !mistralrs_quant::titan_cfg::flag("TITAN_DENSE_BF16_MATVEC", true) {
         return None;
     }
     if x.dtype() == DType::F32 && x.device().is_cuda() {
@@ -1969,7 +1969,7 @@ fn lin_rows_as(w: &Arc<dyn QuantMethod>, x: &Tensor, narrow: bool) -> Result<Ten
 fn mtp_rowwise_experts() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        mistralrs_quant::titan_cfg::var("TITAN_MTP_ROWWISE_EXPERTS").is_ok_and(|v| !v.is_empty() && v != "0")
+        mistralrs_quant::titan_cfg::flag("TITAN_MTP_ROWWISE_EXPERTS", false)
     })
 }
 
@@ -2600,23 +2600,30 @@ impl ModelConfig::FromGGUF for ModelWeights {
         };
 
         {
-            // Nothing is gated silently: every tunable path and its state, once per load.
-            let flag = |name: &str, on_by_default: bool| -> String {
-                mistralrs_quant::titan_cfg::var(name).unwrap_or_else(|_| {
-                    if on_by_default { "default-on".into() } else { "default-off".into() }
-                })
+            // Nothing is gated silently: every tunable path and its state, once per load. A setting left
+            // unset prints the code's own default ("default=<value>"); the graphs line said "default-on"
+            // while titan_graph::enabled() is off unless exactly "1".
+            let flag = |name: &str, default: &str| -> String {
+                mistralrs_quant::titan_cfg::var(name).unwrap_or_else(|_| format!("default={default}"))
             };
             tracing::info!(
-                "titan paths: mtp={} graphs={} dense_graphs={} q3k_rows={} rows_all={} mmvq_max_batch={} mmq_small_cols={} gdn_direct={} admit={} prefill_chunk={} lookahead={}",
-                flag("TITAN_MTP", false),
-                flag("TITAN_CUDA_GRAPHS", true),
-                flag("TITAN_DENSE_GRAPHS", false),
-                flag("TITAN_Q3K_ROWS", true),
-                flag("TITAN_ROWS_ALL", false),
-                flag("TITAN_MMVQ_MAX_BATCH", false),
-                flag("TITAN_MMQ_SMALL_COLS", false),
-                flag("TITAN_GDN_DIRECT", true),
-                flag("TITAN_ADMIT", false),
+                "titan paths: mtp={} graphs={} dense_graphs={} host_graphs={} q3k_rows={} q3k_warps={} rows_all={} mmvq_max_batch={} mmq_small_cols={} mmq_rows={} verify_mmq={} dense_bf16_matvec={} llama_mmq={} lookup={} gdn_direct={} admit={} prefill_chunk={} lookahead={}",
+                flag("TITAN_MTP", "0"),
+                flag("TITAN_CUDA_GRAPHS", "0"),
+                flag("TITAN_DENSE_GRAPHS", "0"),
+                flag("TITAN_HOST_GRAPHS", "0"),
+                flag("TITAN_Q3K_ROWS", "1"),
+                flag("TITAN_Q3K_WARPS", "0"),
+                flag("TITAN_ROWS_ALL", "0"),
+                flag("TITAN_MMVQ_MAX_BATCH", "2"),
+                flag("TITAN_MMQ_SMALL_COLS", "0"),
+                flag("TITAN_MMQ_ROWS", "3"),
+                flag("TITAN_VERIFY_MMQ", "1"),
+                flag("TITAN_DENSE_BF16_MATVEC", "1"),
+                flag("TITAN_LLAMA_MMQ", "1"),
+                flag("TITAN_LOOKUP", "1"),
+                flag("TITAN_GDN_DIRECT", "1"),
+                flag("TITAN_ADMIT", "off"),
                 prefill_chunk_size(),
                 lookahead_depth()
             );
@@ -2748,7 +2755,7 @@ impl ModelWeights {
         // are ~23 ms of a ~38 ms token.
         let prof_step = input_ids.dim(1).ok() == Some(1) && input_ids.dim(0).ok() == Some(1);
         let prof_on = prof_step
-            && mistralrs_quant::titan_cfg::var("TITAN_STEP_PROF").is_ok_and(|v| v == "1");
+            && mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false);
         static STEP_PROF_LAST: std::sync::Mutex<Option<std::time::Instant>> =
             std::sync::Mutex::new(None);
         let prof_t0 = std::time::Instant::now();
@@ -3037,9 +3044,7 @@ impl ModelWeights {
                     // back (a copy of the whole conv + recurrent state, per layer, per token) is
                     // pure overhead. TITAN_GDN_DIRECT=0 restores the copy path.
                     let direct_slot = if matches!(recurrent_metadata.batch_kind(), RecurrentBatchKind::Decode)
-                        && mistralrs_quant::titan_cfg::var("TITAN_GDN_DIRECT")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
+                        && mistralrs_quant::titan_cfg::flag("TITAN_GDN_DIRECT", true)
                     {
                         recurrent_metadata
                             .state_indices_host()
@@ -3184,7 +3189,7 @@ impl ModelWeights {
         } else {
             Vec::new()
         };
-        let gdn_direct = mistralrs_quant::titan_cfg::var("TITAN_GDN_DIRECT").map(|v| v != "0").unwrap_or(true);
+        let gdn_direct = mistralrs_quant::titan_cfg::flag("TITAN_GDN_DIRECT", true);
 
         let mut x = self
             .tok_embeddings
@@ -3673,7 +3678,31 @@ impl ModelWeights {
             let layers_ok = mixers_ok && (self.all_moe() || (self.all_dense() && Self::dense_graphs_enabled()));
             // host-RAM KV attends on the CPU between segments, outside any capture
             let ok = one_device && layers_ok && lookahead_depth() == 0 && !crate::titan_hostkv::enabled();
-            tracing::info!("titan graphs: piecewise CUDA graphs for batch-1 decode {}", if ok { "on" } else { "off (unsupported model setup)" });
+            if ok {
+                tracing::info!("titan graphs: piecewise CUDA graphs for batch-1 decode on");
+            } else {
+                // say which condition failed: "unsupported model setup" left the audit tracing code
+                let mut why = Vec::new();
+                if !one_device {
+                    why.push("layers span more than one device");
+                }
+                if !mixers_ok {
+                    why.push("paged attention");
+                }
+                if mixers_ok && !self.all_moe() && !self.all_dense() {
+                    why.push("mixed MoE and dense layers");
+                }
+                if self.all_dense() && !Self::dense_graphs_enabled() {
+                    why.push("a dense model needs TITAN_DENSE_GRAPHS=1");
+                }
+                if lookahead_depth() != 0 {
+                    why.push("TITAN_TIERED_LOOKAHEAD is set");
+                }
+                if crate::titan_hostkv::enabled() {
+                    why.push("host-RAM KV (TITAN_KV_HOST; TITAN_HOST_GRAPHS covers verification only)");
+                }
+                tracing::warn!("titan graphs: TITAN_CUDA_GRAPHS=1 but batch-1 decode graphs are off: {}", why.join("; "));
+            }
             ok
         })
     }
@@ -3852,7 +3881,7 @@ impl ModelWeights {
     /// (launch gaps) turns out to follow the *number of graph launches* just as it followed the
     /// number of kernel launches; the remaining lever is fewer, larger segments.
     fn dense_graphs_enabled() -> bool {
-        mistralrs_quant::titan_cfg::var("TITAN_DENSE_GRAPHS").is_ok_and(|v| v == "1")
+        mistralrs_quant::titan_cfg::flag("TITAN_DENSE_GRAPHS", false)
     }
 
     /// Every layer dense (no experts)? Then the dense graphed trunk can run.
@@ -4293,7 +4322,7 @@ impl ModelWeights {
     fn host_graphs_ok(&self) -> bool {
         static OK: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
         *OK.get_or_init(|| {
-            if !mistralrs_quant::titan_cfg::var("TITAN_HOST_GRAPHS").is_ok_and(|v| v == "1") {
+            if !mistralrs_quant::titan_cfg::flag("TITAN_HOST_GRAPHS", false) {
                 return false;
             }
             let one_device = self.mapper.as_ref().is_none_or(|m| m.get_unique_devices().len() == 1);
@@ -4498,7 +4527,7 @@ impl ModelWeights {
         let Some(mtp) = &self.mtp else {
             return Ok(None);
         };
-        if mistralrs_quant::titan_cfg::var("TITAN_MTP_NODRAFT").is_ok_and(|v| v == "1") {
+        if mistralrs_quant::titan_cfg::flag("TITAN_MTP_NODRAFT", false) {
             return Ok(None); // A/B: MTP block loaded (same VRAM plan), plain decoding
         }
         let t0 = std::time::Instant::now();

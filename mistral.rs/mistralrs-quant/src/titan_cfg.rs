@@ -38,6 +38,48 @@ pub fn var_os(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
 }
 
+/// An on/off setting: `1`/`true`/`on`/`yes`/`enable(d)` or `0`/`false`/`off`/`no`/`disable(d)` (any case,
+/// trimmed); unset means `default`. Anything else keeps `default` and warns once per setting. The settings
+/// used to disagree: some were on only for exactly "1" (so "true" meant off), others for anything but "0"
+/// (so "false" meant on), and neither said so.
+pub fn flag(name: &str, default: bool) -> bool {
+    match var(name) {
+        Err(_) => default,
+        Ok(v) => parse_flag(&v).unwrap_or_else(|| {
+            warn_once(name, &v, &default.to_string());
+            default
+        }),
+    }
+}
+
+fn parse_flag(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "off" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// A numeric setting; unset means `default`, and a value that does not parse keeps `default` and warns once
+/// per setting (it used to fall back silently).
+pub fn num<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, default: T) -> T {
+    match var(name) {
+        Err(_) => default,
+        Ok(v) => v.trim().parse::<T>().unwrap_or_else(|_| {
+            warn_once(name, &v, &default.to_string());
+            default
+        }),
+    }
+}
+
+fn warn_once(name: &str, value: &str, used: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(format!("{name}={value}")) {
+        tracing::warn!("titan setting {name}={value:?} is not understood; using {used}");
+    }
+}
+
 /// The settings generation; bumped by [`begin_model`] and [`end_model`].
 pub fn generation() -> u64 {
     GEN.load(Ordering::Acquire)
@@ -171,6 +213,28 @@ pub fn q3k_rows_enabled(dev: &candle_core::Device) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn flags_and_numbers_read_every_usual_spelling() {
+        for (v, want) in [("1", true), ("true", true), ("ON", true), (" yes ", true), ("0", false), ("false", false), ("Off", false), ("no", false)] {
+            assert_eq!(parse_flag(v), Some(want), "{v}");
+        }
+        assert_eq!(parse_flag("maybe"), None);
+        std::env::set_var("TITAN_CFG_TEST_FLAG", "true");
+        assert!(flag("TITAN_CFG_TEST_FLAG", false), "\"true\" used to mean off for exact-\"1\" settings");
+        std::env::set_var("TITAN_CFG_TEST_FLAG", "false");
+        assert!(!flag("TITAN_CFG_TEST_FLAG", true), "\"false\" used to mean on for anything-but-\"0\" settings");
+        std::env::set_var("TITAN_CFG_TEST_FLAG", "sometimes");
+        assert!(flag("TITAN_CFG_TEST_FLAG", true));
+        std::env::remove_var("TITAN_CFG_TEST_FLAG");
+        assert!(!flag("TITAN_CFG_TEST_FLAG", false));
+        std::env::set_var("TITAN_CFG_TEST_NUM", " 64 ");
+        assert_eq!(num("TITAN_CFG_TEST_NUM", 8usize), 64);
+        std::env::set_var("TITAN_CFG_TEST_NUM", "64x");
+        assert_eq!(num("TITAN_CFG_TEST_NUM", 8usize), 8);
+        std::env::remove_var("TITAN_CFG_TEST_NUM");
+    }
+
     use super::*;
 
     #[test]

@@ -591,7 +591,7 @@ pub(crate) fn flash_decode_rows(
 /// `TITAN_ATTN_F32REF=1`: see `run_attention_noflash` (a debug reference, off by default).
 fn f32_reference_attention() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_ATTN_F32REF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_ATTN_F32REF", false))
 }
 
 fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {

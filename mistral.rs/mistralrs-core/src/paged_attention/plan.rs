@@ -615,7 +615,7 @@ pub(crate) fn prompt_prefill_workspace(
 /// path needs to take the kernel (`TITAN_ATTN_FLASH_PREFILL_MIN`).
 pub(crate) fn titan_flash_prefill_planned(input: &PrefixPrefillPlanInput, query_len: usize, kv_len: usize) -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    let on = *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_PAGED_FLASH_PREFILL").map(|v| v != "0").unwrap_or(true));
+    let on = *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_PAGED_FLASH_PREFILL", true));
     on && input.device_is_cuda
         && !input.has_alibi
         && !input.has_sinks

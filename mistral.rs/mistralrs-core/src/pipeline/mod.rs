@@ -3868,7 +3868,7 @@ pub(crate) static TITAN_STEP: std::sync::Mutex<(std::time::Duration, u64)> =
 fn titan_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false)
+        mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false)
     })
 }
 

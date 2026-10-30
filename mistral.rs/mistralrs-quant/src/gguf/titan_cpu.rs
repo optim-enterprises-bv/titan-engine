@@ -475,7 +475,7 @@ pub fn vnni() -> bool {
         2 => true,
         _ => {
             let detected = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("avxvnni");
-            let on = detected && std::env::var("TITAN_CPU_VNNI").map_or(true, |v| v != "0");
+            let on = detected && crate::titan_cfg::flag("TITAN_CPU_VNNI", true);
             if STATE.swap(if on { 2 } else { 1 }, Relaxed) == 0 {
                 tracing::info!("titan cpu twin: integer dot {} (avxvnni detected: {detected})", if on { "AVX-VNNI" } else { "AVX2" });
             }

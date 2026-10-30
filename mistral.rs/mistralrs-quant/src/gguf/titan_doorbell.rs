@@ -64,7 +64,7 @@ fn collect_shape() -> (u32, u32) {
 
 pub(crate) fn enabled() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_DOORBELL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_DOORBELL", false))
 }
 
 /// Byte offsets of the mapped regions, sized for the first layer's shapes.
@@ -496,7 +496,15 @@ impl TieredExperts {
             return Ok(None);
         }
         db.start();
-        db.check()?;
+        if let Err(e) = db.check() {
+            // The previous pass failed (host panic or GPU wait timeout), so this request's last step ran
+            // without its CPU experts: fail it. But the failure used to be sticky (`failed` / CTL_ERR stayed
+            // set) and every later request failed until the model was unloaded. Drop the doorbell instead;
+            // the next forward creates a fresh one. `db` is not touched after this.
+            release();
+            tracing::error!("titan doorbell: reset after a failed CPU expert pass; the next request starts a fresh one");
+            return Err(e);
+        }
         let two_phase = onepass::mode() == 0;
         let dev = &gate.dev;
         if gate.pfs.is_some() {

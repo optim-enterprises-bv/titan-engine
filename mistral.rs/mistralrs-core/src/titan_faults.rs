@@ -15,7 +15,7 @@ const BUCKETS: [u64; 4] = [1, 2, 8, 64];
 
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_FAULT_LOG").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_FAULT_LOG", false))
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]

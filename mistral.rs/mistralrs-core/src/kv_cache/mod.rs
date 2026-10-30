@@ -97,7 +97,7 @@ pub(crate) fn cpu_kv_f16() -> bool {
 pub(crate) fn cuda_kv_fp8() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_KV_FP8").is_ok_and(|v| v == "1");
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_KV_FP8", false);
         if on {
             tracing::info!("titan kv: CUDA KV cache stored as F8E4M3");
         }

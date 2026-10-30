@@ -91,7 +91,7 @@ static MISS_POOL: crate::titan_cfg::GenCell<Option<super::titan_spin::SpinPool>>
 
 fn miss_pool() -> Option<&'static super::titan_spin::SpinPool> {
     MISS_POOL.get_or_init(|| {
-        if crate::titan_cfg::var("TITAN_TIERED_SPIN").is_ok_and(|v| v == "0") {
+        if !crate::titan_cfg::flag("TITAN_TIERED_SPIN", true) {
             return None;
         }
         // the calling thread works too; with the doorbell it is not the decode thread, and the memory-bound pass
@@ -212,7 +212,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// `TITAN_TIERED_WILLNEED=0` drops the within-layer MADV_WILLNEED hint on mapped misses.
 fn willneed_on() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_TIERED_WILLNEED").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_TIERED_WILLNEED", true))
 }
 
 /// `TITAN_TIERED_FINGERPRINT=M`: slots per tensor re-seeded from each request's prefill (0 = off).
@@ -421,7 +421,7 @@ fn trace_ids(f: &std::sync::Mutex<std::fs::File>, layer: usize, batch: usize, to
 }
 
 fn env_flag(name: &str) -> bool {
-    crate::titan_cfg::var(name).is_ok_and(|v| v == "1")
+    crate::titan_cfg::flag(name, false)
 }
 
 impl TieredExperts {

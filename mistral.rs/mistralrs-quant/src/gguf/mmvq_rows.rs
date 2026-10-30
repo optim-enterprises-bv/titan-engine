@@ -172,8 +172,10 @@ pub fn plain_rows_q8(w: &QTensor, x: &Q8Rows) -> Result<Tensor> {
         DType::F16 => (1, "f16"),
         _ => (2, "f32"),
     };
-    // Issue-bound single-row Q3_K: allow a different warp geometry (same dot, same order per warp).
-    let nw = if rows == 1 && w.dtype() == GgmlDType::Q3K { q3k_warps() } else { 0 };
+    // Issue-bound single-row Q3_K: allow a different warp geometry (same dot, same order per warp). Only the
+    // bf16-output kernels exist in that geometry (`…_bf16_rows1w{4,16}`); an f16/f32 row asked for a missing
+    // kernel and failed with CUDA_ERROR_NOT_FOUND, so it keeps the standard one.
+    let nw = if rows == 1 && w.dtype() == GgmlDType::Q3K && dst.0 == 0 { q3k_warps() } else { 0 };
     let func = if nw > 0 { rows_func_w(dev, fmt, dst, rows, nw)? } else { rows_func(dev, fmt, dst, rows)? };
 
     let stream = dev.cuda_stream();

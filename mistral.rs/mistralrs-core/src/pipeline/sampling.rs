@@ -1562,7 +1562,7 @@ pub async fn sample_sequence(
         }
     }
 
-    if std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false) {
+    if mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false) {
         super::titan_prof_add(&super::TITAN_SAMPLE, titan_t_sample.elapsed());
     }
     Ok(second_logprobs_response)

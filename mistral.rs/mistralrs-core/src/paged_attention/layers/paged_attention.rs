@@ -38,7 +38,7 @@ static UNCALIBRATED_FP8_ATTENTION_WARNING: Once = Once::new();
 /// and the path it took.
 fn pattn_trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_PATTN_TRACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_PATTN_TRACE", false))
 }
 
 #[cfg(all(feature = "cuda", target_family = "unix"))]

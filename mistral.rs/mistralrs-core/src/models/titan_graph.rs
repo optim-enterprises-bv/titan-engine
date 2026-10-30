@@ -29,7 +29,7 @@ use crate::pipeline::cuda_graph::{
 
 pub(crate) fn enabled() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_CUDA_GRAPHS", false))
 }
 
 /// Identifies one captured segment: what it computes (`tag`, `layer`) plus every value the capture

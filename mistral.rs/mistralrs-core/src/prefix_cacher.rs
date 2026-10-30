@@ -30,7 +30,7 @@ const BLOCK_PRESSURE_EVICTION_REASON: &str = "block_pressure";
 /// `TITAN_PREFIX_CACHE=0`: no prefix reuse for hybrid (recurrent) models.
 pub(crate) fn hybrid_prefix_cache_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| !mistralrs_quant::titan_cfg::var("TITAN_PREFIX_CACHE").is_ok_and(|v| v == "0"))
+    *ON.get_or_init(|| !!mistralrs_quant::titan_cfg::flag("TITAN_PREFIX_CACHE", true))
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

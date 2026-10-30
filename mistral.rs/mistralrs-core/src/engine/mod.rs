@@ -1576,6 +1576,11 @@ impl Engine {
                                 pipeline.cache(),
                                 crate::pipeline::EitherCache::Normal(_)
                             ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume());
+                            // Token counts before the step: an OOM raised after sampling had already
+                            // appended to (and maybe streamed for) a sequence must not run that
+                            // sequence again, so the retry only happens if nothing advanced.
+                            let toks_before: Vec<usize> =
+                                scheduled.prompt.iter().map(|seq| seq.get_toks().len()).collect();
 
                             // hybrid prefix-cache hits: their saved caches go into place now
                             let restored = scheduled
@@ -1607,7 +1612,16 @@ impl Engine {
                                         // free: two ~7.8k-token prompts failed at 11.3 GiB in use, and the same
                                         // pair succeeded right after the recovery below freed 6 GiB. Release
                                         // that and run the step once more before failing the request.
-                                        Err(e) if retryable_oom && crate::titan_swap::is_oom(&e) => {
+                                        Err(e)
+                                            if retryable_oom
+                                                && crate::titan_swap::is_oom(&e)
+                                                && scheduled
+                                                    .prompt
+                                                    .iter()
+                                                    .zip(&toks_before)
+                                                    .all(|(seq, n)| seq.get_toks().len() == *n) =>
+                                        {
+                                            tracing::warn!("titan: prompt step out of memory: {e}");
                                             let rows: usize =
                                                 scheduled.prompt.iter().map(|seq| seq.get_toks().len()).sum();
                                             // Free what the failure path would: the model cache the failed step
@@ -2448,7 +2462,7 @@ static TITAN_ENG: std::sync::Mutex<Vec<(&'static str, std::time::Duration, u64)>
 
 fn titan_eng_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false))
 }
 
 fn titan_eng_prof_add(tag: &'static str, d: std::time::Duration) {
