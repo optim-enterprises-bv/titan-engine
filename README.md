@@ -75,15 +75,17 @@ Only a fraction of each MoE layer's experts fits in VRAM. `TITAN_TIERED_GPU_FRAC
 the free memory after the dense weights, KV and a reserve. A hotness profile picks which experts stay resident
 (`TITAN_TIERED_PROFILE`, made from calibration prompts). An expert a token needs that is not on the GPU (a miss) is
 computed on the CPU in the same step. The CPU kernels are a "twin" of the GPU kernels: they emulate the GPU's
-reduction order, so a tiered forward and an all-resident forward produce the same text, byte for byte. As of
-2026-09-29 the CPU path may also use faster, numerically different kernels; those are gated statistically (KL,
-perplexity and task scores). Host experts are either owned in RAM or read through the GGUF mmap for models larger
+reduction order, so with those kernels a tiered forward and an all-resident forward produce the same text, byte for
+byte. That no longer holds for every configuration: one-pass misses (`TITAN_CPU_ONEPASS`, host `exp` in the SwiGLU) and
+PFS's default MMQ kernel are numerically different, and Sage runs both. Since 2026-09-29 the CPU path may also use
+faster, numerically different kernels; those are gated statistically (KL, perplexity and task scores). Host experts are either owned in RAM or read through the GGUF mmap for models larger
 than RAM (the 80B and 120B), with a router-lookahead prefetch.
 
 ### Doorbell and one-pass CPU experts
 With `TITAN_DOORBELL=1`, the expert ids and the quantized input of a layer are published to pinned, mapped host
-memory. A host thread answers, and the GPU waits in-stream, so there is no host synchronisation in the MoE layer and
-the step stays CUDA-graph capturable. With `TITAN_CPU_ONEPASS=1`, a miss runs gate/up, SwiGLU, the q8_1
+memory. A host thread answers, and the GPU waits in-stream, so there is no host synchronisation in the MoE layer.
+With CUDA graphs on, the routed experts of a tiered layer still run eagerly between graph segments; the doorbell does
+not put them inside a captured graph. With `TITAN_CPU_ONEPASS=1`, a miss runs gate/up, SwiGLU, the q8_1
 requantisation and down on the host in one pass, with no GPU round trip between the two projections. The CPU work
 runs on a spinning fork-join pool (waking a sleeping pool per pass cost more than the pass).
 
@@ -105,7 +107,11 @@ Decode attention over long contexts uses a split-K flash-decoding kernel. It is 
 
 ### Multi-token prediction (MTP)
 For Qwen3.6 GGUFs that carry the MTP head (`nextn_predict_layers`), `TITAN_MTP=N` drafts N tokens with it and
-verifies them in one batched forward. Greedy output is the same as without MTP; the release gate checks that.
+verifies them in one batched forward. Context lookup drafting (`TITAN_LOOKUP`, on by default next to MTP) adds the
+tokens that followed an earlier occurrence of the context's last tokens, so a batch-1 verification can be up to 8
+rows wide. The release gate checks greedy output against MTP off for the gated configurations; with the default
+`TITAN_VERIFY_MMQ=1` the verification runs on the MMQ tile, which is not the decode kernel, so equality there is
+measured rather than guaranteed by construction (see "Row-exact batched matvec").
 
 ### Hybrid prefix cache
 Qwen3.6 and Qwen3-Next mix Gated DeltaNet (recurrent) layers with attention layers, so a prompt prefix cannot be
@@ -114,8 +120,9 @@ MTP state are kept in host memory. A new prompt that shares a prefix resumes fro
 loops that is the difference between re-reading a 13k-token system prompt and not.
 
 ### Chunked prefill
-Unpaged prompt passes run in chunks (default 512 tokens). KV, RoPE and the mask continue at the chunk offset, the GDN
-convolution carries state across chunks, and MTP catches up per chunk. KV is reserved in 8192-token buckets, so long
+Unpaged prompt passes run in chunks: `TITAN_PREFILL_CHUNK` (default 512 tokens), with the bulk of a long prompt in
+`TITAN_PREFILL_BIG_CHUNK` chunks (default 2048; 0 turns them off) and the last stretch in the small ones. KV, RoPE and
+the mask continue at the chunk offset, the GDN convolution carries state across chunks, and MTP catches up per chunk. KV is reserved in 8192-token buckets, so long
 prompts do not fragment the device pool.
 
 ### Host-RAM KV cache (256k context on 16 GB)
@@ -135,24 +142,29 @@ sequence, and a batched verification rolls the GDN state back by replaying kept 
 copies did not fit next to a prefill). Further requests wait in the admission queue.
 
 ### Row-exact batched matvec
-An MTP verification multiplies 2 (or, batched, 4) activation rows by every weight matrix. The `rows` kernels
-(`oxide-kernels/mmvq-rows`) read and decode each weight block once for all rows, while reducing every row exactly as
-the batch-1 kernel does, so a verification row equals its decode step bit for bit (`oxide-kernels/mmvq-rows/src/gate.rs`
-checks this against nvcc). The Q4_K / Q5_K two-row kernels are capped at 48 registers (`#[launch_bounds]`): at 56
+An MTP verification multiplies several activation rows (MTP drafts plus lookup drafts, up to 8 at batch 1) by every
+weight matrix. The `rows` kernels (`oxide-kernels/mmvq-rows`) read and decode each weight block once for all rows,
+while reducing every row exactly as the batch-1 kernel does, so a verification row on them equals its decode step bit
+for bit (`oxide-kernels/mmvq-rows/src/gate.rs` checks this against nvcc). They are not the default verify path:
+`TITAN_VERIFY_MMQ` (on by default) sends verification to the MMQ tile instead; set it to 0 for the row-exact kernels. The Q4_K / Q5_K two-row kernels are capped at 48 registers (`#[launch_bounds]`): at 56
 the lost occupancy made one two-row launch slower than two one-row launches.
 
 ### nvcc-free build with cuda-oxide
 The kernels in the service path live in `oxide-kernels/`. They are Rust `#[kernel]` functions compiled to PTX by
 cuda-oxide's rustc backend: GGUF dequantisation, the Q8_0 and K-quant matvecs, the expert GEMVs, MMQ prefill tiles,
 the flash-decode kernel and the doorbell. The PTX is committed, so building the engine needs Rust and the CUDA
-libraries and headers (cuBLAS, NVRTC, driver), but no nvcc. Rebuilding the kernels themselves needs cuda-oxide; see
+driver, but no nvcc; the installed binary links only `libcuda.so.1` (no cuBLAS, cuBLASLt, cuRAND or NVRTC). Rebuilding the kernels themselves needs cuda-oxide; see
 `cuda-oxide-fast/README.md`. Ported kernels are checked against llama.cpp's output bits by the benchmark's kernel tier.
 
 ### Kernel verification
 Each ported kernel has a gate crate that runs the same entry on the same inputs twice - once from the reference
 (llama.cpp `acecd560`, or the PrismML sm_120 build where the pinned one does not execute) and once from the
-cuda-oxide module - then compares the outputs byte for byte. The tally is `oxide-kernels/GATES.md`: **28 crates
-pass, and nothing in the tree is blocked by the GPU.**
+cuda-oxide module - then compares the outputs byte for byte. The tally is `oxide-kernels/GATES.md`: 28 gate rows pass,
+and nothing in the tree is blocked by the GPU. The gates are binaries run by hand (not `cargo test`, not CI), and
+several kernel crates in the served binary have no gate row. `oxide-kernels/check_ptx_copies.py` checks that each PTX the
+engine embeds is the build of its crate (ignoring function order); as of 2026-10-31 thirteen match and twelve do not
+(gemm, mxfp4, q1_0, ptq1_0, the fmt_mmq builds; `titan_kernels_oxide` has no crate), so those are not established as
+the gated build.
 
 Headline numbers on this box (RTX 5080 Laptop, cc 12.0):
 
