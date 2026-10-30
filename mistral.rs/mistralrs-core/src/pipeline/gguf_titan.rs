@@ -725,6 +725,10 @@ impl Pipeline for TitanGGUFPipeline {
         }
     }
 
+    fn supports_hybrid_prefix(&self) -> bool {
+        true
+    }
+
     fn hybrid_prefix_export(
         &self,
         seq: &Sequence,

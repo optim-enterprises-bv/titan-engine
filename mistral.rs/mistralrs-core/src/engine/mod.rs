@@ -760,6 +760,49 @@ impl Engine {
 
     /// Keep the caches of every hybrid sequence that finished in the step just run (from its own copies, so a
     /// batched step works too), for prefix reuse by a later request.
+    /// Unpaged hybrid models whose pipeline keeps no resume points of its own (lfm3 through the
+    /// NormalPipeline): keep each prompt's caches with its recurrent state at the end of the prompt. A
+    /// recurrent entry is only usable at exactly its own length, and the entry a finished sequence leaves
+    /// (prompt + generated tokens) never lines up with the next turn, which re-renders the assistant
+    /// message: the cache filled up and never hit. The next turn does start with this prompt.
+    fn save_prompt_point(&self, seqs: &mut [&mut crate::sequence::Sequence]) {
+        let pipeline = get_mut_arcmutex!(self.pipeline);
+        if pipeline.get_metadata().no_kv_cache
+            || !pipeline.cache().is_hybrid()
+            || pipeline.get_metadata().cache_engine.is_some()
+            || pipeline.supports_hybrid_prefix()
+        {
+            return;
+        }
+        let mut cacher = get_mut_arcmutex!(self.prefix_cacher);
+        if !cacher.accepts_sequence_cache() {
+            return;
+        }
+        for seq in seqs.iter_mut() {
+            if seq.has_images() || seq.has_audios() || seq.has_videos() {
+                continue;
+            }
+            // the entry shares buffers with the still-running sequence: a normal cache only grows past
+            // the saved length, a rotating one overwrites in place
+            if seq.normal_cache().iter().flatten().any(|l| matches!(l, crate::pipeline::KvCache::Rotating { .. })) {
+                continue;
+            }
+            let Some(idx) = seq.recurrent_state_idx() else {
+                continue;
+            };
+            if pipeline.flush_recurrent_speculative_transitions(&[*seq.id()]).is_err() {
+                continue;
+            }
+            match pipeline.cache().hybrid().snapshot_recurrent_state(*seq.id(), idx) {
+                Ok(snapshots) => cacher.add_sequence(seq, Some(snapshots)),
+                Err(error) => tracing::debug!(sequence_id = seq.id(), %error, "prompt point not cached"),
+            }
+        }
+        if let Err(error) = cacher.evict_caches() {
+            tracing::warn!(%error, "prefix cache eviction failed");
+        }
+    }
+
     fn save_hybrid_prefix(&self, seqs: &[&mut crate::sequence::Sequence]) {
         for seq in seqs.iter().filter(|seq| matches!(seq.getstate(), SequenceState::Done(_))) {
             self.save_hybrid_prefix_one(seq);
@@ -1690,6 +1733,7 @@ impl Engine {
                             self.prefix_cacher
                         );
                         self.save_hybrid_prefix(&scheduled.prompt);
+                        self.save_prompt_point(&mut scheduled.prompt);
 
                         let total_processed_tokens: usize = scheduled
                             .prompt

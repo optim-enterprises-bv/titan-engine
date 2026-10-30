@@ -1940,6 +1940,14 @@ pub trait Pipeline:
         candle_core::bail!("this pipeline cannot resume a hybrid prefix-cache entry")
     }
 
+    /// Whether this pipeline keeps unpaged hybrid sequences itself (`hybrid_prefix_export` /
+    /// `hybrid_prefix_restore` at saved resume points). Hybrid pipelines that do not (lfm3 through the
+    /// NormalPipeline) use the sequence-level prefix cache with recurrent snapshots; routing them to the
+    /// hybrid path, which only titan fills, left them with no prefix cache at all.
+    fn supports_hybrid_prefix(&self) -> bool {
+        false
+    }
+
     /// Hybrid prefix cache: host copies of the caches of `seq`, which finished in the step just run
     /// (as the only sequence of that step).
     fn hybrid_prefix_export(

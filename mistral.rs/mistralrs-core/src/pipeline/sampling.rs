@@ -157,7 +157,7 @@ pub(crate) fn cache_finished_sequence(
     // titan: a hybrid model's recurrent state cannot be rewound to a partial match, and here (mid-
     // verification with MTP) the caches may still hold rejected rows. Unpaged hybrid sequences are
     // kept by the engine after the step instead (Engine::save_hybrid_prefix), at saved resume points.
-    if this.cache().is_hybrid() {
+    if this.cache().is_hybrid() && this.supports_hybrid_prefix() {
         prefix_cacher.evict_caches()?;
         return Ok(());
     }
