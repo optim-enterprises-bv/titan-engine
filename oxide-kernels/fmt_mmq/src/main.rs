@@ -719,10 +719,8 @@ mod kernels {
         n.wrapping_sub(fdiv(n, f).wrapping_mul(f.d))
     }
 
-    /// tile<16,8,int> via ldmatrix.sync.aligned.m8n8.x4.b16 (generic address, as the reference).
-    #[inline(always)]
-
     /// m16n8k16 A fragment: 16 rows x 16 int8 -> 2 registers (lanes 0..15 supply the row addresses).
+    #[inline(always)]
     unsafe fn ldmatrix_a16(xs0: *const i32, stride: i32) -> [u32; 2] {
         let lane = tx();
         let p = xs0.wrapping_offset(((lane % 16) * stride) as isize);
@@ -735,11 +733,13 @@ mod kernels {
         [a0, a1]
     }
     /// m16n8k16 B fragment: 8 rows x 16 int8 -> 1 register.
+    #[inline(always)]
     unsafe fn load_b16(xs0: *const i32, stride: i32) -> u32 {
         let lane = tx();
         let base = (lane / 4) * stride + lane % 4;
         *xs0.offset(base as isize) as u32
     }
+    #[inline(always)]
     unsafe fn mma_s8_16(a: [u32; 2], b: u32) -> [i32; 4] {
         let (d0, d1, d2, d3): (i32, i32, i32, i32);
         ptx_asm!(
@@ -751,6 +751,10 @@ mod kernels {
         [d0, d1, d2, d3]
     }
 
+    /// tile<16,8,int> via ldmatrix.sync.aligned.m8n8.x4.b16 (generic address, as the reference).
+    // (this and vec_dot_q8_0 lost their #[inline(always)] when the k16 helpers were inserted above them;
+    // out of line, `sum` went to local memory and IQ4_XS / IQ4_NL prefill ran 2.5x slower)
+    #[inline(always)]
     unsafe fn ldmatrix_a(xs0: *const i32, stride: i32) -> [u32; 4] {
         let lane = tx();
         let p = xs0.wrapping_offset(((lane % 16) * stride + (lane / 16) * 4) as isize);
@@ -1239,16 +1243,13 @@ mod kernels {
         }
     }
 
-    /// ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<.., MMQ_Q8_1_DS_LAYOUT_D4> (NVIDIA branch):
-    /// `sum += (dA * (float) C) * dB` as mul.ftz + fma.ftz.
-    #[inline(always)]
-
     /// `ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma`: the NVFP4 int8 dot.
     ///
     /// Bit-identical to the reference, which means matching its exact loop nesting: `k01` (one 16-value
     /// step) outermost, then `j0`, then `n`, with a single `sum += C*dA*dB` per 16-value group. Any other
     /// nesting (j outer, or both halves of a 32-value chunk accumulated together) is arithmetically equal
     /// but rounds differently, which shows up as 15% of bytes differing in the low byte.
+    #[inline(always)]
     unsafe fn vec_dot_q8_0_16<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
         let ntx = Jc::<J>::NTX;
         let rows_per_warp = 16 * ntx;
@@ -1293,7 +1294,9 @@ mod kernels {
         }
     }
 
-
+    /// ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<.., MMQ_Q8_1_DS_LAYOUT_D4> (NVIDIA branch):
+    /// `sum += (dA * (float) C) * dB` as mul.ftz + fma.ftz.
+    #[inline(always)]
     unsafe fn vec_dot_q8_0<const J: i32, const SRAM: i32>(sum: &mut [f32; 64], k00: i32) {
         let ntx = Jc::<J>::NTX;
         let rows_per_warp = 16 * ntx;

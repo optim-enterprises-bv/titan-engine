@@ -4,7 +4,7 @@ oxide-kernels crate.
 
 A shipped copy's crate is the crate PTX that defines all of the copy's kernel entries. The two are compared
 as the multiset of their top-level blocks (functions, entries, globals) with comments dropped and branch labels
-renumbered: the compiler does not keep function order stable between builds (and labels carry the function's
+renumbered and Rust crate hashes dropped from mangled names: the compiler does not keep function order stable between builds (and labels carry the function's
 position), so a byte compare would flag equivalent builds.
 
     python3 oxide-kernels/check_ptx_copies.py        # from the titan-engine root; exit 1 on any mismatch
@@ -22,13 +22,16 @@ BLOCK_START = re.compile(r"^(\.visible |\.extern |\.weak )?(\.entry|\.func|\.glo
 LABEL = re.compile(r"\$L__BB\d+_")
 # shared-memory symbols are numbered in emission order too
 SHARED = re.compile(r"__shared_mem_\d+")
+# Rust v0 mangling embeds the crate's disambiguator hash (`Cs<hash>_`), which changes with the build path
+CRATE_HASH = re.compile(r"Cs[0-9A-Za-z]{6,}_")
 
 
 def blocks(path):
     """Top-level PTX blocks, comments stripped, as a Counter of their text."""
     out, cur, depth = collections.Counter(), [], 0
     for line in open(path, encoding="utf-8", errors="replace"):
-        line = SHARED.sub("__shared_mem_", LABEL.sub("$L__BB_", line.split("//", 1)[0].rstrip()))
+        line = line.split("//", 1)[0].rstrip()
+        line = CRATE_HASH.sub("Cs_", SHARED.sub("__shared_mem_", LABEL.sub("$L__BB_", line)))
         if not line:
             continue
         if depth == 0 and not cur and not BLOCK_START.match(line):
@@ -62,8 +65,9 @@ def shipped():
 
 def main():
     crates = {}
-    for name in sorted(os.listdir(CRATES)):
-        d = os.path.join(CRATES, name)
+    # the gated crates, plus titan-kernels-oxide (kept at the repo root)
+    dirs = [os.path.join(CRATES, n) for n in sorted(os.listdir(CRATES))] + [os.path.join(ROOT, "titan-kernels-oxide")]
+    for d in dirs:
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if f.endswith(".ptx"):
