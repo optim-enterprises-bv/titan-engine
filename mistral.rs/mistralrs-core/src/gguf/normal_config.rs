@@ -3031,6 +3031,7 @@ mod tests {
             NormalLoaderType::Spark2_5 => {
                 assert_deserializes::<models::spark2_5::Config>(loader, config)
             }
+            NormalLoaderType::Lfm3 => assert_deserializes::<models::lfm3::Config>(loader, config),
         }
     }
 

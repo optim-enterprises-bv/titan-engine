@@ -95,10 +95,13 @@ xml_param_lt: {}
 }
 
 // Any `<` that does not open the closing `</parameter>` tag may appear inside a value (HTML, XML, code).
+// Once a value holds `</parameter`, the only continuation is `>`: nothing a value carries looks like that
+// except a botched close. Allowing `</parameter=path>` as value text let Spark-4B write it, then
+// `</function>` and `</invoke>` until max_tokens, all inside the value, so the call never closed or parsed.
 fn xml_param_lt_rule() -> String {
     const CLOSE: &str = "/parameter>";
     let mut alternatives = vec![r#""<" /[^\/]/"#.to_string()];
-    for (idx, ch) in CLOSE.chars().enumerate().skip(1) {
+    for (idx, ch) in CLOSE.chars().enumerate().skip(1).filter(|(_, ch)| *ch != '>') {
         let prefix = &CLOSE[..idx];
         let escaped = if ch == '/' {
             "\\/".to_string()
@@ -486,6 +489,41 @@ print(1 < 2)
 
         assert!(mask.is_allowed(start_token));
         matcher.consume_token(start_token).unwrap();
+    }
+
+    /// `</parameter` inside a value can only become the close: `</parameter=path>` is rejected, while
+    /// `</b>` and `</param` stay ordinary value text.
+    #[test]
+    fn a_value_cannot_hold_a_botched_parameter_close() {
+        let parameters: HashMap<String, Value> = serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+            "required": ["path"]
+        }))
+        .unwrap();
+        let tool = crate::Tool {
+            tp: ToolType::Function,
+            function: Function { name: "write_file".to_string(), description: None, parameters: Some(parameters), strict: None },
+        };
+        let grammar = QwenParser.tool_call_grammar(&[tool], "<tool_call>");
+        let trie = wrapper_token_trie();
+        let env: toktrie::TokEnv = Arc::new(GreedyTokenizerEnv { trie: trie.clone() });
+        let factory = llguidance::ParserFactory::new_simple(&env).unwrap();
+        let mut matcher = llguidance::Matcher::new(Ok(factory.create_parser(grammar).unwrap()));
+        let feed = |matcher: &mut llguidance::Matcher, text: &str| {
+            for token in trie.greedy_tokenize(text.as_bytes()) {
+                assert!(matcher.compute_mask().unwrap().is_allowed(token), "rejected {text:?}");
+                matcher.consume_token(token).unwrap();
+            }
+        };
+        feed(&mut matcher, "\n<function=write_file>\n<parameter=content>\n# Report </b> </param x\n</parameter");
+        let eq = trie.greedy_tokenize(b"=")[0];
+        let gt = trie.greedy_tokenize(b">")[0];
+        let mask = matcher.compute_mask().unwrap();
+        assert!(!mask.is_allowed(eq), "`</parameter=` must not continue a value");
+        assert!(mask.is_allowed(gt));
+        feed(&mut matcher, ">\n<parameter=path>\n/tmp/r.md\n</parameter>\n</function>\n");
+        assert!(matcher.compute_mask().unwrap().is_allowed(trie.get_special_token("</tool_call>").unwrap()));
     }
 
     #[test]
