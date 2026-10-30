@@ -72,3 +72,12 @@ affect it.
   can be compared against a real `sm_120a` binary.
 - `FMT_MMQ_RATE=<n>` -- override the specials density for every case; a huge value means no inf/nan/denormal
   poisoning, which is the only way to see the arithmetic on its own.
+
+## Resolved 2026-10-31
+
+The residual was the dot, not the tile or the scales. The port of `ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma` followed the
+branch the reference compiles for AMD (k01 outermost, one `sum += C*dA*dB` per 16 values). On this card nvcc builds the
+`TURING_MMA_AVAILABLE` branch: `j0` outermost, `k01` in steps of 8, two m16n8k16 MMAs per step and
+`sum += dB * (C0*dA0 + C1*dA1)`, emitted as `mul(dA1, C1)`, `fma(dA0, C0, .)`, `fma(dB, ., sum)`.
+`vec_dot_q8_0_16_turing` is that branch; nvfp4q8 is bit-identical with it (469 launches, 0 failing) and in the default
+run. IQ2_XS / IQ2_S use the same dot.

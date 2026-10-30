@@ -421,27 +421,6 @@ impl GgufMatMul {
                 return Ok(None);
             }
         }
-        // i-quants with an MMVQ (decode) but no MMQ port: a prefill batch dequantizes the whole weight to f32 and runs
-        // cuBLAS on every call. Correct, but slow on long prompts; say so once rather than leave it silent.
-        if let QMatMul::QTensor(q) = &self.w {
-            if q.device().is_cuda() && matches!(
-                    q.dtype(),
-                    GgmlDType::IQ3S | GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ2XS
-                ) {
-                // candle's llama_fmt path keeps its MMVQ up to 8 rows (mmvq_1..8) and dequantizes above that
-                const CANDLE_LLAMA_MMVQ_MAX: usize = 8;
-                let flat_batch = a.dims()[..a.dims().len().saturating_sub(1)].iter().product::<usize>();
-                if flat_batch > CANDLE_LLAMA_MMVQ_MAX {
-                    let dtype = q.dtype();
-                    crate::titan_cfg::note_once(&format!("dequant-prefill-{dtype:?}"), || {
-                        format!(
-                            "titan: {dtype:?} has no MMQ kernel; prefill batches over {CANDLE_LLAMA_MMVQ_MAX} rows \
-                             dequantize each weight to f32 + cuBLAS per call"
-                        )
-                    });
-                }
-            }
-        }
         if !self.uses_fast_mmvq() || !matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32) {
             return Ok(None);
         }

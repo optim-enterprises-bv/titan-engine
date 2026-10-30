@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """export_ptx.py [mistral.rs dir]: split fmt_mmq.ptx into the per-format prefill modules mistral.rs
-embeds (mistralrs-quant/src/gguf/{iq4_nl,mxfp4,nvfp4,iq4_xs}_mmq_oxide.ptx: the format's activation
+embeds (mistralrs-quant/src/gguf/{iq4_nl,mxfp4,nvfp4,iq4_xs,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s}_mmq_oxide.ptx: the format's activation
 quantizers, mul_mat_q instances and stream-k fixups), so each JIT-compiles only what its model
 uses. Every non-entry item (.func bodies, extern shared declarations) is kept in each module."""
 import re, subprocess, sys, os
@@ -18,8 +18,10 @@ head = "\n".join(lines[: starts[0]])
 ok = True
 # IQ4_XS's prefill uses IQ4_NL's activation quantizer (quantize_mmq_q8_1<D4>); the gate mutants
 # (`iq4_xs_mut*`) are not exported.
-QUANT_FROM = {"iq4_xs": "iq4_nl_quantize_mmq_d4_"}
-for fmt in ("iq4_nl", "mxfp4", "nvfp4", "iq4_xs"):
+# the i-quants' prefill uses the same activation quantizer (all D4 layout)
+IQUANTS = ("iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s")
+QUANT_FROM = {f: "iq4_nl_quantize_mmq_d4_" for f in ("iq4_xs",) + IQUANTS}
+for fmt in ("iq4_nl", "mxfp4", "nvfp4", "iq4_xs") + IQUANTS:
     out, n = [head], 0
     for s, e, ent in items:
         if ent is not None and "_mut" in ent:

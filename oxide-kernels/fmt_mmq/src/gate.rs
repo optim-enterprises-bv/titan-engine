@@ -318,17 +318,22 @@ fn input(r: &mut Rng, it: usize, n: usize, rate: u64) -> (Vec<u8>, Vec<u8>) {
 
 pub struct M {
     pub quant: cu::CUmodule,
-    pub mmq: [cu::CUmodule; 6],
+    pub mmq: [cu::CUmodule; 11],
     pub ox: cu::CUmodule,
 }
 
-const FMT: [&str; 6] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8", "nvfp4q8"];
-const GGML_TYPE: [u32; 6] = [20, 39, 40, 23, 39, 40];
-const QK: [i32; 6] = [32, 32, 64, 256, 32, 64];
-const BYTES: [usize; 6] = [18, 17, 36, 136, 17, 36];
+// 6..10: the grid i-quants (one 256-value block per tile iteration, IQ4_NL's activation quantizer)
+const FMT: [&str; 11] = ["iq4_nl", "mxfp4", "nvfp4", "iq4_xs", "mxfp4q8", "nvfp4q8", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s"];
+const GGML_TYPE: [u32; 11] = [20, 39, 40, 23, 39, 40, 16, 17, 22, 18, 21];
+const QK: [i32; 11] = [32, 32, 64, 256, 32, 64, 256, 256, 256, 256, 256];
+const BYTES: [usize; 11] = [18, 17, 36, 136, 17, 36, 66, 74, 82, 98, 110];
+/// IQ4_XS and the grid i-quants: 256-value blocks, one per tile iteration
+fn qk256(f: usize) -> bool {
+    f == 3 || f >= 6
+}
 /// values per activation block (block_q8_1_mmq / block_fp4_mmq)
 // indices 4 and 5 are the int8 (q8_1) paths: 128-value activation blocks, not the 256-value fp4 ones
-const NEB: [i64; 6] = [128, 256, 256, 128, 128, 128];
+const NEB: [i64; 11] = [128, 256, 256, 128, 128, 128, 128, 128, 128, 128, 128];
 const TY: [&str; 3] = ["f32", "f16", "bf16"];
 
 // ---------------------------------------------------------------------------------------------
@@ -457,6 +462,16 @@ fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
                 v.push(e);
                 v.extend_from_slice(&r.bytes(16));
             }
+            6..=10 => {
+                // block_iq2_xxs / iq2_xs / iq2_s / iq3_xxs / iq3_s: half d, then codes, signs, scales
+                let d = if r.next() % rate == 0 {
+                    [0u16, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x7bff][(r.next() % 8) as usize]
+                } else {
+                    0x1000 + (r.next() % 0x1000) as u16 | (((r.next() & 1) as u16) << 15)
+                };
+                v.extend_from_slice(&d.to_le_bytes());
+                v.extend_from_slice(&r.bytes(BYTES[f] - 2));
+            }
             3 => {
                 // block_iq4_xs: d, scales_h, scales_l[4], qs[128]
                 let d = if r.next() % rate == 0 {
@@ -483,7 +498,7 @@ fn x_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
 fn y_blocks(r: &mut Rng, f: usize, n: usize, rate: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 144);
     for _ in 0..n {
-        match if f == 4 || f == 5 { 0 } else { f } {
+        match if f == 4 || f == 5 || f >= 6 { 0 } else { f } {
             0 | 3 => {
                 for _ in 0..4 {
                     let d = acts(r, 1, rate, true)[0].abs() / 127.0;
@@ -578,7 +593,7 @@ fn mmq_case_named(m: &M, t: &mut Tally, r: &mut Rng, f: usize, c: &MmqCase, nsm:
     // The NVFP4 sram layout has stride 84 rather than 76, so its tile needs 128*(84-76)*4 more bytes.
     let smem = mmq_smem(j)
         // stride 84 instead of 76 over a 128-row tile, for both the int8 tile and its scale array
-        + if f == 5 { 128 * 8 * 4 * 2 } else { 0 }
+        + if f == 5 || f == 7 || f == 8 { 128 * 8 * 4 * 2 } else { 0 }
         + std::env::var("FMT_MMQ_SMEM_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
     let stride_ch_y = nyb_ch * 36;
     let mmq_params = |dst: &Buf, tmp: &Buf| {
@@ -813,6 +828,11 @@ fn modules() -> M {
             load(&format!("{dir}/ref/mmq_iq4_xs.cubin")),
             load(&format!("{dir}/ref/mmq_mxfp4_q8.cubin")),
             load(&format!("{dir}/ref/mmq_nvfp4_q8.cubin")),
+            load(&format!("{dir}/ref/mmq_iq2_xxs.cubin")),
+            load(&format!("{dir}/ref/mmq_iq2_xs.cubin")),
+            load(&format!("{dir}/ref/mmq_iq2_s.cubin")),
+            load(&format!("{dir}/ref/mmq_iq3_xxs.cubin")),
+            load(&format!("{dir}/ref/mmq_iq3_s.cubin")),
         ],
         ox: load(&std::env::var("FMT_MMQ_MODULE").unwrap_or_else(|_| format!("{dir}/fmt_mmq.ptx"))),
     }
@@ -911,9 +931,8 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     let allow_bs = std::env::var("FMT_MMQ_NO_BLOCKSCALED").is_err();
     let fmts: Vec<usize> = match only {
         Some(f) => vec![f],
-        // slot 5 (NVFP4 int8) needs the m16n8k16 dot with 16-value scales, see the note in main.rs;
-        // until that exists it must not take the default run down.
-        None => vec![0, 1, 2, 3, 4],
+        // every slot, NVFP4's int8 one (5) included: with the NVIDIA k16 dot it is bit-identical
+        None => vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
     }
     .into_iter()
     .filter(|&f| {
@@ -925,7 +944,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     })
     .collect();
     // quantizers (IQ4_XS uses IQ4_NL's)
-    for &f in fmts.iter().filter(|&&f| f != 3) {
+    for &f in fmts.iter().filter(|&&f| !qk256(f)) {
         let min_k = if f == 2 { 64 } else { 128 };
         for it in 0..3 {
             let shapes: &[(i64, i64, i64, i64, i64, bool)] = &[
@@ -954,7 +973,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
     // MMQ
     let nsm = nsm();
     for &f in &fmts {
-        let k_unit = if f == 0 || f == 3 { 256 } else { 512 };
+        let k_unit = if f == 0 || qk256(f) { 256 } else { 512 };
         let mut cases = vec![];
         for &j in &MMQ_J_NC {
             cases.push(MmqCase { nrows: 256, k: 2 * k_unit, ncols: j, pad_row: 0, grid: None, nch: 1, yscale: true });
@@ -971,7 +990,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
         }
         // K not a multiple of the tile iteration (the reference reads the next blocks: identical bytes)
         // (IQ4_XS: one block is one tile iteration, K is always a whole number of them)
-        if f != 3 {
+        if !qk256(f) {
             cases.push(MmqCase { nrows: 256, k: 3 * k_unit / 2, ncols: 33, pad_row: 1, grid: None, nch: 1, yscale: true });
         }
         // channels (x broadcast over 2 / 3 y channels)
@@ -985,7 +1004,7 @@ pub fn run_gate(quick: bool, only: Option<usize>) -> bool {
                 }
             }
             // IQ4_XS: the rest of Qwen3.5-27B (OrcaSAQ-2): 5120 -> 48 / 12288, 6144 / 10240 -> 5120
-            if f == 3 {
+            if qk256(f) {
                 for &(nrows, k) in &[(48, 5120), (12288, 5120), (5120, 6144), (5120, 10240)] {
                     for &ncols in &[9, 64, 512] {
                         cases.push(MmqCase { nrows, k, ncols, pad_row: 0, grid: None, nch: 1, yscale: true });
@@ -1145,6 +1164,6 @@ pub fn run() -> bool {
         return true;
     }
     let quick = args.iter().any(|a| a == "--quick");
-    let only = args.iter().find_map(|a| a.strip_prefix("--fmt=")).map(|s| FMT.iter().position(|&n| n == s).expect("--fmt=iq4_nl|mxfp4|nvfp4|iq4_xs"));
+    let only = args.iter().find_map(|a| a.strip_prefix("--fmt=")).map(|s| FMT.iter().position(|&n| n == s).expect("--fmt=iq4_nl|mxfp4|nvfp4|iq4_xs|mxfp4q8|nvfp4q8|iq2_xxs|iq2_xs|iq2_s|iq3_xxs|iq3_s"));
     run_gate(quick, only)
 }

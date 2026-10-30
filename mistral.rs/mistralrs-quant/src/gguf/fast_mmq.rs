@@ -568,6 +568,9 @@ struct LlamaMmq {
     iter_k: usize,
     /// index of this format in the function cache (slots 1000 + 200 * fi ..)
     fi: usize,
+    /// shared memory beyond the stride-76 tile: the Q3_K layout (stride 84, IQ2_XS / IQ2_S) needs
+    /// 128 rows x 8 more ints for the quants and for the scales
+    smem_extra: u32,
     ws: &'static OnceLock<super::fast_mmvq::Q1WsMap>,
 }
 
@@ -585,6 +588,7 @@ static IQ4_NL_MMQ: LlamaMmq = LlamaMmq {
     neb: 128,
     iter_k: 256,
     fi: 0,
+    smem_extra: 0,
     ws: &IQ4_NL_MMQ_WS,
 };
 static MXFP4_MMQ: LlamaMmq = LlamaMmq {
@@ -595,6 +599,7 @@ static MXFP4_MMQ: LlamaMmq = LlamaMmq {
     neb: 256,
     iter_k: 512,
     fi: 1,
+    smem_extra: 0,
     ws: &MXFP4_MMQ_WS,
 };
 static NVFP4_MMQ: LlamaMmq = LlamaMmq {
@@ -605,6 +610,7 @@ static NVFP4_MMQ: LlamaMmq = LlamaMmq {
     neb: 256,
     iter_k: 512,
     fi: 2,
+    smem_extra: 0,
     ws: &NVFP4_MMQ_WS,
 };
 
@@ -618,6 +624,7 @@ static PTQ1_0_MMQ: LlamaMmq = LlamaMmq {
     neb: 128,
     iter_k: 256,
     fi: 3,
+    smem_extra: 0,
     ws: &PTQ1_0_MMQ_WS,
 };
 
@@ -633,8 +640,35 @@ static IQ4_XS_MMQ: LlamaMmq = LlamaMmq {
     neb: 128,
     iter_k: 256,
     fi: 4,
+    smem_extra: 0,
     ws: &IQ4_XS_MMQ_WS,
 };
+
+// The grid i-quants (types 16, 17, 22, 18, 21; dense): `mul_mat_q<IQ*, J, fallback>` from oxide-kernels/fmt_mmq,
+// bit-identical to llama.cpp acecd560 (mmq-config-ampere.cuh, D4 activations from IQ4_NL's quantizer, one
+// 256-value block per tile iteration). IQ2_XS / IQ2_S use the Q3_K SRAM layout (stride 84) and the 16-value-
+// scale dot. Before these, their prefill dequantized each weight to f32 for cuBLAS on every call.
+macro_rules! iquant_mmq {
+    ($ws:ident, $st:ident, $name:literal, $file:literal, $module:literal, $fi:literal, $extra:expr) => {
+        static $ws: OnceLock<super::fast_mmvq::Q1WsMap> = OnceLock::new();
+        static $st: LlamaMmq = LlamaMmq {
+            name: $name,
+            ptx: include_str!($file),
+            module: $module,
+            qk: 256,
+            neb: 128,
+            iter_k: 256,
+            fi: $fi,
+            smem_extra: $extra,
+            ws: &$ws,
+        };
+    };
+}
+iquant_mmq!(IQ2_XXS_MMQ_WS, IQ2_XXS_MMQ, "iq2_xxs", "iq2_xxs_mmq_oxide.ptx", "titan_iq2_xxs_mmq", 5, 0);
+iquant_mmq!(IQ2_XS_MMQ_WS, IQ2_XS_MMQ, "iq2_xs", "iq2_xs_mmq_oxide.ptx", "titan_iq2_xs_mmq", 6, 128 * 8 * 4 * 2);
+iquant_mmq!(IQ2_S_MMQ_WS, IQ2_S_MMQ, "iq2_s", "iq2_s_mmq_oxide.ptx", "titan_iq2_s_mmq", 7, 128 * 8 * 4 * 2);
+iquant_mmq!(IQ3_XXS_MMQ_WS, IQ3_XXS_MMQ, "iq3_xxs", "iq3_xxs_mmq_oxide.ptx", "titan_iq3_xxs_mmq", 8, 0);
+iquant_mmq!(IQ3_S_MMQ_WS, IQ3_S_MMQ, "iq3_s", "iq3_s_mmq_oxide.ptx", "titan_iq3_s_mmq", 9, 0);
 
 fn llama_mmq(dtype: GgmlDType) -> Option<&'static LlamaMmq> {
     match dtype {
@@ -643,6 +677,11 @@ fn llama_mmq(dtype: GgmlDType) -> Option<&'static LlamaMmq> {
         GgmlDType::MXFP4 => Some(&MXFP4_MMQ),
         GgmlDType::NVFP4 => Some(&NVFP4_MMQ),
         GgmlDType::IQ4XS => Some(&IQ4_XS_MMQ),
+        GgmlDType::IQ2XXS => Some(&IQ2_XXS_MMQ),
+        GgmlDType::IQ2XS => Some(&IQ2_XS_MMQ),
+        GgmlDType::IQ2S => Some(&IQ2_S_MMQ),
+        GgmlDType::IQ3XXS => Some(&IQ3_XXS_MMQ),
+        GgmlDType::IQ3S => Some(&IQ3_S_MMQ),
         _ => None,
     }
 }
@@ -719,7 +758,7 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
         let z64 = 0u64;
         if quantize {
             let quant = super::fast_mmvq::q1_0_func(dev, slot0 + ti, f.module, f.ptx, || match f.fi {
-                0 | 4 => format!("iq4_nl_quantize_mmq_d4_{ts}"),
+                0 | 4..=9 => format!("iq4_nl_quantize_mmq_d4_{ts}"),
                 3 => format!("ptq1_0_quantize_mmq_d4_{ts}"),
                 _ => format!("{}_quantize_mmq_{ts}", f.name),
             })?;
@@ -728,8 +767,8 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
             let mut b = stream.launch_builder(&quant);
             let cfg = match f.fi {
                 // quantize_mmq_q8_1 / quantize_mmq_mxfp4: x, ids, vy, ne00, s01, s02, s03, ne0,
-                // ne1, ne2, n_expert_used (int)
-                0 | 1 | 4 => {
+                // ne1, ne2, n_expert_used (int); IQ4_XS and the grid i-quants take IQ4_NL's
+                0 | 1 | 4..=9 => {
                     b.arg(&x_ptr).arg(&z64).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
                     b.arg(&ne1_32).arg(&ne2_32).arg(&neu);
                     let block_dim = if f.fi == 1 { (32, 8, 1) } else { (128, 1, 1) };
@@ -761,7 +800,7 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
             (nrows as i32, b_size as i32, (k / f.qk) as i32, b_size as i32, nrows as i32);
         let z32 = 0i32;
         let ys = if f.fi == 2 { scale_ptr } else { 0u64 };
-        let smem = q1_0_mmq_smem(j);
+        let smem = q1_0_mmq_smem(j) + f.smem_extra;
         let slot = (j / 8) as usize * 2 + fb as usize;
         let name = f.name;
         let mmq = super::fast_mmvq::q1_0_func(dev, slot0 + 10 + slot, f.module, f.ptx, || format!("{name}_mmq_j{j}_f{fb}"))?;
