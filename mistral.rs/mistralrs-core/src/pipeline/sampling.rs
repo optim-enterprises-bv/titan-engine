@@ -86,6 +86,11 @@ fn activate_required_tool_call_grammar(
         return;
     };
     crate::tools::specialize_required_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
+    if let Some(close) = seq.open_reasoning_close_tag() {
+        if crate::tools::close_reasoning_before_tool_call(&mut grm, close, factory.tok_env().tok_trie()) {
+            tracing::debug!("forced tool call waits for {close}");
+        }
+    }
     match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
         Ok(matcher) => {
             seq.recognizer = SequenceRecognizer::Llguidance(Box::new(matcher));
@@ -262,8 +267,11 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             .as_mut()
             .and_then(|state| state.maybe_activate_continuation_grammar(text.as_deref()));
 
-        if let Some(grm) = grm {
+        if let Some(mut grm) = grm {
             if let Some(ref factory) = metadata.llg_factory {
+                // name the tokenizer's special tokens (e.g. Spark's <arg_key>) instead of their text, as
+                // the required-call path already did
+                crate::tools::specialize_required_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
                 match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
                     Ok(matcher) => {
                         tracing::debug!("Activated tool call grammar");
@@ -1455,6 +1463,13 @@ pub async fn sample_sequence(
         )?
     };
 
+    if let (SequenceRecognizer::Llguidance(llg), Some(state)) =
+        (&mut seq.recognizer, seq.tool_call_state.as_mut())
+    {
+        if llg.is_accepting().unwrap_or(false) {
+            state.mark_grammar_call_complete();
+        }
+    }
     let stop_token_requires_tool = seq.tool_call_state.as_ref().is_some_and(|state| {
         state.is_stop_token_blocked(first_lobprobs_response.token, eos_tok, seq.stop_tokens())
     });

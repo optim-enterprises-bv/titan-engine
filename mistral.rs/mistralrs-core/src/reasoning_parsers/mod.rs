@@ -28,6 +28,10 @@ pub trait ReasoningParser: Send + Sync {
     fn content(&self) -> Option<String>;
     /// Get all accumulated reasoning.
     fn reasoning_content(&self) -> Option<String>;
+    /// The tag that closes the block the output is in now, when it is inside a reasoning block.
+    fn open_block_close_tag(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The active reasoning format for a sequence.
