@@ -36,7 +36,7 @@ const E4M3_AS_F16_SCALE: f32 = 256.0;
 pub(crate) fn enabled() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_KV_HOST").is_ok_and(|v| v == "1");
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_KV_HOST", false);
         if on {
             tracing::info!(
                 "titan kv: host-RAM F8E4M3 KV cache, CPU attention up to {CPU_MAX_ROWS} rows, {} keys per prompt tile",
@@ -70,9 +70,22 @@ struct Pool {
     prewarming: std::sync::atomic::AtomicBool,
 }
 
-fn pool(env: &str, default: usize, name: &'static str) -> Pool {
+/// The pool `env` asks for under the current model's settings. Pools are kept per (setting, thread
+/// count), so a model swap that changes the count builds one new pool and one that does not reuses it.
+fn pool(env: &'static str, default: usize, name: &'static str) -> &'static Pool {
+    static POOLS: std::sync::Mutex<Vec<(&'static str, usize, &'static Pool)>> = std::sync::Mutex::new(Vec::new());
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let n = mistralrs_quant::titan_cfg::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default).clamp(1, cores);
+    let n = mistralrs_quant::titan_cfg::num(env, default).clamp(1, cores);
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, _, p)) = pools.iter().find(|(e, k, _)| *e == env && *k == n) {
+        return p;
+    }
+    let p: &'static Pool = Box::leak(Box::new(new_pool(n, name)));
+    pools.push((env, n, p));
+    p
+}
+
+fn new_pool(n: usize, name: &'static str) -> Pool {
     Pool {
         pool: rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -84,13 +97,19 @@ fn pool(env: &str, default: usize, name: &'static str) -> Pool {
 }
 
 /// `TITAN_HOSTKV_THREADS=<n>`: threads for caches of `SMALL_POOL_MAX_KEYS` keys or more (default: every core).
-static POOL: LazyLock<Pool> = LazyLock::new(|| pool("TITAN_HOSTKV_THREADS", usize::MAX, "titan-hostkv"));
+/// Per model (a process-wide LazyLock kept the first model's count).
+fn big_pool() -> &'static Pool {
+    static P: mistralrs_quant::titan_cfg::GenCell<&'static Pool> = mistralrs_quant::titan_cfg::GenCell::new();
+    P.get_or_init(|| pool("TITAN_HOSTKV_THREADS", usize::MAX, "titan-hostkv"))
+}
 /// `TITAN_HOSTKV_SMALL_THREADS=<n>`: threads for shorter caches.
-static SMALL_POOL: LazyLock<Pool> =
-    LazyLock::new(|| pool("TITAN_HOSTKV_SMALL_THREADS", SMALL_POOL_THREADS, "titan-hostkv-small"));
+fn small_pool() -> &'static Pool {
+    static P: mistralrs_quant::titan_cfg::GenCell<&'static Pool> = mistralrs_quant::titan_cfg::GenCell::new();
+    P.get_or_init(|| pool("TITAN_HOSTKV_SMALL_THREADS", SMALL_POOL_THREADS, "titan-hostkv-small"))
+}
 
 fn pool_for(kv_len: usize) -> &'static Pool {
-    if kv_len < SMALL_POOL_MAX_KEYS { &SMALL_POOL } else { &POOL }
+    if kv_len < SMALL_POOL_MAX_KEYS { small_pool() } else { big_pool() }
 }
 
 /// Wake the threads that will attend over `kv_len` cached keys, ahead of a decode attention while the GPU still runs
@@ -113,7 +132,7 @@ pub(crate) fn prewarm(kv_len: usize) {
 /// `TITAN_HOSTKV_PROF=1`: per-phase wall time of decode host attentions, logged every `PROF_EVERY` calls.
 pub(crate) fn prof_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_HOSTKV_PROF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_HOSTKV_PROF", false))
 }
 
 const PROF_EVERY: u64 = 2048;
@@ -723,14 +742,14 @@ mod tests {
         for s in [1usize, 2] {
             let q: Vec<f32> = (0..h * s * HEAD_DIM).map(|i| (i % 7) as f32 * 0.01).collect();
             let sh = Shape { h, kvh, s, kv_len, hd: HEAD_DIM, k_hs: kv_len * HEAD_DIM, v_hs: kv_len * HEAD_DIM, scale: 0.0625 };
-            let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
+            let _ = big_pool().pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             let t0 = std::time::Instant::now();
             for _ in 0..50 {
-                let _ = POOL.pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
+                let _ = big_pool().pool.install(|| run(&q, as_bytes(&kf), as_bytes(&kf), &sh));
             }
             let ms = t0.elapsed().as_secs_f64() * 1000.0 / 50.0;
             let gb = (2 * kvh * kv_len * HEAD_DIM) as f64 / 1e9;
-            println!("keys {kv_len} rows {s}: {ms:.3} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, POOL.pool.current_num_threads());
+            println!("keys {kv_len} rows {s}: {ms:.3} ms per layer, {:.1} GB/s, {} threads", gb / ms * 1e3, big_pool().pool.current_num_threads());
         }
         }
     }
@@ -795,8 +814,8 @@ mod tests {
             })
             .collect();
         let shape = |n: usize| Shape { h, kvh, s: 2, kv_len: n, hd: HEAD_DIM, k_hs: n * HEAD_DIM, v_hs: n * HEAD_DIM, scale: 0.0625 };
-        for alone_pool in [&*SMALL_POOL, &*POOL] {
-            for batch_pool in [&*SMALL_POOL, &*POOL] {
+        for alone_pool in [small_pool(), big_pool()] {
+            for batch_pool in [small_pool(), big_pool()] {
                 let alone: Vec<Vec<f32>> = data
                     .iter()
                     .zip(lens)

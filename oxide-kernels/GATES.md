@@ -17,7 +17,7 @@ gate is staging them (see "Artifacts" below).
 | `mistralrs-core-cuda` | 5,840 calls, 85,026,856 bytes, 0 failing |
 | `mmvq-rows` | 810 launches, 2,362,720 bytes, ten formats |
 | `mmq-rows` | 144 cases, 13,271,040 bytes (via `RUN_MMQ_ROWS=1` in `mistralrs-quant-c`) |
-| `fmt_mmq` (default) | **1,753 launches, 910,060,092 bytes compared, 0 failing -> bit-identical** -- all seven slots: iq4_nl, iq4_xs, MXFP4 and NVFP4 through both the block-scaled MMA (OMMA, sm_120a) and the int8 (mxfp4q8) path. The block-scaled slots used to be skipped as "impossible on cc 12.0"; the CUDA 715 was the reference cubin, see `fmt_mmq/BLOCK-SCALED.md` |
+| `fmt_mmq` (default) | **3,326 launches, 2,118,493,928 bytes compared, 0 failing -> bit-identical** (2026-10-31) -- all eleven slots: iq4_nl, iq4_xs, MXFP4 and NVFP4 through both the block-scaled MMA (OMMA, sm_120a) and the int8 paths (mxfp4q8, nvfp4q8), and the grid i-quants iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s (references: `fmt_mmq/ref/nvcc_mmq_iquant.sh`, acecd560, nvcc 13.4). The block-scaled slots used to be skipped as "impossible on cc 12.0"; the CUDA 715 was the reference cubin, see `fmt_mmq/BLOCK-SCALED.md` |
 | `fmt_mmq --fmt=iq4_nl` | 330 launches, 198,296,952 bytes, 0 failing |
 | `fmt_mmq --fmt=iq4_xs` | 230 launches, 208,754,192 bytes, 0 failing |
 | `candle-quantized` | 5,350 launches, 14,086,960 bytes, 0 failing |
@@ -49,7 +49,7 @@ its values differ.
 
 | crate | status |
 |---|---|
-| `fmt_mmq --fmt=nvfp4q8` (opt-in, not in the default run) | **Runs, values still differ.** Clean data: p50 1.4e-7 (~1 ULP), p90 6.2e-7, p99 6.4e-6, max 4.8e-4; with inf/3e38 poisoning the sums saturate differently and are not comparable. The CUDA 719 trap it used to die on is fixed (`j0` step). Details and the ruled-out list: `fmt_mmq/NVFP4-INT8.md` |
+| `fmt_mmq --fmt=nvfp4q8` | 469 launches, 169,161,784 bytes, 0 failing -> bit-identical (2026-10-31). The ~1 ULP gap was the dot: the port followed the reference's AMD branch of `vec_dot_q8_0_16_q8_1_mma`; nvcc builds the TURING_MMA one (`j0` outer, `sum += dB*(C0*dA0 + C1*dA1)`) for this card. In the default run now. History: `fmt_mmq/NVFP4-INT8.md` |
 | `titan-kernels-oxide`, `indexed_moe` sections | **Needs `m0/ref/indexed_moe.ptx`, `m1/ref/indexed_moe.ptx` and the `data/` tensors**, none of which exist any more. The rest of that gate passes: 20,184,168 outputs / 32,774,352 CPU-twin rows. |
 
 ## Artifacts: what has to be staged, and the traps

@@ -54,9 +54,7 @@ struct Cfg {
 fn cfg() -> &'static Cfg {
     static C: mistralrs_quant::titan_cfg::GenCell<Cfg> = mistralrs_quant::titan_cfg::GenCell::new();
     C.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_ATTN_FLASH", true);
         let min_kv = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_MIN")
             .ok()
             .and_then(|v| v.parse().ok())

@@ -906,6 +906,7 @@ impl Engine {
                 !pipeline.get_metadata().no_kv_cache
                     && pipeline.cache().is_hybrid()
                     && pipeline.get_metadata().cache_engine.is_none()
+                    && pipeline.supports_hybrid_prefix()
             };
             if hybrid_unpaged {
                 let hit = if seq.has_images() || seq.has_audios() || seq.has_videos() {

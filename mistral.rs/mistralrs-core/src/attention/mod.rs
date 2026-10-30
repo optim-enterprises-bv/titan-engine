@@ -591,7 +591,7 @@ pub(crate) fn flash_decode_rows(
 /// `TITAN_ATTN_F32REF=1`: see `run_attention_noflash` (a debug reference, off by default).
 fn f32_reference_attention() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_ATTN_F32REF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_ATTN_F32REF", false))
 }
 
 fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
@@ -687,8 +687,28 @@ impl Sdpa {
     ) -> Result<Tensor> {
         // TITAN_KV_HOST: a CUDA query over a host-RAM cache; causality is positional (the last rows of the cache)
         if q.device().is_cuda() && k.device().is_cpu() {
+            // Host-RAM KV attends positionally (causal over the whole cache): a sliding window, softcap or
+            // sinks would be silently dropped, so refuse instead of attending wrongly.
+            if sdpa_params.sliding_window.is_some() || sdpa_params.softcap.is_some() || sdpa_params.sinks.is_some() {
+                candle_core::bail!("TITAN_KV_HOST does not support sliding-window, softcap or sink attention layers; turn it off for this model");
+            }
             return crate::titan_hostkv::attend(q, k, v, sdpa_params);
         }
+        // A mask built for the whole (rows, past + rows) history can meet a sliding-window layer whose
+        // rotating cache returned only the retained window plus the new rows: keys past - retained ..
+        // past + rows, in order, i.e. the mask's last kv_len columns. Every model whose sliding layers pass
+        // a full-history mask failed on a prompt continuing a cached prefix longer than the window ("shape
+        // mismatch in broadcast_add"); spark2_5 was fixed on its own, gemma2/3, qwen2, qwen3_moe, glm4,
+        // gpt-oss and the VL text models were not. Narrowing here covers all of them.
+        let narrowed;
+        let mask = match mask {
+            AttentionMask::Custom(m) if m.rank() >= 2 && k.rank() == 4 && m.dim(candle_core::D::Minus1)? > k.dim(2)? => {
+                let (cols, kv_len) = (m.dim(candle_core::D::Minus1)?, k.dim(2)?);
+                narrowed = AttentionMask::Custom(m.narrow(candle_core::D::Minus1, cols - kv_len, kv_len)?);
+                &narrowed
+            }
+            _ => mask,
+        };
         if flash_params.is_some_and(|params| params.packed)
             && (!matches!(mask, AttentionMask::CausalFlash)
                 || !flash_params.is_some_and(|params| params.causal)

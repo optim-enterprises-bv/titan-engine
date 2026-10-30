@@ -5,7 +5,7 @@
 the time. Every non-entry item (.func bodies, extern shared declarations) is kept in both."""
 import re, subprocess, sys, os
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ptq1_0.ptx")).read()
-dst_dir = os.path.expanduser("~/titan-engine/mr-b2/mistralrs-quant/src/gguf")
+dst_dir = os.path.join(sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/src/titan-engine/mistral.rs"), "mistralrs-quant/src/gguf")
 lines = src.split("\n")
 # top-level item starts: a line at column 0 beginning with '.' (directive) or '//' comment before it
 starts = [i for i, l in enumerate(lines) if re.match(r"^\.(visible|entry|func|extern|global|shared|weak|const)\b", l)]

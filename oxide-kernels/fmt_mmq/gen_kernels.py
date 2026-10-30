@@ -21,7 +21,10 @@ FIX_A = ("ids_dst, expert_bounds, dst, tmp_last_tile, Fd { mp: bpn_mp, l: bpn_l,
 
 # (J, fallback) instances of mmq-config-ampere.cuh (IQ4_NL) / mmq-config-blackwell.cuh (MXFP4, NVFP4)
 MMQ = [(j, False) for j in (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128)] + [(j, True) for j in (8, 16, 32, 64, 128)]
-FMTS = [("iq4_nl", "Iq4Nl"), ("mxfp4", "Mxfp4"), ("nvfp4", "Nvfp4"), ("iq4_xs", "Iq4Xs")]
+# mxfp4q8 / nvfp4q8: the int8 (q8_1) MXFP4 / NVFP4 slots, gated but not exported
+FMTS = [("iq4_nl", "Iq4Nl"), ("mxfp4", "Mxfp4"), ("nvfp4", "Nvfp4"), ("iq4_xs", "Iq4Xs"),
+        ("mxfp4q8", "Mxfp4Q8"), ("nvfp4q8", "Nvfp4Q8"),
+        ("iq2_xxs", "Iq2Xxs"), ("iq2_xs", "Iq2Xs"), ("iq2_s", "Iq2S"), ("iq3_xxs", "Iq3Xxs"), ("iq3_s", "Iq3S")]
 # gate mutants of the IQ4_XS loader (one J / fallback instance each; export_ptx.py leaves them out)
 MUTS = [("iq4_xs_mut1", "Iq4XsMut1"), ("iq4_xs_mut2", "Iq4XsMut2")]
 

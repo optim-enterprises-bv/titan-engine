@@ -97,7 +97,7 @@ pub(crate) fn cpu_kv_f16() -> bool {
 pub(crate) fn cuda_kv_fp8() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_KV_FP8").is_ok_and(|v| v == "1");
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_KV_FP8", false);
         if on {
             tracing::info!("titan kv: CUDA KV cache stored as F8E4M3");
         }
@@ -199,7 +199,10 @@ impl KvCache {
         };
         let dt = k.dtype();
         let to_f8 = k.device().is_cuda() && matches!(dt, DType::BF16 | DType::F16);
-        let host = to_f8 && crate::titan_hostkv::enabled();
+        // Host-RAM KV attends positionally over the whole cache (no mask, window, softcap or sinks), so a
+        // sliding-window (rotating) cache stays on the GPU: moved to the host, its layer attended over every
+        // retained key. Attention refuses host KV for any windowed, softcapped or sink layer (Sdpa::run_attention).
+        let host = to_f8 && crate::titan_hostkv::enabled() && matches!(self, Self::Normal { .. });
         let fp8 = to_f8 && !host && cuda_kv_fp8();
         let (k, v) = if host {
             let cpu = candle_core::Device::Cpu;

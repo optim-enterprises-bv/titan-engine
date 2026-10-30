@@ -7,7 +7,7 @@ pub(crate) fn preload_candle_ptx(device: &Device) -> Result<usize> {
         return Ok(0);
     };
     // Kernel inventory needs first load == first use.
-    if std::env::var("TITAN_KTRACE").is_ok_and(|v| v == "1") {
+    if mistralrs_quant::titan_cfg::flag("TITAN_KTRACE", false) {
         return Ok(0);
     }
 

@@ -91,7 +91,7 @@ static MISS_POOL: crate::titan_cfg::GenCell<Option<super::titan_spin::SpinPool>>
 
 fn miss_pool() -> Option<&'static super::titan_spin::SpinPool> {
     MISS_POOL.get_or_init(|| {
-        if crate::titan_cfg::var("TITAN_TIERED_SPIN").is_ok_and(|v| v == "0") {
+        if !crate::titan_cfg::flag("TITAN_TIERED_SPIN", true) {
             return None;
         }
         // the calling thread works too; with the doorbell it is not the decode thread, and the memory-bound pass
@@ -212,7 +212,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// `TITAN_TIERED_WILLNEED=0` drops the within-layer MADV_WILLNEED hint on mapped misses.
 fn willneed_on() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_TIERED_WILLNEED").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_TIERED_WILLNEED", true))
 }
 
 /// `TITAN_TIERED_FINGERPRINT=M`: slots per tensor re-seeded from each request's prefill (0 = off).
@@ -421,7 +421,7 @@ fn trace_ids(f: &std::sync::Mutex<std::fs::File>, layer: usize, batch: usize, to
 }
 
 fn env_flag(name: &str) -> bool {
-    crate::titan_cfg::var(name).is_ok_and(|v| v == "1")
+    crate::titan_cfg::flag(name, false)
 }
 
 impl TieredExperts {
@@ -451,14 +451,36 @@ impl TieredExperts {
         match crate::titan_cfg::var("TITAN_TIERED_POLICY").as_deref() {
             Ok("lru") => Policy::Lru,
             Ok("lfu") => Policy::Lfu,
-            _ => Policy::Static,
+            Ok("static") | Err(_) => Policy::Static,
+            Ok(other) => {
+                crate::titan_cfg::note_once(&format!("tiered-policy={other}"), || {
+                    format!("titan setting TITAN_TIERED_POLICY={other:?} is not understood (static|lru|lfu); using static")
+                });
+                Policy::Static
+            }
         }
     }
 
     /// Experts of `layer` ordered hottest first, from `TITAN_TIERED_PROFILE` (`layer expert count` lines).
     fn profile_order(layer: usize, num_experts: usize) -> Option<Vec<usize>> {
-        let path = crate::titan_cfg::var("TITAN_TIERED_PROFILE").ok()?;
-        let text = std::fs::read_to_string(&path).ok()?;
+        let Ok(path) = crate::titan_cfg::var("TITAN_TIERED_PROFILE") else {
+            crate::titan_cfg::note_once("tiered-profile-unset", || {
+                "titan tiered: no TITAN_TIERED_PROFILE, so the GPU-resident experts are the lowest expert ids, \
+                 not the hottest"
+                    .to_string()
+            });
+            return None;
+        };
+        let path = crate::titan_cfg::expand_home(&path);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                crate::titan_cfg::note_once(&format!("tiered-profile={path}"), || {
+                    format!("titan tiered: TITAN_TIERED_PROFILE={path} cannot be read ({e}); resident experts are the lowest ids")
+                });
+                return None;
+            }
+        };
         let mut counts = vec![0u64; num_experts];
         for line in text.lines() {
             let f: Vec<u64> = line.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -482,8 +504,27 @@ impl TieredExperts {
 
     fn gpu_fraction() -> f64 {
         match crate::titan_cfg::var("TITAN_TIERED_GPU_FRACTION").as_deref() {
-            Ok("auto") => *AUTO_FRACTION.get().unwrap_or(&1.0),
-            Ok(v) => v.parse::<f64>().map_or(1.0, |f| f.clamp(0.0, 1.0)),
+            Ok("auto") => match AUTO_FRACTION.get() {
+                Some(f) => *f,
+                None => {
+                    // no plan was made: device_layers set, or an architecture the planner does not size
+                    crate::titan_cfg::note_once("tiered-fraction-auto-unplanned", || {
+                        "titan tiered: TITAN_TIERED_GPU_FRACTION=auto was not planned for this model (device_layers \
+                         set, or an architecture the planner does not size); all experts go on the GPU (1.0)"
+                            .to_string()
+                    });
+                    1.0
+                }
+            },
+            Ok(v) => match v.parse::<f64>() {
+                Ok(f) => f.clamp(0.0, 1.0),
+                Err(_) => {
+                    crate::titan_cfg::note_once(&format!("tiered-fraction={v}"), || {
+                        format!("titan setting TITAN_TIERED_GPU_FRACTION={v:?} is not understood (auto or 0..1); using 1.0")
+                    });
+                    1.0
+                }
+            },
             Err(_) => 1.0,
         }
     }
@@ -613,6 +654,25 @@ impl TieredExperts {
         let slot_map = dev.clone_htod(&map)?;
         let policy = Self::policy();
         let flex = fingerprint_slots().min(num_resident);
+        if policy != Policy::Static || flex > 0 {
+            let off: Vec<&str> = [
+                (titan_pfs::enabled(), "PFS"),
+                (doorbell::enabled(), "the doorbell"),
+                (onepass::mode() != 0, "one-pass"),
+            ]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+            if !off.is_empty() {
+                crate::titan_cfg::note_once("tiered-dynamic-disables", || {
+                    format!(
+                        "titan tiered: {} placement turns off {} (they need static residents and no fingerprint slots)",
+                        if flex > 0 { "TITAN_TIERED_FINGERPRINT" } else { "TITAN_TIERED_POLICY lru/lfu" },
+                        off.join(", ")
+                    )
+                });
+            }
+        }
         let (host, host_index, host_mib, host_kind) = match mapped {
             Some((mm, offset)) => {
                 // TITAN_TIERED_POPULATE=f: page in (and map) the hottest f of the non-resident experts now.

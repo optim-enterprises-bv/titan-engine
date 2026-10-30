@@ -17,416 +17,44 @@
 //!   q8_1 words `l0` and `l0+1` of block `iqs/2`; finally `sumi = (ls*sumi + sumi/2)/2` with
 //!   `ls = aux32 >> 28`, and `d = block_d * q8_1[iqs/2].d`. The caller accumulates in one FFMA.
 //!
-//! The grid codebook is kept as its 256 little-endian `u32` words read through `.to_le_bytes()`
-//! rather than as a `u8` array: Rust lowers a runtime-indexed array read to local-memory LDL, while
-//! a word read becomes a select chain (see PORTING.md #43 / #175).
+//! The grid codebook is its 256 little-endian `u32` words in an initialized immutable `static` (a
+//! `.global` array in the PTX, read with a runtime index like llama.cpp's `__device__` table; bytes via
+//! `.to_le_bytes()`), as in iq3_s. A select chain per lookup made the dense decode compute-bound.
 #![allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
 mod gate;
 
 use cuda_device::{SharedArray, convert, device, dotprod, kernel, ptx_asm, thread, warp};
 use cuda_host::cuda_module;
 
+/// `iq3xxs_grid[256]` (ggml-common.h).
+pub static IQ3XXS_GRID: [u32; 256] = include!("iq3xxs_grid.rs");
+/// `ksigns_iq2xs[128]` (ggml-common.h).
+pub static KSIGNS_IQ2XS: [u8; 128] = [
+    0x00, 0x81, 0x82, 0x03, 0x84, 0x05, 0x06, 0x87, 0x88, 0x09, 0x0a, 0x8b, 0x0c, 0x8d, 0x8e, 0x0f,
+    0x90, 0x11, 0x12, 0x93, 0x14, 0x95, 0x96, 0x17, 0x18, 0x99, 0x9a, 0x1b, 0x9c, 0x1d, 0x1e, 0x9f,
+    0xa0, 0x21, 0x22, 0xa3, 0x24, 0xa5, 0xa6, 0x27, 0x28, 0xa9, 0xaa, 0x2b, 0xac, 0x2d, 0x2e, 0xaf,
+    0x30, 0xb1, 0xb2, 0x33, 0xb4, 0x35, 0x36, 0xb7, 0xb8, 0x39, 0x3a, 0xbb, 0x3c, 0xbd, 0xbe, 0x3f,
+    0xc0, 0x41, 0x42, 0xc3, 0x44, 0xc5, 0xc6, 0x47, 0x48, 0xc9, 0xca, 0x4b, 0xcc, 0x4d, 0x4e, 0xcf,
+    0x50, 0xd1, 0xd2, 0x53, 0xd4, 0x55, 0x56, 0xd7, 0xd8, 0x59, 0x5a, 0xdb, 0x5c, 0xdd, 0xde, 0x5f,
+    0x60, 0xe1, 0xe2, 0x63, 0xe4, 0x65, 0x66, 0xe7, 0xe8, 0x69, 0x6a, 0xeb, 0x6c, 0xed, 0xee, 0x6f,
+    0xf0, 0x71, 0x72, 0xf3, 0x74, 0xf5, 0xf6, 0x77, 0x78, 0xf9, 0xfa, 0x7b, 0xfc, 0x7d, 0x7e, 0xff,
+];
+
 #[cuda_module]
 mod kernels {
     use super::*;
 
-    /// `grid_word`: explicit compare chain; a runtime-indexed Rust array would spill to local
-    /// memory (PORTING.md #43) and a host-side table never reaches the PTX at all.
+    /// `iq3xxs_grid[i]` from the `.global` table (as iq3_s reads its grid): the 256-way compare chain
+    /// this replaced made the dense decode ~10x slower than IQ3_S (625 us vs 72 us for a 5120x17408
+    /// row at m = 1).
     #[inline(always)]
     pub fn grid_word(i: u32) -> u32 {
-        let mut v: u32 = 0;
-        if i == 0u32 { v = 0x04040404u32 as u32; }
-        if i == 1u32 { v = 0x04040414u32 as u32; }
-        if i == 2u32 { v = 0x04040424u32 as u32; }
-        if i == 3u32 { v = 0x04040c0cu32 as u32; }
-        if i == 4u32 { v = 0x04040c1cu32 as u32; }
-        if i == 5u32 { v = 0x04040c3eu32 as u32; }
-        if i == 6u32 { v = 0x04041404u32 as u32; }
-        if i == 7u32 { v = 0x04041414u32 as u32; }
-        if i == 8u32 { v = 0x04041c0cu32 as u32; }
-        if i == 9u32 { v = 0x04042414u32 as u32; }
-        if i == 10u32 { v = 0x04043e1cu32 as u32; }
-        if i == 11u32 { v = 0x04043e2cu32 as u32; }
-        if i == 12u32 { v = 0x040c040cu32 as u32; }
-        if i == 13u32 { v = 0x040c041cu32 as u32; }
-        if i == 14u32 { v = 0x040c0c04u32 as u32; }
-        if i == 15u32 { v = 0x040c0c14u32 as u32; }
-        if i == 16u32 { v = 0x040c140cu32 as u32; }
-        if i == 17u32 { v = 0x040c142cu32 as u32; }
-        if i == 18u32 { v = 0x040c1c04u32 as u32; }
-        if i == 19u32 { v = 0x040c1c14u32 as u32; }
-        if i == 20u32 { v = 0x040c240cu32 as u32; }
-        if i == 21u32 { v = 0x040c2c24u32 as u32; }
-        if i == 22u32 { v = 0x040c3e04u32 as u32; }
-        if i == 23u32 { v = 0x04140404u32 as u32; }
-        if i == 24u32 { v = 0x04140414u32 as u32; }
-        if i == 25u32 { v = 0x04140424u32 as u32; }
-        if i == 26u32 { v = 0x04140c0cu32 as u32; }
-        if i == 27u32 { v = 0x04141404u32 as u32; }
-        if i == 28u32 { v = 0x04141414u32 as u32; }
-        if i == 29u32 { v = 0x04141c0cu32 as u32; }
-        if i == 30u32 { v = 0x04141c1cu32 as u32; }
-        if i == 31u32 { v = 0x04141c3eu32 as u32; }
-        if i == 32u32 { v = 0x04142c0cu32 as u32; }
-        if i == 33u32 { v = 0x04142c3eu32 as u32; }
-        if i == 34u32 { v = 0x04143e2cu32 as u32; }
-        if i == 35u32 { v = 0x041c040cu32 as u32; }
-        if i == 36u32 { v = 0x041c043eu32 as u32; }
-        if i == 37u32 { v = 0x041c0c04u32 as u32; }
-        if i == 38u32 { v = 0x041c0c14u32 as u32; }
-        if i == 39u32 { v = 0x041c142cu32 as u32; }
-        if i == 40u32 { v = 0x041c3e04u32 as u32; }
-        if i == 41u32 { v = 0x04240c1cu32 as u32; }
-        if i == 42u32 { v = 0x04241c3eu32 as u32; }
-        if i == 43u32 { v = 0x04242424u32 as u32; }
-        if i == 44u32 { v = 0x04242c3eu32 as u32; }
-        if i == 45u32 { v = 0x04243e1cu32 as u32; }
-        if i == 46u32 { v = 0x04243e2cu32 as u32; }
-        if i == 47u32 { v = 0x042c040cu32 as u32; }
-        if i == 48u32 { v = 0x042c043eu32 as u32; }
-        if i == 49u32 { v = 0x042c1c14u32 as u32; }
-        if i == 50u32 { v = 0x042c2c14u32 as u32; }
-        if i == 51u32 { v = 0x04341c2cu32 as u32; }
-        if i == 52u32 { v = 0x04343424u32 as u32; }
-        if i == 53u32 { v = 0x043e0c04u32 as u32; }
-        if i == 54u32 { v = 0x043e0c24u32 as u32; }
-        if i == 55u32 { v = 0x043e0c34u32 as u32; }
-        if i == 56u32 { v = 0x043e241cu32 as u32; }
-        if i == 57u32 { v = 0x043e340cu32 as u32; }
-        if i == 58u32 { v = 0x0c04040cu32 as u32; }
-        if i == 59u32 { v = 0x0c04041cu32 as u32; }
-        if i == 60u32 { v = 0x0c040c04u32 as u32; }
-        if i == 61u32 { v = 0x0c040c14u32 as u32; }
-        if i == 62u32 { v = 0x0c04140cu32 as u32; }
-        if i == 63u32 { v = 0x0c04141cu32 as u32; }
-        if i == 64u32 { v = 0x0c041c04u32 as u32; }
-        if i == 65u32 { v = 0x0c041c14u32 as u32; }
-        if i == 66u32 { v = 0x0c041c24u32 as u32; }
-        if i == 67u32 { v = 0x0c04243eu32 as u32; }
-        if i == 68u32 { v = 0x0c042c04u32 as u32; }
-        if i == 69u32 { v = 0x0c0c0404u32 as u32; }
-        if i == 70u32 { v = 0x0c0c0414u32 as u32; }
-        if i == 71u32 { v = 0x0c0c0c0cu32 as u32; }
-        if i == 72u32 { v = 0x0c0c1404u32 as u32; }
-        if i == 73u32 { v = 0x0c0c1414u32 as u32; }
-        if i == 74u32 { v = 0x0c14040cu32 as u32; }
-        if i == 75u32 { v = 0x0c14041cu32 as u32; }
-        if i == 76u32 { v = 0x0c140c04u32 as u32; }
-        if i == 77u32 { v = 0x0c140c14u32 as u32; }
-        if i == 78u32 { v = 0x0c14140cu32 as u32; }
-        if i == 79u32 { v = 0x0c141c04u32 as u32; }
-        if i == 80u32 { v = 0x0c143e14u32 as u32; }
-        if i == 81u32 { v = 0x0c1c0404u32 as u32; }
-        if i == 82u32 { v = 0x0c1c0414u32 as u32; }
-        if i == 83u32 { v = 0x0c1c1404u32 as u32; }
-        if i == 84u32 { v = 0x0c1c1c0cu32 as u32; }
-        if i == 85u32 { v = 0x0c1c2434u32 as u32; }
-        if i == 86u32 { v = 0x0c1c3434u32 as u32; }
-        if i == 87u32 { v = 0x0c24040cu32 as u32; }
-        if i == 88u32 { v = 0x0c24042cu32 as u32; }
-        if i == 89u32 { v = 0x0c242c04u32 as u32; }
-        if i == 90u32 { v = 0x0c2c1404u32 as u32; }
-        if i == 91u32 { v = 0x0c2c1424u32 as u32; }
-        if i == 92u32 { v = 0x0c2c2434u32 as u32; }
-        if i == 93u32 { v = 0x0c2c3e0cu32 as u32; }
-        if i == 94u32 { v = 0x0c34042cu32 as u32; }
-        if i == 95u32 { v = 0x0c3e1414u32 as u32; }
-        if i == 96u32 { v = 0x0c3e2404u32 as u32; }
-        if i == 97u32 { v = 0x14040404u32 as u32; }
-        if i == 98u32 { v = 0x14040414u32 as u32; }
-        if i == 99u32 { v = 0x14040c0cu32 as u32; }
-        if i == 100u32 { v = 0x14040c1cu32 as u32; }
-        if i == 101u32 { v = 0x14041404u32 as u32; }
-        if i == 102u32 { v = 0x14041414u32 as u32; }
-        if i == 103u32 { v = 0x14041434u32 as u32; }
-        if i == 104u32 { v = 0x14041c0cu32 as u32; }
-        if i == 105u32 { v = 0x14042414u32 as u32; }
-        if i == 106u32 { v = 0x140c040cu32 as u32; }
-        if i == 107u32 { v = 0x140c041cu32 as u32; }
-        if i == 108u32 { v = 0x140c042cu32 as u32; }
-        if i == 109u32 { v = 0x140c0c04u32 as u32; }
-        if i == 110u32 { v = 0x140c0c14u32 as u32; }
-        if i == 111u32 { v = 0x140c140cu32 as u32; }
-        if i == 112u32 { v = 0x140c1c04u32 as u32; }
-        if i == 113u32 { v = 0x140c341cu32 as u32; }
-        if i == 114u32 { v = 0x140c343eu32 as u32; }
-        if i == 115u32 { v = 0x140c3e04u32 as u32; }
-        if i == 116u32 { v = 0x14140404u32 as u32; }
-        if i == 117u32 { v = 0x14140414u32 as u32; }
-        if i == 118u32 { v = 0x14140c0cu32 as u32; }
-        if i == 119u32 { v = 0x14140c3eu32 as u32; }
-        if i == 120u32 { v = 0x14141404u32 as u32; }
-        if i == 121u32 { v = 0x14141414u32 as u32; }
-        if i == 122u32 { v = 0x14141c3eu32 as u32; }
-        if i == 123u32 { v = 0x14142404u32 as u32; }
-        if i == 124u32 { v = 0x14142c2cu32 as u32; }
-        if i == 125u32 { v = 0x141c040cu32 as u32; }
-        if i == 126u32 { v = 0x141c0c04u32 as u32; }
-        if i == 127u32 { v = 0x141c0c24u32 as u32; }
-        if i == 128u32 { v = 0x141c3e04u32 as u32; }
-        if i == 129u32 { v = 0x141c3e24u32 as u32; }
-        if i == 130u32 { v = 0x14241c2cu32 as u32; }
-        if i == 131u32 { v = 0x14242c1cu32 as u32; }
-        if i == 132u32 { v = 0x142c041cu32 as u32; }
-        if i == 133u32 { v = 0x142c143eu32 as u32; }
-        if i == 134u32 { v = 0x142c240cu32 as u32; }
-        if i == 135u32 { v = 0x142c3e24u32 as u32; }
-        if i == 136u32 { v = 0x143e040cu32 as u32; }
-        if i == 137u32 { v = 0x143e041cu32 as u32; }
-        if i == 138u32 { v = 0x143e0c34u32 as u32; }
-        if i == 139u32 { v = 0x143e242cu32 as u32; }
-        if i == 140u32 { v = 0x1c04040cu32 as u32; }
-        if i == 141u32 { v = 0x1c040c04u32 as u32; }
-        if i == 142u32 { v = 0x1c040c14u32 as u32; }
-        if i == 143u32 { v = 0x1c04140cu32 as u32; }
-        if i == 144u32 { v = 0x1c04141cu32 as u32; }
-        if i == 145u32 { v = 0x1c042c04u32 as u32; }
-        if i == 146u32 { v = 0x1c04342cu32 as u32; }
-        if i == 147u32 { v = 0x1c043e14u32 as u32; }
-        if i == 148u32 { v = 0x1c0c0404u32 as u32; }
-        if i == 149u32 { v = 0x1c0c0414u32 as u32; }
-        if i == 150u32 { v = 0x1c0c1404u32 as u32; }
-        if i == 151u32 { v = 0x1c0c1c0cu32 as u32; }
-        if i == 152u32 { v = 0x1c0c2424u32 as u32; }
-        if i == 153u32 { v = 0x1c0c2434u32 as u32; }
-        if i == 154u32 { v = 0x1c14040cu32 as u32; }
-        if i == 155u32 { v = 0x1c14041cu32 as u32; }
-        if i == 156u32 { v = 0x1c140c04u32 as u32; }
-        if i == 157u32 { v = 0x1c14142cu32 as u32; }
-        if i == 158u32 { v = 0x1c142c14u32 as u32; }
-        if i == 159u32 { v = 0x1c143e14u32 as u32; }
-        if i == 160u32 { v = 0x1c1c0c0cu32 as u32; }
-        if i == 161u32 { v = 0x1c1c1c1cu32 as u32; }
-        if i == 162u32 { v = 0x1c241c04u32 as u32; }
-        if i == 163u32 { v = 0x1c24243eu32 as u32; }
-        if i == 164u32 { v = 0x1c243e14u32 as u32; }
-        if i == 165u32 { v = 0x1c2c0404u32 as u32; }
-        if i == 166u32 { v = 0x1c2c0434u32 as u32; }
-        if i == 167u32 { v = 0x1c2c1414u32 as u32; }
-        if i == 168u32 { v = 0x1c2c2c2cu32 as u32; }
-        if i == 169u32 { v = 0x1c340c24u32 as u32; }
-        if i == 170u32 { v = 0x1c341c34u32 as u32; }
-        if i == 171u32 { v = 0x1c34341cu32 as u32; }
-        if i == 172u32 { v = 0x1c3e1c1cu32 as u32; }
-        if i == 173u32 { v = 0x1c3e3404u32 as u32; }
-        if i == 174u32 { v = 0x24040424u32 as u32; }
-        if i == 175u32 { v = 0x24040c3eu32 as u32; }
-        if i == 176u32 { v = 0x24041c2cu32 as u32; }
-        if i == 177u32 { v = 0x24041c3eu32 as u32; }
-        if i == 178u32 { v = 0x24042c1cu32 as u32; }
-        if i == 179u32 { v = 0x24042c3eu32 as u32; }
-        if i == 180u32 { v = 0x240c3e24u32 as u32; }
-        if i == 181u32 { v = 0x24141404u32 as u32; }
-        if i == 182u32 { v = 0x24141c3eu32 as u32; }
-        if i == 183u32 { v = 0x24142404u32 as u32; }
-        if i == 184u32 { v = 0x24143404u32 as u32; }
-        if i == 185u32 { v = 0x24143434u32 as u32; }
-        if i == 186u32 { v = 0x241c043eu32 as u32; }
-        if i == 187u32 { v = 0x241c242cu32 as u32; }
-        if i == 188u32 { v = 0x24240424u32 as u32; }
-        if i == 189u32 { v = 0x24242c0cu32 as u32; }
-        if i == 190u32 { v = 0x24243424u32 as u32; }
-        if i == 191u32 { v = 0x242c142cu32 as u32; }
-        if i == 192u32 { v = 0x242c241cu32 as u32; }
-        if i == 193u32 { v = 0x242c3e04u32 as u32; }
-        if i == 194u32 { v = 0x243e042cu32 as u32; }
-        if i == 195u32 { v = 0x243e0c04u32 as u32; }
-        if i == 196u32 { v = 0x243e0c14u32 as u32; }
-        if i == 197u32 { v = 0x243e1c04u32 as u32; }
-        if i == 198u32 { v = 0x2c040c14u32 as u32; }
-        if i == 199u32 { v = 0x2c04240cu32 as u32; }
-        if i == 200u32 { v = 0x2c043e04u32 as u32; }
-        if i == 201u32 { v = 0x2c0c0404u32 as u32; }
-        if i == 202u32 { v = 0x2c0c0434u32 as u32; }
-        if i == 203u32 { v = 0x2c0c1434u32 as u32; }
-        if i == 204u32 { v = 0x2c0c2c2cu32 as u32; }
-        if i == 205u32 { v = 0x2c140c24u32 as u32; }
-        if i == 206u32 { v = 0x2c141c14u32 as u32; }
-        if i == 207u32 { v = 0x2c143e14u32 as u32; }
-        if i == 208u32 { v = 0x2c1c0414u32 as u32; }
-        if i == 209u32 { v = 0x2c1c2c1cu32 as u32; }
-        if i == 210u32 { v = 0x2c240c04u32 as u32; }
-        if i == 211u32 { v = 0x2c24141cu32 as u32; }
-        if i == 212u32 { v = 0x2c24143eu32 as u32; }
-        if i == 213u32 { v = 0x2c243e14u32 as u32; }
-        if i == 214u32 { v = 0x2c2c0414u32 as u32; }
-        if i == 215u32 { v = 0x2c2c1c0cu32 as u32; }
-        if i == 216u32 { v = 0x2c342c04u32 as u32; }
-        if i == 217u32 { v = 0x2c3e1424u32 as u32; }
-        if i == 218u32 { v = 0x2c3e2414u32 as u32; }
-        if i == 219u32 { v = 0x34041424u32 as u32; }
-        if i == 220u32 { v = 0x34042424u32 as u32; }
-        if i == 221u32 { v = 0x34042434u32 as u32; }
-        if i == 222u32 { v = 0x34043424u32 as u32; }
-        if i == 223u32 { v = 0x340c140cu32 as u32; }
-        if i == 224u32 { v = 0x340c340cu32 as u32; }
-        if i == 225u32 { v = 0x34140c3eu32 as u32; }
-        if i == 226u32 { v = 0x34143424u32 as u32; }
-        if i == 227u32 { v = 0x341c1c04u32 as u32; }
-        if i == 228u32 { v = 0x341c1c34u32 as u32; }
-        if i == 229u32 { v = 0x34242424u32 as u32; }
-        if i == 230u32 { v = 0x342c042cu32 as u32; }
-        if i == 231u32 { v = 0x342c2c14u32 as u32; }
-        if i == 232u32 { v = 0x34341c1cu32 as u32; }
-        if i == 233u32 { v = 0x343e041cu32 as u32; }
-        if i == 234u32 { v = 0x343e140cu32 as u32; }
-        if i == 235u32 { v = 0x3e04041cu32 as u32; }
-        if i == 236u32 { v = 0x3e04042cu32 as u32; }
-        if i == 237u32 { v = 0x3e04043eu32 as u32; }
-        if i == 238u32 { v = 0x3e040c04u32 as u32; }
-        if i == 239u32 { v = 0x3e041c14u32 as u32; }
-        if i == 240u32 { v = 0x3e042c14u32 as u32; }
-        if i == 241u32 { v = 0x3e0c1434u32 as u32; }
-        if i == 242u32 { v = 0x3e0c2404u32 as u32; }
-        if i == 243u32 { v = 0x3e140c14u32 as u32; }
-        if i == 244u32 { v = 0x3e14242cu32 as u32; }
-        if i == 245u32 { v = 0x3e142c14u32 as u32; }
-        if i == 246u32 { v = 0x3e1c0404u32 as u32; }
-        if i == 247u32 { v = 0x3e1c0c2cu32 as u32; }
-        if i == 248u32 { v = 0x3e1c1c1cu32 as u32; }
-        if i == 249u32 { v = 0x3e1c3404u32 as u32; }
-        if i == 250u32 { v = 0x3e24140cu32 as u32; }
-        if i == 251u32 { v = 0x3e24240cu32 as u32; }
-        if i == 252u32 { v = 0x3e2c0404u32 as u32; }
-        if i == 253u32 { v = 0x3e2c0414u32 as u32; }
-        if i == 254u32 { v = 0x3e2c1424u32 as u32; }
-        if i == 255u32 { v = 0x3e341c04u32 as u32; }
-        v
+        unsafe { *(&raw const IQ3XXS_GRID as *const u32).add((i & 255) as usize) }
     }
-    /// `ksign`: explicit compare chain; a runtime-indexed Rust array would spill to local
-    /// memory (PORTING.md #43) and a host-side table never reaches the PTX at all.
+    /// `ksigns_iq2xs[i]` from the `.global` table (see grid_word).
     #[inline(always)]
     pub fn ksign(i: u32) -> u8 {
-        let mut v: u8 = 0;
-        if i == 0u32 { v = 0x00000000u32 as u8; }
-        if i == 1u32 { v = 0x00000081u32 as u8; }
-        if i == 2u32 { v = 0x00000082u32 as u8; }
-        if i == 3u32 { v = 0x00000003u32 as u8; }
-        if i == 4u32 { v = 0x00000084u32 as u8; }
-        if i == 5u32 { v = 0x00000005u32 as u8; }
-        if i == 6u32 { v = 0x00000006u32 as u8; }
-        if i == 7u32 { v = 0x00000087u32 as u8; }
-        if i == 8u32 { v = 0x00000088u32 as u8; }
-        if i == 9u32 { v = 0x00000009u32 as u8; }
-        if i == 10u32 { v = 0x0000000au32 as u8; }
-        if i == 11u32 { v = 0x0000008bu32 as u8; }
-        if i == 12u32 { v = 0x0000000cu32 as u8; }
-        if i == 13u32 { v = 0x0000008du32 as u8; }
-        if i == 14u32 { v = 0x0000008eu32 as u8; }
-        if i == 15u32 { v = 0x0000000fu32 as u8; }
-        if i == 16u32 { v = 0x00000090u32 as u8; }
-        if i == 17u32 { v = 0x00000011u32 as u8; }
-        if i == 18u32 { v = 0x00000012u32 as u8; }
-        if i == 19u32 { v = 0x00000093u32 as u8; }
-        if i == 20u32 { v = 0x00000014u32 as u8; }
-        if i == 21u32 { v = 0x00000095u32 as u8; }
-        if i == 22u32 { v = 0x00000096u32 as u8; }
-        if i == 23u32 { v = 0x00000017u32 as u8; }
-        if i == 24u32 { v = 0x00000018u32 as u8; }
-        if i == 25u32 { v = 0x00000099u32 as u8; }
-        if i == 26u32 { v = 0x0000009au32 as u8; }
-        if i == 27u32 { v = 0x0000001bu32 as u8; }
-        if i == 28u32 { v = 0x0000009cu32 as u8; }
-        if i == 29u32 { v = 0x0000001du32 as u8; }
-        if i == 30u32 { v = 0x0000001eu32 as u8; }
-        if i == 31u32 { v = 0x0000009fu32 as u8; }
-        if i == 32u32 { v = 0x000000a0u32 as u8; }
-        if i == 33u32 { v = 0x00000021u32 as u8; }
-        if i == 34u32 { v = 0x00000022u32 as u8; }
-        if i == 35u32 { v = 0x000000a3u32 as u8; }
-        if i == 36u32 { v = 0x00000024u32 as u8; }
-        if i == 37u32 { v = 0x000000a5u32 as u8; }
-        if i == 38u32 { v = 0x000000a6u32 as u8; }
-        if i == 39u32 { v = 0x00000027u32 as u8; }
-        if i == 40u32 { v = 0x00000028u32 as u8; }
-        if i == 41u32 { v = 0x000000a9u32 as u8; }
-        if i == 42u32 { v = 0x000000aau32 as u8; }
-        if i == 43u32 { v = 0x0000002bu32 as u8; }
-        if i == 44u32 { v = 0x000000acu32 as u8; }
-        if i == 45u32 { v = 0x0000002du32 as u8; }
-        if i == 46u32 { v = 0x0000002eu32 as u8; }
-        if i == 47u32 { v = 0x000000afu32 as u8; }
-        if i == 48u32 { v = 0x00000030u32 as u8; }
-        if i == 49u32 { v = 0x000000b1u32 as u8; }
-        if i == 50u32 { v = 0x000000b2u32 as u8; }
-        if i == 51u32 { v = 0x00000033u32 as u8; }
-        if i == 52u32 { v = 0x000000b4u32 as u8; }
-        if i == 53u32 { v = 0x00000035u32 as u8; }
-        if i == 54u32 { v = 0x00000036u32 as u8; }
-        if i == 55u32 { v = 0x000000b7u32 as u8; }
-        if i == 56u32 { v = 0x000000b8u32 as u8; }
-        if i == 57u32 { v = 0x00000039u32 as u8; }
-        if i == 58u32 { v = 0x0000003au32 as u8; }
-        if i == 59u32 { v = 0x000000bbu32 as u8; }
-        if i == 60u32 { v = 0x0000003cu32 as u8; }
-        if i == 61u32 { v = 0x000000bdu32 as u8; }
-        if i == 62u32 { v = 0x000000beu32 as u8; }
-        if i == 63u32 { v = 0x0000003fu32 as u8; }
-        if i == 64u32 { v = 0x000000c0u32 as u8; }
-        if i == 65u32 { v = 0x00000041u32 as u8; }
-        if i == 66u32 { v = 0x00000042u32 as u8; }
-        if i == 67u32 { v = 0x000000c3u32 as u8; }
-        if i == 68u32 { v = 0x00000044u32 as u8; }
-        if i == 69u32 { v = 0x000000c5u32 as u8; }
-        if i == 70u32 { v = 0x000000c6u32 as u8; }
-        if i == 71u32 { v = 0x00000047u32 as u8; }
-        if i == 72u32 { v = 0x00000048u32 as u8; }
-        if i == 73u32 { v = 0x000000c9u32 as u8; }
-        if i == 74u32 { v = 0x000000cau32 as u8; }
-        if i == 75u32 { v = 0x0000004bu32 as u8; }
-        if i == 76u32 { v = 0x000000ccu32 as u8; }
-        if i == 77u32 { v = 0x0000004du32 as u8; }
-        if i == 78u32 { v = 0x0000004eu32 as u8; }
-        if i == 79u32 { v = 0x000000cfu32 as u8; }
-        if i == 80u32 { v = 0x00000050u32 as u8; }
-        if i == 81u32 { v = 0x000000d1u32 as u8; }
-        if i == 82u32 { v = 0x000000d2u32 as u8; }
-        if i == 83u32 { v = 0x00000053u32 as u8; }
-        if i == 84u32 { v = 0x000000d4u32 as u8; }
-        if i == 85u32 { v = 0x00000055u32 as u8; }
-        if i == 86u32 { v = 0x00000056u32 as u8; }
-        if i == 87u32 { v = 0x000000d7u32 as u8; }
-        if i == 88u32 { v = 0x000000d8u32 as u8; }
-        if i == 89u32 { v = 0x00000059u32 as u8; }
-        if i == 90u32 { v = 0x0000005au32 as u8; }
-        if i == 91u32 { v = 0x000000dbu32 as u8; }
-        if i == 92u32 { v = 0x0000005cu32 as u8; }
-        if i == 93u32 { v = 0x000000ddu32 as u8; }
-        if i == 94u32 { v = 0x000000deu32 as u8; }
-        if i == 95u32 { v = 0x0000005fu32 as u8; }
-        if i == 96u32 { v = 0x00000060u32 as u8; }
-        if i == 97u32 { v = 0x000000e1u32 as u8; }
-        if i == 98u32 { v = 0x000000e2u32 as u8; }
-        if i == 99u32 { v = 0x00000063u32 as u8; }
-        if i == 100u32 { v = 0x000000e4u32 as u8; }
-        if i == 101u32 { v = 0x00000065u32 as u8; }
-        if i == 102u32 { v = 0x00000066u32 as u8; }
-        if i == 103u32 { v = 0x000000e7u32 as u8; }
-        if i == 104u32 { v = 0x000000e8u32 as u8; }
-        if i == 105u32 { v = 0x00000069u32 as u8; }
-        if i == 106u32 { v = 0x0000006au32 as u8; }
-        if i == 107u32 { v = 0x000000ebu32 as u8; }
-        if i == 108u32 { v = 0x0000006cu32 as u8; }
-        if i == 109u32 { v = 0x000000edu32 as u8; }
-        if i == 110u32 { v = 0x000000eeu32 as u8; }
-        if i == 111u32 { v = 0x0000006fu32 as u8; }
-        if i == 112u32 { v = 0x000000f0u32 as u8; }
-        if i == 113u32 { v = 0x00000071u32 as u8; }
-        if i == 114u32 { v = 0x00000072u32 as u8; }
-        if i == 115u32 { v = 0x000000f3u32 as u8; }
-        if i == 116u32 { v = 0x00000074u32 as u8; }
-        if i == 117u32 { v = 0x000000f5u32 as u8; }
-        if i == 118u32 { v = 0x000000f6u32 as u8; }
-        if i == 119u32 { v = 0x00000077u32 as u8; }
-        if i == 120u32 { v = 0x00000078u32 as u8; }
-        if i == 121u32 { v = 0x000000f9u32 as u8; }
-        if i == 122u32 { v = 0x000000fau32 as u8; }
-        if i == 123u32 { v = 0x0000007bu32 as u8; }
-        if i == 124u32 { v = 0x000000fcu32 as u8; }
-        if i == 125u32 { v = 0x0000007du32 as u8; }
-        if i == 126u32 { v = 0x0000007eu32 as u8; }
-        if i == 127u32 { v = 0x000000ffu32 as u8; }
-        v
+        unsafe { *(&raw const KSIGNS_IQ2XS as *const u8).add((i & 127) as usize) }
     }
     /// IQ3_XXS grid words: `iq3xxs_grid[256]` verbatim (values 1..127, 8 bytes per entry).
     /// The 8 bytes of an entry are read out with `to_le_bytes()`.

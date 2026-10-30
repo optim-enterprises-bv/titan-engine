@@ -760,6 +760,49 @@ impl Engine {
 
     /// Keep the caches of every hybrid sequence that finished in the step just run (from its own copies, so a
     /// batched step works too), for prefix reuse by a later request.
+    /// Unpaged hybrid models whose pipeline keeps no resume points of its own (lfm3 through the
+    /// NormalPipeline): keep each prompt's caches with its recurrent state at the end of the prompt. A
+    /// recurrent entry is only usable at exactly its own length, and the entry a finished sequence leaves
+    /// (prompt + generated tokens) never lines up with the next turn, which re-renders the assistant
+    /// message: the cache filled up and never hit. The next turn does start with this prompt.
+    fn save_prompt_point(&self, seqs: &mut [&mut crate::sequence::Sequence]) {
+        let pipeline = get_mut_arcmutex!(self.pipeline);
+        if pipeline.get_metadata().no_kv_cache
+            || !pipeline.cache().is_hybrid()
+            || pipeline.get_metadata().cache_engine.is_some()
+            || pipeline.supports_hybrid_prefix()
+        {
+            return;
+        }
+        let mut cacher = get_mut_arcmutex!(self.prefix_cacher);
+        if !cacher.accepts_sequence_cache() {
+            return;
+        }
+        for seq in seqs.iter_mut() {
+            if seq.has_images() || seq.has_audios() || seq.has_videos() {
+                continue;
+            }
+            // the entry shares buffers with the still-running sequence: a normal cache only grows past
+            // the saved length, a rotating one overwrites in place
+            if seq.normal_cache().iter().flatten().any(|l| matches!(l, crate::pipeline::KvCache::Rotating { .. })) {
+                continue;
+            }
+            let Some(idx) = seq.recurrent_state_idx() else {
+                continue;
+            };
+            if pipeline.flush_recurrent_speculative_transitions(&[*seq.id()]).is_err() {
+                continue;
+            }
+            match pipeline.cache().hybrid().snapshot_recurrent_state(*seq.id(), idx) {
+                Ok(snapshots) => cacher.add_sequence(seq, Some(snapshots)),
+                Err(error) => tracing::debug!(sequence_id = seq.id(), %error, "prompt point not cached"),
+            }
+        }
+        if let Err(error) = cacher.evict_caches() {
+            tracing::warn!(%error, "prefix cache eviction failed");
+        }
+    }
+
     fn save_hybrid_prefix(&self, seqs: &[&mut crate::sequence::Sequence]) {
         for seq in seqs.iter().filter(|seq| matches!(seq.getstate(), SequenceState::Done(_))) {
             self.save_hybrid_prefix_one(seq);
@@ -1576,6 +1619,11 @@ impl Engine {
                                 pipeline.cache(),
                                 crate::pipeline::EitherCache::Normal(_)
                             ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume());
+                            // Token counts before the step: an OOM raised after sampling had already
+                            // appended to (and maybe streamed for) a sequence must not run that
+                            // sequence again, so the retry only happens if nothing advanced.
+                            let toks_before: Vec<usize> =
+                                scheduled.prompt.iter().map(|seq| seq.get_toks().len()).collect();
 
                             // hybrid prefix-cache hits: their saved caches go into place now
                             let restored = scheduled
@@ -1607,7 +1655,16 @@ impl Engine {
                                         // free: two ~7.8k-token prompts failed at 11.3 GiB in use, and the same
                                         // pair succeeded right after the recovery below freed 6 GiB. Release
                                         // that and run the step once more before failing the request.
-                                        Err(e) if retryable_oom && crate::titan_swap::is_oom(&e) => {
+                                        Err(e)
+                                            if retryable_oom
+                                                && crate::titan_swap::is_oom(&e)
+                                                && scheduled
+                                                    .prompt
+                                                    .iter()
+                                                    .zip(&toks_before)
+                                                    .all(|(seq, n)| seq.get_toks().len() == *n) =>
+                                        {
+                                            tracing::warn!("titan: prompt step out of memory: {e}");
                                             let rows: usize =
                                                 scheduled.prompt.iter().map(|seq| seq.get_toks().len()).sum();
                                             // Free what the failure path would: the model cache the failed step
@@ -1676,6 +1733,7 @@ impl Engine {
                             self.prefix_cacher
                         );
                         self.save_hybrid_prefix(&scheduled.prompt);
+                        self.save_prompt_point(&mut scheduled.prompt);
 
                         let total_processed_tokens: usize = scheduled
                             .prompt
@@ -2447,8 +2505,8 @@ static TITAN_ENG: std::sync::Mutex<Vec<(&'static str, std::time::Duration, u64)>
     std::sync::Mutex::new(Vec::new());
 
 fn titan_eng_prof_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_STEP_PROF").map(|v| v == "1").unwrap_or(false))
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false))
 }
 
 fn titan_eng_prof_add(tag: &'static str, d: std::time::Duration) {

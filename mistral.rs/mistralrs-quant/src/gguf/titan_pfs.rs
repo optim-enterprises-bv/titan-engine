@@ -56,7 +56,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 pub(crate) fn enabled() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_PFS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_PFS", false))
 }
 
 pub(crate) fn min_rows() -> usize {
@@ -80,7 +80,7 @@ pub(crate) fn mmq() -> bool {
 
 fn timing_on() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| crate::titan_cfg::var("TITAN_PFS_TIMING").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_PFS_TIMING", false))
 }
 
 /// One tensor's streamed experts: their host bytes in staging order and the device map to their
@@ -157,7 +157,7 @@ pub(crate) fn register<'a>(
     let bytes = ranges.iter().map(|r| r.1).sum();
     let mut registered = None;
     // `TITAN_PFS_PIN=0`: leave the owned host store pageable (bounce copies).
-    let pin = crate::titan_cfg::var("TITAN_PFS_PIN").map_or(true, |v| v != "0");
+    let pin = crate::titan_cfg::flag("TITAN_PFS_PIN", true);
     if let Some(buf) = owned.filter(|_| pin && !staged.is_empty()) {
         // The enclosing pages: a large Vec is its own mapping, so they belong to it.
         let a0 = buf.as_ptr() as usize & !(PAGE - 1);

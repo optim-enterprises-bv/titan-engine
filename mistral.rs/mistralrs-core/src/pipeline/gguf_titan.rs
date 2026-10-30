@@ -249,7 +249,7 @@ pub(super) fn load(
                 * dtype.size_in_bytes();
             let kv = (per_layer as f64 * cfg.num_layers() as f64 * frac).ceil() as usize;
             // TITAN_CUDA_GRAPHS=1: graph memory (captured decode segments) comes from its own pool
-            let graphs = if mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS").is_ok_and(|v| v == "1") {
+            let graphs = if mistralrs_quant::titan_cfg::flag("TITAN_CUDA_GRAPHS", false) {
                 mistralrs_quant::titan_cfg::var("TITAN_CUDA_GRAPHS_RESERVE_MIB")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -396,11 +396,13 @@ pub(super) fn load(
         gguf_chat_template,
     );
 
-    let max_seq_len = match model {
+    let gguf_max_seq_len = match model {
         Model::Qwen3MoE(ref p) => p.max_seq_len,
         Model::Qwen35MoE(ref p) => p.max_seq_len,
         Model::GptOss(ref p) => p.max_seq_len,
     };
+    let max_seq_len = capped_max_seq_len(gguf_max_seq_len);
+    crate::titan_monitor::set_max_seq_len(max_seq_len);
     let llg_factory = build_llg_factory(tokenizer.clone())?;
     let num_hidden_layers = match model {
         Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
@@ -723,6 +725,10 @@ impl Pipeline for TitanGGUFPipeline {
         }
     }
 
+    fn supports_hybrid_prefix(&self) -> bool {
+        true
+    }
+
     fn hybrid_prefix_export(
         &self,
         seq: &Sequence,
@@ -975,3 +981,23 @@ impl crate::speculative::driver::SpeculativePipelineExt for TitanGGUFPipeline {
 }
 
 impl AnyMoePipelineMixin for TitanGGUFPipeline {}
+
+/// The context length requests are held to: the GGUF's `context_length`, capped by the configured
+/// `[models.device] max_seq_len` (TITAN_MAX_SEQ_LEN, set per model by the swap config). Without the cap a
+/// model whose GGUF says 262144 accepted prompts far past the configured 32k/65k, and on host-RAM KV one
+/// such request asks for ~8 GiB of host memory.
+fn capped_max_seq_len(gguf: usize) -> usize {
+    let configured = mistralrs_quant::titan_cfg::var("TITAN_MAX_SEQ_LEN").ok();
+    match configured.as_deref().map(str::trim).map(str::parse::<usize>) {
+        Some(Ok(n)) if n > 0 => {
+            let len = n.min(gguf);
+            tracing::info!("titan context: {len} tokens (configured {n}, GGUF {gguf})");
+            len
+        }
+        Some(_) => {
+            tracing::warn!("titan context: TITAN_MAX_SEQ_LEN={:?} is not a positive number; using the GGUF's {gguf}", configured.unwrap_or_default());
+            gguf
+        }
+        None => gguf,
+    }
+}

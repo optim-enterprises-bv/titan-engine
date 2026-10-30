@@ -63,7 +63,8 @@ fuzzy-matcher = "0.3"
 # (mistralrs-core/cublas): the oxide binary links none of them.
 oxide = ["mistralrs-core/oxide", "mistralrs-server-core/oxide"]
 # titan: this tree is only ever the nvcc-free oxide engine, so oxide is default; a plain `cargo build` is the real
-# build. Needs TITAN_OXIDE_DIR set (the prebuilt PTX). The cuBLAS/nvcc path stays reachable via `--no-default-features`.
+# build. Needs TITAN_OXIDE_DIR set (the prebuilt PTX). `--no-default-features` does not reach the upstream cuBLAS/nvcc
+# path: the titan guards and the workspace defaults keep oxide on.
 default = ["code-execution", "oxide"]
 cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda", "mistralrs-core/cublas"]
 cutile = ["cuda", "mistralrs-core/cutile"]

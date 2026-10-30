@@ -64,7 +64,7 @@ fn cfg() -> &'static Cfg {
     static C: mistralrs_quant::titan_cfg::GenCell<Cfg> = mistralrs_quant::titan_cfg::GenCell::new();
     C.get_or_init(|| {
         let env = |n: &str, d: usize| mistralrs_quant::titan_cfg::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let on = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_PREFILL").map(|v| v != "0").unwrap_or(true);
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_ATTN_FLASH_PREFILL", true);
         let min_kv = env("TITAN_ATTN_FLASH_PREFILL_MIN", DEFAULT_MIN_KV).max(1);
         let units = env("TITAN_ATTN_FLASH_PREFILL_UNITS", DEFAULT_UNITS).max(1);
         let want = mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_PREFILL_KERNEL").unwrap_or_else(|_| "w8".into());
@@ -475,7 +475,7 @@ pub(crate) fn attend_any(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32,
     }
     let d512_w8 = {
         static W8: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-        *W8.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_ATTN_FLASH_PREFILL_D512_W8").is_ok_and(|v| v == "1"))
+        *W8.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_ATTN_FLASH_PREFILL_D512_W8", false))
     };
     let (name, nw): (&'static str, usize) = match (d, f16, out32, d512_w8) {
         (128, false, _, _) => ("flash_prefill_d128_w8", 8),

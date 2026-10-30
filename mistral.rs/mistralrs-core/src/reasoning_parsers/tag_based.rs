@@ -401,6 +401,10 @@ impl Default for TagReasoningContext {
 }
 
 impl super::ReasoningParser for TagReasoningContext {
+    fn open_block_close_tag(&self) -> Option<&str> {
+        self.in_think_block.then_some(self.close_tag.as_str())
+    }
+
     fn process_bytes(&mut self, bytes: &[u8]) {
         Self::process_bytes(self, bytes);
     }

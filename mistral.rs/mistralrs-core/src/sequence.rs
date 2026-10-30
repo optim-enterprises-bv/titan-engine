@@ -2276,6 +2276,11 @@ impl Sequence {
         self.reasoning_mode = Some(mode);
     }
 
+    /// The close tag of the reasoning block the output is in now, if any.
+    pub fn open_reasoning_close_tag(&self) -> Option<&str> {
+        self.reasoning_parser.as_ref()?.open_block_close_tag()
+    }
+
     pub fn has_reasoning_state(&self) -> bool {
         self.reasoning_parser.is_some()
             || self

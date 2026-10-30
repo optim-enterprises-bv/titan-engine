@@ -556,7 +556,7 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
     if crate::titan_cfg::q3k_rows_enabled(&w.device())
         && w.device().is_cuda()
         && (dtype == GgmlDType::Q3K
-            || crate::titan_cfg::var("TITAN_ROWS_ALL").is_ok_and(|v| v == "1"))
+            || crate::titan_cfg::flag("TITAN_ROWS_ALL", false))
         && super::mmvq_rows::supports(w, xs)
     {
         return super::mmvq_rows::plain_rows(w, xs);

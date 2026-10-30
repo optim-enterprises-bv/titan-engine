@@ -48,7 +48,7 @@ quant = "4"
 |---|---|---|---|
 | `max_seqs` | `--max-seqs` | 32 | Max concurrent sequences. |
 | `no_kv_cache` | `--no-kv-cache` | false | Disable KV cache entirely. |
-| `prefix_cache_n` | `--prefix-cache-n` | 16 | Prefix caches retained (0 to disable). |
+| `prefix_cache_n` | `--prefix-cache-n` | 16 | Prefix caches retained (0 to disable). For titan's hybrid (GDN) models it only turns the cache on or off; that cache is bounded by `TITAN_PREFIX_CACHE_ENTRIES` (2), `TITAN_PREFIX_CACHE_MIB` (1280) and `TITAN_PREFIX_CACHE_POINTS` (4). |
 | `chat_template` | `-c`, `--chat-template` | not set | Custom chat template file (`.json` or `.jinja`), applied to every model. Per-model `chat_template` in `[[models]]` overrides it. |
 | `jinja_explicit` | `-j`, `--jinja-explicit` | not set | Explicit Jinja template override. Per-model `jinja_explicit` also exists. |
 | `matformer_config_path` | `--matformer-config-path` | not set | MatFormer (nested-submodel) slice config (CSV/JSON). |

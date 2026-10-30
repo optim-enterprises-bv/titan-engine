@@ -15,7 +15,7 @@ struct Cfg {
 fn cfg() -> &'static Cfg {
     static C: mistralrs_quant::titan_cfg::GenCell<Cfg> = mistralrs_quant::titan_cfg::GenCell::new();
     C.get_or_init(|| {
-        let on = mistralrs_quant::titan_cfg::var("TITAN_LOOKUP").map(|v| v != "0").unwrap_or(true);
+        let on = mistralrs_quant::titan_cfg::flag("TITAN_LOOKUP", true);
         let min_ngram = mistralrs_quant::titan_cfg::var("TITAN_LOOKUP_MIN")
             .ok()
             .and_then(|v| v.parse().ok())

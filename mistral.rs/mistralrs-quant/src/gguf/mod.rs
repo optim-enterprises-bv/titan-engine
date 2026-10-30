@@ -440,16 +440,14 @@ impl GgufMatMul {
         let ncols_w = q.shape().dims2()?.1;
         let tall_skinny = ncols_w <= mmq_small_cols();
 
-        // Small batches: MMVQ (decode kernel). Larger: MMQ (the GEMM kernel).
+        // Small batches: MMVQ (decode kernel). Larger, or tall-skinny at any batch: MMQ (the GEMM kernel).
+        // Tall-skinny small batches used to return None here, which sent them to the f32-activation candle
+        // path: the opposite of what TITAN_MMQ_SMALL_COLS is for.
         let ceiling = mmvq_max_batch();
         if flat_batch <= ceiling && !tall_skinny {
             return Ok(Some(fast_mmvq::plain(q, a)?));
         }
-        if flat_batch > ceiling {
-            return Ok(Some(fast_mmq::plain(q, a)?));
-        }
-
-        Ok(None)
+        Ok(Some(fast_mmq::plain(q, a)?))
     }
 
     #[cfg(all(feature = "cuda", has_marlin_kernels))]

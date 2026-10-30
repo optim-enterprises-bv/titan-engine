@@ -100,7 +100,7 @@ fn g4_probe(t: &Tensor, what: impl FnOnce() -> String) -> Result<()> {
 /// the mask; the KV cache stays in the model dtype. Off by default.
 fn g4_attn_f32() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
-    *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_G4_ATTN_F32").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_G4_ATTN_F32", false))
 }
 
 /// gemma4 attention numerics (titan).
@@ -120,11 +120,11 @@ struct G4Prec {
 fn g4_prec() -> &'static G4Prec {
     static P: mistralrs_quant::titan_cfg::GenCell<G4Prec> = mistralrs_quant::titan_cfg::GenCell::new();
     P.get_or_init(|| {
-        let var = |n: &str| mistralrs_quant::titan_cfg::var(n).ok();
+        let on = |n: &str| mistralrs_quant::titan_cfg::flag(n, true);
         let p = G4Prec {
-            flash: var("TITAN_G4_ATTN_FLASH").is_none_or(|v| v != "0"),
-            flash_decode: var("TITAN_G4_FLASH_DECODE").is_none_or(|v| v != "0"),
-            kv16: var("TITAN_G4_KV16").is_none_or(|v| v != "0"),
+            flash: on("TITAN_G4_ATTN_FLASH"),
+            flash_decode: on("TITAN_G4_FLASH_DECODE"),
+            kv16: on("TITAN_G4_KV16"),
         };
         tracing::info!("titan gemma4 attention: flash {} (decode rows {}), f16 KV under F32 activations {}", p.flash, p.flash_decode, p.kv16);
         p
@@ -339,7 +339,7 @@ impl Gemma4Router {
         // Pre-combine: weight = scale * hidden_size^(-0.5)
         let root_size = (hidden_size as f64).powf(-0.5);
         let combined_weight = (&scale * root_size)?;
-        let f32_on = mistralrs_quant::titan_cfg::var("TITAN_G4_ROUTER_F32").map(|v| v != "0").unwrap_or(true);
+        let f32_on = mistralrs_quant::titan_cfg::flag("TITAN_G4_ROUTER_F32", true);
         let f32_path = if f32_on && vb.dtype() != DType::F32 {
             // read the stored tensors again at F32 (a GGUF F32 router stays exact, not rounded via the model dtype)
             let vb32 = vb.clone().set_dtype(DType::F32);

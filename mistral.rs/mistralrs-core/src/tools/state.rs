@@ -199,6 +199,16 @@ impl ToolCallState {
         }
     }
 
+    /// The active grammar holds a complete call (it could stop here): the obligation is met, so the turn may
+    /// end. Before, it was only met when the grammar cleared, which a grammar open for parallel calls never
+    /// does, so end-of-turn stayed blocked and a forced call ran on into call after call until max_tokens.
+    pub(crate) fn mark_grammar_call_complete(&mut self) {
+        if matches!(self.grammar, ToolGrammarState::Active { .. }) {
+            self.obligation
+                .mark_satisfied(self.matcher.requires_tool_call());
+        }
+    }
+
     pub(crate) fn clear_active_grammar(&mut self) -> bool {
         let ToolGrammarState::Active { forced } = self.grammar else {
             return false;

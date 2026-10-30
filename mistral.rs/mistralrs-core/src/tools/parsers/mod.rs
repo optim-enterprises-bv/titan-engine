@@ -22,6 +22,17 @@ use crate::Tool;
 const REQUIRED_TOOL_CALL_CONTROL_TOKENS: &[&str] = &[
     "<tool_call>",
     "</tool_call>",
+    // Qwen XML tags: special tokens in LFM3's tokenizer
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
+    // GLM-style arguments (Spark): special tokens in spark-devsecops' tokenizer, so the grammar must name
+    // the token, not its text, or the model can only close the call with no arguments
+    "<arg_key>",
+    "</arg_key>",
+    "<arg_value>",
+    "</arg_value>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
     "<tool_calls>",
@@ -151,6 +162,49 @@ pub fn build_required_tool_call_grammar(
     qwen::QwenParser.required_tool_call_grammar(tools)
 }
 
+/// Let a forced call wait for the open reasoning block: free text, then its close tag, then the call. Without
+/// this a call forced inside `<think>` became reasoning text and the request failed with "no tools were
+/// called". Returns whether the grammar changed.
+pub fn close_reasoning_before_tool_call(
+    grammar: &mut TopLevelGrammar,
+    close_tag: &str,
+    tok_trie: &toktrie::TokTrie,
+) -> bool {
+    let Some(lark) = grammar
+        .grammars
+        .first_mut()
+        .and_then(|grammar| grammar.lark_grammar.as_mut())
+    else {
+        return false;
+    };
+    let Some(at) = lark
+        .match_indices("start:")
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || lark.as_bytes()[i - 1] == b'\n')
+    else {
+        return false;
+    };
+    // a special close token ends free text by itself; a close that is plain text in this tokenizer (GGUF
+    // vocabularies often leave `</think>` unmarked) needs a lazy rule that stops at its first occurrence
+    let prefix = match tok_trie.get_special_token(close_tag) {
+        Some(id) => {
+            let close = if close_tag.starts_with('<') && close_tag.ends_with('>') {
+                close_tag.to_string()
+            } else {
+                format!("<[{id}]>")
+            };
+            format!("start: open_reasoning {close} \"\\n\"* forced_tool_call\nopen_reasoning: /(?s:.*)/\n")
+        }
+        None => format!(
+            "start: open_reasoning \"\\n\"* forced_tool_call\nopen_reasoning[suffix={}]: /(?s:.*)/\n",
+            serde_json::to_string(close_tag).unwrap_or_default()
+        ),
+    };
+    lark.replace_range(at..at + "start:".len(), "forced_tool_call:");
+    lark.insert_str(0, &prefix);
+    true
+}
+
 pub fn specialize_required_tool_call_grammar(
     grammar: &mut TopLevelGrammar,
     tok_trie: &toktrie::TokTrie,
@@ -164,8 +218,14 @@ pub fn specialize_required_tool_call_grammar(
     };
 
     for token in REQUIRED_TOOL_CALL_CONTROL_TOKENS {
-        if tok_trie.get_special_token(token).is_some() {
-            *lark = lark.replace(&format!(r#""{token}""#), token);
+        if let Some(id) = tok_trie.get_special_token(token) {
+            // `<function=` / `<parameter=` (LFM3) are open tags lark cannot spell as a token name; use the id
+            let reference = if token.ends_with('=') {
+                format!("<[{id}]>")
+            } else {
+                token.to_string()
+            };
+            *lark = lark.replace(&format!(r#""{token}""#), &reference);
         }
     }
 }

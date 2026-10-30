@@ -1360,7 +1360,7 @@ impl FastExpertsWeights {
         config: MoEForwardConfig,
         y: &Tensor,
     ) -> Result<()> {
-        if !mistralrs_quant::titan_cfg::var("TITAN_MOE_XCHECK").is_ok_and(|v| v == "1") {
+        if !mistralrs_quant::titan_cfg::flag("TITAN_MOE_XCHECK", false) {
             return Ok(());
         }
         let Some(r) = self.forward_decode(forward, config)? else {
@@ -1382,7 +1382,7 @@ impl FastExpertsWeights {
     /// `TITAN_MOE_NONFINITE_GUARD=1` (debug, off by default: its F32 sum and sync cost ~19% of a 3.5k prefill).
     #[cfg(feature = "cuda")]
     fn nonfinite_guard() -> bool {
-        mistralrs_quant::titan_cfg::var("TITAN_MOE_NONFINITE_GUARD").is_ok_and(|v| v == "1")
+        mistralrs_quant::titan_cfg::flag("TITAN_MOE_NONFINITE_GUARD", false)
     }
 
     /// Whether every element of `y` is finite (one F32 sum and a device sync; REDCELL rows are far from overflow).

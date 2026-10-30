@@ -420,7 +420,7 @@ fn metal_sysctl_floor_bytes() -> Result<usize> {
 
 /// `TITAN_DEVMAP_LOG=1` (debug): log the CUDA allocator around every prompt step (`devmap_memlog`).
 pub fn devmap_memlog_enabled() -> bool {
-    mistralrs_quant::titan_cfg::var("TITAN_DEVMAP_LOG").is_ok_and(|v| v == "1")
+    mistralrs_quant::titan_cfg::flag("TITAN_DEVMAP_LOG", false)
 }
 
 /// Log free device memory and the stream-ordered pool's used / reserved bytes and their high-water marks, then

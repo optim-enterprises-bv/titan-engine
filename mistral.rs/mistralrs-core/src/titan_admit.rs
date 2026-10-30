@@ -39,8 +39,10 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn mode() -> Mode {
-    static M: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-    *M.get_or_init(|| parse_mode(std::env::var("TITAN_ADMIT").ok().as_deref()))
+    // A GenCell over titan_cfg, so `[models.titan.env] TITAN_ADMIT` applies to its model (a process-wide
+    // OnceLock over std::env ignored it while begin_model logged it as applied).
+    static M: mistralrs_quant::titan_cfg::GenCell<Mode> = mistralrs_quant::titan_cfg::GenCell::new();
+    *M.get_or_init(|| parse_mode(mistralrs_quant::titan_cfg::var("TITAN_ADMIT").ok().as_deref()))
 }
 
 fn parse_mode(v: Option<&str>) -> Mode {
@@ -51,7 +53,11 @@ fn parse_mode(v: Option<&str>) -> Mode {
         Some(v) => match v.trim().to_ascii_lowercase().as_str() {
             "1" | "enforce" | "on" | "true" | "yes" => Mode::Enforce,
             "log" => Mode::Log,
-            _ => Mode::Off,
+            "0" | "off" | "false" | "no" => Mode::Off,
+            other => {
+                tracing::warn!("titan setting TITAN_ADMIT={other:?} is not understood (enforce|log|off); admission is off");
+                Mode::Off
+            }
         },
         None => Mode::Off,
     }
@@ -67,9 +73,7 @@ pub(crate) struct WorkingSet {
 
 impl WorkingSet {
     pub(crate) fn from_env() -> Self {
-        let get = |name: &str, default: usize| {
-            std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default)
-        };
+        let get = |name: &str, default: usize| mistralrs_quant::titan_cfg::num(name, default);
         Self {
             base: get("TITAN_ADMIT_BASE_MIB", 256) << 20,
             per_kv_token: get("TITAN_ADMIT_CTX_KIB", 10) << 10,
@@ -210,6 +214,30 @@ pub(crate) fn check(
 
 #[cfg(test)]
 mod tests {
+
+    /// titan_cfg::flag / num read every usual spelling (mistralrs-quant's own test binary does not link,
+    /// so the helpers are exercised here). Before them, "true" meant off for exact-"1" settings and
+    /// "false" meant on for anything-but-"0" ones; unparseable numbers fell back silently.
+    #[test]
+    fn settings_read_every_usual_spelling() {
+        use mistralrs_quant::titan_cfg::{flag, num};
+        let k = "TITAN_ADMIT_TEST_FLAG";
+        for (v, default, want) in [("1", false, true), ("true", false, true), ("ON", false, true), (" yes ", false, true),
+            ("0", true, false), ("false", true, false), ("Off", true, false), ("no", true, false),
+            ("sometimes", true, true), ("sometimes", false, false)] {
+            std::env::set_var(k, v);
+            assert_eq!(flag(k, default), want, "{v:?} with default {default}");
+        }
+        std::env::remove_var(k);
+        assert!(flag(k, true) && !flag(k, false));
+        let n = "TITAN_ADMIT_TEST_NUM";
+        std::env::set_var(n, " 64 ");
+        assert_eq!(num(n, 8usize), 64);
+        std::env::set_var(n, "64x");
+        assert_eq!(num(n, 8usize), 8);
+        std::env::remove_var(n);
+    }
+
     use super::*;
 
     const MIB: usize = 1 << 20;

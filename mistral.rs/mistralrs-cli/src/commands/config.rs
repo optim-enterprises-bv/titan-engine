@@ -111,7 +111,16 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
             max_resident: swap.max_resident.unwrap_or(mistralrs_core::TITAN_DEFAULT_MAX_RESIDENT),
             models: models
                 .iter()
-                .map(|m| Ok::<_, anyhow::Error>((name(m), m.titan.clone().unwrap_or_default().settings()?)))
+                .map(|m| {
+                    let mut settings = m.titan.clone().unwrap_or_default().settings()?;
+                    // [models.device] max_seq_len reaches the titan loader as a per-model setting: with
+                    // device_layers the device map is explicit and carries no length, so the loader used
+                    // the GGUF's context_length (262144) and accepted prompts far past the configured cap.
+                    if let Some(len) = m.device.max_seq_len {
+                        settings.env.insert("TITAN_MAX_SEQ_LEN".to_string(), len.to_string());
+                    }
+                    Ok::<_, anyhow::Error>((name(m), settings))
+                })
                 .collect::<Result<_>>()?,
         };
         info!("titan swap mode: {} models, default {}, at most {} resident", models.len(), policy.default_model, policy.max_resident);
