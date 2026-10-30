@@ -195,6 +195,30 @@ const IQ4_XS_FMT: LlamaFmt = LlamaFmt {
     deq_per_block: false,
 };
 
+/// IQ3_XXS (type 18, titan-engine/oxide-kernels/iq3_xxs): `dequantize_block_iq3_xxs` + `mul_mat_vec_q
+/// <IQ3_XXS, n, false, false>`. Like IQ3_S it is in llama.cpp's `iq_slow_turing` (mmvq.cu
+/// `should_use_small_k`), so the small_k instance is never picked: `blocks_per_iter_1warp` 0.
+const IQ3_XXS_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq3_xxs_oxide.ptx"),
+    module: "titan_iq3_xxs",
+    prefix: "iq3_xxs",
+    qk: 256,
+    blocks_per_iter_1warp: 0,
+    deq_per_block: false,
+};
+
+/// IQ2_S (type 22, titan-engine/oxide-kernels/iq2_s): `dequantize_block_iq2_s` + `mul_mat_vec_q
+/// <IQ2_S, n, false, small_k>`. qi 16, vdr 2: `blocks_per_iter_1warp` = 2 * 32 / 16 = 4; IQ2_S is
+/// only in `iq_slow_other`, so llama.cpp keeps small_k on NVIDIA Turing+.
+const IQ2_S_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq2_s_oxide.ptx"),
+    module: "titan_iq2_s",
+    prefix: "iq2_s",
+    qk: 256,
+    blocks_per_iter_1warp: 4,
+    deq_per_block: false,
+};
+
 const IQ4_NL_FMT: LlamaFmt = LlamaFmt {
     ptx: include_str!("iq4_nl_oxide.ptx"),
     module: "titan_iq4_nl",
@@ -229,6 +253,10 @@ fn llama_fmt(dtype: GgmlDType) -> Option<&'static LlamaFmt> {
         GgmlDType::NVFP4 => Some(&NVFP4_FMT),
         GgmlDType::IQ3S => Some(&IQ3_S_FMT),
         GgmlDType::IQ4XS => Some(&IQ4_XS_FMT),
+        // dense layers of IQ3_XXS / IQ2_S models (OrcaCyber); before, only MoE experts had kernels
+        // for these and a dense matmul failed
+        GgmlDType::IQ3XXS => Some(&IQ3_XXS_FMT),
+        GgmlDType::IQ2S => Some(&IQ2_S_FMT),
         _ => None,
     }
 }
@@ -897,6 +925,8 @@ impl QCudaStorage {
                 | GgmlDType::NVFP4
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ4XS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -1574,6 +1604,63 @@ mod test {
         Ok(())
     }
 
+    /// IQ3_XXS / IQ2_S dense path: GPU dequantize equals the CPU one bit for bit (f32) and to f16
+    /// rounding, and the MMVQ (m <= 8) / dequantize + matmul (m > 8) products agree with the f32
+    /// product of the CPU-dequantized weight. Random blocks with a finite positive-or-negative scale.
+    #[test]
+    fn cuda_iq3_xxs_and_iq2_s_dense() -> Result<()> {
+        use crate::quantized::{QMatMul, QTensor};
+        use crate::{Device, Module, Tensor};
+        let dev = Device::new_cuda(0)?;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (dtype, block_bytes, name) in [(GgmlDType::IQ3XXS, 98usize, "IQ3_XXS"), (GgmlDType::IQ2S, 82, "IQ2_S")] {
+            for &(n, k) in &[(37usize, 1024usize), (19, 4096), (8, 5120)] {
+                let mut bytes = Vec::with_capacity(n * k / 256 * block_bytes);
+                for _ in 0..n * k / 256 {
+                    let d = (0x1C00 + (next() % 0x0800) as u16) | (((next() & 1) as u16) << 15);
+                    bytes.extend_from_slice(&d.to_le_bytes());
+                    for _ in 0..block_bytes - 2 {
+                        bytes.push(next() as u8);
+                    }
+                }
+                let q_cpu = QTensor::new(
+                    crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &Device::Cpu, dtype)?,
+                    (n, k),
+                )?;
+                let deq_cpu = q_cpu.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                let storage = crate::quantized::QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, dtype)?;
+                let q_gpu = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+                let deq_gpu = q_gpu.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?;
+                assert!(deq_cpu.iter().zip(&deq_gpu).all(|(a, b)| a.to_bits() == b.to_bits()), "{name} dequantize f32");
+                let deq_h = q_gpu.dequantize_f16(&dev)?.flatten_all()?.to_vec1::<half::f16>()?;
+                assert!(deq_cpu.iter().zip(&deq_h).all(|(a, b)| half::f16::from_f32(*a) == *b), "{name} dequantize f16");
+                let mm = QMatMul::from_arc(q_gpu)?;
+                let wd = Tensor::from_vec(deq_cpu, (n, k), &Device::Cpu)?;
+                for m in [1usize, 2, 3, 5, 8, 20] {
+                    let x: Vec<f32> = (0..m * k).map(|i| ((i * 104729 % 997) as f32 - 498.0) / 250.0).collect();
+                    let x = Tensor::from_vec(x, (m, k), &Device::Cpu)?;
+                    let scale = x.abs()?.matmul(&wd.abs()?.t()?)?.to_vec2::<f32>()?;
+                    let exact = x.matmul(&wd.t()?)?.to_vec2::<f32>()?;
+                    let got = mm.forward(&x.to_device(&dev)?)?.to_vec2::<f32>()?;
+                    for r in 0..m {
+                        for c in 0..n {
+                            let (g, s, w) = (got[r][c], scale[r][c], exact[r][c]);
+                            let tol = if m <= 8 { 1e-2 * s } else { 1e-5 * s };
+                            assert!((g - w).abs() <= tol, "{name} n={n} k={k} m={m} ({r},{c}): gpu {g} want {w} (scale {s})");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// IQ4_XS (random blocks with finite scales, as the oxide gate's oracle). CPU dequantize equals
     /// llama.cpp's `dequantize_row_iq4_xs` bit for bit (when the oxide-kernels/iq4_xs gate has
     /// written its oracle file), the GPU dequantize equals the CPU one bit for bit, and the MMVQ
@@ -1591,7 +1678,7 @@ mod test {
                 std::slice::from_raw_parts(blocks.as_ptr() as *const _, blocks.len() / 136)
             };
             let mut ys = vec![0f32; xs.len() * 256];
-            crate::quantized::BlockIQ4xs::to_float(xs, &mut ys);
+            <crate::quantized::BlockIQ4xs as crate::quantized::GgmlType>::to_float(xs, &mut ys);
             let got: Vec<u8> = ys.iter().flat_map(|v| v.to_le_bytes()).collect();
             assert_eq!(got.len(), want.len());
             let bad = got.chunks(4).zip(want.chunks(4)).filter(|(a, b)| a != b).count();
