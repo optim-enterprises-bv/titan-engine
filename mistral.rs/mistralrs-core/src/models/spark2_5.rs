@@ -187,6 +187,17 @@ fn prompt_masks(
     Ok((full, sliding))
 }
 
+/// The columns of a (rows, past + rows) prompt mask that belong to `kv_len` keys ending at the newest position:
+/// what a sliding layer's cache returns on a continued prompt (the retained window, then the new rows).
+fn mask_for_keys(mask: &Tensor, kv_len: usize) -> Result<Tensor> {
+    let cols = mask.dim(D::Minus1)?;
+    if cols > kv_len {
+        mask.narrow(D::Minus1, cols - kv_len, kv_len)
+    } else {
+        Ok(mask.clone())
+    }
+}
+
 fn flash_swa_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_SPARK_FLASH_SWA").map(|v| v != "0").unwrap_or(true))
@@ -286,6 +297,12 @@ impl Attention {
         let AttentionMask::Custom(m) = mask else {
             return Sdpa.run_attention(q, k, v, mask, flash_params, &self.sdpa_params);
         };
+        // The prompt masks are (rows, past + rows). A sliding layer's cache returns only the retained window
+        // plus the new rows — keys past - retained .. past + rows, in order — so on a prompt that continues a
+        // cached prefix longer than the window (every multi-turn conversation past 512 tokens) the keys are
+        // the mask's last kv_len columns. Using the whole mask failed the request with "shape mismatch in
+        // broadcast_add, lhs: [1, 16, 12, 524], rhs: [12, 6438]".
+        let m = &mask_for_keys(m, kv_len)?;
         let window = self.sdpa_params.sliding_window;
         if rows > 1
             && FLASH_PREFILL_REP.is_multiple_of(h / kvh)
@@ -336,7 +353,7 @@ impl Attention {
                 return Tensor::cat(&out, 2);
             }
         }
-        Sdpa.run_attention(q, k, v, mask, flash_params, &self.sdpa_params)
+        Sdpa.run_attention(q, k, v, &AttentionMask::Custom(m.clone()), flash_params, &self.sdpa_params)
     }
 
     fn forward(
@@ -799,6 +816,31 @@ impl AnyMoeBaseModelMixin for Model {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompt continuing a cached prefix longer than the window: the sliding layer's keys are the retained
+    /// window plus the new rows, and the mask it gets must be exactly theirs (multi-turn conversations failed
+    /// with a broadcast shape mismatch).
+    #[test]
+    fn a_continued_prompt_masks_the_sliding_keys_it_has() -> Result<()> {
+        let (rows, past, window) = (3usize, 20usize, 4usize);
+        let (_, sliding) = prompt_masks(rows, past, window, DType::F32, &Device::Cpu)?;
+        assert_eq!(sliding.dims(), [rows, past + rows]);
+        let retained = window; // a rotating cache keeps the last `window` positions
+        let kv_len = retained + rows;
+        let m = mask_for_keys(&sliding, kv_len)?;
+        assert_eq!(m.dims(), [rows, kv_len]);
+        let got: Vec<Vec<f32>> = m.to_vec2()?;
+        for (i, row) in got.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                let key = past - retained + j; // the position of key column j
+                let visible = past + i < key + window && key <= past + i;
+                assert_eq!(v.is_finite(), visible, "row {i} key {key}");
+            }
+        }
+        // a fresh prompt (every key returned) keeps its whole mask
+        assert_eq!(mask_for_keys(&sliding, past + rows)?.dims(), [rows, past + rows]);
+        Ok(())
+    }
 
     fn hf_config() -> serde_json::Value {
         serde_json::json!({
