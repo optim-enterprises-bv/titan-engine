@@ -350,6 +350,10 @@ impl MistralRs {
         if self.titan_known(&id)? {
             Ok(id)
         } else {
+            // still served (clients send placeholder names), but no longer silently
+            mistralrs_quant::titan_cfg::note_once(&format!("unknown-model={name}"), || {
+                format!("titan swap: no model named {name:?}; serving the default model {:?}", st.policy.default_model)
+            });
             Ok(st.policy.default_model.clone())
         }
     }

@@ -1,23 +1,14 @@
-use std::sync::OnceLock;
-
 const CUDA_GRAPHS_ENV: &str = "MISTRALRS_CUDA_GRAPHS";
 const FLASHINFER_DECODE_ENV: &str = "MISTRALRS_FLASHINFER_DECODE";
 
-static CUDA_GRAPHS_ENABLED: OnceLock<bool> = OnceLock::new();
-static FLASHINFER_DECODE_ENABLED: OnceLock<bool> = OnceLock::new();
+// Per model through titan_cfg (`[models.titan.env]` applies; on/off/1/0/true/false/yes/no), recomputed when
+// the settings generation changes. A process-wide OnceLock over std::env ignored the per-model value.
+static CUDA_GRAPHS_ENABLED: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+static FLASHINFER_DECODE_ENABLED: mistralrs_quant::titan_cfg::GenCell<bool> =
+    mistralrs_quant::titan_cfg::GenCell::new();
 
 fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on") {
-                true
-            } else if matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off") {
-                false
-            } else {
-                default
-            }
-        })
-        .unwrap_or(default)
+    mistralrs_quant::titan_cfg::flag(name, default)
 }
 
 pub(crate) fn cuda_graphs_enabled() -> bool {

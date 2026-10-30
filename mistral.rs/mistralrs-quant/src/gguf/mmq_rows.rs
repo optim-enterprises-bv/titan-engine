@@ -49,11 +49,10 @@ const KB_PER_STAGE: usize = 2;
 static MAX_COLS_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn max_cols() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
+    // per model: a OnceLock kept the first model's value for the whole process
+    static N: crate::titan_cfg::GenCell<usize> = crate::titan_cfg::GenCell::new();
     match MAX_COLS_OVERRIDE.load(Ordering::Relaxed) {
-        usize::MAX => *N.get_or_init(|| {
-            crate::titan_cfg::var("TITAN_MMQ_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_COLS).min(MAX_COLS)
-        }),
+        usize::MAX => *N.get_or_init(|| crate::titan_cfg::num("TITAN_MMQ_ROWS", DEFAULT_MAX_COLS).min(MAX_COLS)),
         n => n,
     }
 }

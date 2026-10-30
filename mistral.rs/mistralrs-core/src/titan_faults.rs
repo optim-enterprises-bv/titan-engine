@@ -14,7 +14,7 @@ const LOG_EVERY: u64 = 200;
 const BUCKETS: [u64; 4] = [1, 2, 8, 64];
 
 pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_FAULT_LOG", false))
 }
 

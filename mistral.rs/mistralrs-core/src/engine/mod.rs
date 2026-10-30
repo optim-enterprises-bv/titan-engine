@@ -2505,7 +2505,7 @@ static TITAN_ENG: std::sync::Mutex<Vec<(&'static str, std::time::Duration, u64)>
     std::sync::Mutex::new(Vec::new());
 
 fn titan_eng_prof_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_STEP_PROF", false))
 }
 

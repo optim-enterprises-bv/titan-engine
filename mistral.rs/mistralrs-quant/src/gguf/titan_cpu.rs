@@ -468,20 +468,14 @@ unsafe fn chunk_sumi_vnni(bits: u32, q: &[u8]) -> i32 {
 /// the CPU has `avxvnni` and `TITAN_CPU_VNNI` is not `0`. Decided once per process. Both give the
 /// same integers, so the choice never changes an output bit, only the speed.
 pub fn vnni() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-    static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
-    match STATE.load(Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let detected = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("avxvnni");
-            let on = detected && crate::titan_cfg::flag("TITAN_CPU_VNNI", true);
-            if STATE.swap(if on { 2 } else { 1 }, Relaxed) == 0 {
-                tracing::info!("titan cpu twin: integer dot {} (avxvnni detected: {detected})", if on { "AVX-VNNI" } else { "AVX2" });
-            }
-            on
-        }
-    }
+    // per model (`[models.titan.env] TITAN_CPU_VNNI`); was decided once for the process
+    static STATE: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *STATE.get_or_init(|| {
+        let detected = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("avxvnni");
+        let on = detected && crate::titan_cfg::flag("TITAN_CPU_VNNI", true);
+        tracing::info!("titan cpu twin: integer dot {} (avxvnni detected: {detected})", if on { "AVX-VNNI" } else { "AVX2" });
+        on
+    })
 }
 
 /// `acc` + the dp4a of unsigned bytes `a` with signed bytes `b` in each 32-bit lane. VNNI's vpdpbusd

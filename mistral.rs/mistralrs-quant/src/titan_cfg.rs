@@ -80,6 +80,23 @@ fn warn_once(name: &str, value: &str, used: &str) {
     }
 }
 
+/// Log `msg` once per process for `key` (a setting fell back, or turned another one off).
+pub fn note_once(key: &str, msg: impl FnOnce() -> String) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(key.to_string()) {
+        tracing::warn!("{}", msg());
+    }
+}
+
+/// `~/x` -> `$HOME/x` (models.toml paths are not shell-expanded).
+pub fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// The settings generation; bumped by [`begin_model`] and [`end_model`].
 pub fn generation() -> u64 {
     GEN.load(Ordering::Acquire)
