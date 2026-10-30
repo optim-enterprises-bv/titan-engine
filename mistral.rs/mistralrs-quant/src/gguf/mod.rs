@@ -424,7 +424,10 @@ impl GgufMatMul {
         // i-quants with an MMVQ (decode) but no MMQ port: a prefill batch dequantizes the whole weight to f32 and runs
         // cuBLAS on every call. Correct, but slow on long prompts; say so once rather than leave it silent.
         if let QMatMul::QTensor(q) = &self.w {
-            if q.device().is_cuda() && matches!(q.dtype(), GgmlDType::IQ3S | GgmlDType::IQ3XXS | GgmlDType::IQ2S) {
+            if q.device().is_cuda() && matches!(
+                    q.dtype(),
+                    GgmlDType::IQ3S | GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ2XS
+                ) {
                 // candle's llama_fmt path keeps its MMVQ up to 8 rows (mmvq_1..8) and dequantizes above that
                 const CANDLE_LLAMA_MMVQ_MAX: usize = 8;
                 let flat_batch = a.dims()[..a.dims().len().saturating_sub(1)].iter().product::<usize>();

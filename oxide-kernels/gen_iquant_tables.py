@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Emit the i-quant codebook arrays for candle's iquant.rs from ggml-common.h.
 
-candle needs plain const arrays; the CUDA side keeps its compare chains (a runtime-indexed host
-table never reaches the PTX). GGML_TABLE_BEGIN entries are written in mixed hex and *decimal*
+candle needs plain const arrays. The CUDA crates read the same codebooks from initialized `static`
+tables (`.global` arrays in the PTX, as llama.cpp's `__device__` tables); the compare chains they used
+before made every lookup a 256- to 1024-way select and the decode compute-bound. GGML_TABLE_BEGIN entries are written in mixed hex and *decimal*
 (the ksigns/kmask tables are decimal), so parse tokens generically and assert the length.
 """
 import re, os

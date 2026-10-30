@@ -219,6 +219,27 @@ const IQ2_S_FMT: LlamaFmt = LlamaFmt {
     deq_per_block: false,
 };
 
+/// IQ2_XXS (type 16, titan-engine/oxide-kernels/iq2_xxs) and IQ2_XS (type 17, oxide-kernels/iq2_xs):
+/// `dequantize_block_iq2_{xxs,xs}` + `mul_mat_vec_q<.., n, false, small_k>`. qi 16, vdr 2:
+/// `blocks_per_iter_1warp` = 2 * 32 / 16 = 4; both are only in `iq_slow_other`, so small_k stays on.
+const IQ2_XXS_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq2_xxs_oxide.ptx"),
+    module: "titan_iq2_xxs",
+    prefix: "iq2_xxs",
+    qk: 256,
+    blocks_per_iter_1warp: 4,
+    deq_per_block: false,
+};
+
+const IQ2_XS_FMT: LlamaFmt = LlamaFmt {
+    ptx: include_str!("iq2_xs_oxide.ptx"),
+    module: "titan_iq2_xs",
+    prefix: "iq2_xs",
+    qk: 256,
+    blocks_per_iter_1warp: 4,
+    deq_per_block: false,
+};
+
 const IQ4_NL_FMT: LlamaFmt = LlamaFmt {
     ptx: include_str!("iq4_nl_oxide.ptx"),
     module: "titan_iq4_nl",
@@ -257,6 +278,8 @@ fn llama_fmt(dtype: GgmlDType) -> Option<&'static LlamaFmt> {
         // for these and a dense matmul failed
         GgmlDType::IQ3XXS => Some(&IQ3_XXS_FMT),
         GgmlDType::IQ2S => Some(&IQ2_S_FMT),
+        GgmlDType::IQ2XXS => Some(&IQ2_XXS_FMT),
+        GgmlDType::IQ2XS => Some(&IQ2_XS_FMT),
         _ => None,
     }
 }
@@ -927,6 +950,8 @@ impl QCudaStorage {
                 | GgmlDType::IQ4XS
                 | GgmlDType::IQ3XXS
                 | GgmlDType::IQ2S
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ2XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -1604,7 +1629,7 @@ mod test {
         Ok(())
     }
 
-    /// IQ3_XXS / IQ2_S dense path: GPU dequantize equals the CPU one bit for bit (f32) and to f16
+    /// IQ3_XXS / IQ2_S / IQ2_XXS / IQ2_XS dense path: GPU dequantize equals the CPU one bit for bit (f32) and to f16
     /// rounding, and the MMVQ (m <= 8) / dequantize + matmul (m > 8) products agree with the f32
     /// product of the CPU-dequantized weight. Random blocks with a finite positive-or-negative scale.
     #[test]
@@ -1619,7 +1644,12 @@ mod test {
             state ^= state << 17;
             state
         };
-        for (dtype, block_bytes, name) in [(GgmlDType::IQ3XXS, 98usize, "IQ3_XXS"), (GgmlDType::IQ2S, 82, "IQ2_S")] {
+        for (dtype, block_bytes, name) in [
+            (GgmlDType::IQ3XXS, 98usize, "IQ3_XXS"),
+            (GgmlDType::IQ2S, 82, "IQ2_S"),
+            (GgmlDType::IQ2XXS, 66, "IQ2_XXS"),
+            (GgmlDType::IQ2XS, 74, "IQ2_XS"),
+        ] {
             for &(n, k) in &[(37usize, 1024usize), (19, 4096), (8, 5120)] {
                 let mut bytes = Vec::with_capacity(n * k / 256 * block_bytes);
                 for _ in 0..n * k / 256 {
