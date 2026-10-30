@@ -199,7 +199,10 @@ impl KvCache {
         };
         let dt = k.dtype();
         let to_f8 = k.device().is_cuda() && matches!(dt, DType::BF16 | DType::F16);
-        let host = to_f8 && crate::titan_hostkv::enabled();
+        // Host-RAM KV attends positionally over the whole cache (no mask, window, softcap or sinks), so a
+        // sliding-window (rotating) cache stays on the GPU: moved to the host, its layer attended over every
+        // retained key. Attention refuses host KV for any windowed, softcapped or sink layer (Sdpa::run_attention).
+        let host = to_f8 && crate::titan_hostkv::enabled() && matches!(self, Self::Normal { .. });
         let fp8 = to_f8 && !host && cuda_kv_fp8();
         let (k, v) = if host {
             let cpu = candle_core::Device::Cpu;
