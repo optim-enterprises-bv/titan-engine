@@ -198,20 +198,24 @@ pub(crate) fn is_oom(e: &impl std::fmt::Debug) -> bool {
 /// captured graphs, the pfs staging ring and the doorbell, sync, and trim the pools, so the next request starts
 /// from the memory of a fresh load instead of failing on what the pool kept.
 pub(crate) fn recover_from_oom(p: &dyn crate::pipeline::Pipeline) {
-    use crate::pipeline::MetadataMixin;
+    let (before, after) = release_after_oom(p);
+    warn!(
+        "titan: CUDA out of memory: the request failed; graphs, staging ring and doorbell reset, pools trimmed ({} -> {} MiB free)",
+        before >> 20,
+        after >> 20
+    );
+}
+
+/// The release half of `recover_from_oom`, for a caller that will try again: destroy the captured graphs, the pfs
+/// staging ring and the doorbell, release the kernels' cached workspaces, sync, and trim the pools. Returns VRAM
+/// free (bytes) before and after.
+pub(crate) fn release_after_oom(p: &dyn crate::pipeline::Pipeline) -> (usize, usize) {
     let device = p.device();
     let before = device_free(&device);
     p.titan_reset_graphs();
     mistralrs_quant::titan_recover_oom();
-    #[cfg(feature = "cuda")]
-    if let candle_core::Device::Cuda(dev) = &device {
-        trim_cuda(dev);
-    }
-    warn!(
-        "titan: CUDA out of memory: the request failed; graphs, staging ring and doorbell reset, pools trimmed ({} -> {} MiB free)",
-        before >> 20,
-        device_free(&device) >> 20
-    );
+    release_workspaces_and_trim(&device);
+    (before, device_free(&device))
 }
 
 #[cfg(feature = "cuda")]

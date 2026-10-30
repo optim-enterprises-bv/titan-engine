@@ -1566,6 +1566,17 @@ impl Engine {
                                 }
                             };
 
+                            // Whether a prompt step that ran out of memory can simply run again. With a plain
+                            // KV cache it can: the pre_op either resets the model cache (a fresh prompt) or
+                            // copies each sequence's saved prefix into new tensors (`clone_in_cache`; a
+                            // prefix-cache hit, which every request sharing a chat template is), so the failed
+                            // step left the sequences' own caches untouched. Recurrent state (EitherCache::Hybrid,
+                            // a hybrid prefix resume) is updated in place and is not retried.
+                            let retryable_oom = matches!(
+                                pipeline.cache(),
+                                crate::pipeline::EitherCache::Normal(_)
+                            ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume());
+
                             // hybrid prefix-cache hits: their saved caches go into place now
                             let restored = scheduled
                                 .prompt
@@ -1575,7 +1586,7 @@ impl Engine {
                             match restored {
                                 Err(e) => Err(e),
                                 Ok(()) => {
-                                    pipeline
+                                    let first = pipeline
                                         .step(
                                             &mut scheduled.prompt,
                                             true,
@@ -1589,7 +1600,69 @@ impl Engine {
                                             },
                                             self.logger.as_ref(),
                                         )
-                                        .await
+                                        .await;
+                                    match first {
+                                        // The pool, workspaces and staging ring keep what earlier, smaller
+                                        // requests reserved, and the pre-prompt trim only fires under 1 GiB
+                                        // free: two ~7.8k-token prompts failed at 11.3 GiB in use, and the same
+                                        // pair succeeded right after the recovery below freed 6 GiB. Release
+                                        // that and run the step once more before failing the request.
+                                        Err(e) if retryable_oom && crate::titan_swap::is_oom(&e) => {
+                                            let rows: usize =
+                                                scheduled.prompt.iter().map(|seq| seq.get_toks().len()).sum();
+                                            // Free what the failure path would: the model cache the failed step
+                                            // filled (the retry's pre_op rebuilds it) and the prefix cache, whose
+                                            // entries keep earlier requests' KV on the device with no byte bound
+                                            // unless `prefix_cache_max_mib` is set — ~6 GiB after a few long
+                                            // prompts on a 4B. The sequences keep their own prefix copies.
+                                            if let Err(reset_err) =
+                                                pipeline.set_none_cache(&mut scheduled.prompt, false, true, false)
+                                            {
+                                                tracing::error!("Failed to reset model cache before retry: {reset_err}");
+                                            }
+                                            let evicted = get_mut_arcmutex!(self.prefix_cacher)
+                                                .evict_all_caches()
+                                                .unwrap_or(0);
+                                            let (before, after) =
+                                                crate::titan_swap::release_after_oom(&*pipeline);
+                                            tracing::warn!(
+                                                "titan: prompt step out of memory ({} seqs, {} tokens); evicted {} prefix-cache entries, released {} -> {} MiB free, retrying once",
+                                                scheduled.prompt.len(),
+                                                rows,
+                                                evicted,
+                                                before >> 20,
+                                                after >> 20
+                                            );
+                                            let retried = pipeline
+                                                .step(
+                                                    &mut scheduled.prompt,
+                                                    true,
+                                                    return_raw_logits,
+                                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
+                                                    self.disable_eos_stop,
+                                                    rng.clone(),
+                                                    CacheBackendMetadata::DefaultInstructions {
+                                                        pre_op,
+                                                        post_op,
+                                                    },
+                                                    self.logger.as_ref(),
+                                                )
+                                                .await;
+                                            if retried.is_ok() {
+                                                tracing::info!(
+                                                    "titan: prompt step succeeded on retry after releasing memory"
+                                                );
+                                            }
+                                            retried
+                                        }
+                                        Err(e) if crate::titan_swap::is_oom(&e) => {
+                                            tracing::warn!(
+                                                "titan: prompt step out of memory, not retried: the model's recurrent state is updated in place"
+                                            );
+                                            Err(e)
+                                        }
+                                        other => other,
+                                    }
                                 }
                             }
                         };
