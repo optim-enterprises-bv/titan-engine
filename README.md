@@ -162,9 +162,8 @@ Each ported kernel has a gate crate that runs the same entry on the same inputs 
 cuda-oxide module - then compares the outputs byte for byte. The tally is `oxide-kernels/GATES.md`: 28 gate rows pass,
 and nothing in the tree is blocked by the GPU. The gates are binaries run by hand (not `cargo test`, not CI), and
 several kernel crates in the served binary have no gate row. `oxide-kernels/check_ptx_copies.py` checks that each PTX the
-engine embeds is the build of its crate (ignoring function order); as of 2026-10-31 thirteen match and twelve do not
-(gemm, mxfp4, q1_0, ptq1_0, the fmt_mmq builds; `titan_kernels_oxide` has no crate), so those are not established as
-the gated build.
+engine embeds is the build of its crate (ignoring function order, label numbering and crate hashes); as of 2026-10-31
+every one is.
 
 Headline numbers on this box (RTX 5080 Laptop, cc 12.0):
 
