@@ -1319,6 +1319,9 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// Context window in tokens, when the server knows it (titan swap mode: the configured max_seq_len).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<usize>,
     /// Public source identifier for this model card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,

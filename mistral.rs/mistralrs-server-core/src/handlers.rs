@@ -61,6 +61,7 @@ pub async fn models(State(state): ExtractedMistralRsState) -> Response {
             object: "model",
             created: state.get_creation_time(),
             owned_by: "local",
+            context_length: state.titan_context_len("default"),
             root: Some("default".to_string()),
             parent: None,
             adapter_generation: None,
@@ -94,6 +95,7 @@ pub async fn models(State(state): ExtractedMistralRsState) -> Response {
 
         model_objects.push(ModelObject {
             root: Some(model_id.clone()),
+            context_length: state.titan_context_len(&model_id),
             id: model_id,
             object: "model",
             created: state.get_creation_time(),
@@ -118,6 +120,7 @@ pub async fn models(State(state): ExtractedMistralRsState) -> Response {
             object: "model",
             created: state.get_creation_time(),
             owned_by: "local",
+            context_length: None,
             parent: Some(adapter_model.parent),
             adapter_generation: Some(adapter_model.adapter.generation.to_string()),
             status: Some(CoreModelStatus::Loaded.to_string()),
