@@ -330,6 +330,14 @@ impl MistralRs {
         self.titan_swap.get()
     }
 
+    /// Swap mode: a model's configured context (`[models.device] max_seq_len`, carried as TITAN_MAX_SEQ_LEN), for
+    /// `/v1/models`. Clients (Hermes) size their compaction from it; without it they assumed 256k.
+    pub fn titan_context_len(&self, model_id: &str) -> Option<usize> {
+        let st = self.titan_swap.get()?;
+        let id = if model_id == "default" { st.policy.default_model.clone() } else { self.resolve_alias(model_id).ok()? };
+        st.settings(&id).get("TITAN_MAX_SEQ_LEN")?.parse().ok()
+    }
+
     /// The serving defaults captured at swap start, for building a model added at runtime.
     pub fn titan_swap_globals(&self) -> Option<TitanSwapGlobals> {
         self.titan_swap.get().map(|st| st.globals().clone())

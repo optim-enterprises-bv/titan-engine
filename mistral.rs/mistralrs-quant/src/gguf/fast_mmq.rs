@@ -276,6 +276,14 @@ pub(crate) fn release_workspaces() {
     super::free_leaked(&MXFP4_MMQ_WS);
     super::free_leaked(&NVFP4_MMQ_WS);
     super::free_leaked(&PTQ1_0_MMQ_WS);
+    // every format's workspace must be listed: one left out stays allocated after its model unloads (IQ4_XS's
+    // and the i-quants' did, ~350 MiB after an OrcaCyber prefill, which left the next model a prompt-step OOM)
+    super::free_leaked(&IQ4_XS_MMQ_WS);
+    super::free_leaked(&IQ2_XXS_MMQ_WS);
+    super::free_leaked(&IQ2_XS_MMQ_WS);
+    super::free_leaked(&IQ2_S_MMQ_WS);
+    super::free_leaked(&IQ3_XXS_MMQ_WS);
+    super::free_leaked(&IQ3_S_MMQ_WS);
 }
 
 #[derive(Clone, Copy)]
