@@ -28,7 +28,7 @@ use crate::paged_attention::AttentionImplementation;
 const ARCH: &str = "kimi-linear";
 const PREFILL_CHUNK: usize = 512;
 /// Largest attention score block (bytes) one query block may build.
-const SCORES_BYTES: usize = 512 << 20;
+const SCORES_BYTES: usize = 96 << 20;
 const L2_EPS: f64 = 1e-6;
 const RECURRENT_SLOTS: usize = 2;
 const GATING_SIGMOID: u64 = 2;
@@ -276,6 +276,10 @@ impl Kda {
 /// Gated delta rule with a per-key-channel log-decay `g`; `s` is `(n, heads, k, v)`. Returns `(o, s)` with
 /// `o` shaped `(n, t, heads, v)`.
 fn delta_scan(q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor, mut s: Tensor) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda() && q.dim(3)? == crate::titan_kda::HEAD_DIM && mistralrs_quant::titan_cfg::flag("TITAN_KDA_KERNEL", true) {
+        return crate::titan_kda::scan(q, k, v, g, beta, &s);
+    }
     let t = q.dim(1)?;
     let decay = g.exp()?;
     let step = |x: &Tensor, i: usize| x.narrow(1, i, 1)?.squeeze(1)?.contiguous();
