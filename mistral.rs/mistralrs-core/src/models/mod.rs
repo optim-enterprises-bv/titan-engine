@@ -19,6 +19,7 @@ pub(crate) mod phi2;
 pub(crate) mod phi3;
 pub(crate) mod phi3_5_moe;
 pub(crate) mod quantized_gpt_oss;
+pub(crate) mod quantized_kimi_linear;
 pub(crate) mod quantized_llama;
 pub(crate) mod bonsai_vision;
 pub(crate) mod quantized_qwen35_moe;

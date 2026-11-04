@@ -57,6 +57,8 @@ pub enum GGUFArchitecture {
     Mistral3,
     #[strum(to_string = "gpt-oss")]
     GptOss,
+    #[strum(to_string = "kimi-linear")]
+    KimiLinear,
 }
 
 // Wraps from_str() for some convenience:
