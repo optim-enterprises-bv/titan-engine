@@ -18,7 +18,7 @@ measure() { # label, extra VAR=VAL assignments
   systemd-run --user --unit=titan-dense \
     --property=WorkingDirectory=/home/dingo/src/titan-engine \
     "${setenv[@]}" \
-    /home/dingo/src/titan-engine/serve-dense.sh "$CTX" >/dev/null 2>&1
+    /home/dingo/src/titan-engine/scripts/serve-dense.sh "$CTX" >/dev/null 2>&1
   for i in $(seq 1 40); do
     sleep 3
     ss -tln | grep -q ':1234' && break

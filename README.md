@@ -34,7 +34,7 @@ Decode is 1.59x llama.cpp with MTP on both sides (1.37x without); prompt process
 
 ### Qwen3.8-27B dense, Q4_K_M, 256k context (15.5 GB model, KV in host RAM)
 
-Measured 2026-10-24 on the same machine, `serve-q4.sh` defaults (MTP=1, host-RAM FP8 KV, `--max-seqs 2`), greedy,
+Measured 2026-10-24 on the same machine, `scripts/serve-q4.sh` defaults (MTP=1, host-RAM FP8 KV, `--max-seqs 2`), greedy,
 one request unless stated. The GGUF is the stock Q4_K_M with `output.weight` and the 33 Q6_K `ffn_down` tensors
 requantised to Q5_K, so the weights fit the 16 GB card.
 
@@ -225,11 +225,11 @@ TITAN_MTP=2 TITAN_PFS=1 TITAN_DOORBELL=1 TITAN_CPU_ONEPASS=1 TITAN_CUDA_GRAPHS=1
   --format gguf -m <dir> -f Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ```
 
-Serve the dense Qwen3.8-27B Q4_K_M with 256k context and host-RAM KV (`serve-q4.sh`; as a user service,
+Serve the dense Qwen3.8-27B Q4_K_M with 256k context and host-RAM KV (`scripts/serve-q4.sh`; as a user service,
 `deploy/titan-dense.service`):
 
 ```bash
-./serve-q4.sh            # [max-seq-len, default 262144] [extra mistralrs args...]
+./scripts/serve-q4.sh            # [max-seq-len, default 262144] [extra mistralrs args...]
 cp deploy/titan-dense.service ~/.config/systemd/user/ && systemctl --user enable --now titan-dense.service
 ```
 

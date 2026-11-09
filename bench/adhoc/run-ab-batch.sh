@@ -8,8 +8,8 @@ start() { # extra env + serve flags
   for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
 }
 echo "=== A: bf16 matvec ON, single stream + 8 concurrent ==="
-start --setenv=TITAN_DENSE_BF16_MATVEC=1 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+start --setenv=TITAN_DENSE_BF16_MATVEC=1 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 python3 bench-concurrent.py 128
 echo "=== B: bf16 matvec OFF (f32), single stream + 8 concurrent ==="
-start --setenv=TITAN_DENSE_BF16_MATVEC=0 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+start --setenv=TITAN_DENSE_BF16_MATVEC=0 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 python3 bench-concurrent.py 128

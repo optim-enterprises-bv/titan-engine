@@ -8,7 +8,7 @@ start() {
 }
 echo "=== default ceiling (mmvq 1 row), paged ON, batch 16 ==="
 start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=16 \
-      --setenv=TITAN_RECURRENT_SLOTS=16 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+      --setenv=TITAN_RECURRENT_SLOTS=16 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 python3 - <<'PY'
 import json, sys, threading, time, urllib.request
 URL="http://127.0.0.1:1234/v1/chat/completions"

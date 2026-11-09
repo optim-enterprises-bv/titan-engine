@@ -6,7 +6,10 @@ start() {
   systemd-run --user --unit=titan-dense --property=WorkingDirectory=/home/dingo/src/titan-engine "$@" >/dev/null 2>&1
   for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
 }
-echo "=== default ceiling=1, paged ON, batch 8 ==="
-start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=8 \
-      --setenv=TITAN_RECURRENT_SLOTS=8 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
-python3 bench-concurrent.py 96
+for cap in 8 2 1; do
+  echo "=== paged ON, batch 8, MMVQ_MAX_BATCH=$cap (mmq above it) ==="
+  start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=8 \
+        --setenv=TITAN_RECURRENT_SLOTS=8 --setenv=TITAN_MMVQ_MAX_BATCH=$cap \
+        -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
+  python3 bench-concurrent.py 96
+done

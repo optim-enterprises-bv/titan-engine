@@ -12,6 +12,6 @@ start() {
 }
 for m in 1 0 1 0; do
   echo "=== TITAN_DENSE_BF16_MATVEC=$m ==="
-  start --setenv=TITAN_MTP=0 --setenv=TITAN_DENSE_BF16_MATVEC=$m -- /home/dingo/src/titan-engine/serve-dense.sh 65536
+  start --setenv=TITAN_MTP=0 --setenv=TITAN_DENSE_BF16_MATVEC=$m -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 65536
   cd /tmp && python3 "$REPO/decode-once.py" 16 >/dev/null 2>&1; python3 "$REPO/decode-once.py" 256; cd /home/dingo/src/titan-engine
 done

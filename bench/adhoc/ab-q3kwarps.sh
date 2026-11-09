@@ -14,7 +14,7 @@ run() {
   pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 4
   systemctl --user reset-failed titan-dense.service 2>/dev/null
   systemd-run --user --unit=titan-dense --property=WorkingDirectory="$REPO" "$@" \
-    "$REPO/serve-dense.sh" 65536 >/dev/null 2>&1
+    "$REPO/../../scripts/serve-dense.sh" 65536 >/dev/null 2>&1
   for i in $(seq 1 40); do
     sleep 3
     ss -tln | grep -q ':1234' && break

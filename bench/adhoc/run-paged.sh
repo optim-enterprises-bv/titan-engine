@@ -7,7 +7,7 @@ start() {
   for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
 }
 echo "=== paged-attn ON, batch 8 ==="
-start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=8 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=8 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 curl -s -m 5 http://127.0.0.1:1234/v1/models | head -c 120; echo
 python3 bench-concurrent.py 128
 echo "--- server log tail ---"

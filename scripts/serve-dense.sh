@@ -1,6 +1,6 @@
 #!/bin/bash
 # Serve the optim 27B (qwen35 dense, GDN hybrid, MTP head) on titan-engine.
-#   ./serve-dense.sh <max-seq-len> [extra mistralrs args...]
+#   ./scripts/serve-dense.sh <max-seq-len> [extra mistralrs args...]
 # Dense qwen35 notes from the repo's own m4/orca runs: no experts, so no tiering;
 # every layer must be on the GPU (a CPU layer gives 'device mismatch'); the
 # 2048-row big prefill chunks OOM on a dense 27B, so they are off (512-row only).

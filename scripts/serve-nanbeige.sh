@@ -3,7 +3,7 @@
 # 16 GB RTX 5080 Laptop. The Q4_K_M file is ~20 GB > VRAM, so this leans on titan's device map to
 # split layers GPU/CPU. NO MTP head and NO GDN recurrent slots here (both are Qwen3.5-specific) —
 # this is a pure-attention Llama, so every layer carries a real KV cache.
-#   ./serve-nanbeige.sh [max-seq-len, default 8192] [extra mistralrs args...]
+#   ./scripts/serve-nanbeige.sh [max-seq-len, default 8192] [extra mistralrs args...]
 #
 # Knobs to tune after reading the TITAN_DEVMAP_LOG split line:
 #   TITAN_KV_HOST=1  -> attention KV lives in host RAM (F8E4M3), decode attn runs on CPU. Frees VRAM
