@@ -196,7 +196,7 @@ pub enum Command {
         url: String,
 
         /// Swap config read for each model's on-disk size.
-        #[arg(long, default_value = "/usr/local/etc/titan-engine/models.toml")]
+        #[arg(long, default_value = "/etc/titan-engine/models.toml")]
         config: PathBuf,
     },
 
@@ -222,7 +222,7 @@ pub enum Command {
         url: String,
 
         /// Swap config to append the model to so it persists across restarts.
-        #[arg(long, default_value = "/usr/local/etc/titan-engine/models.toml")]
+        #[arg(long, default_value = "/etc/titan-engine/models.toml")]
         config: PathBuf,
     },
 

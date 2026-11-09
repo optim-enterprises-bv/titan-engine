@@ -135,7 +135,7 @@ pub async fn run_ls(url: &str, config: &Path) -> Result<()> {
 }
 
 fn default_config() -> PathBuf {
-    PathBuf::from("/usr/local/etc/titan-engine/models.toml")
+    PathBuf::from("/etc/titan-engine/models.toml")
 }
 
 /// The serve dir (where GGUFs live) = the common `model_id` of the config's models.
