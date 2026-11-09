@@ -1,6 +1,6 @@
 #!/bin/bash
 # Serve the Q4_K_M 27B (qwen35 dense, GDN hybrid, MTP head) on titan-engine, single user, up to 256k context.
-#   ./serve-q4.sh [max-seq-len, default 262144] [extra mistralrs args...]
+#   ./scripts/serve-q4.sh [max-seq-len, default 262144] [extra mistralrs args...]
 # The file is the stock Q4_K_M with only output.weight and the 33 Q6_K ffn_down tensors
 # requantized to Q5_K (every other tensor byte-identical): 15.5 GB instead of 16.0, so the
 # weights fit the 16 GB card with room for KV. token_embd stays on the CPU (titan loads it there).

@@ -187,9 +187,9 @@ on the chart), but don't base a deploy decision on it: rerun.
 | `lib/report.py` | summary, history line and markdown |
 | `lib/mkhtml.py` | the chart page |
 
-## Ad-hoc A/B harness (repo root)
+## Ad-hoc A/B harness (`bench/adhoc/`)
 
-For one-knob questions (an env var, a warps count, a chunk size) use the root scripts rather than the standing
+For one-knob questions (an env var, a warps count, a chunk size) use the scripts in `bench/adhoc/` rather than the standing
 suite - a full window takes ten minutes and needs the GPU to itself:
 
 | script | what it does |

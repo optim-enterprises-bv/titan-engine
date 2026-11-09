@@ -11,7 +11,7 @@ run() { # label, extra setenv pairs...
             --setenv=TITAN_PREFILL_BIG_CHUNK=0 --setenv=TITAN_RECURRENT_SLOTS=2)
   local kv; for kv in "$@"; do se+=("--setenv=$kv"); done
   systemd-run --user --unit=titan-dense --property=WorkingDirectory=/home/dingo/src/titan-engine \
-    "${se[@]}" /home/dingo/src/titan-engine/serve-dense.sh "$CTX" >/dev/null 2>&1
+    "${se[@]}" /home/dingo/src/titan-engine/scripts/serve-dense.sh "$CTX" >/dev/null 2>&1
   for i in $(seq 1 30); do sleep 3; ss -tln | grep -q ':1234' && break; done
   python3 - "$label" <<'PY'
 import json, sys, time, urllib.request

@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/src/titan-engine
-# every TITAN_* default (model, context, KV placement, batching, prefix cache) lives in serve-q4.sh
-ExecStart=%h/src/titan-engine/serve-q4.sh
+# every TITAN_* default (model, context, KV placement, batching, prefix cache) lives in scripts/serve-q4.sh
+ExecStart=%h/src/titan-engine/scripts/serve-q4.sh
 # SIGINT lets the engine drain the request in flight; loading the 15.5 GB of weights again takes ~1 min
 KillSignal=SIGINT
 TimeoutStopSec=60

@@ -8,7 +8,7 @@ run() { # label extra env...
   sudo -n pkill -f "mistralrs ser[v]e" 2>/dev/null; sleep 5
   systemctl --user reset-failed titan-dense.service 2>/dev/null
   systemd-run --user --unit=titan-dense --property=WorkingDirectory=/home/dingo/src/titan-engine \
-    --setenv=TITAN_STEP_PROF=1 "$@" /home/dingo/src/titan-engine/serve-dense.sh 65536 >/dev/null 2>&1
+    --setenv=TITAN_STEP_PROF=1 "$@" /home/dingo/src/titan-engine/scripts/serve-dense.sh 65536 >/dev/null 2>&1
   for i in $(seq 1 40); do sleep 3; ss -tln | grep -q ':1234' && break; done
   echo "=== $label ==="
   python3 - <<'PY'

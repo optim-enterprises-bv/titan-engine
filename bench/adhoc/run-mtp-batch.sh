@@ -8,10 +8,10 @@ start() {
 }
 echo "=== MTP=2, batch 8 (speculative under batching) ==="
 start --setenv=TITAN_MTP=2 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=8 \
-      --setenv=TITAN_RECURRENT_SLOTS=8 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+      --setenv=TITAN_RECURRENT_SLOTS=8 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 python3 bench-concurrent.py 96 2>&1 | grep -E "concurrent|speedup"
 echo "=== MTP=0, batch 12 ==="
 start --setenv=TITAN_MTP=0 --setenv=TITAN_PAGED=on --setenv=TITAN_BATCH=12 \
-      --setenv=TITAN_RECURRENT_SLOTS=12 -- /home/dingo/src/titan-engine/serve-dense.sh 32768
+      --setenv=TITAN_RECURRENT_SLOTS=12 -- /home/dingo/src/titan-engine/scripts/serve-dense.sh 32768
 python3 bench-concurrent.py 96 2>&1 | grep -E "concurrent|speedup"
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
