@@ -41,9 +41,15 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
             num_attn_heads: metadata[&format!("{arch}.attention.head_count")]
                 .to_u64()
                 .unwrap() as usize,
-            num_kv_heads: metadata[&format!("{arch}.attention.head_count_kv")]
-                .to_u64()
-                .unwrap() as usize,
+            num_kv_heads: match &metadata[&format!("{arch}.attention.head_count_kv")] {
+                // per-layer list (kimi-linear): the widest layer sizes the estimate
+                gguf_file::Value::Array(per_layer) => per_layer
+                    .iter()
+                    .filter_map(|v| v.to_u64().ok())
+                    .max()
+                    .unwrap_or(1) as usize,
+                scalar => scalar.to_u64().unwrap() as usize,
+            },
             num_layers: metadata[&format!("{arch}.block_count")].to_u64().unwrap() as usize
                 - crate::models::quantized_qwen35_moe::nextn_predict_layers(metadata, &arch),
             key_length: metadata
@@ -307,6 +313,41 @@ const GPT_OSS_LAYER_TENSORS: &[&str] = &[
     "ffn_down_exps.bias",
 ];
 
+const KIMI_LINEAR_LAYER_TENSORS: &[&str] = &[
+    "attn_norm.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_output.weight",
+    "attn_kv_a_mqa.weight",
+    "attn_kv_a_norm.weight",
+    "attn_k_b.weight",
+    "attn_v_b.weight",
+    "ssm_a",
+    "ssm_beta.weight",
+    "ssm_conv1d_q.weight",
+    "ssm_conv1d_k.weight",
+    "ssm_conv1d_v.weight",
+    "ssm_dt.bias",
+    "ssm_f_a.weight",
+    "ssm_f_b.weight",
+    "ssm_g_a.weight",
+    "ssm_g_b.weight",
+    "ssm_norm.weight",
+    "ffn_norm.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ffn_gate_inp.weight",
+    "exp_probs_b.bias",
+    "ffn_gate_exps.weight",
+    "ffn_up_exps.weight",
+    "ffn_down_exps.weight",
+    "ffn_gate_shexp.weight",
+    "ffn_up_shexp.weight",
+    "ffn_down_shexp.weight",
+];
+
 pub struct GgufDeviceMapLoaderInner<'a, 'f> {
     pub model: &'a Content<'f, fs::File>,
     pub arch: GGUFArchitecture,
@@ -333,6 +374,7 @@ impl GgufDeviceMapLoaderInner<'_, '_> {
                 Some(QWEN35MOE_LAYER_TENSORS)
             }
             GGUFArchitecture::GptOss => Some(GPT_OSS_LAYER_TENSORS),
+            GGUFArchitecture::KimiLinear => Some(KIMI_LINEAR_LAYER_TENSORS),
             _ => None,
         }
     }
@@ -477,7 +519,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 output_norm + output + self.mtp_block_bytes()?
             }
-            GGUFArchitecture::GptOss => {
+            GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear => {
                 // token_embd stays quantized in host memory (quantized_qwen35_moe::QEmbedding)
                 let output_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("output_norm.weight")?,
@@ -512,6 +554,15 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         Ok(block_count - self.nextn_layers())
     }
     fn kv_cache_layer_fraction(&self, config: &str) -> Result<f64> {
+        if matches!(self.arch, GGUFArchitecture::KimiLinear) {
+            // only the MLA layers (head_count_kv > 0) keep a KV cache
+            let per_layer = match self.model.get_metadata().get("kimi-linear.attention.head_count_kv") {
+                Some(gguf_file::Value::Array(a)) => a.clone(),
+                _ => return Ok(1.0),
+            };
+            let attn = per_layer.iter().filter(|v| v.to_u64().is_ok_and(|n| n > 0)).count();
+            return Ok(attn as f64 / per_layer.len().max(1) as f64);
+        }
         if !matches!(self.arch, GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next) {
             return Ok(1.0);
         }
@@ -538,8 +589,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         if let Some(layer_tensors) = self.layer_tensors() {
             use mistralrs_quant::TieredExperts;
             // dense qwen35 has no experts to tier
-            if matches!(self.arch, GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::GptOss)
-                && TieredExperts::wants_auto_plan()
+            if matches!(
+                self.arch,
+                GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear
+            ) && TieredExperts::wants_auto_plan()
             {
                 // Split every layer tensor into tierable experts vs everything else, then size the
                 // expert share from the free VRAM on the main device.
