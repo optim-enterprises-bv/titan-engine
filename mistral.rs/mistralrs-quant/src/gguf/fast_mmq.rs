@@ -703,10 +703,28 @@ pub fn supports_llama_mmq(dtype: GgmlDType) -> bool {
 /// [`plain`] for IQ4_NL / MXFP4 / NVFP4. `None` when the shape is outside what the port covers
 /// (K not a whole number of tile iterations), so the caller keeps its fallback.
 fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nrows: usize, k: usize, b_size: usize) -> Result<Option<Tensor>> {
+    llama_mmq_plain_at(f, w, 0, xs, dev, nrows, k, b_size, false)
+}
+
+/// [`llama_mmq_plain`] on the `nrows x k` matrix starting `w_off` bytes into `w` (one expert of a stack).
+#[allow(clippy::too_many_arguments)]
+/// `partial_k` must stay false: the stream-k split counts whole tile iterations, so a partial last tile is dropped
+/// (measured: K = 2304 with 512-wide tiles lost 256/2304 of every dot product).
+fn llama_mmq_plain_at(
+    f: &LlamaMmq,
+    w: &QTensor,
+    w_off: u64,
+    xs: &Tensor,
+    dev: &CudaDevice,
+    nrows: usize,
+    k: usize,
+    b_size: usize,
+    partial_k: bool,
+) -> Result<Option<Tensor>> {
     use candle_core::cuda::cudarc::driver::sys::CUfunction_attribute_enum;
     use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda::WrapErr;
-    if k % f.iter_k != 0 || !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+    if (!partial_k && k % f.iter_k != 0) || k % f.qk != 0 || !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
         return Ok(None);
     }
     let input_ty = xs.dtype();
@@ -748,7 +766,7 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
     let (fixup_ptr, _fixup_guard) = fixup_ws.ptr_mut();
 
     let (w_ptr, _w_guard) = w.device_ptr_with_guard(&stream)?;
-    let w_ptr = w_ptr as u64;
+    let w_ptr = w_ptr as u64 + w_off;
     let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     let slot0 = 1000 + 200 * f.fi;
     {
@@ -844,6 +862,27 @@ fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nro
     y_ws.tag = Some(tag);
     let out = wrap_cuda_output(out, dev, output_shape(&xs, nrows));
     Ok(Some(if input_ty == DType::F32 { out } else { out.to_dtype(input_ty)? }))
+}
+
+/// One expert `e` of a `(n_expert, nrows, k)` stack times `xs` through the llama.cpp MMQ port; `None` when the
+/// format is not covered or K is not a whole number of tile iterations.
+pub fn llama_fmt_plain_expert(w: &QTensor, e: usize, xs: &Tensor) -> Result<Option<Tensor>> {
+    let Some(f) = llama_mmq(w.dtype()) else {
+        return Ok(None);
+    };
+    let Device::Cuda(dev) = w.device() else {
+        return Ok(None);
+    };
+    let Ok((n_expert, nrows, k)) = w.shape().dims3() else {
+        return Ok(None);
+    };
+    let (b_size, xk) = xs.dims2()?;
+    if e >= n_expert || xk != k || b_size == 0 {
+        return Ok(None);
+    }
+    let dtype = w.dtype();
+    let off = (e * nrows * (k / dtype.block_size()) * dtype.type_size()) as u64;
+    llama_mmq_plain_at(f, w, off, xs, &dev, nrows, k, b_size, false)
 }
 
 /// Prefill (batch > 8) for IQ4_NL / MXFP4 / NVFP4 through the llama.cpp MMQ port; `None` when

@@ -204,7 +204,7 @@ pub use gguf::fast_mmq::{
     grouped_llama_from_glu_packed as grouped_moe_llama_mmq_from_glu_packed,
     grouped_from_glu_pair as grouped_moe_mmq_from_glu_pair, grouped_pair as grouped_moe_mmq_pair,
     grouped_pair_packed as grouped_moe_mmq_pair_packed, plain as mmq_plain, plain_shared as mmq_plain_shared,
-    supports as supports_mmq,
+    supports as supports_mmq, llama_fmt_plain_expert as mmq_plain_expert, supports_llama_mmq,
 };
 #[cfg(feature = "cuda")]
 pub use gguf::titan_tiered::{QInput, TieredExperts};

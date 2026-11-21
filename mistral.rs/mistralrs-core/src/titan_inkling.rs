@@ -6,6 +6,9 @@ use candle_core::{Result, Tensor};
 pub(crate) const MIX_MAX: usize = 16;
 /// Most convolution taps.
 pub(crate) const CONV_MAX_TAPS: usize = 8;
+/// Attention: aim for this many (kv head, query, split) blocks, never fewer than this many keys per split.
+const ATTN_TARGET_BLOCKS: usize = 512;
+const ATTN_MIN_KEYS: usize = 64;
 
 #[cfg(feature = "cuda")]
 const SRC: &str = r#"
@@ -154,6 +157,99 @@ extern "C" __global__ void ink_attn(
     float acc = 0.f;
     for (int w = 0; w < 4; w++) acc += sa[w][d] * __expf(sm[w] - M);
     out[((size_t)ti * H + h) * 128 + d] = acc / S;
+}
+
+// split-K flash decoding: block (4 warps) per (kv head, query, key split); the G query heads of the kv head share
+// each K/V row. Writes per (split, head) the running max, sum and unnormalized 128-wide accumulator.
+#define ATTN_G_MAX 8
+extern "C" __global__ void ink_attn_split(
+    const float* __restrict__ q, const unsigned short* __restrict__ k, const unsigned short* __restrict__ v,
+    long long kh, long long kj, long long vh, long long vj,
+    const float* __restrict__ table, float* __restrict__ part,
+    int T, int H, int Hkv, int L, int ext, int start, int first_key, int swa, int n_swa, float scale, int S)
+{
+    const int hk = blockIdx.x, ti = blockIdx.y, sp = blockIdx.z;
+    const int G = H / Hkv;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int p = start + ti;
+    const int chunk = (L + S - 1) / S;
+    const int j0 = sp * chunk, j1 = min(L, j0 + chunk);
+    float4 qv[ATTN_G_MAX];
+    const float* tb[ATTN_G_MAX];
+    float m[ATTN_G_MAX], s[ATTN_G_MAX], a[ATTN_G_MAX][4];
+    for (int g = 0; g < G; g++) {
+        const int h = hk * G + g;
+        qv[g] = *(const float4*)(q + ((size_t)ti * H + h) * 128 + lane * 4);
+        tb[g] = table + ((size_t)ti * H + h) * (ext + 1);
+        m[g] = -3.402823466e38f; s[g] = 0.f;
+        a[g][0] = a[g][1] = a[g][2] = a[g][3] = 0.f;
+    }
+    const unsigned short* kb = k + hk * kh;
+    const unsigned short* vb = v + hk * vh;
+    for (int j = j0 + warp; j < j1; j += 4) {
+        const int kp = first_key + j;
+        if (kp > p || (swa && p - kp >= n_swa)) continue;
+        const unsigned short* kr = kb + j * kj + lane * 4;
+        const float k0 = bf16f(kr[0]), k1 = bf16f(kr[1]), k2 = bf16f(kr[2]), k3 = bf16f(kr[3]);
+        const unsigned short* vr = vb + j * vj + lane * 4;
+        const float v0 = bf16f(vr[0]), v1 = bf16f(vr[1]), v2 = bf16f(vr[2]), v3 = bf16f(vr[3]);
+        const int dist = p - kp;
+        const int idx = dist < ext ? dist : ext;
+        for (int g = 0; g < G; g++) {
+            float dot = qv[g].x * k0 + qv[g].y * k1 + qv[g].z * k2 + qv[g].w * k3;
+            dot = warp_sum(dot);
+            const float logit = dot * scale + tb[g][idx];
+            const float mn = fmaxf(m[g], logit);
+            const float c = __expf(m[g] - mn), e = __expf(logit - mn);
+            s[g] = s[g] * c + e;
+            a[g][0] = a[g][0] * c + e * v0;
+            a[g][1] = a[g][1] * c + e * v1;
+            a[g][2] = a[g][2] * c + e * v2;
+            a[g][3] = a[g][3] * c + e * v3;
+            m[g] = mn;
+        }
+    }
+    __shared__ float sm[4][ATTN_G_MAX], ss[4][ATTN_G_MAX];
+    __shared__ float sa[4][ATTN_G_MAX][128];
+    for (int g = 0; g < G; g++) {
+        if (lane == 0) { sm[warp][g] = m[g]; ss[warp][g] = s[g]; }
+        sa[warp][g][lane * 4] = a[g][0]; sa[warp][g][lane * 4 + 1] = a[g][1];
+        sa[warp][g][lane * 4 + 2] = a[g][2]; sa[warp][g][lane * 4 + 3] = a[g][3];
+    }
+    __syncthreads();
+    const int d = threadIdx.x;
+    for (int g = 0; g < G; g++) {
+        float M = -3.402823466e38f;
+        for (int w = 0; w < 4; w++) M = fmaxf(M, sm[w][g]);
+        float S2 = 0.f, acc = 0.f;
+        for (int w = 0; w < 4; w++) {
+            const float c = sm[w][g] > -3.0e38f ? __expf(sm[w][g] - M) : 0.f;
+            S2 += ss[w][g] * c;
+            acc += sa[w][g][d] * c;
+        }
+        const int h = hk * G + g;
+        float* pr = part + (((size_t)ti * H + h) * S + sp) * 130;
+        if (d == 0) { pr[0] = M; pr[1] = S2; }
+        pr[2 + d] = acc;
+    }
+}
+
+// combine the splits of one (head, query) with the zero-logit sink
+extern "C" __global__ void ink_attn_combine(const float* __restrict__ part, float* __restrict__ out, int H, int S)
+{
+    const int h = blockIdx.x, ti = blockIdx.y, d = threadIdx.x;
+    const float* pr = part + ((size_t)ti * H + h) * S * 130;
+    float M = 0.f;
+    for (int i = 0; i < S; i++) M = fmaxf(M, pr[i * 130]);
+    float den = __expf(-M), acc = 0.f;
+    for (int i = 0; i < S; i++) {
+        const float mi = pr[i * 130];
+        if (mi < -3.0e38f) continue;
+        const float c = __expf(mi - M);
+        den += pr[i * 130 + 1] * c;
+        acc += pr[i * 130 + 2 + d] * c;
+    }
+    out[((size_t)ti * H + h) * 128 + d] = acc / den;
 }
 
 // block per row of D: mode 0 clip (optional per-head scale, then L2 norm capped at thr, then optional per-token
@@ -350,7 +446,7 @@ mod imp {
         let (t, h, d) = q.dims3()?;
         let (hkv, l, kd) = k.dims3()?;
         let ext = table.dim(2)? - 1;
-        if d != 128 || kd != 128 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+        if d != 128 || kd != 128 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 || h % hkv != 0 || h / hkv > 8 {
             candle_core::bail!("titan_inkling attn: want 128-wide heads and BF16 K/V");
         }
         let bf = |x: &Tensor| -> Result<(u64, i64, i64)> {
@@ -369,16 +465,28 @@ mod imp {
         let q_p = addr(&q, &dev)?;
         let t_p = addr(&table, &dev)?;
         let (out, out_p) = alloc(&dev, t * h * d)?;
-        let f = dev.get_or_load_custom_func("ink_attn", "titan_inkling", ptx()?)?;
         let (ti, hi, hkvi, li, exti) = (t as i32, h as i32, hkv as i32, l as i32, ext as i32);
         let (st, fk, sw, nsw) = (start as i32, first_key as i32, i32::from(swa.is_some()), swa.unwrap_or(0) as i32);
+        // enough (kv head, query, split) blocks to fill the GPU, each split at least ATTN_MIN_KEYS keys
+        let splits = (ATTN_TARGET_BLOCKS / (hkv * t).max(1)).clamp(1, l.div_ceil(ATTN_MIN_KEYS).max(1));
+        let si = splits as i32;
+        let (part, part_p) = alloc(&dev, t * h * splits * 130)?;
+        let f = dev.get_or_load_custom_func("ink_attn_split", "titan_inkling", ptx()?)?;
         let mut b = f.builder();
-        b.arg(&q_p).arg(&k_p).arg(&v_p).arg(&kh).arg(&kj).arg(&vh).arg(&vj).arg(&t_p).arg(&out_p);
-        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale);
+        b.arg(&q_p).arg(&k_p).arg(&v_p).arg(&kh).arg(&kj).arg(&vh).arg(&vj).arg(&t_p).arg(&part_p);
+        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale).arg(&si);
+        unsafe {
+            b.launch(LaunchConfig { grid_dim: (hkv as u32, t as u32, splits as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+        }
+        .w()?;
+        let f = dev.get_or_load_custom_func("ink_attn_combine", "titan_inkling", ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&part_p).arg(&out_p).arg(&hi).arg(&si);
         unsafe {
             b.launch(LaunchConfig { grid_dim: (h as u32, t as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
         }
         .w()?;
+        drop(part);
         Ok(wrap(out, &dev, &[t, h * d]))
     }
 

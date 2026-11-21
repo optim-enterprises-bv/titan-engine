@@ -47,8 +47,10 @@ const ROUTER_NORM_MIN: f32 = 1e-20;
 const MIX_EPS: f64 = 1e-6;
 const CTRL_Q: usize = 0;
 const CTRL_FFN: usize = 3;
-/// Query chunks up to this many tokens use the fused decode attention kernel.
-const FUSED_ATTN_MAX_T: usize = 16;
+/// Query chunks up to this many tokens use the fused attention kernel (every chunk: the reference path is for checks).
+const FUSED_ATTN_MAX_T: usize = PREFILL_CHUNK;
+/// Expert chunks of at least this many tokens run gate/up per expert through MMQ instead of the indexed GEMV.
+const EXPERT_MMQ_MIN_TOKENS: usize = 32;
 
 fn value_u64(v: &Value) -> Option<u64> {
     Some(match v {
@@ -310,12 +312,14 @@ fn check(part: &'static str, fused: &Tensor, reference: impl FnOnce() -> Result<
     static WORST: Mutex<Option<HashMap<&'static str, f32>>> = Mutex::new(None);
     let r = reference()?.to_dtype(DType::F32)?;
     let scale = r.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-30);
-    let diff = (fused.to_dtype(DType::F32)? - &r)?.abs()?.max_all()?.to_scalar::<f32>()? / scale;
+    let d = (fused.to_dtype(DType::F32)? - &r)?.abs()?;
+    let diff = d.max_all()?.to_scalar::<f32>()? / scale;
+    let mean_rel = d.mean_all()?.to_scalar::<f32>()? / r.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-30);
     let mut g = WORST.lock().expect("check");
     let w = g.get_or_insert_with(HashMap::new).entry(part).or_insert(0.0);
     if diff > *w {
         *w = diff;
-        tracing::info!("inkling2 check {part}: new worst relative max diff {diff:.3e}");
+        tracing::info!("inkling2 check {part}: new worst relative max diff {diff:.3e} (this call mean rel {mean_rel:.3e})");
     }
     Ok(())
 }
@@ -679,14 +683,22 @@ impl Moe {
         let k = hp.top_k;
         let ff = hp.n_ff_exp;
         let ids = topk.indices.contiguous()?;
+        if let Some(y) = self.experts_mmq(flat, &ids, &topk.values, gate_up, down, hp)? {
+            return Ok(y);
+        }
         let per_slot = |scale: &Option<Tensor>| -> Result<Option<Tensor>> {
             scale.as_ref().map(|s| s.index_select(&ids.flatten_all()?, 0)?.reshape((tokens, k, 1))).transpose()
         };
-        let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, &ids)?.to_dtype(DType::F32)?; // (T, k, 2F)
-        if let Some(s) = per_slot(&self.experts.gate_up_scale_t)? {
-            gu = gu.broadcast_mul(&s)?;
-        }
-        let act = situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
+        let act = match self.gate_up_mmq(flat, &ids, gate_up, hp)? {
+            Some(act) => act,
+            None => {
+                let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, &ids)?.to_dtype(DType::F32)?; // (T, k, 2F)
+                if let Some(s) = per_slot(&self.experts.gate_up_scale_t)? {
+                    gu = gu.broadcast_mul(&s)?;
+                }
+                situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?
+            }
+        };
         let mut y = down.indexed_moe_forward(&act, &ids)?.to_dtype(DType::F32)?; // (T, k, E)
         let mut w = topk.values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
         if let Some(s) = per_slot(&self.experts.down_scale_t)? {
@@ -694,6 +706,124 @@ impl Moe {
         }
         y = y.broadcast_mul(&w)?;
         y.sum(1)
+    }
+}
+
+impl Moe {
+    /// Prefill: every used expert's gate/up and down as two MMQs over its tokens, weighted outputs added straight into
+    /// `(T, E)`; `None` for short chunks or formats without an MMQ port (the indexed GEMV path then runs).
+    fn experts_mmq(&self, flat: &Tensor, ids: &Tensor, values: &Tensor, gate_up: &QMatMul, down: &QMatMul, hp: &Hp) -> Result<Option<Tensor>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (tokens, e) = flat.dims2()?;
+            let (QMatMul::QTensor(wgu), QMatMul::QTensor(wd)) = (gate_up, down) else { return Ok(None) };
+            if tokens < EXPERT_MMQ_MIN_TOKENS
+                || !flat.device().is_cuda()
+                || !fused_part("EXPERT_MMQ")
+                || !mistralrs_quant::supports_llama_mmq(wgu.dtype())
+                || !mistralrs_quant::supports_llama_mmq(wd.dtype())
+            {
+                return Ok(None);
+            }
+            let ff = hp.n_ff_exp;
+            let host_ids = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+            let host_w = values.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
+            let mut per_expert: HashMap<usize, (Vec<u32>, Vec<f32>)> = HashMap::new();
+            for (tok, (row, wrow)) in host_ids.iter().zip(&host_w).enumerate() {
+                for (&id, &w) in row.iter().zip(wrow) {
+                    let entry = per_expert.entry(id as usize).or_default();
+                    entry.0.push(tok as u32);
+                    entry.1.push(w);
+                }
+            }
+            let mut out = Tensor::zeros((tokens, e), DType::F32, flat.device())?;
+            let mut experts: Vec<usize> = per_expert.keys().copied().collect();
+            experts.sort_unstable();
+            for id in experts {
+                let (toks, ws) = &per_expert[&id];
+                let idx = Tensor::from_slice(toks, toks.len(), flat.device())?;
+                let xe = flat.index_select(&idx, 0)?.contiguous()?;
+                let Some(mut gu) = mistralrs_quant::mmq_plain_expert(wgu, id, &xe)? else { return Ok(None) };
+                if let Some(s) = &self.experts.gate_up_scale {
+                    gu = (gu * f64::from(s[id]))?;
+                }
+                let act = situ(&gu.narrow(1, 0, ff)?, &gu.narrow(1, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
+                let Some(y) = mistralrs_quant::mmq_plain_expert(wd, id, &act)? else { return Ok(None) };
+                let ds = self.experts.down_scale.as_ref().map_or(1.0, |s| s[id]);
+                let w: Vec<f32> = ws.iter().map(|w| w * ds).collect();
+                let y = y.broadcast_mul(&Tensor::from_vec(w, (toks.len(), 1), flat.device())?)?;
+                out = out.index_add(&idx, &y, 0)?;
+            }
+            check("experts_mmq", &out, || {
+                let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, ids)?.to_dtype(DType::F32)?;
+                let k = hp.top_k;
+                let per_slot = |s: &Tensor| -> Result<Tensor> { s.index_select(&ids.flatten_all()?, 0)?.reshape((tokens, k, 1)) };
+                if let Some(s) = &self.experts.gate_up_scale_t {
+                    gu = gu.broadcast_mul(&per_slot(s)?)?;
+                }
+                let act = situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
+                let y = down.indexed_moe_forward(&act, ids)?.to_dtype(DType::F32)?;
+                let mut w = values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
+                if let Some(s) = &self.experts.down_scale_t {
+                    w = w.mul(&per_slot(s)?)?;
+                }
+                y.broadcast_mul(&w)?.sum(1)
+            })?;
+            return Ok(Some(out));
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
+    }
+
+    /// Prefill: activated gate/up `(T, k, F)` with one MMQ per used expert over its tokens; `None` for short chunks
+    /// or formats/shapes without an MMQ port (the indexed GEMV path then runs).
+    fn gate_up_mmq(&self, flat: &Tensor, ids: &Tensor, gate_up: &QMatMul, hp: &Hp) -> Result<Option<Tensor>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (tokens, _) = flat.dims2()?;
+            let QMatMul::QTensor(w) = gate_up else { return Ok(None) };
+            if tokens < EXPERT_MMQ_MIN_TOKENS || !flat.device().is_cuda() || !fused_part("EXPERT_MMQ") {
+                return Ok(None);
+            }
+            let k = hp.top_k;
+            let ff = hp.n_ff_exp;
+            let host = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+            let mut per_expert: HashMap<usize, (Vec<u32>, Vec<u32>)> = HashMap::new();
+            for (tok, row) in host.iter().enumerate() {
+                for (slot, &id) in row.iter().enumerate() {
+                    let entry = per_expert.entry(id as usize).or_default();
+                    entry.0.push(tok as u32);
+                    entry.1.push((tok * k + slot) as u32);
+                }
+            }
+            let mut act = Tensor::zeros((tokens * k, ff), DType::F32, flat.device())?;
+            let mut experts: Vec<usize> = per_expert.keys().copied().collect();
+            experts.sort_unstable();
+            for id in experts {
+                let (toks, pairs) = &per_expert[&id];
+                let xe = flat.index_select(&Tensor::from_slice(toks, toks.len(), flat.device())?, 0)?.contiguous()?;
+                let Some(mut gu) = mistralrs_quant::mmq_plain_expert(w, id, &xe)? else {
+                    return Ok(None);
+                };
+                if let Some(s) = &self.experts.gate_up_scale {
+                    gu = (gu * f64::from(s[id]))?;
+                }
+                let a = situ(&gu.narrow(1, 0, ff)?, &gu.narrow(1, ff, ff)?, hp.situ_beta, hp.situ_lb)?;
+                act = act.index_add(&Tensor::from_slice(pairs, pairs.len(), flat.device())?, &a.contiguous()?, 0)?;
+            }
+            let act = act.reshape((tokens, k, ff))?;
+            check(if matches!(w.dtype(), GgmlDType::NVFP4) { "expert_mmq_nvfp4" } else { "expert_mmq_iq" }, &act, || {
+                let e = flat.dim(1)?;
+                let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, ids)?.to_dtype(DType::F32)?;
+                if let Some(s) = &self.experts.gate_up_scale_t {
+                    gu = gu.broadcast_mul(&s.index_select(&ids.flatten_all()?, 0)?.reshape((tokens, k, 1))?)?;
+                }
+                situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)
+            })?;
+            return Ok(Some(act));
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
     }
 }
 
@@ -1276,7 +1406,7 @@ impl Prof {
         *map.entry(self.cur).or_default() += dt;
         if next == "end" {
             *visits += 1;
-            if *visits % 2048 == 0 {
+            if *visits % 384 == 0 {
                 let mut v: Vec<_> = map.iter().map(|(k, t)| (*k, *t)).collect();
                 v.sort_by(|a, b| b.1.total_cmp(&a.1));
                 let total: f64 = v.iter().map(|x| x.1).sum();
