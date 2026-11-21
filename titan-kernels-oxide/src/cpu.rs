@@ -31,6 +31,15 @@ const Q1_0_BLOCKS_PER_ITER: usize = 32;
 /// IQ4_NL (llama.cpp mul_mat_vec_q, qi 4, vdr 2).
 const IQ4NL_THREADS_PER_BLOCK: usize = 2;
 const IQ4NL_BLOCKS_PER_ITER: usize = 64;
+/// IQ3_XXS / IQ4_XS / Q3_K (qi 16 vdr 2, qi 32 vdr 4, qi 16 vdr 2): 8 threads per block, 16 blocks per iteration.
+const IQK_THREADS_PER_BLOCK: usize = 8;
+const IQK_BLOCKS_PER_ITER: usize = 16;
+/// iq3xxs_grid (ggml-common.h).
+const IQ3XXS_GRID: [u32; 256] = include!("iq3xxs_grid.rs");
+/// block_q3_K: hmask 0..32, qs 32..96, scales 96..108, half d 108..110.
+const Q3K_QS: usize = 32;
+const Q3K_SCALES: usize = 96;
+const Q3K_D: usize = 108;
 /// kvalues_iq4nl (ggml-common.h).
 const KVALUES_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 /// kvalues_mxfp4 (ggml-common.h kvalues_fp4): doubled E2M1 values.
@@ -133,6 +142,9 @@ impl Format {
             Format::IQ4NL => 18,
             Format::MXFP4 => 17,
             Format::NVFP4 => 36,
+            Format::IQ3XXS => 98,
+            Format::IQ4XS => 136,
+            Format::Q3K => 110,
         }
     }
 
@@ -153,6 +165,8 @@ impl Format {
             Format::Q1_0 => (Q1_0_THREADS_PER_BLOCK, Q1_0_BLOCKS_PER_ITER, 1),
             Format::IQ4NL | Format::MXFP4 => (IQ4NL_THREADS_PER_BLOCK, IQ4NL_BLOCKS_PER_ITER, 2),
             Format::NVFP4 => (IQ4NL_THREADS_PER_BLOCK, IQ4NL_BLOCKS_PER_ITER, 4),
+            Format::IQ3XXS | Format::Q3K => (IQK_THREADS_PER_BLOCK, IQK_BLOCKS_PER_ITER, 2),
+            Format::IQ4XS => (IQK_THREADS_PER_BLOCK, IQK_BLOCKS_PER_ITER, 4),
             _ => (THREADS_PER_BLOCK, BLOCKS_PER_ITER, 2),
         }
     }
@@ -227,8 +241,8 @@ fn dot(fmt: Format, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
             }
             v
         }
-        Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 => {
-            unreachable!("Q6_K / Q1_0 / IQ4_NL / MXFP4 / NVFP4 accumulate through acc_*")
+        Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K => {
+            unreachable!("formats other than Q4_K / Q5_K accumulate through acc_*")
         }
     };
     let s = k_scales(blk, bq8_offset);
@@ -271,6 +285,9 @@ fn row_impl(fmt: Format, w_row: &[u8], xq: &[u8], k: usize, simd: bool) -> f32 {
                 Format::IQ4NL => acc_iq4nl(*t, blk, x, kqs),
                 Format::MXFP4 => acc_mxfp4(*t, blk, x, kqs),
                 Format::NVFP4 => acc_nvfp4(*t, blk, x, kqs),
+                Format::IQ3XXS => acc_iq3xxs(*t, blk, x, kqs),
+                Format::IQ4XS => acc_iq4xs(*t, blk, x, kqs),
+                Format::Q3K => acc_q3k(*t, blk, x, kqs),
                 _ => *t + dot(fmt, blk, x, kqs),
             };
             kbx += bpi;
@@ -403,6 +420,162 @@ fn acc_nvfp4(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
     tmp + sum
 }
 
+/// `unpack_ksigns`: 7 sign bits plus their parity as bit 7 (the 8 signs of a grid pair).
+#[inline(always)]
+fn ksigns(v: u32) -> u32 {
+    let v = v & 0x7F;
+    v ^ ((v.count_ones() & 1) << 7)
+}
+
+/// `tmp += vec_dot_iq3_xxs_q8_1`: 32 values of grid bytes, each negated where its sign bit is set,
+/// dotted with Q8_1 block `iqs / 2`; `sumi = (ls * sumi + sumi / 2) / 2`, then `fma(d * d8, sumi, tmp)`.
+fn acc_iq3xxs(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
+    let q8 = &xq[(iqs / 2) * Q8_BYTES..(iqs / 2 + 1) * Q8_BYTES];
+    let aux32 = word(blk, 2 + 64 + 4 * (iqs / 2));
+    let mut sumi = 0i32;
+    for l in 0..8 {
+        let g = IQ3XXS_GRID[blk[2 + 4 * iqs + l] as usize];
+        let signs = ksigns(aux32 >> (7 * (l / 2)));
+        for b in 0..4 {
+            let v = (g >> (8 * b)) as u8 as i32;
+            let v = if signs & (1 << (4 * (l % 2) + b)) != 0 { -v } else { v };
+            sumi += v * q8[4 + 4 * l + b] as i8 as i32;
+        }
+    }
+    let ls = (aux32 >> 28) as i32;
+    let sumi = (ls * sumi + sumi / 2) / 2;
+    let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+    (d * d8).mul_add(sumi as f32, tmp)
+}
+
+/// `tmp += vec_dot_iq4_xs_q8_1`: 32 kvalues_iq4nl values (nibbles of words iqs..iqs + 4) dotted with
+/// Q8_1 block `iqs / 4`, times the 6-bit scale - 32, then `fma(d * d8, sumi, tmp)`.
+fn acc_iq4xs(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
+    let q8 = &xq[(iqs / 4) * Q8_BYTES..(iqs / 4 + 1) * Q8_BYTES];
+    let mut sumi = 0i32;
+    for j in 0..4 {
+        for b in 0..4 {
+            let q = blk[8 + 4 * (iqs + j) + b];
+            sumi += KVALUES_IQ4NL[(q & 0xf) as usize] as i32 * q8[4 + 4 * j + b] as i8 as i32;
+            sumi += KVALUES_IQ4NL[(q >> 4) as usize] as i32 * q8[4 + 16 + 4 * j + b] as i8 as i32;
+        }
+    }
+    let sh = u16::from_le_bytes([blk[2], blk[3]]) as u32;
+    let ls = ((blk[4 + iqs / 8] as u32 >> (iqs & 4)) & 0x0F) | (((sh >> (iqs / 2)) & 0x03) << 4);
+    let sumi = sumi * (ls as i32 - 32);
+    let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+    (d * d8).mul_add(sumi as f32, tmp)
+}
+
+/// `tmp += vec_dot_q3_K_q8_1` (vdr 2): per shift i, the 8 quants (2 low bits | high bit << 2) - 4 of
+/// words iqs, iqs + 1 against Q8_1 block `bq8_offset + i`, `sumf = fma(d8, sumi * sc, sumf)`, then
+/// `fma(d, sumf, tmp)`.
+fn acc_q3k(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
+    let bq8_offset = 4 * (iqs / 8);
+    let iqs8 = iqs % 8;
+    let sc_shift = 8 * (iqs8 / 4) + 4 * (iqs / 8);
+    let scales: [i32; 3] = std::array::from_fn(|l| (word(blk, Q3K_SCALES + 4 * l) as i32) >> sc_shift);
+    let mut sumf = 0f32;
+    for i in 0..4 {
+        let sc_low = (scales[i / 2] >> (16 * (i % 2))) & 0x0F;
+        let sc_high = (scales[2] >> (16 * (i % 2) + 2 * (i / 2))) & 0x03;
+        let sc = (sc_low | (sc_high << 4)) - 32;
+        let q8 = &xq[(bq8_offset + i) * Q8_BYTES..(bq8_offset + i + 1) * Q8_BYTES];
+        let mut sumi = 0i32;
+        for j in 0..2 {
+            let vl = word(blk, Q3K_QS + 4 * (iqs + j));
+            let vh = word(blk, 4 * (iqs8 + j)) >> bq8_offset;
+            for b in 0..4 {
+                let lo = (vl >> (8 * b + 2 * i)) & 3;
+                let hi = (vh >> (8 * b + i)) & 1;
+                sumi += ((lo | (hi << 2)) as i32 - 4) * q8[4 + 4 * (iqs8 + j) + b] as i8 as i32;
+            }
+        }
+        let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+        sumf = d8.mul_add((sumi * sc) as f32, sumf);
+    }
+    let d = f16_to_f32(u16::from_le_bytes([blk[Q3K_D], blk[Q3K_D + 1]]));
+    d.mul_add(sumf, tmp)
+}
+
+/// Most 256-value blocks per row `row_iqk` takes (its per-row sums live on the stack).
+const IQK_MAX_BLOCKS: usize = 64;
+
+/// Horizontal sum of 8 i32 lanes.
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let h = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    let h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0b01_00_11_10));
+    let h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0b10_11_00_01));
+    _mm_cvtsi128_si32(h)
+}
+
+/// Exact dot of 32 int8 weights with the 32 int8 quants of a Q8_1 block, widened to i16 (no saturation edge).
+#[target_feature(enable = "avx2")]
+unsafe fn dot32_i8(w: std::arch::x86_64::__m256i, q8: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    let q = _mm256_loadu_si256(q8.as_ptr() as *const __m256i);
+    let lo = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(w)), _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q)));
+    let hi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1)), _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q, 1)));
+    hsum_i32(_mm256_add_epi32(lo, hi))
+}
+
+/// `row` for IQ3_XXS / IQ4_XS with AVX2 integer dots: GPU thread t covers sub-block t % 8 of blocks t / 8, t / 8 + 16, ..,
+/// so each per-thread sumi is formed exactly here and the float program (`fma(d * d8, sumi, tmp)`, then `reduce`) replayed.
+/// SAFETY: caller checked avx2 and fma; `k / 256 <= IQK_MAX_BLOCKS`.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_iqk(fmt: Format, w_row: &[u8], xq: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bpr = k / 256;
+    let bb = fmt.block_bytes();
+    let mut sumi = [[0i32; 8]; IQK_MAX_BLOCKS];
+    let kv = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let nib = _mm_set1_epi8(0x0F);
+    let byte_shuf = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    let bit_masks = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+    for (b, s) in sumi.iter_mut().enumerate().take(bpr) {
+        let blk = &w_row[b * bb..(b + 1) * bb];
+        for (j, sj) in s.iter_mut().enumerate() {
+            let q8 = &xq[(8 * b + j) * Q8_BYTES + 4..(8 * b + j + 1) * Q8_BYTES];
+            *sj = if fmt == Format::IQ4XS {
+                let q = _mm_loadu_si128(blk[8 + 16 * j..].as_ptr() as *const __m128i);
+                let lo = _mm_shuffle_epi8(kv, _mm_and_si128(q, nib));
+                let hi = _mm_shuffle_epi8(kv, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
+                let raw = dot32_i8(_mm256_set_m128i(hi, lo), q8);
+                let sh = u16::from_le_bytes([blk[2], blk[3]]) as u32;
+                let ls = ((blk[4 + j / 2] as u32 >> (4 * (j % 2))) & 0x0F) | (((sh >> (2 * j)) & 0x03) << 4);
+                raw * (ls as i32 - 32)
+            } else {
+                let g = |l: usize| IQ3XXS_GRID[blk[2 + 8 * j + l] as usize] as i32;
+                let grid = _mm256_setr_epi32(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7));
+                let aux32 = word(blk, 2 + 64 + 4 * j);
+                let signs = (0..4).fold(0u32, |m, p| m | (ksigns(aux32 >> (7 * p)) << (8 * p)));
+                let m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(signs as i32), byte_shuf), bit_masks), bit_masks);
+                let raw = dot32_i8(_mm256_sub_epi8(_mm256_xor_si256(grid, m), m), q8);
+                let ls = (aux32 >> 28) as i32;
+                (ls * raw + raw / 2) / 2
+            };
+        }
+    }
+    let mut tmp = [0f32; THREADS];
+    for (t, v) in tmp.iter_mut().enumerate() {
+        let j = t % IQK_THREADS_PER_BLOCK;
+        let mut kbx = t / IQK_THREADS_PER_BLOCK;
+        while kbx < bpr {
+            let blk = &w_row[kbx * bb..];
+            let q8 = &xq[(8 * kbx + j) * Q8_BYTES..];
+            let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+            *v = (d * d8).mul_add(sumi[kbx][j] as f32, *v);
+            kbx += IQK_BLOCKS_PER_ITER;
+        }
+    }
+    reduce(&tmp)
+}
+
 /// `chunk_sumi` with AVX2: the bits become 0/1 bytes, maddubs (unsigned 0/1 x signed q, no pair
 /// can saturate) + madd give the selected sum and the total exactly.
 #[target_feature(enable = "avx2")]
@@ -439,7 +612,10 @@ pub unsafe fn rows8(fmt: Format, w_rows: &[&[u8]; 8], xq: &[u8], k: usize) -> [f
     let lanes_u32 = |f: &dyn Fn(usize) -> u32| -> __m256i {
         _mm256_setr_epi32(f(0) as i32, f(1) as i32, f(2) as i32, f(3) as i32, f(4) as i32, f(5) as i32, f(6) as i32, f(7) as i32)
     };
-    if matches!(fmt, Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4) {
+    if matches!(fmt, Format::IQ3XXS | Format::IQ4XS) && k / 256 <= IQK_MAX_BLOCKS {
+        return std::array::from_fn(|r| row_iqk(fmt, w_rows[r], xq, k));
+    }
+    if matches!(fmt, Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K) {
         // The float work is one fma per 32 weights; the AVX2 part is Q1_0's integer chunk sum.
         return std::array::from_fn(|r| row_impl(fmt, w_rows[r], xq, k, true));
     }
@@ -489,10 +665,10 @@ pub unsafe fn rows8(fmt: Format, w_rows: &[&[u8]; 8], xq: &[u8], k: usize) -> [f
                     let ql = 48 + 16 * bq8_offset + 4 * ((iqs / 2) % 4);
                     (std::array::from_fn(|r| word(blk(r), ql)), std::array::from_fn(|r| word(blk(r), ql + 16)))
                 }
-                Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 => unreachable!(),
+                Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K => unreachable!(),
             };
             let (h0, h1): ([u32; 8], [u32; 8]) = match fmt {
-                Format::Q4K | Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 => ([0; 8], [0; 8]),
+                Format::Q4K | Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K => ([0; 8], [0; 8]),
                 Format::Q5K => {
                     let qh = 16 + 4 * ((iqs / 2) % 4);
                     (std::array::from_fn(|r| word(blk(r), qh) >> bq8_offset), std::array::from_fn(|r| word(blk(r), qh + 16) >> bq8_offset))

@@ -1335,12 +1335,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                                 v.capacity_seq_len = tk.current_seq_len;
                             }
                             (KvCache::Rotating { k: tk, .. }, KvCache::Rotating { k, v }) => {
-                                k.all_data = Some(batched_k);
-                                k.current_seq_len = tk.current_seq_len;
-                                k.capacity_seq_len = tk.current_seq_len;
-                                v.all_data = Some(batched_v);
-                                v.current_seq_len = tk.current_seq_len;
-                                v.capacity_seq_len = tk.current_seq_len;
+                                // the batch holds only the retained windows: the buffer is exactly that long
+                                let retained = batched_k.dim(tk.dim)?;
+                                for (c, data) in [(&mut *k, batched_k), (&mut *v, batched_v)] {
+                                    c.all_data = Some(data);
+                                    c.current_seq_len = tk.current_seq_len;
+                                    c.capacity_seq_len = retained;
+                                    c.write_pos = retained;
+                                    c.last_append_result = None;
+                                }
                             }
                             _ => {}
                         }

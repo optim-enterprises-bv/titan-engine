@@ -38,9 +38,15 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
             hidden_size: metadata[&format!("{arch}.embedding_length")]
                 .to_u64()
                 .unwrap() as usize,
-            num_attn_heads: metadata[&format!("{arch}.attention.head_count")]
-                .to_u64()
-                .unwrap() as usize,
+            num_attn_heads: match &metadata[&format!("{arch}.attention.head_count")] {
+                // per-layer list (inkling2): the widest layer sizes the estimate
+                gguf_file::Value::Array(per_layer) => per_layer
+                    .iter()
+                    .filter_map(|v| v.to_u64().ok())
+                    .max()
+                    .unwrap_or(1) as usize,
+                scalar => scalar.to_u64().unwrap() as usize,
+            },
             num_kv_heads: match &metadata[&format!("{arch}.attention.head_count_kv")] {
                 // per-layer list (kimi-linear): the widest layer sizes the estimate
                 gguf_file::Value::Array(per_layer) => per_layer
@@ -313,6 +319,49 @@ const GPT_OSS_LAYER_TENSORS: &[&str] = &[
     "ffn_down_exps.bias",
 ];
 
+const INKLING2_LAYER_TENSORS: &[&str] = &[
+    "attn_norm.weight",
+    "attn_q_inp_norm.weight",
+    "attn_k_inp_norm.weight",
+    "attn_v_inp_norm.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_output.weight",
+    "attn_gate.weight",
+    "attn_q_clip.weight",
+    "attn_sink_proj.weight",
+    "attn_rel.weight",
+    "attn_rel_bias.weight",
+    "attn_rel_clip.weight",
+    "attn_k_conv.weight",
+    "attn_v_conv.weight",
+    "attn_post_conv.weight",
+    "attn_k_conv_proj.weight",
+    "attn_v_conv_proj.weight",
+    "attn_res_query.weight",
+    "ffn_res_query.weight",
+    "ffn_norm.weight",
+    "ffn_gate_inp.weight",
+    "exp_probs_b.bias",
+    "ffn_gate_up_exps.weight",
+    "ffn_down_exps.weight",
+    "ffn_post_conv.weight",
+    "loop_msg_query.weight",
+    "loop_q_ctrl_down.weight",
+    "loop_q_ctrl_gain.weight",
+    "loop_q_ctrl_forget.weight",
+    "loop_k_ctrl_down.weight",
+    "loop_k_ctrl_gain.weight",
+    "loop_k_ctrl_forget.weight",
+    "loop_v_ctrl_down.weight",
+    "loop_v_ctrl_gain.weight",
+    "loop_v_ctrl_forget.weight",
+    "loop_ffn_ctrl_down.weight",
+    "loop_ffn_ctrl_gain.weight",
+    "loop_ffn_ctrl_forget.weight",
+];
+
 const KIMI_LINEAR_LAYER_TENSORS: &[&str] = &[
     "attn_norm.weight",
     "attn_q.weight",
@@ -375,6 +424,7 @@ impl GgufDeviceMapLoaderInner<'_, '_> {
             }
             GGUFArchitecture::GptOss => Some(GPT_OSS_LAYER_TENSORS),
             GGUFArchitecture::KimiLinear => Some(KIMI_LINEAR_LAYER_TENSORS),
+            GGUFArchitecture::Inkling2 | GGUFArchitecture::Inkling2Loop => Some(INKLING2_LAYER_TENSORS),
             _ => None,
         }
     }
@@ -420,8 +470,12 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         else {
             anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
         };
-        let num_heads = self.model.get_metadata()[&format!("{}.attention.head_count", self.arch)]
-            .to_u32()? as usize;
+        let num_heads = match &self.model.get_metadata()[&format!("{}.attention.head_count", self.arch)] {
+            gguf_file::Value::Array(per_layer) => {
+                per_layer.iter().filter_map(|v| v.to_u64().ok()).max().unwrap_or(1) as usize
+            }
+            scalar => scalar.to_u32()? as usize,
+        };
         Ok(max_batch_size * num_heads * max_seq_len.min(&ATTENTION_CHUNK_SIZE))
     }
     fn non_mapped_max_act_size_elems(
@@ -519,7 +573,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 output_norm + output + self.mtp_block_bytes()?
             }
-            GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear => {
+            GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear | GGUFArchitecture::Inkling2 | GGUFArchitecture::Inkling2Loop => {
                 // token_embd stays quantized in host memory (quantized_qwen35_moe::QEmbedding)
                 let output_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("output_norm.weight")?,
@@ -554,6 +608,15 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         Ok(block_count - self.nextn_layers())
     }
     fn kv_cache_layer_fraction(&self, config: &str) -> Result<f64> {
+        if matches!(self.arch, GGUFArchitecture::Inkling2 | GGUFArchitecture::Inkling2Loop) {
+            // full-attention visits keep every position; the sliding-window rings stay small
+            let pattern = format!("{}.attention.sliding_window_pattern", self.arch);
+            let full = match self.model.get_metadata().get(&pattern) {
+                Some(gguf_file::Value::Array(a)) => a.iter().filter(|v| matches!(v, gguf_file::Value::Bool(false))).count(),
+                _ => return Ok(1.0),
+            };
+            return Ok(2.0 * full as f64 / self.num_layers(config)?.max(1) as f64);
+        }
         if matches!(self.arch, GGUFArchitecture::KimiLinear) {
             // only the MLA layers (head_count_kv > 0) keep a KV cache
             let per_layer = match self.model.get_metadata().get("kimi-linear.attention.head_count_kv") {

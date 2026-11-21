@@ -59,6 +59,10 @@ pub enum GGUFArchitecture {
     GptOss,
     #[strum(to_string = "kimi-linear")]
     KimiLinear,
+    #[strum(to_string = "inkling2")]
+    Inkling2,
+    #[strum(to_string = "inkling2_loop")]
+    Inkling2Loop,
 }
 
 // Wraps from_str() for some convenience:

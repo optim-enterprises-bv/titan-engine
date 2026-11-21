@@ -276,6 +276,7 @@ fn bpe_tokenizer(p: &PropsGGUF) -> Result<(Tokenizer, TokenizerKind)> {
             match p.pre.as_deref() {
                 Some("gpt-4o") => O200K_SPLIT,
                 Some("kimi-k2") => KIMI_K2_SPLIT,
+                Some("inkling2") => O200K_SPLIT,
                 _ => DEFAULT_BPE_SPLIT,
             }
             .to_string(),
