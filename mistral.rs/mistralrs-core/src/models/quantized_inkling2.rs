@@ -47,6 +47,8 @@ const ROUTER_NORM_MIN: f32 = 1e-20;
 const MIX_EPS: f64 = 1e-6;
 const CTRL_Q: usize = 0;
 const CTRL_FFN: usize = 3;
+/// Query chunks up to this many tokens use the fused decode attention kernel.
+const FUSED_ATTN_MAX_T: usize = 16;
 
 fn value_u64(v: &Value) -> Option<u64> {
     Some(match v {
@@ -1152,6 +1154,38 @@ impl ModelWeights {
         let dev = q.device();
         let mut rows = Vec::with_capacity(n);
         for b in 0..n {
+            let end = pos.starts[b] + pos.t;
+            #[cfg(feature = "cuda")]
+            if dev.is_cuda() && t <= FUSED_ATTN_MAX_T && d == 128 && fused_part("ATTN") {
+                let o = crate::titan_inkling::attn(
+                    &q.get(b)?,
+                    &k_all.get(b)?,
+                    &v_all.get(b)?,
+                    &table.get(b)?,
+                    pos.starts[b],
+                    end - l,
+                    swa.then_some(hp.n_swa),
+                    scale as f32,
+                )?;
+                check("attn", &o, || self.attend_ref_one(q, k_all, v_all, table, swa, pos, b))?;
+                rows.push(o);
+                continue;
+            }
+            rows.push(self.attend_ref_one(q, k_all, v_all, table, swa, pos, b)?);
+        }
+        Tensor::stack(&rows, 0)
+    }
+
+    fn attend_ref_one(&self, q: &Tensor, k_all: &Tensor, v_all: &Tensor, table: &Tensor, swa: bool, pos: &Positions, b: usize) -> Result<Tensor> {
+        let hp = &self.hp;
+        let (_, t, h, d) = q.dims4()?;
+        let hkv = hp.n_head_kv;
+        let g = h / hkv;
+        let l = k_all.dim(2)?;
+        let ext = hp.rel_extent;
+        let scale = 1.0 / (d as f64).sqrt();
+        let dev = q.device();
+        {
             let kb = k_all.get(b)?.to_dtype(DType::F32)?; // (Hkv, L, D)
             let vb_t = v_all.get(b)?.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?; // (Hkv, D, L)
             let qb = q.get(b)?.transpose(0, 1)?.contiguous()?; // (H, t, D)
@@ -1199,9 +1233,8 @@ impl ModelWeights {
                 outs.push(o);
             }
             let o = if outs.len() == 1 { outs.remove(0) } else { Tensor::cat(&outs, 1)? };
-            rows.push(o.transpose(0, 1)?.contiguous()?.reshape((t, h * d))?);
+            o.transpose(0, 1)?.contiguous()?.reshape((t, h * d))
         }
-        Tensor::stack(&rows, 0)
     }
 }
 

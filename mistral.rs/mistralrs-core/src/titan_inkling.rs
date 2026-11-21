@@ -101,6 +101,61 @@ extern "C" __global__ void ink_mix(
     }
 }
 
+__device__ __forceinline__ float bf16f(unsigned short b) { return __uint_as_float(((unsigned)b) << 16); }
+
+// flash-decoding style: block (4 warps) per (head, query, sequence); each warp walks every 4th key with an
+// online softmax, lanes hold 4 of the 128 dims. logit = q.k * scale + table[dist]; one extra zero-logit sink.
+// keys: element (h, j, d) at k + h * kh + j * kj + d (bf16); positions: key j sits at first_key + j.
+extern "C" __global__ void ink_attn(
+    const float* __restrict__ q, const unsigned short* __restrict__ k, const unsigned short* __restrict__ v,
+    long long kh, long long kj, long long vh, long long vj,
+    const float* __restrict__ table, float* __restrict__ out,
+    int T, int H, int Hkv, int L, int ext, int start, int first_key, int swa, int n_swa, float scale)
+{
+    const int h = blockIdx.x, ti = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int hk = h / (H / Hkv);
+    const int p = start + ti;
+    const float* qr = q + ((size_t)ti * H + h) * 128;
+    const float4 qv = *(const float4*)(qr + lane * 4);
+    const float* tb = table + ((size_t)ti * H + h) * (ext + 1);
+    float m = -3.402823466e38f, s = 0.f;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    const unsigned short* kb = k + hk * kh;
+    const unsigned short* vb = v + hk * vh;
+    for (int j = warp; j < L; j += 4) {
+        const int kp = first_key + j;
+        if (kp > p || (swa && p - kp >= n_swa)) continue;
+        const unsigned short* kr = kb + j * kj + lane * 4;
+        float dot = qv.x * bf16f(kr[0]) + qv.y * bf16f(kr[1]) + qv.z * bf16f(kr[2]) + qv.w * bf16f(kr[3]);
+        dot = warp_sum(dot);
+        const int dist = p - kp;
+        const float logit = dot * scale + tb[dist < ext ? dist : ext];
+        const float mn = fmaxf(m, logit);
+        const float c = __expf(m - mn), e = __expf(logit - mn);
+        const unsigned short* vr = vb + j * vj + lane * 4;
+        s = s * c + e;
+        a0 = a0 * c + e * bf16f(vr[0]);
+        a1 = a1 * c + e * bf16f(vr[1]);
+        a2 = a2 * c + e * bf16f(vr[2]);
+        a3 = a3 * c + e * bf16f(vr[3]);
+        m = mn;
+    }
+    __shared__ float sm[4], ss[4];
+    __shared__ float sa[4][128];
+    if (lane == 0) { sm[warp] = m; ss[warp] = s; }
+    sa[warp][lane * 4] = a0; sa[warp][lane * 4 + 1] = a1; sa[warp][lane * 4 + 2] = a2; sa[warp][lane * 4 + 3] = a3;
+    __syncthreads();
+    float M = 0.f;
+    for (int w = 0; w < 4; w++) M = fmaxf(M, sm[w]);
+    float S = __expf(-M);
+    for (int w = 0; w < 4; w++) S += ss[w] * __expf(sm[w] - M);
+    const int d = threadIdx.x;
+    float acc = 0.f;
+    for (int w = 0; w < 4; w++) acc += sa[w][d] * __expf(sm[w] - M);
+    out[((size_t)ti * H + h) * 128 + d] = acc / S;
+}
+
 // block per row of D (<= 1024): mode 0 clip (optional per-head scale, then L2 norm capped at thr, then optional
 // per-token tau), mode 1 unweighted RMS norm
 extern "C" __global__ void ink_rows(
@@ -274,6 +329,57 @@ mod imp {
         Ok(wrap(out, &dev, &shape))
     }
 
+    /// Decode attention for one sequence: `q` `(t, H, 128)` F32, `k`/`v` `(Hkv, L, 128)` BF16 views (last dim
+    /// contiguous), `table` `(t, H, ext + 1)`. Returns `(t, H * 128)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        table: &Tensor,
+        start: usize,
+        first_key: usize,
+        swa: Option<usize>,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let dev = cuda_dev(q)?;
+        let q = q.contiguous()?;
+        let table = table.contiguous()?;
+        let (t, h, d) = q.dims3()?;
+        let (hkv, l, kd) = k.dims3()?;
+        let ext = table.dim(2)? - 1;
+        if d != 128 || kd != 128 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+            candle_core::bail!("titan_inkling attn: want 128-wide heads and BF16 K/V");
+        }
+        let bf = |x: &Tensor| -> Result<(u64, i64, i64)> {
+            let (storage, layout) = x.storage_and_layout();
+            let Storage::Cuda(cuda) = &*storage else { candle_core::bail!("titan_inkling attn: K/V not on CUDA") };
+            let st = layout.stride();
+            if st[2] != 1 {
+                candle_core::bail!("titan_inkling attn: K/V last dim must be contiguous");
+            }
+            let stream = dev.cuda_stream();
+            let (base, _g) = cuda.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+            Ok((base + (layout.start_offset() * 2) as u64, st[0] as i64, st[1] as i64))
+        };
+        let (k_p, kh, kj) = bf(k)?;
+        let (v_p, vh, vj) = bf(v)?;
+        let q_p = addr(&q, &dev)?;
+        let t_p = addr(&table, &dev)?;
+        let (out, out_p) = alloc(&dev, t * h * d)?;
+        let f = dev.get_or_load_custom_func("ink_attn", "titan_inkling", ptx()?)?;
+        let (ti, hi, hkvi, li, exti) = (t as i32, h as i32, hkv as i32, l as i32, ext as i32);
+        let (st, fk, sw, nsw) = (start as i32, first_key as i32, i32::from(swa.is_some()), swa.unwrap_or(0) as i32);
+        let mut b = f.builder();
+        b.arg(&q_p).arg(&k_p).arg(&v_p).arg(&kh).arg(&kj).arg(&vh).arg(&vj).arg(&t_p).arg(&out_p);
+        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale);
+        unsafe {
+            b.launch(LaunchConfig { grid_dim: (h as u32, t as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+        }
+        .w()?;
+        Ok(wrap(out, &dev, &[t, h * d]))
+    }
+
     /// Rows of the last dim `D` of `x` `(.., H, D)`: clip (mode 0) or RMS (mode 1); see the kernel.
     pub(crate) fn rows(x: &Tensor, scale: Option<&Tensor>, thr: f32, tau: Option<&Tensor>, rms_eps: Option<f32>) -> Result<Tensor> {
         let dev = cuda_dev(x)?;
@@ -306,4 +412,4 @@ mod imp {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use imp::{conv, mix, rows};
+pub(crate) use imp::{attn, conv, mix, rows};
