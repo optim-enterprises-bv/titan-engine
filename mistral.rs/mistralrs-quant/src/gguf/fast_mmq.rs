@@ -864,6 +864,134 @@ fn llama_mmq_plain_at(
     Ok(Some(if input_ty == DType::F32 { out } else { out.to_dtype(input_ty)? }))
 }
 
+/// Whether [`grouped_parts`] covers `dtype` with `k` columns: the K-quant MoE launchers, or the llama.cpp MMQ
+/// port in MoE mode (whole tile iterations only, and not NVFP4, whose activations carry a per-column scale).
+pub fn supports_grouped(dtype: GgmlDType, k: usize) -> bool {
+    supports(dtype) || llama_mmq(dtype).is_some_and(|f| f.fi != 2 && k % f.iter_k == 0)
+}
+
+/// [`grouped_parts`] for the llama.cpp MMQ port (`mul_mat_q` with `ids_dst` / `expert_bounds`, as
+/// DEFINE_MMQ_MOE_LAUNCHER drives it): the dispatch rows are quantized once through `ids_src`, then one
+/// stream-k launch per part with one channel per expert of that part.
+#[allow(clippy::too_many_arguments)]
+fn llama_grouped_parts(
+    f: &LlamaMmq,
+    nrows: usize,
+    xs: &Tensor,
+    ids_src: &CudaSlice<u32>,
+    ids_dst: &CudaSlice<u32>,
+    expert_bounds: &CudaSlice<u32>,
+    total: usize,
+    parts: &[GroupedPart],
+    out: &CudaSlice<f32>,
+    dev: &CudaDevice,
+) -> Result<()> {
+    use candle_core::cuda::cudarc::driver::sys::CUfunction_attribute_enum;
+    use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda::WrapErr;
+    let (_, k) = xs.dims2()?;
+    if k % f.iter_k != 0 || xs.dtype() != DType::F32 {
+        candle_core::bail!("fast_mmq grouped_parts: input {:?} {:?} (k must be a multiple of {}, f32)", xs.dims(), xs.dtype(), f.iter_k);
+    }
+    let xs = xs.contiguous()?;
+    let (xs_storage, xs_layout) = xs.storage_and_layout();
+    let Storage::Cuda(xs_cuda) = &*xs_storage else {
+        candle_core::bail!("fast_mmq grouped_parts: input must live on CUDA");
+    };
+    let stream = dev.cuda_stream();
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let y_bytes = (total * (k_padded / f.neb) + 128) * BLOCK_Q8_1_MMQ_SIZE;
+    let mut y_ws = super::fast_mmvq::q1_0_workspace(f.ws, dev, y_bytes)?;
+    // the dispatch-ordered rows are not what a plain call cached
+    y_ws.tag = None;
+    let (y_ptr, _y_guard) = {
+        use candle_core::cuda::cudarc::driver::DevicePtrMut;
+        y_ws.slice.device_ptr_mut(&stream)
+    };
+    let slot0 = 1000 + 200 * f.fi;
+    let (x_ptr, _x_guard) = slice_ptr_on_stream(xs_cuda.as_cuda_slice::<f32>()?, xs_layout.start_offset(), &stream);
+    let (src_ptr, _src_guard) = slice_ptr(ids_src, 0);
+    let (dst_ids_ptr, _dst_guard) = slice_ptr(ids_dst, 0);
+    let (bounds_ptr, _bounds_guard) = slice_ptr(expert_bounds, 0);
+    let (out_ptr, _out_guard) = slice_ptr(out, 0);
+    let z64 = 0u64;
+    let z32 = 0i32;
+    {
+        let quant = super::fast_mmvq::q1_0_func(dev, slot0, f.module, f.ptx, || match f.fi {
+            0 | 4..=9 => "iq4_nl_quantize_mmq_d4_f32".to_string(),
+            3 => "ptq1_0_quantize_mmq_d4_f32".to_string(),
+            _ => format!("{}_quantize_mmq_f32", f.name),
+        })?;
+        let (ne00, s01, s02, ne0) = (k as i64, k as i64, (k * total) as i64, k_padded as i64);
+        let (ne1, ne2, neu) = (total as i32, 1i32, 0i32);
+        let mut b = stream.launch_builder(&quant);
+        b.arg(&x_ptr).arg(&src_ptr).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
+        b.arg(&ne1).arg(&ne2).arg(&neu);
+        if f.fi == 3 {
+            b.arg(&z64).arg(&z64).arg(&z64);
+        }
+        let block_dim = if f.fi == 1 { (32, 8, 1) } else { (128, 1, 1) };
+        let cfg = LaunchConfig { grid_dim: (total as u32, (k_padded as u32).div_ceil(512), 1), block_dim, shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.w()?;
+    }
+    let fallback = nrows % 128 != 0;
+    let fb = fallback as u32;
+    let nsm = get_device_info(dev).nsm.max(1) as u32;
+    let bpn = super::fast_mmvq::q1_0_fastdiv((k / f.qk) as u32);
+    let one = super::fast_mmvq::q1_0_fastdiv(1);
+    let (nrows_x, ncols_dst, stride_row_x, stride_col_dst) = (nrows as i32, total as i32, (k / f.qk) as i32, nrows as i32);
+    let stride_channel_x = nrows_x * stride_row_x;
+    let name = f.name;
+    for p in parts.iter().filter(|p| p.count > 0 && p.ncols_max > 0) {
+        let j = q1_0_mmq_pick_j(p.ncols_max, fallback);
+        let nty = nrows.div_ceil(128) as u32;
+        let ntx = p.ncols_max.div_ceil(j as usize) as u32;
+        let ntiles = ntx * nty * p.count as u32;
+        let nwaves = ntiles.div_ceil(nsm);
+        let nblocks = if 100 * ntiles / (nsm * nwaves) >= 90 { ntiles } else { nsm };
+        let fixup_needed = ntiles % nblocks != 0;
+        let fixup_bytes = if fixup_needed { nblocks as usize * j as usize * 128 * 4 } else { 4 };
+        let mut fixup_ws = workspace_ensure(&FIXUP_WORKSPACE, dev, fixup_bytes, &stream)?;
+        let (fixup_ptr, _fixup_guard) = fixup_ws.ptr_mut();
+        let fixup_ptr = fixup_ptr as u64;
+        let ncy = super::fast_mmvq::q1_0_fastdiv(p.count as u32);
+        let ntx_fd = super::fast_mmvq::q1_0_fastdiv(ntx);
+        let w_ptr = p.weight;
+        let b_ptr = bounds_ptr + 4 * p.first as u64;
+        let slot = (j / 8) as usize * 2 + fb as usize;
+        let smem = q1_0_mmq_smem(j) + f.smem_extra;
+        let mmq = super::fast_mmvq::q1_0_func(dev, slot0 + 10 + slot, f.module, f.ptx, || format!("{name}_mmq_j{j}_f{fb}"))?;
+        mmq.set_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).w()?;
+        let mut b = stream.launch_builder(&mmq);
+        // x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst,
+        // stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_{x,y,dst},
+        // sample_ratio, nsamples_y, stride_sample_{x,y,dst}, ntx
+        b.arg(&w_ptr).arg(&y_ptr).arg(&dst_ids_ptr).arg(&b_ptr).arg(&out_ptr).arg(&fixup_ptr).arg(&z64);
+        b.arg(&bpn[0]).arg(&bpn[1]).arg(&bpn[2]);
+        b.arg(&nrows_x).arg(&ncols_dst).arg(&stride_row_x).arg(&ncols_dst).arg(&stride_col_dst);
+        b.arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&ncy[0]).arg(&ncy[1]).arg(&ncy[2]);
+        b.arg(&stride_channel_x).arg(&z32).arg(&z32);
+        b.arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&z32).arg(&z32).arg(&z32);
+        b.arg(&ntx_fd[0]).arg(&ntx_fd[1]).arg(&ntx_fd[2]);
+        let cfg = LaunchConfig { grid_dim: (nblocks, 1, 1), block_dim: (32, 8, 1), shared_mem_bytes: smem };
+        unsafe { b.launch(cfg) }.w()?;
+        if fixup_needed {
+            let fix = super::fast_mmvq::q1_0_func(dev, slot0 + 100 + slot, f.module, f.ptx, || format!("{name}_mmq_fixup_j{j}_f{fb}"))?;
+            let mut b = stream.launch_builder(&fix);
+            // ids_dst, expert_bounds, dst, tmp_last_tile, blocks_per_ne00, nrows_x, ncols_dst, stride_col_dst,
+            // nchannels_y, stride_channel_dst, nsamples_y, stride_sample_dst, ntx
+            b.arg(&dst_ids_ptr).arg(&b_ptr).arg(&out_ptr).arg(&fixup_ptr);
+            b.arg(&bpn[0]).arg(&bpn[1]).arg(&bpn[2]);
+            b.arg(&nrows_x).arg(&ncols_dst).arg(&stride_col_dst);
+            b.arg(&ncy[0]).arg(&ncy[1]).arg(&ncy[2]).arg(&z32).arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&z32);
+            b.arg(&ntx_fd[0]).arg(&ntx_fd[1]).arg(&ntx_fd[2]);
+            let cfg = LaunchConfig { grid_dim: (nblocks, 4, 1), block_dim: (32, 4, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.w()?;
+        }
+    }
+    Ok(())
+}
+
 /// One expert `e` of a `(n_expert, nrows, k)` stack times `xs` through the llama.cpp MMQ port; `None` when the
 /// format is not covered or K is not a whole number of tile iterations.
 pub fn llama_fmt_plain_expert(w: &QTensor, e: usize, xs: &Tensor) -> Result<Option<Tensor>> {
@@ -1620,6 +1748,9 @@ pub fn grouped_parts(
     dev: &CudaDevice,
 ) -> Result<()> {
     if !supports(dtype) {
+        if let Some(f) = llama_mmq(dtype).filter(|f| f.fi != 2) {
+            return llama_grouped_parts(f, nrows, xs, ids_src, ids_dst, expert_bounds, total_assignments, parts, out, dev);
+        }
         candle_core::bail!("fast_mmq grouped_parts: unsupported quant dtype {dtype:?}");
     }
     let (_, k) = xs.dims2()?;

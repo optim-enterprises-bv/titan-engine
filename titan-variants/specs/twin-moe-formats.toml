@@ -70,3 +70,27 @@ doc = "GGML type 40: 4 UE4M3 sub-block scales, 64 4-bit indices into kvalues_mxf
 id = 6
 prefix = "nvfp4"
 ftz = true
+
+# GGML type 18: half d, 64 grid-index bytes into iq3xxs_grid, 8 words of 7-bit sign groups + 4-bit scale.
+[[twin.variant]]
+name = "IQ3XXS"
+doc = "GGML type 18: half d, 64 grid-index bytes into iq3xxs_grid, 8 words of sign groups + 4-bit scale."
+id = 7
+prefix = "iq3_xxs"
+ftz = true
+
+# GGML type 23: half d, 6-bit sub-block scales (scales_h + scales_l), 128 nibble bytes into kvalues_iq4nl.
+[[twin.variant]]
+name = "IQ4XS"
+doc = "GGML type 23: half d, 6-bit sub-block scales (scales_h + scales_l), 128 nibble bytes into kvalues_iq4nl."
+id = 8
+prefix = "iq4_xs"
+ftz = true
+
+# GGML type 11: 32 hmask bytes, 64 2-bit quant bytes, 12 bytes of 6-bit scales, half d (110 bytes).
+[[twin.variant]]
+name = "Q3K"
+doc = "GGML type 11: 32 hmask bytes, 64 2-bit quant bytes, 12 bytes of 6-bit scales, half d (110 bytes)."
+id = 9
+prefix = "q3k"
+ftz = true

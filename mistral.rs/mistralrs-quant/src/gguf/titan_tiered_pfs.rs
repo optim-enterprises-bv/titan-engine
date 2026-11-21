@@ -90,7 +90,7 @@ impl TieredExperts {
 
     /// Whether streamed forwards of this tensor run the grouped MMQ (`TITAN_PFS_KERNEL=mmq`, K-quants).
     pub fn streams_mmq(&self) -> bool {
-        titan_pfs::mmq() && crate::gguf::fast_mmq::supports(self.dtype)
+        titan_pfs::mmq() && crate::gguf::fast_mmq::supports_grouped(self.dtype, self.k)
     }
 
     /// `forward_streamed` through llama.cpp's grouped MMQ (`streams_mmq`): the dispatch sorts the tasks by

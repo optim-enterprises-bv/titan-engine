@@ -444,6 +444,9 @@ impl TieredExperts {
                 | GgmlDType::IQ4NL
                 | GgmlDType::MXFP4
                 | GgmlDType::NVFP4
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
+                | GgmlDType::Q3K
         )
     }
 
@@ -942,6 +945,9 @@ impl TieredExperts {
             GgmlDType::IQ4NL => Format::IQ4NL,
             GgmlDType::MXFP4 => Format::MXFP4,
             GgmlDType::NVFP4 => Format::NVFP4,
+            GgmlDType::IQ3XXS => Format::IQ3XXS,
+            GgmlDType::IQ4XS => Format::IQ4XS,
+            GgmlDType::Q3K => Format::Q3K,
             _ => Format::Q4K,
         }
     }
@@ -1034,6 +1040,11 @@ impl TieredExperts {
         }
     }
 
+    /// Whether mmvq_moe_oxide.ptx has this dtype's `_moe_b1` / `_moe_mmvq` kernels (else the slot-map GEMV).
+    fn has_mmvq_moe(&self) -> bool {
+        !matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ4XS | GgmlDType::Q3K)
+    }
+
     /// llama.cpp `should_use_small_k` at b = 1: fewer quant blocks per row than 4 warps cover in one
     /// iteration (4 * 32 / (qi / vdr)), so a block computes 4 rows.
     fn b1_small_k(&self) -> bool {
@@ -1062,6 +1073,9 @@ impl TieredExperts {
             GgmlDType::IQ4NL => "iq4_nl_q8_1_moe_gemv",
             GgmlDType::MXFP4 => "mxfp4_q8_1_moe_gemv",
             GgmlDType::NVFP4 => "nvfp4_q8_1_moe_gemv",
+            GgmlDType::IQ3XXS => "iq3_xxs_q8_1_moe_gemv",
+            GgmlDType::IQ4XS => "iq4_xs_q8_1_moe_gemv",
+            GgmlDType::Q3K => "q3k_q8_1_moe_gemv",
             _ => unreachable!("checked in from_qtensor"),
         };
         (name, warp_rows)
@@ -1228,7 +1242,7 @@ impl TieredExperts {
 
         let (n, topk_u, dim1) = (self.n as u32, topk as u32, input_dim1 as u32);
         let moe = mmvq_moe_mode();
-        if moe != 0 && batch <= MMVQ_MOE_MAX_BATCH {
+        if moe != 0 && batch <= MMVQ_MOE_MAX_BATCH && self.has_mmvq_moe() {
             // llama.cpp-shaped kernels (oxide-kernels/mmvq-moe), each column reduced exactly as the
             // kernel below reduces it: same output bits, so the CPU twin is unchanged.
             // b = 1: llama.cpp's b1 grid where k is large (gate/up); for small k (the down projections)
@@ -1347,7 +1361,7 @@ impl TieredExperts {
         let expert = self.host_expert(e);
         let row_of = |r: usize| &expert[r * row_bytes..][..row_bytes];
         let end = (r0 + rows_per_chunk()).min(n);
-        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4) {
+        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS) {
             let rows: Vec<&[u8]> = (r0..end).map(row_of).collect();
             let mut vals = vec![0f32; end - r0];
             unsafe { titan_cpu::rows_lanes(fmt, &rows, xq_row, self.k, &mut vals) };

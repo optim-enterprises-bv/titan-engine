@@ -29,3 +29,12 @@ bit-identical to the oxide implementation across all four formats. Their tree ca
 template — `has_gate` between `has_fusion` and `small_k`, so symbols have six template parameters
 instead of five. The gate accepts both mangled names; the runtime parameter list (160 bytes:
 3 pointers, the 48-byte fusion struct, `dst`, then twenty `u32`s) is identical either way.
+
+## IQ3_XXS / IQ4_XS / Q3_K, and the newer kernel ABI
+
+The `iq3_xxs` / `iq4_xs` / `q3k` gates (and the four above) also pass against a cubin mined from a plain
+upstream build (llama.cpp 6196d98, `-DCMAKE_CUDA_ARCHITECTURES=120`): pass the object
+`build/ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/mmvq.cu.o` to the mining script with the 4-bool symbol
+pattern. That build's `ggml_cuda_mm_fusion_args_device` is 80 bytes (x_scale, gate_scale and the shared-expert
+fields were added); the gate packs `FUSION_BYTES` (80) of nulls, `GATE_FUSION_BYTES=48` for the older cubin.
+Its Q3_K kernel runs two rows per CUDA block at ncols_dst 1, which the gate launches with half the grid.
