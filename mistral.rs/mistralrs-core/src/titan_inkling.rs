@@ -156,38 +156,40 @@ extern "C" __global__ void ink_attn(
     out[((size_t)ti * H + h) * 128 + d] = acc / S;
 }
 
-// block per row of D (<= 1024): mode 0 clip (optional per-head scale, then L2 norm capped at thr, then optional
-// per-token tau), mode 1 unweighted RMS norm
+// block per row of D: mode 0 clip (optional per-head scale, then L2 norm capped at thr, then optional per-token
+// tau), mode 1 unweighted RMS norm
 extern "C" __global__ void ink_rows(
     const float* __restrict__ x, const float* __restrict__ scale, int H, int D, float thr,
     const float* __restrict__ tau, float* __restrict__ out, int mode, float eps)
 {
     const size_t r = blockIdx.x;
-    const int d = threadIdx.x;
     const int head = (int)(r % H);
     __shared__ float red[32];
-    float v = 0.f;
-    if (d < D) {
-        v = x[r * D + d];
+    float ss = 0.f;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float v = x[r * D + d];
         if (scale) v *= scale[(size_t)head * D + d];
+        ss = fmaf(v, v, ss);
     }
-    float ss = warp_sum(v * v);
-    const int lane = d & 31, warp = d >> 5, nw = (blockDim.x + 31) >> 5;
+    ss = warp_sum(ss);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
     if (lane == 0) red[warp] = ss;
     __syncthreads();
-    if (d == 0) { float s = 0.f; for (int i = 0; i < nw; i++) s += red[i]; red[0] = s; }
+    if (threadIdx.x == 0) { float s = 0.f; for (int i = 0; i < nw; i++) s += red[i]; red[0] = s; }
     __syncthreads();
     ss = red[0];
-    if (d >= D) return;
     float f;
     if (mode == 0) {
-        const float norm = sqrtf(ss) + 1e-6f;
-        f = fminf(fmaxf(thr / norm, 0.f), 1.f);
+        f = fminf(fmaxf(thr / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
         if (tau) f *= tau[r / H];
     } else {
         f = rsqrtf(ss / D + eps);
     }
-    out[r * D + d] = v * f;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float v = x[r * D + d];
+        if (scale) v *= scale[(size_t)head * D + d];
+        out[r * D + d] = v * f;
+    }
 }
 "#;
 
@@ -386,7 +388,7 @@ mod imp {
         let x = x.contiguous()?;
         let dims = x.dims().to_vec();
         let d = dims[dims.len() - 1];
-        let h = dims[dims.len() - 2];
+        let h = if dims.len() >= 2 { dims[dims.len() - 2] } else { 1 };
         let rows = x.elem_count() / d;
         let x_p = addr(&x, &dev)?;
         let s_p = match scale {
@@ -402,7 +404,7 @@ mod imp {
         let (hi, di, mode, eps) = (h as i32, d as i32, i32::from(rms_eps.is_some()), rms_eps.unwrap_or(0.0));
         let mut b = f.builder();
         b.arg(&x_p).arg(&s_p).arg(&hi).arg(&di).arg(&thr).arg(&t_p).arg(&out_p).arg(&mode).arg(&eps);
-        let threads = (d.div_ceil(32) * 32) as u32;
+        let threads = (d.div_ceil(32) * 32).min(256) as u32;
         unsafe {
             b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 })
         }

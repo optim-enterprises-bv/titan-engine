@@ -363,6 +363,17 @@ struct ConvCtx {
     out: Tensor,
 }
 
+/// `x @ w.t()` for `x` `(.., K)` and an F32 weight `w` `(N, K)`: flattened to 2-D so the GEMV sees the transposed
+/// view (k-split kernel) instead of a broadcast copy in (K, N) layout.
+fn mm_t(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let k = *dims.last().expect("rank > 0");
+    let y = x.reshape(((), k))?.matmul(&w.t()?)?;
+    let mut out = dims[..dims.len() - 1].to_vec();
+    out.push(w.dim(0)?);
+    y.reshape(out)
+}
+
 fn take(x: &Tensor, i: usize) -> Result<Tensor> {
     x.narrow(2, i, 1)?.squeeze(2)?.contiguous()
 }
@@ -1099,7 +1110,7 @@ impl ModelWeights {
         let r = clip_tau(&r.reshape((n, t, h, hp.n_rel))?, Some(&a.rel_clip), hp.rel_clip, tau)?;
         let sinks = fwd(&a.sink, &inputs[0])?; // (n, t, H)
         // distance table per (token, head): R . bias_table - sink; the last column (past the extent) is -sink
-        let table = r.broadcast_matmul(&a.rel_bias.t()?)?.broadcast_sub(&sinks.unsqueeze(3)?)?; // (n, t, H, extent+1)
+        let table = mm_t(&r, &a.rel_bias)?.broadcast_sub(&sinks.unsqueeze(3)?)?; // (n, t, H, extent+1)
 
         let (k_all, v_all) = kv.append(
             &k.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?,
@@ -1282,8 +1293,8 @@ impl Prof {
 /// gated on `cur` and the message.
 fn control(cur: &Tensor, message: &Tensor, ctrl: &(Tensor, Tensor, Tensor)) -> Result<Tensor> {
     let (down, gain, forget) = ctrl;
-    let gate = Tensor::cat(&[rms(cur, MIX_EPS)?, rms(message, MIX_EPS)?], D::Minus1)?.broadcast_matmul(&down.t()?)?;
-    let gain = gate.broadcast_matmul(&gain.t()?)?.tanh()?;
-    let forget = gate.broadcast_matmul(&forget.t()?)?.tanh()?;
+    let gate = mm_t(&Tensor::cat(&[rms_rows(cur, MIX_EPS)?, rms_rows(message, MIX_EPS)?], D::Minus1)?, down)?;
+    let gain = mm_t(&gate, gain)?.tanh()?;
+    let forget = mm_t(&gate, forget)?.tanh()?;
     (cur - forget.mul(cur)?)? + gain.mul(message)?
 }
