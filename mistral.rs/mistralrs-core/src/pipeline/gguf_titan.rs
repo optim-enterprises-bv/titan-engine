@@ -40,6 +40,7 @@ use crate::utils::model_config::FromGGUF;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::{
     distributed, models::quantized_gpt_oss::ModelWeights as QGptOss,
+    models::quantized_inkling2::ModelWeights as QInkling2,
     models::quantized_kimi_linear::ModelWeights as QKimiLinear,
     models::quantized_qwen35_moe::ModelWeights as QQwen35MoE,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE, DeviceMapSetting, PagedAttentionConfig,
@@ -79,7 +80,7 @@ pub(super) fn titan_arch(paths: &dyn ModelPaths) -> Result<Option<String>> {
         _ => return Ok(None),
     };
     let titan = match arch.as_str() {
-        "qwen35moe" | "qwen35" | "qwen3next" | "gpt-oss" | "kimi-linear" => true,
+        "qwen35moe" | "qwen35" | "qwen3next" | "gpt-oss" | "kimi-linear" | "inkling2" | "inkling2_loop" => true,
         "qwen3moe" => mistralrs_quant::TieredExperts::enabled(),
         _ => false,
     };
@@ -91,6 +92,7 @@ enum Model {
     Qwen35MoE(QQwen35MoE),
     GptOss(QGptOss),
     KimiLinear(QKimiLinear),
+    Inkling2(QInkling2),
 }
 
 /// The Bonsai GGUF chat template inserts the `<|vision_start|><|image_pad|><|vision_end|>` tokens
@@ -360,6 +362,13 @@ pub(super) fn load(
             attention,
             internal_dtype,
         )?),
+        GGUFArchitecture::Inkling2 | GGUFArchitecture::Inkling2Loop => Model::Inkling2(QInkling2::from_gguf(
+            model,
+            device,
+            mapper,
+            attention,
+            internal_dtype,
+        )?),
         a => anyhow::bail!("titan GGUF loader: unsupported architecture `{a:?}`"),
     };
 
@@ -410,6 +419,7 @@ pub(super) fn load(
         Model::Qwen35MoE(ref p) => p.max_seq_len,
         Model::GptOss(ref p) => p.max_seq_len,
         Model::KimiLinear(ref p) => p.max_seq_len,
+        Model::Inkling2(ref p) => p.max_seq_len,
     };
     let max_seq_len = capped_max_seq_len(gguf_max_seq_len);
     crate::titan_monitor::set_max_seq_len(max_seq_len);
@@ -419,6 +429,7 @@ pub(super) fn load(
         Model::Qwen35MoE(ref model) => model.cache.hybrid().num_layers(),
         Model::GptOss(ref model) => model.cache.normal().0.len(),
         Model::KimiLinear(ref model) => model.cache.hybrid().num_layers(),
+        Model::Inkling2(ref model) => model.cache.hybrid().num_layers(),
     };
 
     if chat_template.bos_token.is_none() {
@@ -558,6 +569,7 @@ impl CacheManagerMixin for TitanGGUFPipeline {
             Model::Qwen35MoE(ref model) => &model.cache,
             Model::GptOss(ref model) => &model.cache,
             Model::KimiLinear(ref model) => &model.cache,
+            Model::Inkling2(ref model) => &model.cache,
         }
     }
 }
@@ -569,6 +581,7 @@ impl MetadataMixin for TitanGGUFPipeline {
             Model::Qwen35MoE(ref model) => model.device.clone(),
             Model::GptOss(ref model) => model.device.clone(),
             Model::KimiLinear(ref model) => model.device.clone(),
+            Model::Inkling2(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -673,6 +686,22 @@ impl Pipeline for TitanGGUFPipeline {
                 model.forward(&input_ids, &mut ctx)?
             }
             Model::KimiLinear(ref model) => {
+                let recurrent_metadata = {
+                    let hybrid = model.cache.hybrid();
+                    hybrid.state_indices().cloned().map(|indices| {
+                        RecurrentMetadata::new(
+                            recurrent_batch_kind,
+                            indices,
+                            hybrid.state_indices_host().map(ToOwned::to_owned),
+                        )
+                    })
+                };
+                let mut ctx = ModelForwardContext::new(&seqlen_offsets, &context_lens, &position_ids, None, &flash_meta)
+                    .with_recurrent_batch_kind(recurrent_batch_kind)
+                    .with_recurrent_metadata(recurrent_metadata);
+                model.forward(&input_ids, &mut ctx)?
+            }
+            Model::Inkling2(ref model) => {
                 let recurrent_metadata = {
                     let hybrid = model.cache.hybrid();
                     hybrid.state_indices().cloned().map(|indices| {
