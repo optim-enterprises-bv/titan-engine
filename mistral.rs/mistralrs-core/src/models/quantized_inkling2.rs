@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use candle_core::quantized::gguf_file::Value;
-use candle_core::quantized::{QStorage, QTensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Result, Tensor, D};
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
@@ -349,12 +349,41 @@ struct Attn {
     v_conv_proj: Option<Arc<dyn QuantMethod>>,
 }
 
+enum ExpertWeights {
+    /// whole `(n_expert, rows, cols)` tensors run by candle's indexed MoE (routing ids stay on the device)
+    Indexed { gate_up: QMatMul, down: QMatMul },
+    /// one matmul per routed expert: any GGUF format, one host sync per layer visit
+    PerExpert { gate_up: Vec<Arc<dyn QuantMethod>>, down: Vec<Arc<dyn QuantMethod>> },
+}
+
 struct Experts {
-    /// per expert: fused gate/up `(2 * n_ff, E)` and down `(E, n_ff)`
-    gate_up: Vec<Arc<dyn QuantMethod>>,
-    down: Vec<Arc<dyn QuantMethod>>,
+    w: ExpertWeights,
     gate_up_scale: Option<Vec<f32>>,
     down_scale: Option<Vec<f32>>,
+    /// device copies of the scales for the indexed path, `(n_expert,)`
+    gate_up_scale_t: Option<Tensor>,
+    down_scale_t: Option<Tensor>,
+}
+
+/// GGUF expert formats candle's CUDA indexed MoE covers.
+fn indexed_moe_supported(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ4NL
+            | GgmlDType::NVFP4
+    )
 }
 
 struct Moe {
@@ -430,21 +459,33 @@ impl Experts {
         hp: &Hp,
         device: &Device,
     ) -> Result<Self> {
-        let gu = ct.tensor(&format!("{prefix}.ffn_gate_up_exps.weight"), &Device::Cpu)?;
-        let down = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), &Device::Cpu)?;
-        let gate_up = split_rows(&gu, 2 * hp.n_ff_exp, hp.n_embd, device)?
-            .into_iter()
-            .map(linear)
-            .collect::<Result<Vec<_>>>()?;
-        let down = split_rows(&down, hp.n_embd, hp.n_ff_exp, device)?
-            .into_iter()
-            .map(linear)
-            .collect::<Result<Vec<_>>>()?;
+        let gu_name = format!("{prefix}.ffn_gate_up_exps.weight");
+        let down_name = format!("{prefix}.ffn_down_exps.weight");
+        let indexed = device.is_cuda()
+            && !mistralrs_quant::titan_cfg::flag("INKLING_PER_EXPERT", false)
+            && [&gu_name, &down_name].iter().all(|n| ct.tensor_info(n).is_ok_and(|i| indexed_moe_supported(i.ggml_dtype)));
+        let w = if indexed {
+            ExpertWeights::Indexed {
+                gate_up: QMatMul::from_qtensor(ct.tensor(&gu_name, device)?)?,
+                down: QMatMul::from_qtensor(ct.tensor(&down_name, device)?)?,
+            }
+        } else {
+            let gu = ct.tensor(&gu_name, &Device::Cpu)?;
+            let down = ct.tensor(&down_name, &Device::Cpu)?;
+            ExpertWeights::PerExpert {
+                gate_up: split_rows(&gu, 2 * hp.n_ff_exp, hp.n_embd, device)?.into_iter().map(linear).collect::<Result<Vec<_>>>()?,
+                down: split_rows(&down, hp.n_embd, hp.n_ff_exp, device)?.into_iter().map(linear).collect::<Result<Vec<_>>>()?,
+            }
+        };
+        let gate_up_scale = load_scale(ct, &format!("{prefix}.ffn_gate_up_exps.scale"))?;
+        let down_scale = load_scale(ct, &format!("{prefix}.ffn_down_exps.scale"))?;
+        let dev_scale = |s: &Option<Vec<f32>>| s.as_ref().map(|v| Tensor::from_slice(v, v.len(), device)).transpose();
         Ok(Self {
-            gate_up,
-            down,
-            gate_up_scale: load_scale(ct, &format!("{prefix}.ffn_gate_up_exps.scale"))?,
-            down_scale: load_scale(ct, &format!("{prefix}.ffn_down_exps.scale"))?,
+            w,
+            gate_up_scale_t: dev_scale(&gate_up_scale)?,
+            down_scale_t: dev_scale(&down_scale)?,
+            gate_up_scale,
+            down_scale,
         })
     }
 }
@@ -469,6 +510,9 @@ impl Moe {
             self.select_bias.as_ref(),
             None,
         )?;
+        let ExpertWeights::PerExpert { gate_up, down } = &self.experts.w else {
+            return self.forward_indexed(&flat, &topk, hp)?.reshape((n, t, e));
+        };
         let ids = topk.indices.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
         let weights = topk.values.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
         let mut per_expert: HashMap<usize, (Vec<u32>, Vec<f32>)> = HashMap::new();
@@ -487,14 +531,14 @@ impl Moe {
             let (toks, ws) = &per_expert[&id];
             let idx = Tensor::from_slice(toks, toks.len(), x.device())?;
             let xe = flat.index_select(&idx, 0)?;
-            let mut gu = fwd(&self.experts.gate_up[id], &xe)?;
+            let mut gu = fwd(&gate_up[id], &xe)?;
             if let Some(s) = &self.experts.gate_up_scale {
                 gu = (gu * f64::from(s[id]))?;
             }
             let gate = gu.narrow(1, 0, ff)?;
             let up = gu.narrow(1, ff, ff)?;
             let act = situ(&gate, &up, hp.situ_beta, hp.situ_lb)?;
-            let mut y = fwd(&self.experts.down[id], &act.contiguous()?)?;
+            let mut y = fwd(&down[id], &act.contiguous()?)?;
             let mut scale = Tensor::from_slice(ws, (ws.len(), 1), x.device())?;
             if let Some(s) = &self.experts.down_scale {
                 scale = (scale * f64::from(s[id]))?;
@@ -503,6 +547,34 @@ impl Moe {
             out = out.index_add(&idx, &y, 0)?;
         }
         out.reshape((n, t, e))
+    }
+}
+
+impl Moe {
+    /// All routed experts of all tokens in two indexed launches; `flat` `(T, E)`, returns `(T, E)`.
+    fn forward_indexed(&self, flat: &Tensor, topk: &crate::ops::TopKOutput, hp: &Hp) -> Result<Tensor> {
+        let ExpertWeights::Indexed { gate_up, down } = &self.experts.w else {
+            candle_core::bail!("inkling2: indexed experts expected");
+        };
+        let (tokens, e) = flat.dims2()?;
+        let k = hp.top_k;
+        let ff = hp.n_ff_exp;
+        let ids = topk.indices.contiguous()?;
+        let per_slot = |scale: &Option<Tensor>| -> Result<Option<Tensor>> {
+            scale.as_ref().map(|s| s.index_select(&ids.flatten_all()?, 0)?.reshape((tokens, k, 1))).transpose()
+        };
+        let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, &ids)?.to_dtype(DType::F32)?; // (T, k, 2F)
+        if let Some(s) = per_slot(&self.experts.gate_up_scale_t)? {
+            gu = gu.broadcast_mul(&s)?;
+        }
+        let act = situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
+        let mut y = down.indexed_moe_forward(&act, &ids)?.to_dtype(DType::F32)?; // (T, k, E)
+        let mut w = topk.values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
+        if let Some(s) = per_slot(&self.experts.down_scale_t)? {
+            w = w.mul(&s)?;
+        }
+        y = y.broadcast_mul(&w)?;
+        y.sum(1)
     }
 }
 

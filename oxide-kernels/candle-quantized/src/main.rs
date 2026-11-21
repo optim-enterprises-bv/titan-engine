@@ -476,6 +476,9 @@ pub static IQ2XS_GRID: [u32; 1024] = [
 ];
 
 /// `iq3xxs_grid[256]` (ggml-common.h).
+/// `iq3s_grid[512]` (ggml-common.h), from oxide-kernels/iq3_s.
+pub static IQ3S_GRID: [u32; 512] = include!("iq3s_grid.rs");
+
 pub static IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
@@ -1378,6 +1381,9 @@ mod kernels {
             23 => (256, 32, 4, 136), // iq4_xs (GGML type 23)
             17 => (256, 16, 2, 74), // iq2_xs (GGML type 17)
             22 => (256, 16, 2, 82), // iq2_s (GGML type 22)
+            20 => (32, 4, 2, 18), // iq4_nl (GGML type 20)
+            21 => (256, 16, 2, 110), // iq3_s (GGML type 21)
+            40 => (64, 8, 4, 36), // nvfp4 (GGML type 40)
             _ => (256, 32, 1, 210),
         }
     }
@@ -1516,8 +1522,108 @@ pub fn xs_grid_hi(i: u32) -> u32 {
         unsafe { *(&raw const super::IQ2XS_GRID as *const u32).add(2 * (i & 511) as usize + 1) }
     }
 
+pub fn i3s_grid(i: u32) -> u32 {
+        unsafe { *(&raw const super::IQ3S_GRID as *const u32).add((i & 511) as usize) }
+    }
+
+    /// `kvalues_mxfp4` as the four little-endian words `get_int_from_table_16` reads.
+    pub const NV_TABLE: [u32; 4] = [0x03020100, 0x0C080604, 0xFDFEFF00, 0xF4F8FAFC];
+
+    pub fn nv_table16(q4: u32) -> (u32, u32) {
+        let sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
+        let lo0 = byte_perm(NV_TABLE[0], NV_TABLE[1], q4);
+        let hi0 = byte_perm(NV_TABLE[2], NV_TABLE[3], q4);
+        let t0 = byte_perm(lo0, hi0, sel);
+        let lo1 = byte_perm(NV_TABLE[0], NV_TABLE[1], q4 >> 16);
+        let hi1 = byte_perm(NV_TABLE[2], NV_TABLE[3], q4 >> 16);
+        let t1 = byte_perm(lo1, hi1, sel >> 16);
+        (byte_perm(t0, t1, 0x6420), byte_perm(t0, t1, 0x7531))
+    }
+
+    /// `ggml_cuda_ue4m3_to_fp32`: 0x7F / 0xFF -> 0, e4m3 -> f16 -> f32, then `/ 2`.
+    pub fn ue4m3(b: u8) -> f32 {
+        let b = if b & 0x7F == 0x7F { 0u16 } else { b as u16 };
+        let r: u32;
+        unsafe { ptx_asm!("cvt.rn.f16x2.e4m3x2 %0, %1;", out("=r") r, in("h") b, options(register_only)); }
+        let v = h2f((r & 0xFFFF) as u16);
+        let q: f32;
+        unsafe { ptx_asm!("div.approx.ftz.f32 %0, %1, 0f40000000;", out("=f") q, in("f") v, options(register_only)); }
+        q
+    }
+
     pub unsafe fn mmvq_acc<const FMT: u32>(tmp: f32, xb: *const u8, yb: *const u8, iqs: usize) -> f32 {
         match FMT {
+            20 => {
+                // vec_dot_iq4_nl_q8_1 (oxide-kernels/iq4_nl); iqs is 2*(tid % 2), q8 block = kby.
+                let qs = xb.add(2) as *const u16;
+                let q8 = yb.add(4) as *const u32;
+                let mut sumi = 0i32;
+                let mut l = 0usize;
+                while l < 2 {
+                    let w = iqs + l;
+                    let aux = (*qs.add(2 * w) as u32) | ((*qs.add(2 * w + 1) as u32) << 16);
+                    let (v0, v1) = i4_table16(aux);
+                    sumi = dp4a(v0, *q8.add(w), sumi);
+                    sumi = dp4a(v1, *q8.add(w + 4), sumi);
+                    l += 1;
+                }
+                let d = mul(h2f(ld16(xb, 0) as u16), h2f(ld16(yb, 0) as u16));
+                fma(d, sumi as f32, tmp)
+            }
+            21 => {
+                // vec_dot_iq3_s_q8_1 (oxide-kernels/iq3_s); iqs is 2*(tid % 8) => q8 block iqs/2.
+                let b8 = yb.add((iqs / 2) * 36);
+                let q0 = get_b2(xb.add(2), iqs as i32);
+                let q1 = get_b2(xb.add(2), iqs as i32 + 1);
+                let qs = [
+                    q0 as u8, (q0 >> 8) as u8, (q0 >> 16) as u8, (q0 >> 24) as u8,
+                    q1 as u8, (q1 >> 8) as u8, (q1 >> 16) as u8, (q1 >> 24) as u8,
+                ];
+                let qh = *xb.add(66 + iqs / 2) as u32;
+                let sp = get_b2(xb.add(74), iqs as i32 / 2);
+                let q8 = b8.add(4) as *const u32;
+                let mut sumi = 0i32;
+                let mut l0 = 0usize;
+                while l0 < 8 {
+                    let g0 = i3s_grid(qs[l0] as u32 | ((qh << (8 - l0 as u32)) & 0x100));
+                    let g1 = i3s_grid(qs[l0 + 1] as u32 | ((qh << (7 - l0 as u32)) & 0x100));
+                    let s8 = (sp >> (8 * (l0 as u32 / 2))) & 0xFF;
+                    let s0 = vcmpne4_zero(((s8 & 0x03) << 7) | ((s8 & 0x0C) << 21));
+                    let s1 = vcmpne4_zero(((s8 & 0x30) << 3) | ((s8 & 0xC0) << 17));
+                    let gl = vsub4_wrap(g0 ^ s0, s0);
+                    let gh = vsub4_wrap(g1 ^ s1, s1);
+                    sumi = dp4a(gl, *q8.add(l0), sumi);
+                    sumi = dp4a(gh, *q8.add(l0 + 1), sumi);
+                    l0 += 2;
+                }
+                let sc = ((*xb.add(106 + iqs / 4) as u32) >> (((iqs as u32) << 1) & 0x04)) & 0x0F;
+                let sumi = sumi.wrapping_mul(1 + 2 * sc as i32);
+                let d = mul(h2f(ld16(xb, 0) as u16), h2f(ld16(b8, 0) as u16));
+                fma(d, sumi as f32, tmp)
+            }
+            40 => {
+                // vec_dot_nvfp4_q8_1 (oxide-kernels/nvfp4); iqs is 4*(tid % 2), yb the first of two q8 blocks.
+                let qs = xb.add(4);
+                let mut sum = 0f32;
+                let mut i = 0usize;
+                while i < 2 {
+                    let iqs0 = iqs + 2 * i;
+                    let is = iqs0 >> 1;
+                    let (v0x, v0y) = nv_table16(*(qs.add(4 * iqs0) as *const u32));
+                    let (v1x, v1y) = nv_table16(*(qs.add(4 * iqs0 + 4) as *const u32));
+                    let bq8 = yb.add((is >> 1) * 36);
+                    let q8 = bq8.add(4) as *const u32;
+                    let i8 = (is & 1) << 2;
+                    let mut sumi = dp4a(v0x, *q8.add(i8), 0);
+                    sumi = dp4a(v0y, *q8.add(i8 + 2), sumi);
+                    sumi = dp4a(v1x, *q8.add(i8 + 1), sumi);
+                    sumi = dp4a(v1y, *q8.add(i8 + 3), sumi);
+                    let d = mul(ue4m3(*xb.add(is)), h2f(ld16(bq8, 0) as u16));
+                    sum = fma(d, sumi as f32, sum);
+                    i += 1;
+                }
+                add(tmp, sum)
+            }
             18 => {
                 // vec_dot_iq3_xxs_q8_1; kqs = 4*(tid % (qi/vdr)) => q8 block = kby + iqs/vdr.
                 let qs = xb.add(2);
@@ -2041,7 +2147,7 @@ pub fn xs_grid_hi(i: u32) -> u32 {
         let expert_id = *indices.offset(task_id as isize);
         let (qk, qi, vdr, bs) = fmt_params::<FMT>();
         // (size_t)(n * k) / QK_K * sizeof(block_q_t): QK_K = 256 for every format, q8_0 included.
-        let weight_expert_stride = ((n.wrapping_mul(k) as i64 as u64) / 256).wrapping_mul(bs as u64);
+        let weight_expert_stride = ((n.wrapping_mul(k) as i64 as u64) / qk as u64).wrapping_mul(bs as u64);
         let input_task_stride = (k_padded as i64 as u64 / 32).wrapping_mul(36);
         let xw = w.wrapping_add((expert_id as u64).wrapping_mul(weight_expert_stride) as usize);
         let xq = xin.wrapping_add((input_idx as i64 as u64).wrapping_mul(input_task_stride) as usize);
@@ -2184,6 +2290,9 @@ pub fn xs_grid_hi(i: u32) -> u32 {
     #[kernel] pub unsafe fn indexed_moe_forward_q5k_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<8>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
     #[kernel] pub unsafe fn indexed_moe_forward_q6k_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<9>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
     #[kernel] pub unsafe fn indexed_moe_forward_q8_0_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<4>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq4_nl_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<20>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_iq3_s_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<21>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
+    #[kernel] pub unsafe fn indexed_moe_forward_nvfp4_q8_1(w: *const u8, xin: *const u8, indices: *const u32, out: *mut f32, n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32) { moe::<40>(w, xin, indices, out, n, k, batch, topk, k_padded, input_dim1) }
 
     // ------------------------------------------------------------------------------------------
     // Family 5: mul_mat_q* (10 entries): llama.cpp's tiled MMQ, non-tensor-core Ampere configs

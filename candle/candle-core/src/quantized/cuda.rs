@@ -817,6 +817,9 @@ fn indexed_moe_forward_fused_q8_1_input(
         GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1",
         GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1",
         GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1",
+        GgmlDType::IQ4NL => "indexed_moe_forward_iq4_nl_q8_1",
+        GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1",
+        GgmlDType::NVFP4 => "indexed_moe_forward_nvfp4_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -878,6 +881,9 @@ impl QCudaStorage {
  | GgmlDType::IQ3XXS
  | GgmlDType::IQ2S
  | GgmlDType::IQ2XS
+ | GgmlDType::IQ4NL
+ | GgmlDType::IQ3S
+ | GgmlDType::NVFP4
         ) {
             let input_storage = input.as_cuda_slice::<f32>()?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
