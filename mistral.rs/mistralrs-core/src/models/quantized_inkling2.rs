@@ -274,6 +274,18 @@ fn clip(x: &Tensor, scale: Option<&Tensor>, thr: f64) -> Result<Tensor> {
 /// Attention over depth: `blocks` and `cur` are `(n, t, E)`; `query` is `(q, E)`. Returns `(n, t, q, E)`,
 /// each query's softmax-weighted sum of the RMS-normalized states.
 fn mix(blocks: &[Tensor], cur: &Tensor, query: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if cur.device().is_cuda() && blocks.len() < crate::titan_inkling::MIX_MAX && fused_part("MIX") {
+        let mut all: Vec<&Tensor> = blocks.iter().collect();
+        all.push(cur);
+        let y = crate::titan_inkling::mix(&all, query, MIX_EPS as f32)?;
+        check("mix", &y, || mix_ref(blocks, cur, query))?;
+        return Ok(y);
+    }
+    mix_ref(blocks, cur, query)
+}
+
+fn mix_ref(blocks: &[Tensor], cur: &Tensor, query: &Tensor) -> Result<Tensor> {
     let mut all: Vec<&Tensor> = blocks.iter().collect();
     all.push(cur);
     let states = rms(&Tensor::stack(&all, 2)?, MIX_EPS)?; // (n, t, nb, E)
@@ -281,6 +293,72 @@ fn mix(blocks: &[Tensor], cur: &Tensor, query: &Tensor) -> Result<Tensor> {
     let scores = (states.broadcast_matmul(&query.t()?)? / (e as f64).sqrt())?; // (n, t, nb, q)
     let probs = candle_nn::ops::softmax_last_dim(&scores.transpose(2, 3)?.contiguous()?)?; // (n, t, q, nb)
     probs.matmul(&states)
+}
+
+/// `INKLING_FUSED=0` falls back to the candle-op reference path.
+fn fused() -> bool {
+    mistralrs_quant::titan_cfg::flag("INKLING_FUSED", true)
+}
+
+/// `INKLING_CHECK=1`: run the reference beside each fused kernel and log the worst relative difference seen.
+fn check(part: &'static str, fused: &Tensor, reference: impl FnOnce() -> Result<Tensor>) -> Result<()> {
+    if !mistralrs_quant::titan_cfg::flag("INKLING_CHECK", false) {
+        return Ok(());
+    }
+    static WORST: Mutex<Option<HashMap<&'static str, f32>>> = Mutex::new(None);
+    let r = reference()?.to_dtype(DType::F32)?;
+    let scale = r.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-30);
+    let diff = (fused.to_dtype(DType::F32)? - &r)?.abs()?.max_all()?.to_scalar::<f32>()? / scale;
+    let mut g = WORST.lock().expect("check");
+    let w = g.get_or_insert_with(HashMap::new).entry(part).or_insert(0.0);
+    if diff > *w {
+        *w = diff;
+        tracing::info!("inkling2 check {part}: new worst relative max diff {diff:.3e}");
+    }
+    Ok(())
+}
+
+fn fused_part(part: &str) -> bool {
+    fused() && mistralrs_quant::titan_cfg::flag(&format!("INKLING_FUSED_{part}"), true)
+}
+
+/// Row clip with an optional per-token scale after it (`tau` `(n, t, 1, 1)`).
+fn clip_tau(x: &Tensor, scale: Option<&Tensor>, thr: f64, tau: Option<&Tensor>) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() && fused() {
+        if fused_part("ROWS") {
+            let y = crate::titan_inkling::rows(x, scale, thr as f32, tau, None)?;
+            check("clip", &y, || {
+                let y = clip(x, scale, thr)?;
+                match tau {
+                    Some(t) => y.broadcast_mul(t),
+                    None => Ok(y),
+                }
+            })?;
+            return Ok(y);
+        }
+    }
+    let y = clip(x, scale, thr)?;
+    match tau {
+        Some(t) => y.broadcast_mul(t),
+        None => Ok(y),
+    }
+}
+
+fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() && fused_part("ROWS") {
+        let y = crate::titan_inkling::rows(x, None, 0.0, None, Some(eps as f32))?;
+        check("rms", &y, || rms(x, eps))?;
+        return Ok(y);
+    }
+    rms(x, eps)
+}
+
+/// One layer visit's convolution state: the gathered history (`None` when fresh) and the next one, `(n, C, taps - 1)`.
+struct ConvCtx {
+    input: Option<Tensor>,
+    out: Tensor,
 }
 
 fn take(x: &Tensor, i: usize) -> Result<Tensor> {
@@ -293,6 +371,34 @@ struct Conv {
 }
 
 impl Conv {
+    /// [`Conv::forward`] on channels `off..off + C` of the visit's state.
+    fn run(&self, cur: &Tensor, cx: &mut ConvCtx, off: usize, dynamic: Option<(&Tensor, usize)>) -> Result<Tensor> {
+        let (n, _, c) = cur.dims3()?;
+        let taps = self.w.dim(1)?;
+        #[cfg(feature = "cuda")]
+        if cur.device().is_cuda() && taps <= crate::titan_inkling::CONV_MAX_TAPS && fused_part("CONV") {
+            let denom = (((if dynamic.is_some() { 2 } else { 1 }) * taps + 1) as f64).sqrt();
+            let y = crate::titan_inkling::conv(cur, &self.w, cx.input.as_ref(), &cx.out, off, dynamic, (1.0 / denom) as f32)?;
+            check("conv", &y, || {
+                let hist = match &cx.input {
+                    Some(s) => s.narrow(1, off, c)?.contiguous()?,
+                    None => Tensor::zeros((n, c, taps - 1), DType::F32, cur.device())?,
+                };
+                let (y_ref, next) = self.forward(cur, &hist, dynamic.map(|d| d.0))?;
+                check("conv_state", &cx.out.narrow(1, off, c)?, || Ok(next))?;
+                Ok(y_ref)
+            })?;
+            return Ok(y);
+        }
+        let hist = match &cx.input {
+            Some(s) => s.narrow(1, off, c)?.contiguous()?,
+            None => Tensor::zeros((n, c, taps - 1), DType::F32, cur.device())?,
+        };
+        let (y, next) = self.forward(cur, &hist, dynamic.map(|d| d.0))?;
+        cx.out = cx.out.slice_assign(&[0..n, off..off + c, 0..taps - 1], &next)?;
+        Ok(y)
+    }
+
     /// Causal short convolution with a residual. `cur` `(n, t, C)`, `hist` `(n, C, taps - 1)` (the previous
     /// inputs), `dynamic` `(n, t, heads * taps)` adds input-dependent taps per head. Returns the output and
     /// the next history.
@@ -335,8 +441,8 @@ struct Attn {
     q_clip: Tensor,
     sink: Arc<dyn QuantMethod>,
     rel: Arc<dyn QuantMethod>,
-    /// `(n_rel, extent + 1)`: the distance table, one zero column for distances past the extent.
-    rel_bias_t: Tensor,
+    /// `(extent + 1, n_rel)`: the distance table with a zero row for distances past the extent (used transposed).
+    rel_bias: Tensor,
     /// `(n_head, n_rel)`
     rel_clip: Tensor,
     k_conv: Conv,
@@ -387,8 +493,8 @@ fn indexed_moe_supported(dtype: GgmlDType) -> bool {
 }
 
 struct Moe {
-    /// `(E, n_expert)`
-    router_t: Tensor,
+    /// `(n_expert, E)`: used as `x @ router.t()` so the GEMV splits over E (a (E, n) weight gets n/32 blocks)
+    router: Tensor,
     select_bias: Option<Tensor>,
     experts: Experts,
 }
@@ -396,7 +502,7 @@ struct Moe {
 struct LoopLayer {
     /// `(4, E)`: Q, K, V and FFN message queries
     msg_query: Tensor,
-    /// per controller: down `(2E, rank)`, gain `(rank, E)`, forget `(rank, E)`
+    /// per controller, `(out, in)`: down `(rank, 2E)`, gain `(E, rank)`, forget `(E, rank)`
     ctrl: Vec<(Tensor, Tensor, Tensor)>,
 }
 
@@ -497,7 +603,7 @@ impl Moe {
         let flat = x.reshape((n * t, e))?.contiguous()?;
         let tokens = n * t;
         let topk = crate::ops::moe_router_topk(
-            &flat.matmul(&self.router_t)?,
+            &flat.matmul(&self.router.t()?)?,
             crate::ops::MoeRouterTopKConfig {
                 top_k: hp.top_k,
                 score_function: crate::ops::MoeRouterScoreFunction::Sigmoid,
@@ -599,8 +705,7 @@ impl Attn {
             Ok(Conv { w: load_f32(ct, &p(s), device)? })
         };
         let rel_bias = load_f32(ct, &p("attn_rel_bias.weight"), device)?; // (extent, n_rel)
-        let rel_bias_t = Tensor::cat(&[&rel_bias.t()?, &Tensor::zeros((hp.n_rel, 1), DType::F32, device)?], 1)?
-            .contiguous()?;
+        let rel_bias = Tensor::cat(&[&rel_bias, &Tensor::zeros((1, hp.n_rel), DType::F32, device)?], 0)?.contiguous()?;
         let (norm, qkv_norms, k_conv_proj, v_conv_proj) = if swa {
             (Some(QRmsNorm::new(ct.tensor(&p("attn_norm.weight"), device)?, hp.rms_eps as f32)?), None, None, None)
         } else {
@@ -621,7 +726,7 @@ impl Attn {
             q_clip: load_f32(ct, &p("attn_q_clip.weight"), device)?,
             sink: load_linear(ct, &p("attn_sink_proj.weight"), device)?,
             rel: load_linear(ct, &p("attn_rel.weight"), device)?,
-            rel_bias_t,
+            rel_bias,
             rel_clip: load_f32(ct, &p("attn_rel_clip.weight"), device)?,
             k_conv: conv(ct, "attn_k_conv.weight")?,
             v_conv: conv(ct, "attn_v_conv.weight")?,
@@ -641,6 +746,9 @@ struct Positions {
     t: usize,
     /// `(n, t, 1, 1)`
     tau: Tensor,
+    /// distance-table index and mask per (sequence, sliding, keys, first query, queries): every visit of
+    /// the same kind shares them, so each is uploaded once per forward
+    bias_idx: Mutex<HashMap<(usize, bool, usize, usize, usize), (Tensor, Tensor)>>,
 }
 
 impl ModelConfig::FromGGUF for ModelWeights {
@@ -686,7 +794,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 ffn_res_query: load_f32(&mut ct, &format!("{prefix}.ffn_res_query.weight"), device)?.reshape((1, hp.n_embd))?,
                 ffn_norm: QRmsNorm::new(ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?, hp.rms_eps as f32)?,
                 moe: Moe {
-                    router_t: router.t()?.contiguous()?,
+                    router,
                     select_bias,
                     experts: Experts::load(&mut ct, &prefix, &hp, device)?,
                 },
@@ -703,7 +811,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     let down = load_f32(&mut ct, &p(&format!("loop_{c}_ctrl_down.weight")), device)?; // (rank, 2E)
                     let gain = load_f32(&mut ct, &p(&format!("loop_{c}_ctrl_gain.weight")), device)?; // (E, rank)
                     let forget = load_f32(&mut ct, &p(&format!("loop_{c}_ctrl_forget.weight")), device)?;
-                    ctrl.push((down.t()?.contiguous()?, gain.t()?.contiguous()?, forget.t()?.contiguous()?));
+                    ctrl.push((down, gain, forget));
                 }
                 loop_layers.push(LoopLayer {
                     msg_query: load_f32(&mut ct, &p("loop_msg_query.weight"), device)?.reshape((4, hp.n_embd))?,
@@ -824,6 +932,7 @@ impl ModelWeights {
             starts: starts.to_vec(),
             t,
             tau: Tensor::from_vec(tau, (starts.len(), t, 1, 1), &self.device)?,
+            bias_idx: Mutex::new(HashMap::new()),
         })
     }
 
@@ -913,6 +1022,7 @@ impl ModelWeights {
         pos: &Positions,
     ) -> Result<Tensor> {
         let hp = &self.hp;
+        let mut prof = Prof::new(cur.device());
         let il = hp.phys(slot);
         let layer = &self.layers[il];
         let a = &layer.attn;
@@ -927,13 +1037,13 @@ impl ModelWeights {
         } else {
             md.state_indices().to_device(pool.device())?
         };
-        let hist = if fresh {
-            Tensor::zeros((n, hp.conv_channels(), hp.conv_k - 1), DType::F32, cur.device())?
-        } else {
-            pool.gather_conv_state(&indices)?.to_dtype(DType::F32)?
+        prof.mark("state");
+        let mut cx = ConvCtx {
+            input: if fresh { None } else { Some(pool.gather_conv_state(&indices)?.to_dtype(DType::F32)?.contiguous()?) },
+            out: Tensor::zeros((n, hp.conv_channels(), hp.conv_k - 1), DType::F32, cur.device())?,
         };
-        let hist_part = |off: usize, len: usize| hist.narrow(1, off, len);
 
+        prof.mark("inputs");
         let inp_sa = cur.clone();
         let mut inputs = [cur.clone(), cur.clone(), cur.clone()];
         if let Some(q) = &layer.attn_res_query {
@@ -965,6 +1075,7 @@ impl ModelWeights {
             _ => candle_core::bail!("inkling2: layer {il} has no attention input norm"),
         }
 
+        prof.mark("proj");
         // projections and convolutions
         let q = fwd(&a.wq, &inputs[0])?;
         let k_dyn = match &a.k_conv_proj {
@@ -975,31 +1086,30 @@ impl ModelWeights {
             Some(p) => Some(fwd(p, &inputs[2])?),
             None => None,
         };
-        let (k, hk) = a.k_conv.forward(&fwd(&a.wk, &inputs[1])?, &hist_part(0, kg)?, k_dyn.as_ref())?;
-        let (v, hv) = a.v_conv.forward(&fwd(&a.wv, &inputs[2])?, &hist_part(kg, kg)?, v_dyn.as_ref())?;
+        let k = a.k_conv.run(&fwd(&a.wk, &inputs[1])?, &mut cx, 0, k_dyn.as_ref().map(|d| (d, hkv)))?;
+        let v = a.v_conv.run(&fwd(&a.wv, &inputs[2])?, &mut cx, kg, v_dyn.as_ref().map(|d| (d, hkv)))?;
         let r = fwd(&a.rel, &inputs[0])?;
 
-        let mut q = clip(&q.reshape((n, t, h, d))?, Some(&a.q_clip), hp.qk_clip)?;
-        let k = clip(&k.reshape((n, t, hkv, d))?, None, hp.qk_clip)?;
-        let v = rms(&v.reshape((n, t, hkv, d))?, hp.rms_eps)?;
-        let mut r = clip(&r.reshape((n, t, h, hp.n_rel))?, Some(&a.rel_clip), hp.rel_clip)?;
-        if !swa {
-            q = q.broadcast_mul(&pos.tau)?;
-            r = r.broadcast_mul(&pos.tau)?;
-        }
+        let tau = (!swa).then_some(&pos.tau);
+        let q = clip_tau(&q.reshape((n, t, h, d))?, Some(&a.q_clip), hp.qk_clip, tau)?;
+        let k = clip_tau(&k.reshape((n, t, hkv, d))?, None, hp.qk_clip, None)?;
+        let v = rms_rows(&v.reshape((n, t, hkv, d))?, hp.rms_eps)?;
+        let r = clip_tau(&r.reshape((n, t, h, hp.n_rel))?, Some(&a.rel_clip), hp.rel_clip, tau)?;
         let sinks = fwd(&a.sink, &inputs[0])?; // (n, t, H)
         // distance table per (token, head): R . bias_table - sink; the last column (past the extent) is -sink
-        let table = r.broadcast_matmul(&a.rel_bias_t)?.broadcast_sub(&sinks.unsqueeze(3)?)?; // (n, t, H, extent+1)
+        let table = r.broadcast_matmul(&a.rel_bias.t()?)?.broadcast_sub(&sinks.unsqueeze(3)?)?; // (n, t, H, extent+1)
 
         let (k_all, v_all) = kv.append(
             &k.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?,
             &v.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?,
         )?;
+        prof.mark("attend");
         let attn = self.attend(&q, &k_all, &v_all, &table, swa, pos)?; // (n, t, H*D)
 
+        prof.mark("out");
         let gate = candle_nn::ops::sigmoid(&fwd(&a.wgate, &inputs[0])?)?;
         let o = fwd(&a.wo, &attn.mul(&gate)?)?;
-        let (o, ho) = a.post_conv.forward(&o, &hist_part(2 * kg, e)?, None)?;
+        let o = a.post_conv.run(&o, &mut cx, 2 * kg, None)?;
 
         let mut cur = if ip % hp.res_block == 0 {
             blocks.push(inp_sa);
@@ -1008,6 +1118,7 @@ impl ModelWeights {
             (inp_sa + o)?
         };
 
+        prof.mark("mix_ffn");
         // MoE
         let ffn_inp = cur.clone();
         let mut f = take(&mix(blocks, &cur, &layer.ffn_res_query)?, 0)?;
@@ -1015,12 +1126,15 @@ impl ModelWeights {
             f = control(&f, &take(m, CTRL_FFN)?, &ll.ctrl[CTRL_FFN])?;
         }
         let f = layer.ffn_norm.forward(&f)?;
+        prof.mark("moe");
         let f = layer.moe.forward(&f, hp)?;
-        let (f, hf) = layer.ffn_post_conv.forward(&f, &hist_part(2 * kg + e, e)?, None)?;
+        prof.mark("conv");
+        let f = layer.ffn_post_conv.run(&f, &mut cx, 2 * kg + e, None)?;
         cur = (ffn_inp + f)?;
 
-        let new_hist = Tensor::cat(&[hk, hv, ho, hf], 1)?.contiguous()?;
-        pool.scatter_conv_state_with_host_indices(&indices, md.state_indices_host(), &new_hist.to_dtype(pool.conv_dtype())?)?;
+        prof.mark("hist");
+        pool.scatter_conv_state_with_host_indices(&indices, md.state_indices_host(), &cx.out.to_dtype(pool.conv_dtype())?)?;
+        prof.mark("end");
         Ok(cur)
     }
 
@@ -1039,7 +1153,7 @@ impl ModelWeights {
         let mut rows = Vec::with_capacity(n);
         for b in 0..n {
             let kb = k_all.get(b)?.to_dtype(DType::F32)?; // (Hkv, L, D)
-            let vb = v_all.get(b)?.to_dtype(DType::F32)?;
+            let vb_t = v_all.get(b)?.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?; // (Hkv, D, L)
             let qb = q.get(b)?.transpose(0, 1)?.contiguous()?; // (H, t, D)
             let tb = table.get(b)?.transpose(0, 1)?.contiguous()?; // (H, t, ext+1)
             let end = pos.starts[b] + pos.t; // one past the last position in the cache
@@ -1051,20 +1165,29 @@ impl ModelWeights {
                 // (Hkv, g*lq, D) . (Hkv, D, L) -> (H, lq, L)
                 let qg = qb.narrow(1, i0, lq)?.reshape((hkv, g * lq, d))?;
                 let scores = (qg.matmul(&kb.t()?)? * scale)?.reshape((h, lq, l))?;
-                let mut idx = Vec::with_capacity(lq * l);
-                let mut mask = Vec::with_capacity(lq * l);
-                for i in 0..lq {
-                    let p = pos.starts[b] + i0 + i;
-                    for j in 0..l {
-                        let kp = first_key + j;
-                        let valid = kp <= p && (!swa || p - kp < hp.n_swa);
-                        let dist = p.saturating_sub(kp);
-                        idx.push(if valid && dist < ext { dist as u32 } else { ext as u32 });
-                        mask.push(if valid { 0f32 } else { f32::NEG_INFINITY });
+                let key = (b, swa, l, i0, lq);
+                let cached = pos.bias_idx.lock().expect("bias index cache poisoned").get(&key).cloned();
+                let (idx, mask) = match cached {
+                    Some(v) => v,
+                    None => {
+                        let mut idx = Vec::with_capacity(lq * l);
+                        let mut mask = Vec::with_capacity(lq * l);
+                        for i in 0..lq {
+                            let p = pos.starts[b] + i0 + i;
+                            for j in 0..l {
+                                let kp = first_key + j;
+                                let valid = kp <= p && (!swa || p - kp < hp.n_swa);
+                                let dist = p.saturating_sub(kp);
+                                idx.push(if valid && dist < ext { dist as u32 } else { ext as u32 });
+                                mask.push(if valid { 0f32 } else { f32::NEG_INFINITY });
+                            }
+                        }
+                        let idx = Tensor::from_vec(idx, (1, lq, l), dev)?.broadcast_as((h, lq, l))?.contiguous()?;
+                        let mask = Tensor::from_vec(mask, (1, lq, l), dev)?;
+                        pos.bias_idx.lock().expect("bias index cache poisoned").insert(key, (idx.clone(), mask.clone()));
+                        (idx, mask)
                     }
-                }
-                let idx = Tensor::from_vec(idx, (1, lq, l), dev)?.broadcast_as((h, lq, l))?.contiguous()?;
-                let mask = Tensor::from_vec(mask, (1, lq, l), dev)?;
+                };
                 let bias = tb.narrow(1, i0, lq)?.contiguous()?.gather(&idx, 2)?; // (H, lq, L)
                 let logits = (scores + bias)?.broadcast_add(&mask)?;
                 // softmax over the keys and one zero-logit sink
@@ -1072,7 +1195,7 @@ impl ModelWeights {
                 let ex = logits.broadcast_sub(&m)?.exp()?;
                 let denom = (ex.sum_keepdim(2)? + m.neg()?.exp()?)?;
                 let p = ex.broadcast_div(&denom)?.reshape((hkv, g * lq, l))?;
-                let o = p.matmul(&vb)?.reshape((h, lq, d))?; // (H, lq, D)
+                let o = p.matmul(&vb_t.t()?)?.reshape((h, lq, d))?; // (H, lq, D)
                 outs.push(o);
             }
             let o = if outs.len() == 1 { outs.remove(0) } else { Tensor::cat(&outs, 1)? };
@@ -1082,12 +1205,52 @@ impl ModelWeights {
     }
 }
 
+/// `INKLING_PROFILE=1`: device-synchronized wall time per section of a layer visit, printed every 2048 visits.
+struct Prof {
+    dev: Option<Device>,
+    last: std::time::Instant,
+    cur: &'static str,
+}
+
+static PROF_ACC: Mutex<Option<(HashMap<&'static str, f64>, u64)>> = Mutex::new(None);
+
+impl Prof {
+    fn new(dev: &Device) -> Self {
+        let on = mistralrs_quant::titan_cfg::flag("INKLING_PROFILE", false);
+        if on {
+            let _ = dev.synchronize();
+        }
+        Self { dev: on.then(|| dev.clone()), last: std::time::Instant::now(), cur: "pre" }
+    }
+    fn mark(&mut self, next: &'static str) {
+        let Some(dev) = &self.dev else { return };
+        let _ = dev.synchronize();
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f64();
+        let mut acc = PROF_ACC.lock().expect("prof");
+        let (map, visits) = acc.get_or_insert_with(|| (HashMap::new(), 0));
+        *map.entry(self.cur).or_default() += dt;
+        if next == "end" {
+            *visits += 1;
+            if *visits % 2048 == 0 {
+                let mut v: Vec<_> = map.iter().map(|(k, t)| (*k, *t)).collect();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let total: f64 = v.iter().map(|x| x.1).sum();
+                let parts: Vec<String> = v.iter().map(|(k, t)| format!("{k} {:.0}us", 1e6 * t / *visits as f64)).collect();
+                tracing::info!("inkling2 profile ({visits} visits, {:.0}us/visit): {}", 1e6 * total / *visits as f64, parts.join(", "));
+            }
+        }
+        self.last = now;
+        self.cur = next;
+    }
+}
+
 /// Mix a cross-pass message into a looped layer input: `(1 - forget) * cur + gain * message`, both
 /// gated on `cur` and the message.
 fn control(cur: &Tensor, message: &Tensor, ctrl: &(Tensor, Tensor, Tensor)) -> Result<Tensor> {
     let (down, gain, forget) = ctrl;
-    let gate = Tensor::cat(&[rms(cur, MIX_EPS)?, rms(message, MIX_EPS)?], D::Minus1)?.broadcast_matmul(down)?;
-    let gain = gate.broadcast_matmul(gain)?.tanh()?;
-    let forget = gate.broadcast_matmul(forget)?.tanh()?;
+    let gate = Tensor::cat(&[rms(cur, MIX_EPS)?, rms(message, MIX_EPS)?], D::Minus1)?.broadcast_matmul(&down.t()?)?;
+    let gain = gate.broadcast_matmul(&gain.t()?)?.tanh()?;
+    let forget = gate.broadcast_matmul(&forget.t()?)?.tanh()?;
     (cur - forget.mul(cur)?)? + gain.mul(message)?
 }
