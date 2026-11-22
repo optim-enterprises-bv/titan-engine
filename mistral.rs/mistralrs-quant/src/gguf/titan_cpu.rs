@@ -40,6 +40,8 @@ const IQK_BLOCKS_PER_ITER: usize = 16;
 const IQ3XXS_GRID: [u32; 256] = include!("titan_iq3xxs_grid.rs");
 /// iq2xs_grid (ggml-common.h): entry i is words 2i (low 4 bytes) and 2i + 1 (high 4 bytes).
 const IQ2XS_GRID: [u32; 1024] = include!("titan_iq2xs_grid.rs");
+/// iq2xxs_grid (ggml-common.h): entry i is words 2i (low 4 bytes) and 2i + 1 (high 4 bytes).
+const IQ2XXS_GRID: [u32; 512] = include!("titan_iq2xxs_grid.rs");
 /// block_q3_K: hmask 0..32, qs 32..96, scales 96..108, half d 108..110.
 const Q3K_QS: usize = 32;
 const Q3K_SCALES: usize = 96;
@@ -152,6 +154,8 @@ pub enum Format {
     Q2K,
     /// GGML type 17: half d, 32 u16 (9-bit iq2xs_grid index | 7 sign bits), 8 scale bytes (74 bytes).
     IQ2XS,
+    /// GGML type 16: half d, 8 x (4 iq2xxs_grid index bytes + u32 of 4 x 7 sign bits | 4-bit scale) (66 bytes).
+    IQ2XXS,
 }
 
 impl Format {
@@ -169,6 +173,7 @@ impl Format {
             Format::Q3K => 110,
             Format::Q2K => 84,
             Format::IQ2XS => 74,
+            Format::IQ2XXS => 66,
         }
     }
 
@@ -189,7 +194,7 @@ impl Format {
             Format::Q1_0 => (Q1_0_THREADS_PER_BLOCK, Q1_0_BLOCKS_PER_ITER, 1),
             Format::IQ4NL | Format::MXFP4 => (IQ4NL_THREADS_PER_BLOCK, IQ4NL_BLOCKS_PER_ITER, 2),
             Format::NVFP4 => (IQ4NL_THREADS_PER_BLOCK, IQ4NL_BLOCKS_PER_ITER, 4),
-            Format::IQ3XXS | Format::Q3K | Format::Q2K | Format::IQ2XS => (IQK_THREADS_PER_BLOCK, IQK_BLOCKS_PER_ITER, 2),
+            Format::IQ3XXS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS => (IQK_THREADS_PER_BLOCK, IQK_BLOCKS_PER_ITER, 2),
             Format::IQ4XS => (IQK_THREADS_PER_BLOCK, IQK_BLOCKS_PER_ITER, 4),
             _ => (THREADS_PER_BLOCK, BLOCKS_PER_ITER, 2),
         }
@@ -265,7 +270,7 @@ fn dot(fmt: Format, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
             }
             v
         }
-        Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS => {
+        Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS => {
             unreachable!("formats other than Q4_K / Q5_K accumulate through acc_*")
         }
     };
@@ -322,6 +327,7 @@ fn row_impl(fmt: Format, w_row: &[u8], xq: &[u8], k: usize, simd: Dot) -> f32 {
                 Format::Q3K => acc_q3k(*t, blk, x, kqs),
                 Format::Q2K => acc_q2k(*t, blk, x, kqs),
                 Format::IQ2XS => acc_iq2xs(*t, blk, x, kqs),
+                Format::IQ2XXS => acc_iq2xxs(*t, blk, x, kqs),
                 _ => *t + dot(fmt, blk, x, kqs),
             };
             kbx += bpi;
@@ -577,7 +583,19 @@ unsafe fn row_iqk(fmt: Format, w_row: &[u8], xq: &[u8], k: usize) -> f32 {
         let blk = &w_row[b * bb..(b + 1) * bb];
         for (j, sj) in s.iter_mut().enumerate() {
             let q8 = &xq[(8 * b + j) * Q8_BYTES + 4..(8 * b + j + 1) * Q8_BYTES];
-            *sj = if fmt == Format::IQ2XS {
+            *sj = if fmt == Format::IQ2XXS {
+                let o = 2 + 8 * j;
+                let aux32 = u32::from_le_bytes([blk[o + 4], blk[o + 5], blk[o + 6], blk[o + 7]]);
+                let gw = |l: usize, h: usize| IQ2XXS_GRID[2 * blk[o + l] as usize + h] as i32;
+                let grid = _mm256_setr_epi32(gw(0, 0), gw(0, 1), gw(1, 0), gw(1, 1), gw(2, 0), gw(2, 1), gw(3, 0), gw(3, 1));
+                let signs = (0..4).fold(0u32, |m, l| m | (ksigns((aux32 >> (7 * l)) & 127) << (8 * l)));
+                let m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(signs as i32), byte_shuf), bit_masks), bit_masks);
+                let v = _mm256_sub_epi8(_mm256_xor_si256(grid, m), m);
+                let q = _mm256_loadu_si256(q8.as_ptr() as *const __m256i);
+                let lo16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(v)), _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q)));
+                let hi16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1)), _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q, 1)));
+                hsum_i32(_mm256_add_epi32(lo16, hi16)) * ((aux32 >> 27) | 1) as i32 / 8
+            } else if fmt == Format::IQ2XS {
                 let lo = |l: usize| -> (u32, u32) {
                     let w = u16::from_le_bytes([blk[2 + 8 * j + 2 * l], blk[3 + 8 * j + 2 * l]]) as u32;
                     (IQ2XS_GRID[2 * (w & 511) as usize], IQ2XS_GRID[2 * (w & 511) as usize + 1])
@@ -723,6 +741,29 @@ unsafe fn row_q2k(w_row: &[u8], xq: &[u8], k: usize) -> f32 {
     reduce(&tmp)
 }
 
+/// `tmp += vec_dot_iq2_xxs_q8_1`: four 8-bit grid codes against Q8_1 block `iqs / 2`, signs from the next u32 (7 bits
+/// each plus parity), its top 4 bits the scale, `sumi = sumi * (2 * scale + 1) / 8`, then `fma(d * d8, sumi, tmp)`.
+fn acc_iq2xxs(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
+    let q8 = &xq[(iqs / 2) * Q8_BYTES..(iqs / 2 + 1) * Q8_BYTES];
+    let o = 2 + 4 * iqs;
+    let aux32 = u32::from_le_bytes([blk[o + 4], blk[o + 5], blk[o + 6], blk[o + 7]]);
+    let mut sumi = 0i32;
+    for l in 0..4 {
+        let g = blk[o + l] as usize;
+        let g = (IQ2XXS_GRID[2 * g] as u64) | ((IQ2XXS_GRID[2 * g + 1] as u64) << 32);
+        let signs = ksigns((aux32 >> (7 * l)) & 127);
+        for b in 0..8 {
+            let v = (g >> (8 * b)) as u8 as i32;
+            let v = if signs & (1 << b) != 0 { -v } else { v };
+            sumi += v * q8[4 + 8 * l + b] as i8 as i32;
+        }
+    }
+    let sumi = sumi * ((aux32 >> 27) | 1) as i32 / 8;
+    let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+    (d * d8).mul_add(sumi as f32, tmp)
+}
+
 /// `tmp += vec_dot_iq2_xs_q8_1`: four 9-bit grid codes (8 values each, signs from the upper 7 bits plus parity) against
 /// Q8_1 block `iqs / 2`, the first 16 values with scale nibble lo, the rest with hi,
 /// `sumi = (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4`, then `fma(d * d8, sumi, tmp)`.
@@ -834,7 +875,7 @@ pub unsafe fn rows8(fmt: Format, w_rows: &[&[u8]; 8], xq: &[u8], k: usize) -> [f
     let lanes_u32 = |f: &dyn Fn(usize) -> u32| -> __m256i {
         _mm256_setr_epi32(f(0) as i32, f(1) as i32, f(2) as i32, f(3) as i32, f(4) as i32, f(5) as i32, f(6) as i32, f(7) as i32)
     };
-    if matches!(fmt, Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS) {
+    if matches!(fmt, Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS) {
         // The float work is one fma per 32 weights; the AVX2 part is Q1_0's integer chunk sum.
         let dot = if vnni() { Dot::Vnni } else { Dot::Avx2 };
         return std::array::from_fn(|r| row_impl(fmt, w_rows[r], xq, k, dot));
@@ -885,10 +926,10 @@ pub unsafe fn rows8(fmt: Format, w_rows: &[&[u8]; 8], xq: &[u8], k: usize) -> [f
                     let ql = 48 + 16 * bq8_offset + 4 * ((iqs / 2) % 4);
                     (std::array::from_fn(|r| word(blk(r), ql)), std::array::from_fn(|r| word(blk(r), ql + 16)))
                 }
-                Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS => unreachable!(),
+                Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS => unreachable!(),
             };
             let (h0, h1): ([u32; 8], [u32; 8]) = match fmt {
-                Format::Q4K | Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS => ([0; 8], [0; 8]),
+                Format::Q4K | Format::Q6K | Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS => ([0; 8], [0; 8]),
                 Format::Q5K => {
                     let qh = 16 + 4 * ((iqs / 2) % 4);
                     (std::array::from_fn(|r| word(blk(r), qh) >> bq8_offset), std::array::from_fn(|r| word(blk(r), qh + 16) >> bq8_offset))
@@ -965,7 +1006,7 @@ unsafe fn rows_lanes_body<const VNNI: bool>(fmt: Format, w_rows: &[&[u8]], xq: &
     if matches!(fmt, Format::IQ4NL | Format::MXFP4 | Format::NVFP4) {
         return rows_lanes_nl::<VNNI>(fmt, w_rows, xq, k, out);
     }
-    if matches!(fmt, Format::IQ3XXS | Format::IQ4XS | Format::IQ2XS) && k / 256 <= IQK_MAX_BLOCKS {
+    if matches!(fmt, Format::IQ3XXS | Format::IQ4XS | Format::IQ2XS | Format::IQ2XXS) && k / 256 <= IQK_MAX_BLOCKS {
         w_rows.iter().zip(out.iter_mut()).for_each(|(r, o)| *o = row_iqk(fmt, r, xq, k));
         return;
     }
@@ -973,7 +1014,7 @@ unsafe fn rows_lanes_body<const VNNI: bool>(fmt: Format, w_rows: &[&[u8]], xq: &
         w_rows.iter().zip(out.iter_mut()).for_each(|(r, o)| *o = row_q2k(r, xq, k));
         return;
     }
-    if matches!(fmt, Format::Q1_0 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS) {
+    if matches!(fmt, Format::Q1_0 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K | Format::IQ2XS | Format::IQ2XXS) {
         // no lane-vectorised body: the scalar program per row (bit-identical by construction)
         let dot = if VNNI { Dot::Vnni } else { Dot::Avx2 };
         w_rows.iter().zip(out.iter_mut()).for_each(|(r, o)| *o = row_impl(fmt, r, xq, k, dot));
@@ -1461,7 +1502,7 @@ mod tests {
                     put16(&mut out[2..], f16(rng, regime));
                 }
             }
-            Format::Q1_0 | Format::IQ3XXS | Format::IQ4XS | Format::IQ2XS => {
+            Format::Q1_0 | Format::IQ3XXS | Format::IQ4XS | Format::IQ2XS | Format::IQ2XXS => {
                 put16(out, f16(rng, regime));
                 fill_qs(rng, &mut out[2..]);
             }
@@ -1596,7 +1637,7 @@ mod tests {
     /// at its extreme, all rows at once; VNNI must give the same bits as AVX2 and scalar.
     #[test]
     fn titan_cpu_vnni_extremes() {
-        for fmt in [Format::Q4K, Format::Q5K, Format::Q6K, Format::IQ4NL, Format::MXFP4, Format::NVFP4, Format::Q1_0, Format::IQ3XXS, Format::IQ4XS, Format::Q3K, Format::Q2K, Format::IQ2XS] {
+        for fmt in [Format::Q4K, Format::Q5K, Format::Q6K, Format::IQ4NL, Format::MXFP4, Format::NVFP4, Format::Q1_0, Format::IQ3XXS, Format::IQ4XS, Format::Q3K, Format::Q2K, Format::IQ2XS, Format::IQ2XXS] {
             let paths = simd_paths(fmt);
             let bb = fmt.block_bytes();
             let nb = 2048 / fmt.block_values();

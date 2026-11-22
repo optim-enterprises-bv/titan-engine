@@ -40,7 +40,7 @@ impl ExpertRows for TieredExperts {
         let expert = self.host_expert(e);
         let row_of = |r: usize| &expert[r * row_bytes..][..row_bytes];
         let simd = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
-        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K | Format::IQ2XS) {
+        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K | Format::IQ2XS | Format::IQ2XXS) {
             let rows: Vec<&[u8]> = (r0..r1).map(row_of).collect();
             unsafe { titan_cpu::rows_lanes(fmt, &rows, xq_row, self.k, out) };
             return;
