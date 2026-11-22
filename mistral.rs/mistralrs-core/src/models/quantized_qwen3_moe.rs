@@ -54,6 +54,12 @@ pub(crate) enum Experts {
         up: TieredExperts,
         down: TieredExperts,
     },
+    /// NanoQuant factored binary experts (`<name>.nq_*`), all on the GPU.
+    Nq {
+        gate: mistralrs_quant::nq::NqMat,
+        up: mistralrs_quant::nq::NqMat,
+        down: mistralrs_quant::nq::NqMat,
+    },
 }
 
 impl Experts {
@@ -131,6 +137,24 @@ impl Experts {
                 let activated = act(&gate, &up)?;
                 down.indexed_moe_forward(&activated, indices)
             }
+            Experts::Nq { gate, up, down } => {
+                let (n, topk) = indices.dims2()?;
+                let x = xs.reshape(((), gate.in_dim))?;
+                let src_div = if xs.dim(1)? == 1 { topk } else { 1 };
+                let shape = |m: &mistralrs_quant::nq::NqMat| (n, topk, m.out_dim);
+                #[cfg(feature = "cuda")]
+                {
+                    let g = gate.forward_tasks(&x, Some(indices), src_div)?.reshape(shape(gate))?;
+                    let u = up.forward_tasks(&x, Some(indices), src_div)?.reshape(shape(up))?;
+                    let activated = act(&g, &u)?.reshape(((), down.in_dim))?;
+                    down.forward_tasks(&activated, Some(indices), 1)?.reshape(shape(down))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (x, src_div, shape, act);
+                    candle_core::bail!("NanoQuant experts need CUDA")
+                }
+            }
             #[cfg(feature = "cuda")]
             Experts::Tiered { gate, up, down } => {
                 use mistralrs_quant::TieredExperts;
@@ -145,7 +169,7 @@ impl Experts {
                         .iter()
                         .filter_map(|(e, d, t)| match e {
                             Experts::Tiered { gate, up, down } => Some(([gate, up, down], *d, t.clone())),
-                            Experts::Stock { .. } => None,
+                            Experts::Stock { .. } | Experts::Nq { .. } => None,
                         })
                         .collect();
                     if fast.len() == preds.len() {
@@ -366,6 +390,11 @@ pub(crate) fn load_experts<R: std::io::Seek + std::io::Read>(
     device: &Device,
 ) -> Result<Experts> {
     let names = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
+    if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.nq_u")) {
+        let [gate, up, down] = names.map(|n| nq_mat(ct, &format!("{prefix}.{n}"), None, None, device));
+        let (gate, up, down) = (gate?, up?, down?);
+        return Ok(Experts::Nq { gate, up, down });
+    }
     #[cfg(feature = "cuda")]
     if let Device::Cuda(dev) = device {
         if TieredExperts::enabled() {
@@ -417,6 +446,49 @@ pub(crate) fn load_experts<R: std::io::Seek + std::io::Read>(
         up: QMatMul::from_qtensor(up?)?,
         down: QMatMul::from_qtensor(down?)?,
     })
+}
+
+/// NanoQuant factored weight `<base>.nq_{u,v,spre,spost}` (an expert stack when the scales are 2-D). `rows` / `cols`
+/// reorder the output rows / input columns: new index i takes old index `map[i]`.
+pub(crate) fn nq_mat<R: std::io::Seek + std::io::Read>(
+    ct: &mut Content<'_, R>,
+    base: &str,
+    rows: Option<&[usize]>,
+    cols: Option<&[usize]>,
+    device: &Device,
+) -> Result<mistralrs_quant::nq::NqMat> {
+    let raw = |ct: &mut Content<'_, R>, n: &str| -> Result<Vec<u8>> { Ok(ct.tensor(&format!("{base}.{n}"), &Device::Cpu)?.data()?.into_owned()) };
+    let scale = |ct: &mut Content<'_, R>, n: &str| -> Result<Tensor> { ct.tensor(&format!("{base}.{n}"), &Device::Cpu)?.dequantize(&Device::Cpu) };
+    let (mut u, mut v) = (raw(ct, "nq_u")?, raw(ct, "nq_v")?);
+    let (mut spre, mut spost) = (scale(ct, "nq_spre")?, scale(ct, "nq_spost")?);
+    let experts = if spre.rank() == 2 { spre.dim(0)? } else { 1 };
+    if let Some(map) = rows {
+        if experts != 1 || map.len() != spost.elem_count() {
+            candle_core::bail!("{base}: row map of {} for {:?}", map.len(), spost.shape());
+        }
+        let rb = u.len() / map.len();
+        u = map.iter().flat_map(|&r| u[r * rb..(r + 1) * rb].to_vec()).collect();
+        let s: Vec<f32> = spost.to_vec1()?;
+        spost = Tensor::new(map.iter().map(|&r| s[r]).collect::<Vec<f32>>(), &Device::Cpu)?;
+    }
+    if let Some(map) = cols {
+        let in_dim = spre.elem_count();
+        if experts != 1 || map.len() != in_dim {
+            candle_core::bail!("{base}: column map of {} for {:?}", map.len(), spre.shape());
+        }
+        let wpr = in_dim / 32;
+        let words: Vec<u32> = v.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut out = vec![0u32; words.len()];
+        for (row, o) in words.chunks_exact(wpr).zip(out.chunks_exact_mut(wpr)) {
+            for (i, &c) in map.iter().enumerate() {
+                o[i / 32] |= ((row[c / 32] >> (c % 32)) & 1) << (i % 32);
+            }
+        }
+        v = out.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let s: Vec<f32> = spre.to_vec1()?;
+        spre = Tensor::new(map.iter().map(|&c| s[c]).collect::<Vec<f32>>(), &Device::Cpu)?;
+    }
+    mistralrs_quant::nq::NqMat::new(&u, &v, spre, spost, experts, device)
 }
 
 enum MoeOrMlp {
