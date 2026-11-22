@@ -874,8 +874,17 @@ fn llama_mmq_plain_at(
 
 /// Whether [`grouped_parts`] covers `dtype` with `k` columns: the K-quant MoE launchers, or the llama.cpp MMQ
 /// port in MoE mode (whole tile iterations only, and not NVFP4, whose activations carry a per-column scale).
+/// Zeroed bytes each [`grouped_parts`] weight buffer must carry past its last expert: with K not a whole number of
+/// tile iterations the last tile of the last row reads up to one tile past it (zero activations meet it, so it has to
+/// hold finite scales).
+pub const GROUPED_TAIL_BYTES: usize = 4096;
+
 pub fn supports_grouped(dtype: GgmlDType, k: usize) -> bool {
-    supports(dtype) || llama_mmq(dtype).is_some_and(|f| f.fi != 2 && k % f.iter_k == 0)
+    supports(dtype)
+        || llama_mmq(dtype).is_some_and(|f| {
+            let over = (f.iter_k - k % f.iter_k) % f.iter_k / f.qk * dtype.type_size();
+            f.fi != 2 && k % f.qk == 0 && over <= GROUPED_TAIL_BYTES
+        })
 }
 
 /// [`grouped_parts`] for the llama.cpp MMQ port (`mul_mat_q` with `ids_dst` / `expert_bounds`, as
@@ -898,8 +907,8 @@ fn llama_grouped_parts(
     use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda::WrapErr;
     let (_, k) = xs.dims2()?;
-    if k % f.iter_k != 0 || xs.dtype() != DType::F32 {
-        candle_core::bail!("fast_mmq grouped_parts: input {:?} {:?} (k must be a multiple of {}, f32)", xs.dims(), xs.dtype(), f.iter_k);
+    if k % f.qk != 0 || xs.dtype() != DType::F32 {
+        candle_core::bail!("fast_mmq grouped_parts: input {:?} {:?} (k must be a multiple of {}, f32)", xs.dims(), xs.dtype(), f.qk);
     }
     let xs = xs.contiguous()?;
     let (xs_storage, xs_layout) = xs.storage_and_layout();

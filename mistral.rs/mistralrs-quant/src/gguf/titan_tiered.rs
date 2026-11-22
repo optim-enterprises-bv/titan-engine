@@ -648,7 +648,7 @@ impl TieredExperts {
             map[e] = slot as u32;
             owner[slot] = e as u32;
         }
-        let mut slotted = vec![0u8; num_resident.max(1) * expert_bytes];
+        let mut slotted = vec![0u8; num_resident.max(1) * expert_bytes + crate::gguf::fast_mmq::GROUPED_TAIL_BYTES];
         for (slot, &e) in owner.iter().enumerate() {
             let e = e as usize;
             slotted[slot * expert_bytes..(slot + 1) * expert_bytes]
