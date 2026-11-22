@@ -287,6 +287,89 @@ extern "C" __global__ void ink_rows(
         out[r * D + d] = v * f;
     }
 }
+// SiTU of expert gate/up rows gu (rows, 2F), each row scaled by scale[ids[row]] first (scale may be null)
+extern "C" __global__ void ink_situ(const float* __restrict__ gu, const unsigned* __restrict__ ids, const float* __restrict__ scale,
+                                    float* __restrict__ out, int rows, int F, float beta, float lb)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * F) return;
+    const int r = (int)(i / F), c = (int)(i % F);
+    const float s = scale ? scale[ids[r]] : 1.f;
+    const float g = gu[(long long)r * 2 * F + c] * s;
+    float u = gu[(long long)r * 2 * F + F + c] * s;
+    const float a = beta * tanhf(g / beta) * (1.f / (1.f + expf(-g)));
+    if (lb > 0.f) u = lb * tanhf(u / lb);
+    out[i] = a * u;
+}
+
+// out[t, e] = sum_j y[t, j, e] * w[t, j] * dscale[ids[t, j]] (dscale may be null)
+extern "C" __global__ void ink_wsum(const float* __restrict__ y, const float* __restrict__ w, const unsigned* __restrict__ ids,
+                                    const float* __restrict__ dscale, float* __restrict__ out, int T, int k, int E)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)T * E) return;
+    const int t = (int)(i / E), e = (int)(i % E);
+    float acc = 0.f;
+    for (int j = 0; j < k; j++) {
+        float ww = w[t * k + j];
+        if (dscale) ww *= dscale[ids[t * k + j]];
+        acc += y[((long long)t * k + j) * E + e] * ww;
+    }
+    out[i] = acc;
+}
+
+__device__ float block_sum(float v, float* red) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float s = 0.f;
+    for (int i = 0; i < nw; i++) s += red[i];
+    return s;
+}
+
+// loop controller, step 1: gate[r, j] = down[j] . [rms(cur[r]), rms(msg[r])]; block per (8 gate rows, row r)
+extern "C" __global__ void ink_ctrl_gate(const float* __restrict__ cur, const float* __restrict__ msg, const float* __restrict__ down,
+                                         float* __restrict__ gate, int E, int rank, float eps)
+{
+    __shared__ float red[32];
+    const int r = blockIdx.y;
+    const float* c = cur + (long long)r * E;
+    const float* m = msg + (long long)r * E;
+    float sc = 0.f, sm = 0.f;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) { sc = fmaf(c[e], c[e], sc); sm = fmaf(m[e], m[e], sm); }
+    const float ic = rsqrtf(block_sum(sc, red) / E + eps);
+    const float im = rsqrtf(block_sum(sm, red) / E + eps);
+    const int lane = threadIdx.x & 31;
+    const int j = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (j >= rank) return;
+    const float* d = down + (long long)j * 2 * E;
+    float acc = 0.f;
+    for (int e = lane; e < E; e += 32) acc += d[e] * (c[e] * ic) + d[E + e] * (m[e] * im);
+    acc = warp_sum(acc);
+    if (lane == 0) gate[(long long)r * rank + j] = acc;
+}
+
+// loop controller, step 2: out = cur - tanh(forget[e] . g) * cur + tanh(gain[e] . g) * msg; warp per output
+extern "C" __global__ void ink_ctrl_out(const float* __restrict__ cur, const float* __restrict__ msg, const float* __restrict__ gate,
+                                        const float* __restrict__ gain, const float* __restrict__ forget, float* __restrict__ out,
+                                        int E, int rank)
+{
+    const int r = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (e >= E) return;
+    const float* g = gate + (long long)r * rank;
+    float a = 0.f, f = 0.f;
+    for (int j = lane; j < rank; j += 32) { a += gain[(long long)e * rank + j] * g[j]; f += forget[(long long)e * rank + j] * g[j]; }
+    a = tanhf(warp_sum(a));
+    f = tanhf(warp_sum(f));
+    if (lane == 0) {
+        const long long o = (long long)r * E + e;
+        out[o] = (cur[o] - f * cur[o]) + a * msg[o];
+    }
+}
 "#;
 
 #[cfg(feature = "cuda")]
@@ -519,7 +602,87 @@ mod imp {
         .w()?;
         Ok(wrap(out, &dev, &dims))
     }
+
+    fn addr_u32(t: &Tensor, dev: &CudaDevice) -> Result<u64> {
+        if t.dtype() != DType::U32 || !t.is_contiguous() {
+            candle_core::bail!("titan_inkling: want a contiguous U32 tensor, got {:?}", t.dtype());
+        }
+        let (storage, layout) = t.storage_and_layout();
+        let Storage::Cuda(cuda) = &*storage else {
+            candle_core::bail!("titan_inkling: tensor not on CUDA")
+        };
+        let stream = dev.cuda_stream();
+        let (base, _guard) = cuda.as_cuda_slice::<u32>()?.device_ptr(&stream);
+        Ok(base + (layout.start_offset() * std::mem::size_of::<u32>()) as u64)
+    }
+
+    fn cfg1d(n: usize) -> LaunchConfig {
+        LaunchConfig { grid_dim: (n.div_ceil(256).max(1) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
+    }
+
+    /// SiTU of `gu` `(.., 2F)` (rows in `ids` order), each row first scaled by `scale[ids[row]]`. Returns `(.., F)`.
+    pub(crate) fn situ(gu: &Tensor, ids: &Tensor, scale: Option<&Tensor>, beta: f32, lb: f32) -> Result<Tensor> {
+        let dev = cuda_dev(gu)?;
+        let gu = gu.contiguous()?;
+        let dims = gu.dims().to_vec();
+        let f2 = *dims.last().expect("rank > 0");
+        let (rows, ff) = (gu.elem_count() / f2, f2 / 2);
+        let ids = ids.flatten_all()?.contiguous()?;
+        let (g_p, i_p) = (addr(&gu, &dev)?, addr_u32(&ids, &dev)?);
+        let s_p = scale.map(|s| addr(s, &dev)).transpose()?.unwrap_or(0);
+        let (out, out_p) = alloc(&dev, rows * ff)?;
+        let (ri, fi) = (rows as i32, ff as i32);
+        let f = dev.get_or_load_custom_func("ink_situ", "titan_inkling", ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&g_p).arg(&i_p).arg(&s_p).arg(&out_p).arg(&ri).arg(&fi).arg(&beta).arg(&lb);
+        unsafe { b.launch(cfg1d(rows * ff)) }.w()?;
+        let mut shape = dims;
+        *shape.last_mut().expect("rank > 0") = ff;
+        Ok(wrap(out, &dev, &shape))
+    }
+
+    /// `y` `(T, k, E)` weighted by `w` `(T, k)` times `dscale[ids]`, summed over k: `(T, E)`.
+    pub(crate) fn wsum(y: &Tensor, w: &Tensor, ids: &Tensor, dscale: Option<&Tensor>) -> Result<Tensor> {
+        let dev = cuda_dev(y)?;
+        let y = y.contiguous()?;
+        let (t, k, e) = y.dims3()?;
+        let w = w.to_dtype(DType::F32)?.contiguous()?;
+        let ids = ids.contiguous()?;
+        let (y_p, w_p, i_p) = (addr(&y, &dev)?, addr(&w, &dev)?, addr_u32(&ids, &dev)?);
+        let d_p = dscale.map(|s| addr(s, &dev)).transpose()?.unwrap_or(0);
+        let (out, out_p) = alloc(&dev, t * e)?;
+        let (ti, ki, ei) = (t as i32, k as i32, e as i32);
+        let f = dev.get_or_load_custom_func("ink_wsum", "titan_inkling", ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&y_p).arg(&w_p).arg(&i_p).arg(&d_p).arg(&out_p).arg(&ti).arg(&ki).arg(&ei);
+        unsafe { b.launch(cfg1d(t * e)) }.w()?;
+        Ok(wrap(out, &dev, &[t, e]))
+    }
+
+    /// Loop controller: `cur`, `msg` `(.., E)`; `down` `(rank, 2E)`, `gain` / `forget` `(E, rank)`.
+    pub(crate) fn control(cur: &Tensor, msg: &Tensor, down: &Tensor, gain: &Tensor, forget: &Tensor, eps: f32) -> Result<Tensor> {
+        let dev = cuda_dev(cur)?;
+        let (cur, msg) = (cur.contiguous()?, msg.contiguous()?);
+        let dims = cur.dims().to_vec();
+        let e = *dims.last().expect("rank > 0");
+        let rows = cur.elem_count() / e;
+        let rank = down.dim(0)?;
+        let (c_p, m_p, d_p, g_p, f_p) = (addr(&cur, &dev)?, addr(&msg, &dev)?, addr(down, &dev)?, addr(gain, &dev)?, addr(forget, &dev)?);
+        let (gate, gate_p) = alloc(&dev, rows * rank)?;
+        let (out, out_p) = alloc(&dev, rows * e)?;
+        let (ei, ri) = (e as i32, rank as i32);
+        let f = dev.get_or_load_custom_func("ink_ctrl_gate", "titan_inkling", ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&c_p).arg(&m_p).arg(&d_p).arg(&gate_p).arg(&ei).arg(&ri).arg(&eps);
+        unsafe { b.launch(LaunchConfig { grid_dim: (rank.div_ceil(8) as u32, rows as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }.w()?;
+        let f = dev.get_or_load_custom_func("ink_ctrl_out", "titan_inkling", ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&c_p).arg(&m_p).arg(&gate_p).arg(&g_p).arg(&f_p).arg(&out_p).arg(&ei).arg(&ri);
+        unsafe { b.launch(LaunchConfig { grid_dim: (e.div_ceil(8) as u32, rows as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }.w()?;
+        drop(gate);
+        Ok(wrap(out, &dev, &dims))
+    }
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use imp::{attn, conv, mix, rows};
+pub(crate) use imp::{attn, control, conv, mix, rows, situ, wsum};
