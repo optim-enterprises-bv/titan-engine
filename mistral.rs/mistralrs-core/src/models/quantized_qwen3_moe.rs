@@ -69,6 +69,16 @@ impl Experts {
         self.forward_lookahead(xs, indices, &[])
     }
 
+    /// Whether a batch-1 forward runs entirely on the GPU stream (tiered experts through the doorbell), so a CUDA graph
+    /// segment can include it.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn graph_capturable(&self) -> bool {
+        match self {
+            Experts::Tiered { gate, up, down } => mistralrs_quant::TieredExperts::doorbell_capturable(gate, up, down),
+            Experts::Stock { .. } | Experts::Nq { .. } => false,
+        }
+    }
+
     /// `forward`, first handing the tiered prefetcher each `(experts, depth, predicted ids)` of a later
     /// layer; the predictions share the routing ids' device sync and never touch this layer's output.
     pub(crate) fn forward_lookahead(

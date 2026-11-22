@@ -41,7 +41,7 @@ mod pfs;
 mod onepass;
 /// Mapped-memory doorbell for the CPU misses (`TITAN_DOORBELL`).
 #[path = "titan_doorbell.rs"]
-mod doorbell;
+pub mod doorbell;
 
 const PTX: &str = include_str!("titan_kernels_oxide.ptx");
 const MODULE: &str = "titan_kernels_oxide";
@@ -1121,6 +1121,18 @@ impl TieredExperts {
             add_time(3, t2);
         }
         Ok((gate.wrap(og, batch, topk), up.wrap(ou, batch, topk)))
+    }
+
+    /// Whether a batch-1 forward of these projections runs entirely on the GPU stream with the doorbell (no host sync),
+    /// so it can be captured into a CUDA graph (`titan_doorbell::record_begin`). `TITAN_GRAPH_MOE=0` turns it off.
+    pub fn doorbell_capturable(gate: &TieredExperts, up: &TieredExperts, down: &TieredExperts) -> bool {
+        crate::titan_cfg::flag("TITAN_GRAPH_MOE", true)
+            && doorbell::enabled()
+            && trace_path().is_none()
+            && !gate.all_resident()
+            && *gate.fast_ok.get_or_init(|| Self::onepass_ok(gate, up, down))
+            && gate.n % 4 == 0
+            && down.n % 4 == 0
     }
 
     /// The routed experts of one SiLU-gated MoE layer through the new miss paths: the doorbell (`TITAN_DOORBELL=1`)

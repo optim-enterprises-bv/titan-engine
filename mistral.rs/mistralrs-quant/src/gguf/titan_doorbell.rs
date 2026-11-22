@@ -159,6 +159,7 @@ impl Layout {
 }
 
 /// One layer's host work: the three projections, the shapes, and the lookahead predictions riding with the ids.
+#[derive(Clone)]
 struct Job {
     projs: [*const TieredExperts; 3],
     two_phase: bool,
@@ -528,6 +529,69 @@ impl Doorbell {
     }
 }
 
+thread_local! {
+    /// The jobs of the forward being captured into a CUDA graph (`record_begin` .. `record_end`).
+    static RECORD: std::cell::RefCell<Option<Vec<Job>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps `job` in the capture log when one is open, else hands it back for the queue.
+fn record(job: Job) -> Option<Job> {
+    RECORD.with(|r| match r.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(job);
+            None
+        }
+        None => Some(job),
+    })
+}
+
+/// The doorbell jobs a captured CUDA graph's publishes expect, in order; `replay` queues them before each launch.
+#[derive(Clone, Default)]
+pub struct RecordedJobs(Vec<Job>);
+
+unsafe impl Send for RecordedJobs {}
+unsafe impl Sync for RecordedJobs {}
+
+impl RecordedJobs {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Start logging this thread's doorbell jobs instead of queueing them (a CUDA graph capture: the kernels are
+/// recorded, not run, so the host thread must get the jobs when the graph is launched).
+pub fn record_begin() {
+    RECORD.with(|r| *r.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop logging; the jobs logged since `record_begin`.
+pub fn record_end() -> RecordedJobs {
+    RecordedJobs(RECORD.with(|r| r.borrow_mut().take()).unwrap_or_default())
+}
+
+/// Queue a captured graph's jobs, before launching it. Fails when the doorbell is gone (model unload or OOM recovery
+/// released it; the graph must be recaptured) or its last pass failed.
+pub fn replay(jobs: &RecordedJobs) -> Result<()> {
+    if jobs.0.is_empty() {
+        return Ok(());
+    }
+    let g = crate::titan_cfg::generation();
+    let db = match &*DOORBELL.lock().unwrap() {
+        Some((cg, Ok(db))) if *cg == g => *db,
+        _ => candle_core::bail!("titan doorbell: released; the graph must be captured again"),
+    };
+    db.start();
+    if let Err(e) = db.check() {
+        release();
+        tracing::error!("titan doorbell: reset after a failed CPU expert pass; the next request starts a fresh one");
+        return Err(e);
+    }
+    for j in &jobs.0 {
+        db.push(j.clone());
+    }
+    Ok(())
+}
+
 impl TieredExperts {
     /// The routed experts of one MoE layer through the doorbell (`TITAN_DOORBELL=1`); `None` when this layer or batch
     /// does not qualify (the caller runs the synchronous path). `preds`: later layers' predicted routing (lookahead).
@@ -591,7 +655,7 @@ impl TieredExperts {
             db.publish(dev, ids_ptr, n_ids, xq_ptr, rows * qx.q8_row_bytes, db.layout.xq)?;
             drop((g0, g1));
         }
-        db.push(Job {
+        let job = Job {
             projs: [gate, up, down],
             two_phase,
             batch,
@@ -600,7 +664,10 @@ impl TieredExperts {
             xq_row: qx.q8_row_bytes,
             qa_row,
             preds: preds.iter().map(|(p, d, t)| ((*p).map(|x| x as *const TieredExperts), *d, t.elem_count())).collect(),
-        });
+        };
+        if let Some(job) = record(job) {
+            db.push(job);
+        }
         let (st, lay_ids) = ids.storage_and_layout();
         let Storage::Cuda(c) = &*st else {
             candle_core::bail!("titan doorbell: ids not on CUDA");

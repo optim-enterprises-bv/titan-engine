@@ -4004,6 +4004,18 @@ impl ModelWeights {
             let Ffn::Moe(moe) = &layer.ffn else {
                 candle_core::bail!("qwen35 graphs: layer {i} is not MoE");
             };
+            // the routed experts inside the layer's segment when they run on the stream alone (doorbell): one graph per
+            // layer instead of a graph, the eager expert launches and another graph
+            let in_graph = moe.experts.graph_capturable();
+            let experts_in = |r: Vec<Tensor>| -> Result<Vec<Tensor>> {
+                if !in_graph {
+                    return Ok(r);
+                }
+                let (flat, ids) = (&r[1], &r[2]);
+                let (rows, hidden) = flat.dims2()?;
+                let routed = moe.experts.forward_lookahead(&flat.reshape((rows, 1, hidden))?, ids, &[])?;
+                Ok(vec![r[0].clone(), flat.clone(), routed, r[3].clone()])
+            };
             let routed_in = match (&layer.mixer, hybrid_cache.get_mut(i)) {
                 (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
                     let key = SegKey {
@@ -4026,7 +4038,7 @@ impl ModelWeights {
                         let out = gdn.forward_with_conv_carry(&h.to_dtype(self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
                         pool.scatter_conv_state_with_host_indices(&idx[0], host, &gdn_cache.conv_state)?;
                         pool.scatter_recurrent_state_with_host_indices(&idx[0], host, &gdn_cache.recurrent_state)?;
-                        self.graph_route(i, out.to_dtype(DType::F32)?, &x)
+                        experts_in(self.graph_route(i, out.to_dtype(DType::F32)?, &x)?)
                     })?
                 }
                 (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
@@ -4048,12 +4060,16 @@ impl ModelWeights {
                         &[&y, gate, x],
                         |ins| {
                             let out = attn.decode_out(&ins[0], &ins[1], masked, ins[2].dtype())?;
-                            self.graph_route(i, out, &ins[2])
+                            experts_in(self.graph_route(i, out, &ins[2])?)
                         },
                     )?
                 }
                 _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
             };
+            if in_graph {
+                carry = routed_in;
+                continue;
+            }
             let (x_attn, flat, ids, weights) = (&routed_in[0], &routed_in[1], &routed_in[2], &routed_in[3]);
             let hidden = flat.dim(D::Minus1)?;
             let num_tokens = flat.dim(0)?;

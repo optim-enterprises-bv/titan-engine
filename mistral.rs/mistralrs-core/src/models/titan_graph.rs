@@ -43,6 +43,8 @@ pub(crate) struct SegKey {
 
 struct Seg {
     graph: CudaGraphHandle,
+    /// doorbell jobs the graph's MoE layers publish to, queued before each launch
+    jobs: mistralrs_quant::titan_doorbell::RecordedJobs,
     /// what the graph reads for each input
     slots: Vec<Tensor>,
     outputs: Vec<Tensor>,
@@ -199,6 +201,13 @@ impl SegmentGraphs {
                         inner.copies += 1;
                     }
                 }
+                if let Err(e) = mistralrs_quant::titan_doorbell::replay(&seg.jobs) {
+                    // the doorbell was released (OOM recovery) or failed: drop every graph, they publish to it
+                    drop(seg);
+                    let gen = inner.workspace_gen;
+                    drop(std::mem::replace(&mut *inner, Inner { workspace_gen: gen, ..Default::default() }));
+                    return Err(e);
+                }
                 seg.graph.launch()?;
                 inner.replays += 1;
                 let out = seg.outputs.clone();
@@ -232,6 +241,7 @@ impl SegmentGraphs {
                     match stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) {
                         Err(e) => Err(candle_core::Error::wrap(e)),
                         Ok(()) => {
+                            mistralrs_quant::titan_doorbell::record_begin();
                             let outs = f(&slots).and_then(|o| {
                                 if o.len() != bufs.len() {
                                     candle_core::bail!("titan graphs: {} outputs, warm-up had {}", o.len(), bufs.len());
@@ -241,13 +251,14 @@ impl SegmentGraphs {
                                 }
                                 Ok(())
                             });
+                            let jobs = mistralrs_quant::titan_doorbell::record_end();
                             match outs {
                                 Err(e) => {
                                     end_cuda_capture_discard(&stream);
                                     Err(e)
                                 }
                                 Ok(()) => match CudaGraphHandle::end_capture(&stream) {
-                                    Ok(Some(g)) => Ok((g, bufs)),
+                                    Ok(Some(g)) => Ok((g, bufs, jobs)),
                                     Ok(None) => Err(candle_core::Error::msg("empty graph")),
                                     Err(e) => Err(e),
                                 },
@@ -257,13 +268,14 @@ impl SegmentGraphs {
                 };
                 restore_event_tracking_after_capture(&stream, restore);
                 // nothing ran during capture: any failure up to the first launch leaves eager as the fallback
-                let captured = captured.and_then(|(graph, outputs)| {
+                let captured = captured.and_then(|(graph, outputs, jobs)| {
                     graph.upload()?;
+                    mistralrs_quant::titan_doorbell::replay(&jobs)?;
                     graph.launch()?;
-                    Ok((graph, outputs))
+                    Ok((graph, outputs, jobs))
                 });
                 match captured {
-                    Ok((graph, outputs)) => {
+                    Ok((graph, outputs, jobs)) => {
                         inner.captured += 1;
                         // a segment re-keyed (its state pool regrew) replaces its old graph; the old outputs
                         // stop counting as stable (graphs reading them in place now get copies)
@@ -286,7 +298,7 @@ impl SegmentGraphs {
                             inner.stable.insert(p);
                         }
                         let out = outputs.clone();
-                        inner.segs.insert(key, State::Ready(Seg { graph, slots, outputs }));
+                        inner.segs.insert(key, State::Ready(Seg { graph, jobs, slots, outputs }));
                         Ok(out)
                     }
                     Err(e) => {
