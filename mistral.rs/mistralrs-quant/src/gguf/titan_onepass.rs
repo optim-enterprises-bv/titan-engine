@@ -35,11 +35,18 @@ impl ExpertRows for TieredExperts {
         self.k
     }
     fn rows_into_multi(&self, e: usize, r0: usize, r1: usize, xq_rows: &[&[u8]], outs: &mut [&mut [f32]]) {
-        if xq_rows.len() > 1 && matches!(self.format(), Format::IQ4XS | Format::IQ3XXS) && titan_cpu::vnni() {
+        let fmt = self.format();
+        if xq_rows.len() > 1 && (titan_cpu::iqk_vnni_supports(fmt) || titan_cpu::kq23_vnni_supports(fmt)) && titan_cpu::vnni() {
             let row_bytes = self.expert_bytes / self.n;
             let expert = self.host_expert(e);
             let rows: Vec<&[u8]> = (r0..r1).map(|r| &expert[r * row_bytes..][..row_bytes]).collect();
-            unsafe { titan_cpu::rows_iqk_vnni(self.format(), &rows, xq_rows, self.k, outs) };
+            unsafe {
+                if titan_cpu::kq23_vnni_supports(fmt) {
+                    titan_cpu::rows_kq23_vnni(fmt, &rows, xq_rows, self.k, outs)
+                } else {
+                    titan_cpu::rows_iqk_vnni(fmt, &rows, xq_rows, self.k, outs)
+                }
+            };
             return;
         }
         for (x, o) in xq_rows.iter().zip(outs.iter_mut()) {
