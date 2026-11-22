@@ -823,7 +823,12 @@ impl Engine {
             {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
                 if let Some(chat_template) = pipeline.get_chat_template() {
-                    if chat_template.uses_channel_tags() && !chat_template.is_harmony_format() {
+                    if chat_template.uses_inkling_blocks() {
+                        seq.enable_reasoning(
+                            crate::reasoning_parsers::ReasoningMode::TagBased,
+                            Box::new(crate::reasoning_parsers::inkling::InklingReasoningContext::new()),
+                        );
+                    } else if chat_template.uses_channel_tags() && !chat_template.is_harmony_format() {
                         // Gemma 4: <|channel>thought\n...<channel|>
                         let prompt_activates_thinking =
                             seq.get_initial_prompt().contains("<|think|>");

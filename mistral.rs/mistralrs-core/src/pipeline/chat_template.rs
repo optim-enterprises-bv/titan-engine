@@ -147,6 +147,12 @@ impl ChatTemplate {
             .any(|t| crate::reasoning_parsers::tag_based::is_channel_tag_template(t))
     }
 
+    pub fn uses_inkling_blocks(&self) -> bool {
+        self.get_template_contents()
+            .iter()
+            .any(|t| crate::reasoning_parsers::inkling::is_inkling_template(t))
+    }
+
     pub fn uses_gemma_turns(&self) -> bool {
         self.get_template_contents()
             .iter()
@@ -845,6 +851,12 @@ pub fn apply_chat_template_to(
     let date = chrono::Local::now();
     let date_string = date.format("%d, %B, %Y").to_string();
 
+    // titan: TITAN_ENABLE_THINKING=0|1 sets the default for requests that leave enable_thinking unset
+    let enable_thinking = enable_thinking.or_else(|| match mistralrs_quant::titan_cfg::var("TITAN_ENABLE_THINKING").ok()?.as_str() {
+        "0" | "false" | "off" => Some(false),
+        "1" | "true" | "on" => Some(true),
+        _ => None,
+    });
     // titan: a per-model default effort (TITAN_REASONING_EFFORT) for templates whose own default runs long
     // (Ternary Bonsai 2's template defaults to xhigh); an explicit request field or disabled thinking wins
     let reasoning_effort = reasoning_effort.or_else(|| {

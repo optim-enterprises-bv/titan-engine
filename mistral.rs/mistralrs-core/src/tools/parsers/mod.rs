@@ -9,6 +9,7 @@ mod gemma4;
 mod gemma4_strict;
 pub(crate) mod harmony;
 mod hunyuan;
+mod inkling;
 mod liquid;
 mod llama;
 mod mistral_nemo;
@@ -64,6 +65,8 @@ pub enum ToolCallFormat {
     Gemma4,
     /// Harmony commentary channel tool call with `to=...` recipient.
     Harmony,
+    /// `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"...","args":{...}}<|end_message|>`
+    Inkling,
 }
 
 /// A parser that can detect and extract tool calls from model output.
@@ -110,6 +113,7 @@ static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
     std::sync::LazyLock::new(|| {
         vec![
             Box::new(atem::AtemParser),
+            Box::new(inkling::InklingParser),
             Box::new(gemma4::Gemma4Parser),
             Box::new(liquid::LiquidParser),
             Box::new(llama::LlamaParser),
@@ -135,6 +139,10 @@ pub fn build_tool_call_grammar(text: &str, tools: &[Tool]) -> Option<TopLevelGra
             // DeepSeek: wait until the JSON fence is present so we don't
             // activate grammar before the function name is complete.
             if parser.format() == ToolCallFormat::DeepSeek && !text.contains("```json\n") {
+                return None;
+            }
+            // Inkling's call blocks are parsed as generated, like llama.cpp's lazy grammar never starts mid-block
+            if parser.format() == ToolCallFormat::Inkling {
                 return None;
             }
             return Some(parser.tool_call_grammar(tools, text));
@@ -270,6 +278,11 @@ fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
             strip_delimited_segments(message, "<atem:function_calls>", "</atem:function_calls>")
         }
         ToolCallFormat::Harmony => message.to_string(),
+        ToolCallFormat::Inkling => strip_delimited_segments(
+            message,
+            crate::reasoning_parsers::inkling::HEADER,
+            crate::reasoning_parsers::inkling::END,
+        ),
     }
 }
 
