@@ -133,6 +133,124 @@ pub(super) struct TitanLoadArgs<'a> {
     pub mmproj_paths: Vec<std::path::PathBuf>,
 }
 
+/// RAM at or above which the hybrid prefix cache gets `AUTO_PREFIX_CACHE_MIB` (a 30k-token agent turn is ~1.6 GiB of
+/// FP8 KV plus GDN resume points, above the 1280 MiB default, so each turn fell back to an older, shorter entry).
+const AUTO_PREFIX_CACHE_MIN_RAM_GIB: u64 = 24;
+const AUTO_PREFIX_CACHE_MIB: &str = "6144";
+const AUTO_PREFIX_CACHE_ENTRIES: &str = "4";
+/// Models whose files exceed this share of RAM keep host experts in the GGUF mmap and stream them for prefill.
+const AUTO_MMAP_RAM_SHARE: f64 = 0.6;
+/// VRAM headroom (MiB) kept next to the weights and KV when deciding whether KV goes to host RAM.
+const AUTO_KV_HEADROOM_MIB: u64 = 1536;
+
+fn total_ram_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |kib| kib << 10)
+}
+
+#[cfg(feature = "cuda")]
+fn total_vram_bytes(device: &Device) -> u64 {
+    use candle_core::cuda::cudarc::driver::result;
+    let Device::Cuda(dev) = device else {
+        return 0;
+    };
+    if dev.cuda_stream().context().bind_to_thread().is_err() {
+        return 0;
+    }
+    result::mem_get_info().map_or(0, |(_, total)| total as u64)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn total_vram_bytes(_device: &Device) -> u64 {
+    0
+}
+
+/// Every titan path this model supports, as automatic defaults (`titan_cfg::set_auto`; explicit settings win).
+fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_len: Option<usize>) -> Result<std::collections::HashMap<String, String>> {
+    let mut auto = std::collections::HashMap::new();
+    let mut put = |k: &str, v: &str| {
+        auto.insert(k.to_string(), v.to_string());
+    };
+    let files = paths.get_weight_filenames();
+    let Some(first) = files.first() else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let file_bytes: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+    let mut file = std::fs::File::open(first)?;
+    let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+        .map_err(|e| anyhow::anyhow!("reading GGUF header of {}: {e}", first.display()))?;
+    let md = &content.metadata;
+    let get = |k: &str| md.get(&format!("{arch}.{k}")).and_then(|v| v.to_u32().ok()).map(|v| v as u64);
+    let (ram, vram) = (total_ram_bytes(), total_vram_bytes(device));
+
+    let moe = matches!(arch, "qwen35moe" | "qwen3moe" | "qwen3next" | "gpt-oss" | "qwen4exp");
+    if moe {
+        put("TITAN_TIERED", "1");
+        put("TITAN_TIERED_GPU_FRACTION", "auto");
+        put("TITAN_TIERED_RESERVE_MIB", "1536");
+        put("TITAN_PFS", "1");
+        put("TITAN_PFS_HEADROOM_MIB", "768");
+        put("TITAN_DOORBELL", "1");
+        put("TITAN_CPU_ONEPASS", "1");
+        let dir = first.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let candidates = [
+            std::path::PathBuf::from(format!("{}.expert-profile.txt", first.display())),
+            dir.join("expert-profile.txt"),
+        ];
+        if let Some(p) = candidates.iter().find(|p| p.is_file()) {
+            put("TITAN_TIERED_PROFILE", &p.display().to_string());
+        }
+        if ram > 0 && file_bytes as f64 > AUTO_MMAP_RAM_SHARE * ram as f64 {
+            // measured on the 125B (78.5 GB, 30 GB RAM): 2048-token chunks stream each expert once per chunk, and the
+            // 1536 MiB reserve ran a 6k prompt out of memory next to the staging ring
+            put("TITAN_TIERED_MMAP", "1");
+            put("TITAN_PREFILL_CHUNK", "2048");
+            put("TITAN_TIERED_RESERVE_MIB", "3584");
+        }
+    }
+    if matches!(arch, "qwen35moe" | "qwen35" | "qwen3next") {
+        put("TITAN_CUDA_GRAPHS", "1");
+        put("TITAN_CUDA_GRAPHS_RESERVE_MIB", "64");
+    }
+
+    // MTP when the file carries the head and its experts have a kernel (candle's indexed MoE has none for MXFP4)
+    let nextn = crate::models::quantized_qwen35_moe::nextn_predict_layers(md, arch);
+    if nextn > 0 && matches!(arch, "qwen35moe" | "qwen35") {
+        let mtp_block = get("block_count").map(|b| b as usize - nextn).unwrap_or(0);
+        let mxfp4 = content.tensor_infos.iter().any(|(n, t)| {
+            n.starts_with(&format!("blk.{mtp_block}.ffn_")) && t.ggml_dtype == candle_core::quantized::GgmlDType::MXFP4
+        });
+        if !mxfp4 {
+            put("TITAN_MTP", if arch == "qwen35moe" { "2" } else { "1" });
+        }
+    }
+
+    // dense hybrid: KV in host RAM when weights plus the full-context KV do not fit the card
+    if arch == "qwen35" {
+        if let (Some(ctx), Some(blocks), Some(kv_heads), Some(k), Some(v)) = (
+            max_seq_len,
+            get("block_count"),
+            get("attention.head_count_kv"),
+            get("attention.key_length"),
+            get("attention.value_length"),
+        ) {
+            let interval = get("full_attention_interval").unwrap_or(1).max(1);
+            let kv_bytes = (blocks / interval) * kv_heads * (k + v) * 2 * ctx as u64;
+            if vram > 0 && file_bytes + kv_bytes + (AUTO_KV_HEADROOM_MIB << 20) > vram {
+                put("TITAN_KV_HOST", "1");
+            }
+        }
+    }
+
+    if ram >= AUTO_PREFIX_CACHE_MIN_RAM_GIB << 30 && matches!(arch, "qwen35moe" | "qwen35" | "qwen3next" | "qwen4exp" | "kimi-linear") {
+        put("TITAN_PREFIX_CACHE_MIB", AUTO_PREFIX_CACHE_MIB);
+        put("TITAN_PREFIX_CACHE_ENTRIES", AUTO_PREFIX_CACHE_ENTRIES);
+    }
+    Ok(auto)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load(
     args: TitanLoadArgs<'_>,
@@ -152,6 +270,12 @@ pub(super) fn load(
     if paged_attn_config.is_some() {
         warn!("titan GGUF models run without PagedAttention (MTP, hybrid prefix cache and chunked prefill are unpaged); disabling it");
     }
+    let auto_ctx = match &mapper {
+        DeviceMapSetting::Auto(crate::AutoDeviceMapParams::Text { max_seq_len, .. })
+        | DeviceMapSetting::Auto(crate::AutoDeviceMapParams::Multimodal { max_seq_len, .. }) => Some(*max_seq_len),
+        _ => None,
+    };
+    mistralrs_quant::titan_cfg::set_auto(auto_settings(arch_name, paths, device, auto_ctx)?);
 
     let mut readers = Vec::new();
     for filename in paths.get_weight_filenames() {
