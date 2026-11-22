@@ -4,6 +4,8 @@ use mistralrs_quant::ShardedVarBuilder;
 pub struct RmsNormGated {
     pub weight: Tensor,
     eps: f64,
+    /// sigmoid output gate (qwen4exp) instead of silu
+    sigmoid: bool,
 }
 
 impl RmsNormGated {
@@ -17,16 +19,22 @@ impl RmsNormGated {
         if let Some(target_dev) = isq_target_device {
             weight = weight.to_device(target_dev)?;
         }
-        Ok(Self { weight, eps })
+        Ok(Self { weight, eps, sigmoid: false })
     }
 
     pub fn from_weight(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+        Self { weight, eps, sigmoid: false }
+    }
+
+    pub fn with_sigmoid_gate(mut self) -> Self {
+        self.sigmoid = true;
+        self
     }
 
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if x.device().is_cuda()
+            && !self.sigmoid
             && x.rank() == 2
             && gate.shape() == x.shape()
             && self.weight.dtype() == x.dtype()
@@ -37,7 +45,8 @@ impl RmsNormGated {
 
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
-        let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
+        let gate = gate.to_dtype(DType::F32)?;
+        let gate = if self.sigmoid { candle_nn::ops::sigmoid(&gate)? } else { candle_nn::ops::silu(&gate)? };
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let out = normed

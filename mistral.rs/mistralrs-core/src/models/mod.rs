@@ -23,6 +23,7 @@ pub(crate) mod quantized_inkling2;
 pub(crate) mod quantized_kimi_linear;
 pub(crate) mod quantized_llama;
 pub(crate) mod bonsai_vision;
+pub(crate) mod qwen4exp_parts;
 pub(crate) mod quantized_qwen35_moe;
 pub(crate) mod quantized_qwen3_moe;
 #[cfg(feature = "cuda")]

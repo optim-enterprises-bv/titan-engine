@@ -141,6 +141,12 @@ impl GatedDeltaNet {
     }
 
     /// See `out_proj_input_perm`.
+    /// qwen4exp: the gated output norm uses a sigmoid gate, not silu.
+    pub fn with_sigmoid_gate(mut self) -> Self {
+        self.norm = self.norm.with_sigmoid_gate();
+        self
+    }
+
     pub fn with_out_proj_input_perm(mut self, index: Tensor) -> Self {
         self.out_proj_input_perm = Some(index);
         self

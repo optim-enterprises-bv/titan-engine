@@ -63,6 +63,8 @@ pub enum GGUFArchitecture {
     Inkling2,
     #[strum(to_string = "inkling2_loop")]
     Inkling2Loop,
+    #[strum(to_string = "qwen4exp")]
+    Qwen4Exp,
 }
 
 // Wraps from_str() for some convenience:

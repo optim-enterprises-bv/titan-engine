@@ -26,8 +26,9 @@ use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::{
-    EitherCache, ForwardMaskCache, KvCache, ModelForwardContext, RecurrentBatchKind,
+    EitherCache, ForwardMaskCache, KvCache, ModelForwardContext, RecurrentBatchKind, RecurrentMetadata,
 };
+use super::qwen4exp_parts::{self as q4x, HcMix, Ple};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -62,7 +63,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     type Error = anyhow::Error;
 
     fn try_from(c: ContentMetadata) -> std::result::Result<Self, Self::Error> {
-        c.verify_arch_any(&[ARCH_DENSE, ARCH_MOE, ARCH_NEXT])?;
+        c.verify_arch_any(&[ARCH_DENSE, ARCH_MOE, ARCH_NEXT, q4x::ARCH])?;
         let is_moe = c.path_prefix != ARCH_DENSE;
         if is_moe {
             c.has_required_keys(&["expert_count", "expert_used_count"])?;
@@ -246,6 +247,16 @@ fn load_v_reordered<R: std::io::Seek + std::io::Read>(
         return ct.tensor(name, device);
     }
     let q = ct.tensor(name, &Device::Cpu)?;
+    v_reordered(q, name, perm, how, device)
+}
+
+/// `load_v_reordered` on a weight already in host memory.
+fn v_reordered(q: QTensor, name: &str, perm: &[usize], how: VReorder, device: &Device) -> Result<QTensor> {
+    if is_identity(perm) {
+        let shape = q.shape().clone();
+        let dtype = q.dtype();
+        return QTensor::new(QStorage::from_data(std::borrow::Cow::Owned(q.data()?.into_owned()), device, dtype)?, shape);
+    }
     let dtype = q.dtype();
     let shape = q.shape().clone();
     // A 1-D tensor (ssm_a, ssm_dt.bias) has one head per element: each element is a row.
@@ -310,6 +321,17 @@ fn v_index(n: usize, start: usize, unit: usize, perm: &[usize]) -> Vec<usize> {
         }
     }
     idx
+}
+
+/// A host weight `(rows, cols)` split into its first `n` rows and the rest (row-major quant blocks).
+fn split_rows(q: &QTensor, n: usize) -> Result<(QTensor, QTensor)> {
+    let (rows, cols) = q.shape().dims2()?;
+    let data = q.data()?;
+    let rb = data.len() / rows;
+    let part = |r0: usize, r1: usize| -> Result<QTensor> {
+        QTensor::new(QStorage::from_data(std::borrow::Cow::Owned(data[r0 * rb..r1 * rb].to_vec()), &Device::Cpu, q.dtype())?, (r1 - r0, cols))
+    };
+    Ok((part(0, n)?, part(n, rows)?))
 }
 
 fn gguf_linear(q: QTensor) -> Result<Arc<dyn QuantMethod>> {
@@ -1269,6 +1291,10 @@ struct DecoderLayer {
     attn_norm: QRmsNorm,
     post_attention_norm: QRmsNorm,
     ffn: Ffn,
+    /// qwen4exp: the hyper-connection mixers before the mixer and before the FFN (in place of the two norms)
+    hc: Option<(HcMix, HcMix)>,
+    /// qwen4exp: the PLE n-gram block added to the streams before this layer's mixer
+    ple: Option<Ple>,
 }
 
 pub struct ModelWeights {
@@ -1296,6 +1322,8 @@ pub struct ModelWeights {
     /// `TITAN_CUDA_GRAPHS=1`: the captured decode segments (see `forward_trunk_graphed`).
     #[cfg(feature = "cuda")]
     graphs: super::titan_graph::SegmentGraphs,
+    /// qwen4exp: the final hyper-connection mixer (it is the output norm) and the stream count
+    hc_head: Option<(HcMix, usize)>,
 }
 
 /// `TITAN_MTP=<n>`: draft `n` tokens per step with the GGUF's nextn (multi-token prediction) block.
@@ -2221,7 +2249,14 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
     let qkv_name = format!("{prefix}.attn_qkv.weight");
     let z_name = format!("{prefix}.attn_gate.weight");
     let nq = ct.has_tensor(&format!("{prefix}.attn_qkv.nq_u"));
-    let (in_proj_qkv, in_proj_z) = if nq {
+    let merged_qkvz = format!("{prefix}.attn_qkv_gate.weight");
+    let (in_proj_qkv, in_proj_z) = if ct.has_tensor(&merged_qkvz) {
+        // qwen4exp: one [qkv | z] weight
+        let (qkv, z) = split_rows(&ct.tensor(&merged_qkvz, &Device::Cpu)?, conv_dim)?;
+        let qkv = v_reordered(qkv, &qkv_name, perm, rows(2 * key_dim, cfg.head_v_dim), device)?;
+        let z = v_reordered(z, &z_name, perm, rows(0, cfg.head_v_dim), device)?;
+        (prism.linear(&qkv_name, qkv)?, prism.linear(&z_name, z)?)
+    } else if nq {
         let qkv_rows = v_index(conv_dim, 2 * key_dim, cfg.head_v_dim, perm);
         let z_rows = v_index(value_dim, 0, cfg.head_v_dim, perm);
         let qkv = load_nq_linear(ct, &qkv_name, Some(&qkv_rows), None, device)?.expect("checked");
@@ -2237,7 +2272,15 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
     }
     // ssm_beta = in_proj_b, ssm_alpha = in_proj_a; qwen3next fuses them as ssm_ba
     let ba_name = format!("{prefix}.ssm_ba.weight");
-    let (in_proj_b, in_proj_a) = if ct.has_tensor(&ba_name) {
+    let beta_alpha = format!("{prefix}.ssm_beta_alpha.weight");
+    let (in_proj_b, in_proj_a) = if ct.has_tensor(&beta_alpha) {
+        // qwen4exp: one [beta | alpha] weight, each in the tiled V-head order
+        let (b, a) = split_rows(&ct.tensor(&beta_alpha, &Device::Cpu)?, cfg.num_v_heads)?;
+        (
+            v_reordered(b, &format!("{prefix}.ssm_beta.weight"), perm, rows(0, 1), device)?,
+            v_reordered(a, &format!("{prefix}.ssm_alpha.weight"), perm, rows(0, 1), device)?,
+        )
+    } else if ct.has_tensor(&ba_name) {
         if !is_identity(perm) {
             candle_core::bail!("{prefix}: ssm_ba with reordered V heads is not a layout any converter writes");
         }
@@ -2501,7 +2544,25 @@ impl ModelConfig::FromGGUF for ModelWeights {
         } else {
             tok_embeddings
         };
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let is_q4x = arch == q4x::ARCH;
+        let hc_meta = |k: &str| -> Result<usize> {
+            Ok(ct.get_metadata().get(&format!("{arch}.hyper_connection.{k}")).ok_or_else(|| candle_core::Error::msg(format!("{arch}: missing hyper_connection.{k}")))?.to_u32()? as usize)
+        };
+        let (hc_count, hc_rank) = if is_q4x { (hc_meta("count")?, hc_meta("low_rank")?) } else { (0, 0) };
+        let ple_layers: Vec<usize> = match ct.get_metadata().get(&format!("{arch}.ple.layers")) {
+            Some(v) if is_q4x => v.to_vec()?.iter().map(|x| q4x::int_u64(x).map(|u| u as usize)).collect::<Result<_>>()?,
+            _ => Vec::new(),
+        };
+        // qwen4exp has no norms: the hyper-connection mixers carry them (the QRmsNorm fields stay unused ones)
+        let unit_norm = |device: &Device| -> Result<QRmsNorm> {
+            QRmsNorm::new(QTensor::quantize(&Tensor::ones(embedding_length, DType::F32, device)?, GgmlDType::F32)?, rms_norm_eps)
+        };
+        let norm = if is_q4x { unit_norm(device)? } else { QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)? };
+        let hc_head = if is_q4x {
+            Some((HcMix::load(&mut ct, "output_hc", hc_count, hc_rank, rms_norm_eps as f64, device)?, hc_count))
+        } else {
+            None
+        };
         let output_name = if ct.has_tensor("output.weight") { "output.weight" } else { "token_embd.weight" };
         let output = prism.linear(output_name, ct.tensor(output_name, device)?)?;
 
@@ -2564,9 +2625,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     dtype,
                 )?)
             } else {
-                Mixer::Linear(load_gdn(
-                    &mut ct, &prism, &prefix, &gdn_cfg, &perm, device, gdn_dtype,
-                )?)
+                let gdn = load_gdn(&mut ct, &prism, &prefix, &gdn_cfg, &perm, device, gdn_dtype)?;
+                Mixer::Linear(if is_q4x { gdn.with_sigmoid_gate() } else { gdn })
             };
 
             let ffn = if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) || ct.has_tensor(&format!("{prefix}.ffn_gate_exps.nq_u")) {
@@ -2585,6 +2645,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 Ffn::Dense(DenseFfn::load(&mut ct, &prefix, &prism, device)?)
             };
 
+            if is_q4x {
+                let eps = rms_norm_eps as f64;
+                let hc = (
+                    HcMix::load(&mut ct, &format!("{prefix}.hc_attn"), hc_count, hc_rank, eps, device)?,
+                    HcMix::load(&mut ct, &format!("{prefix}.hc_ffn"), hc_count, hc_rank, eps, device)?,
+                );
+                let ple = if ple_layers.contains(&layer_idx) { Some(Ple::load(&mut ct, layer_idx, hc_count, eps, device)?) } else { None };
+                layers.push(DecoderLayer { mixer, attn_norm: unit_norm(device)?, post_attention_norm: unit_norm(device)?, ffn, hc: Some(hc), ple });
+                continue;
+            }
             layers.push(DecoderLayer {
                 mixer,
                 attn_norm: QRmsNorm::new(
@@ -2596,10 +2666,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     rms_norm_eps,
                 )?,
                 ffn,
+                hc: None,
+                ple: None,
             });
         }
 
-        let mtp = if nextn > 0 && mtp_draft_len() > 0 {
+        let mtp = if nextn > 0 && mtp_draft_len() > 0 && !is_q4x {
             if nextn > 1 {
                 tracing::warn!("{arch}: {nextn} nextn blocks, using the first only");
             }
@@ -2730,6 +2802,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             prefix_points: Mutex::new(HashMap::new()),
             #[cfg(feature = "cuda")]
             graphs: Default::default(),
+            hc_head,
         })
     }
 }
@@ -3027,12 +3100,53 @@ impl ModelWeights {
 
     /// Embedding, the decoder layers and the final norm over `input_ids` (the MTP block runs on the
     /// result too); `conv_carry` marks a prompt chunk continuing the previous one.
+    /// qwen4exp: the trunk on `hc` hyper-connection streams. Each layer mixes its mixer and FFN inputs from the streams
+    /// (in place of the norms) and scatters their outputs back; PLE adds its n-gram features first; the final mixer is
+    /// the output norm. One sequence per pass (PLE keeps per-slot history).
+    fn forward_trunk_hc(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>, conv_carry: bool) -> Result<Tensor> {
+        let (head, hc) = self.hc_head.as_ref().expect("checked by the caller");
+        let x0 = self.embed_with_images(input_ids, ctx)?;
+        let out_dtype = x0.dtype();
+        let mut x = q4x::hc_init(&x0, *hc)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let recurrent_metadata = ctx
+            .recurrent_metadata()
+            .cloned()
+            .ok_or_else(|| candle_core::Error::msg("qwen4exp: hybrid recurrent metadata is required"))?;
+        let mask = self.trunk_mask(input_ids, ctx, &hybrid_cache)?;
+        let ids_host: Vec<u32> = if self.layers.iter().any(|l| l.ple.is_some()) { input_ids.flatten_all()?.to_vec1()? } else { Vec::new() };
+        let slot = recurrent_metadata.state_indices_host().and_then(|h| h.first().copied()).unwrap_or(0) as usize;
+        let pos = ctx.seqlen_offsets().first().copied().unwrap_or(0);
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(mapper) = &self.mapper {
+                x = mapper.map(x, i)?;
+            }
+            let (hc_attn, hc_ffn) = layer.hc.as_ref().expect("qwen4exp layers carry hyper-connections");
+            if let Some(ple) = &layer.ple {
+                x = ple.forward(&x, &ids_host, slot, pos)?;
+            }
+            let (h, inject) = hc_attn.mix(&x)?;
+            let h = h.to_dtype(out_dtype)?;
+            let h = self.run_mixer(layer, i, &h, hybrid_cache.get_mut(i), &recurrent_metadata, &mask.get(h.device()), ctx, conv_carry)?;
+            x = q4x::hc_combine(&x, &h, &inject.expect("layer mixers inject"))?;
+            let (h, inject) = hc_ffn.mix(&x)?;
+            let h = layer.ffn.forward(&h.to_dtype(out_dtype)?)?;
+            x = q4x::hc_combine(&x, &h, &inject.expect("layer mixers inject"))?;
+        }
+        drop(hybrid_cache);
+        let (out, _) = head.mix(&x.to_device(&self.device)?)?;
+        out.to_dtype(out_dtype)
+    }
+
     fn forward_trunk(
         &self,
         input_ids: &Tensor,
         ctx: &mut ModelForwardContext<'_>,
         conv_carry: bool,
     ) -> Result<Tensor> {
+        if self.hc_head.is_some() {
+            return self.forward_trunk_hc(input_ids, ctx, conv_carry);
+        }
         let mut x = self.embed_with_images(input_ids, ctx)?;
 
         let mut hybrid_cache = self.cache.hybrid();
@@ -3042,34 +3156,7 @@ impl ModelWeights {
             )
         })?;
 
-        let mask = if input_ids.dim(1)? > 1 && crate::titan_hostkv::enabled() {
-            // host-RAM KV attends positionally; a (rows, keys) mask would cost 1 KiB of device memory per cached token
-            AttentionMask::Custom(Tensor::zeros((1, 1), self.dtype, &self.device)?)
-        } else if ctx.is_paged() {
-            let cache = ForwardMaskCache::Paged(ctx.seqlen_offsets());
-            CausalMasker.make_causal_mask(
-                input_ids,
-                &cache,
-                self.dtype,
-                &CausalMaskConfig::default(),
-            )?
-        } else {
-            CausalMasker.make_causal_mask(
-                input_ids,
-                &*hybrid_cache as &dyn PastKvLenCache,
-                self.dtype,
-                &CausalMaskConfig::default(),
-            )?
-        };
-        let mask = if ctx.is_first_prompt_chunk() {
-            mask
-        } else {
-            AttentionMask::None
-        };
-        let mask = match &self.mapper {
-            Some(mapper) => DeviceMappedMask::new(mask, &**mapper)?,
-            None => DeviceMappedMask::from_single(mask),
-        };
+        let mask = self.trunk_mask(input_ids, ctx, &hybrid_cache)?;
 
         let look = lookahead_depth();
         for (i, layer) in self.layers.iter().enumerate() {
@@ -3079,64 +3166,7 @@ impl ModelWeights {
             let mut t = std::time::Instant::now();
             let residual = &x;
             let h = layer.attn_norm.forward(&x)?;
-            let h = match (&layer.mixer, hybrid_cache.get_mut(i)) {
-                (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
-                    attn.forward(&h, &mask.get(h.device()), kv_cache, ctx, i)?
-                }
-                (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
-                    // Zero-copy decode: with one recurrent slot and one row, the pool row *is* the
-                    // state the GDN kernels update in place, so gathering it out and scattering it
-                    // back (a copy of the whole conv + recurrent state, per layer, per token) is
-                    // pure overhead. TITAN_GDN_DIRECT=0 restores the copy path.
-                    let direct_slot = if matches!(recurrent_metadata.batch_kind(), RecurrentBatchKind::Decode)
-                        && mistralrs_quant::titan_cfg::flag("TITAN_GDN_DIRECT", true)
-                    {
-                        recurrent_metadata
-                            .state_indices_host()
-                            .filter(|h| h.len() == 1)
-                            .map(|h| h[0] as usize)
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = direct_slot {
-                        let mut gdn_cache = GdnLayerCache {
-                            conv_state: pool.conv_state_row(slot)?,
-                            recurrent_state: pool.recurrent_state_row(slot)?,
-                        };
-                        let out = gdn.forward_with_conv_carry(
-                            &h.to_dtype(self.gdn_dtype)?,
-                            &mut gdn_cache,
-                            recurrent_metadata.batch_kind(),
-                            conv_carry,
-                        )?;
-                        out.to_dtype(DType::F32)?
-                    } else {
-                        let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
-                        let mut gdn_cache = GdnLayerCache {
-                            conv_state: pool.gather_conv_state(indices)?,
-                            recurrent_state: pool.gather_recurrent_state(indices)?,
-                        };
-                        let out = gdn.forward_with_conv_carry(
-                            &h.to_dtype(self.gdn_dtype)?,
-                            &mut gdn_cache,
-                            recurrent_metadata.batch_kind(),
-                            conv_carry,
-                        )?;
-                        pool.scatter_conv_state_with_host_indices(
-                            indices,
-                            recurrent_metadata.state_indices_host(),
-                            &gdn_cache.conv_state,
-                        )?;
-                        pool.scatter_recurrent_state_with_host_indices(
-                            indices,
-                            recurrent_metadata.state_indices_host(),
-                            &gdn_cache.recurrent_state,
-                        )?;
-                        out.to_dtype(DType::F32)?
-                    }
-                }
-                _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
-            };
+            let h = self.run_mixer(layer, i, &h, hybrid_cache.get_mut(i), &recurrent_metadata, &mask.get(h.device()), ctx, conv_carry)?;
             if h.dim(1)? == 1 {
                 prof(if matches!(layer.mixer, Mixer::Attention(_)) { "d.attn" } else { "d.gdn" }, &self.device, &mut t);
             }
@@ -3178,6 +3208,114 @@ impl ModelWeights {
             self.mtp_after_trunk(input_ids, &x, ctx)?;
         }
         Ok(x)
+    }
+
+    /// One layer's token mixer on its (normed) input `h`: full attention against its KV cache, or the GDN with its
+    /// recurrent pool row(s) (zero-copy for a single decode slot).
+    #[allow(clippy::too_many_arguments)]
+    fn run_mixer(
+        &self,
+        layer: &DecoderLayer,
+        i: usize,
+        h: &Tensor,
+        cache: Option<&mut HybridLayerCache>,
+        recurrent_metadata: &RecurrentMetadata,
+        mask: &AttentionMask,
+        ctx: &mut ModelForwardContext<'_>,
+        conv_carry: bool,
+    ) -> Result<Tensor> {
+        let h = h.clone();
+        Ok(match (&layer.mixer, cache) {
+            (Mixer::Attention(attn), Some(HybridLayerCache::Attention(kv_cache))) => {
+                attn.forward(&h, mask, kv_cache, ctx, i)?
+            }
+            (Mixer::Linear(gdn), Some(HybridLayerCache::Recurrent(pool))) => {
+                // Zero-copy decode: with one recurrent slot and one row, the pool row *is* the
+                // state the GDN kernels update in place, so gathering it out and scattering it
+                // back (a copy of the whole conv + recurrent state, per layer, per token) is
+                // pure overhead. TITAN_GDN_DIRECT=0 restores the copy path.
+                let direct_slot = if matches!(recurrent_metadata.batch_kind(), RecurrentBatchKind::Decode)
+                    && mistralrs_quant::titan_cfg::flag("TITAN_GDN_DIRECT", true)
+                {
+                    recurrent_metadata
+                        .state_indices_host()
+                        .filter(|h| h.len() == 1)
+                        .map(|h| h[0] as usize)
+                } else {
+                    None
+                };
+                if let Some(slot) = direct_slot {
+                    let mut gdn_cache = GdnLayerCache {
+                        conv_state: pool.conv_state_row(slot)?,
+                        recurrent_state: pool.recurrent_state_row(slot)?,
+                    };
+                    let out = gdn.forward_with_conv_carry(
+                        &h.to_dtype(self.gdn_dtype)?,
+                        &mut gdn_cache,
+                        recurrent_metadata.batch_kind(),
+                        conv_carry,
+                    )?;
+                    out.to_dtype(DType::F32)?
+                } else {
+                    let indices = &pool_indices(recurrent_metadata.state_indices(), pool.device())?;
+                    let mut gdn_cache = GdnLayerCache {
+                        conv_state: pool.gather_conv_state(indices)?,
+                        recurrent_state: pool.gather_recurrent_state(indices)?,
+                    };
+                    let out = gdn.forward_with_conv_carry(
+                        &h.to_dtype(self.gdn_dtype)?,
+                        &mut gdn_cache,
+                        recurrent_metadata.batch_kind(),
+                        conv_carry,
+                    )?;
+                    pool.scatter_conv_state_with_host_indices(
+                        indices,
+                        recurrent_metadata.state_indices_host(),
+                        &gdn_cache.conv_state,
+                    )?;
+                    pool.scatter_recurrent_state_with_host_indices(
+                        indices,
+                        recurrent_metadata.state_indices_host(),
+                        &gdn_cache.recurrent_state,
+                    )?;
+                    out.to_dtype(DType::F32)?
+                }
+            }
+            _ => candle_core::bail!("qwen35: layer {i} cache kind does not match its mixer"),
+        })
+    }
+
+    /// The causal mask of a trunk pass, mapped to the layer devices.
+    fn trunk_mask(&self, input_ids: &Tensor, ctx: &ModelForwardContext<'_>, hybrid: &HybridCache) -> Result<DeviceMappedMask> {
+        let mask = if input_ids.dim(1)? > 1 && crate::titan_hostkv::enabled() {
+            // host-RAM KV attends positionally; a (rows, keys) mask would cost 1 KiB of device memory per cached token
+            AttentionMask::Custom(Tensor::zeros((1, 1), self.dtype, &self.device)?)
+        } else if ctx.is_paged() {
+            let cache = ForwardMaskCache::Paged(ctx.seqlen_offsets());
+            CausalMasker.make_causal_mask(
+                input_ids,
+                &cache,
+                self.dtype,
+                &CausalMaskConfig::default(),
+            )?
+        } else {
+            CausalMasker.make_causal_mask(
+                input_ids,
+                hybrid as &dyn PastKvLenCache,
+                self.dtype,
+                &CausalMaskConfig::default(),
+            )?
+        };
+        let mask = if ctx.is_first_prompt_chunk() {
+            mask
+        } else {
+            AttentionMask::None
+        };
+        let mask = match &self.mapper {
+            Some(mapper) => DeviceMappedMask::new(mask, &**mapper)?,
+            None => DeviceMappedMask::from_single(mask),
+        };
+        Ok(mask)
     }
 
     /// P1: the routing of layers `i + 1 ..= i + depth` predicted from layer `i`'s residual (after its
@@ -3693,7 +3831,7 @@ impl ModelWeights {
     /// sequence, unpaged attention, one device, MoE in every layer, no router lookahead.
     #[cfg(feature = "cuda")]
     fn graphable_decode(&self, input_ids: &Tensor, ctx: &ModelForwardContext<'_>) -> Result<bool> {
-        if !super::titan_graph::enabled() || input_ids.dims2()? != (1, 1) || !self.device.is_cuda() {
+        if self.hc_head.is_some() || !super::titan_graph::enabled() || input_ids.dims2()? != (1, 1) || !self.device.is_cuda() {
             return Ok(false);
         }
         if !matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Decode)) || ctx.is_paged() {

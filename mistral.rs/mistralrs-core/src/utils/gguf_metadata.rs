@@ -295,6 +295,21 @@ const QWEN35MOE_LAYER_TENSORS: &[&str] = &[
     "ffn_gate.weight",
     "ffn_up.weight",
     "ffn_down.weight",
+    // qwen4exp
+    "attn_qkv_gate.weight",
+    "ssm_beta_alpha.weight",
+    "hc_attn_norm.weight",
+    "hc_attn_down_inject.weight",
+    "hc_attn_up.weight",
+    "hc_ffn_norm.weight",
+    "hc_ffn_down_inject.weight",
+    "hc_ffn_up.weight",
+    "ple_key.weight",
+    "ple_value.weight",
+    "ple_norm_key.weight",
+    "ple_norm_query.weight",
+    "ple_norm_conv.weight",
+    "ple_conv1d.weight",
 ];
 
 const GPT_OSS_LAYER_TENSORS: &[&str] = &[
@@ -406,7 +421,7 @@ impl GgufDeviceMapLoaderInner<'_, '_> {
     /// qwen35 nextn (MTP) blocks counted in block_count after the trunk layers.
     fn nextn_layers(&self) -> usize {
         match self.arch {
-            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next => {
+            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp => {
                 crate::models::quantized_qwen35_moe::nextn_predict_layers(
                     self.model.get_metadata(),
                     &self.arch.to_string(),
@@ -419,7 +434,7 @@ impl GgufDeviceMapLoaderInner<'_, '_> {
     /// Arches sized tensor by tensor (heterogeneous layers or titan tiered experts).
     fn layer_tensors(&self) -> Option<&'static [&'static str]> {
         match self.arch {
-            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next => {
+            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp => {
                 Some(QWEN35MOE_LAYER_TENSORS)
             }
             GGUFArchitecture::GptOss => Some(GPT_OSS_LAYER_TENSORS),
@@ -560,12 +575,14 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
-            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next => {
-                // token_embd stays quantized in host memory (see quantized_qwen35_moe::QEmbedding)
-                let output_norm = tensor_info_size_in_bytes!(
-                    self.model.tensor_info("output_norm.weight")?,
-                    DType::F32
-                );
+            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp => {
+                // token_embd stays quantized in host memory (see quantized_qwen35_moe::QEmbedding); qwen4exp's output
+                // norm is the final hyper-connection mixer, and its PLE table stays in the GGUF mmap
+                let output_norm = ["output_norm.weight", "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight"]
+                    .iter()
+                    .filter(|n| self.model.has_tensor(n))
+                    .map(|n| self.model.tensor_info(n).map(|i| tensor_info_size_in_bytes!(i)))
+                    .sum::<candle_core::Result<usize>>()?;
                 let output = if !self.model.has_tensor("output.weight") {
                     tensor_info_size_in_bytes!(self.model.tensor_info("token_embd.weight")?)
                 } else {
@@ -626,7 +643,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
             let attn = per_layer.iter().filter(|v| v.to_u64().is_ok_and(|n| n > 0)).count();
             return Ok(attn as f64 / per_layer.len().max(1) as f64);
         }
-        if !matches!(self.arch, GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next) {
+        if !matches!(self.arch, GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp) {
             return Ok(1.0);
         }
         // qwen35 hybrids: only every `full_attention_interval`-th trunk layer holds a KV cache; the
@@ -654,7 +671,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
             // dense qwen35 has no experts to tier
             if matches!(
                 self.arch,
-                GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear
+                GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp | GGUFArchitecture::GptOss | GGUFArchitecture::KimiLinear
             ) && TieredExperts::wants_auto_plan()
             {
                 // Split every layer tensor into tierable experts vs everything else, then size the

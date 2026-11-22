@@ -94,3 +94,11 @@ doc = "GGML type 11: 32 hmask bytes, 64 2-bit quant bytes, 12 bytes of 6-bit sca
 id = 9
 prefix = "q3k"
 ftz = true
+
+# GGML type 10: 16 scale/min nibble bytes, 64 2-bit quant bytes, half2 dm (84 bytes).
+[[twin.variant]]
+name = "Q2K"
+doc = "GGML type 10: 16 scale/min nibble bytes, 64 2-bit quant bytes, half2 dm (84 bytes)."
+id = 10
+prefix = "q2k"
+ftz = true
