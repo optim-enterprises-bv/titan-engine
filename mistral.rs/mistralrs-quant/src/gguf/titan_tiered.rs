@@ -97,9 +97,15 @@ fn miss_pool() -> Option<&'static super::titan_spin::SpinPool> {
         // the calling thread works too; with the doorbell it is not the decode thread, and the memory-bound pass
         // measured faster on fewer spinning workers (m4/idle: 22 -> 14 workers, MTP=2 decode +5%)
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let default = if doorbell::enabled() { DOORBELL_WORKERS.min(threads.saturating_sub(2)) } else { threads.saturating_sub(1) };
+        let pinned = super::titan_spin::miss_cpus();
+        let default = match pinned {
+            // the doorbell thread works on the first pinned CPU, a worker on each of the others
+            Some(c) if doorbell::enabled() => c.len() - 1,
+            _ if doorbell::enabled() => DOORBELL_WORKERS.min(threads.saturating_sub(2)),
+            _ => threads.saturating_sub(1),
+        };
         let workers = env_usize("TITAN_TIERED_THREADS", default);
-        Some(super::titan_spin::SpinPool::new(workers))
+        Some(super::titan_spin::SpinPool::new(workers, if doorbell::enabled() { pinned } else { None }))
     })
     .as_ref()
 }

@@ -440,6 +440,9 @@ impl Doorbell {
     }
 
     fn serve(&'static self) {
+        if let Some(c) = super::super::titan_spin::miss_cpus() {
+            super::super::titan_spin::pin_current_thread(c[0]);
+        }
         let mut last = 0u32;
         loop {
             let Some(job) = self.next_job() else {
