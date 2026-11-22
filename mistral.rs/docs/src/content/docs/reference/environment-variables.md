@@ -126,6 +126,18 @@ These are read by build scripts, not at runtime.
 | `MISTRALRS_INSTALL_IGNORE_FFMPEG` | `MISTRALRS_INSTALL_IGNORE_FFMPEG=1` skips the installer's FFmpeg step, leaving any existing FFmpeg untouched. |
 | `MISTRALRS_GIT_REVISION` | Git revision embedded in the binary by the build script. |
 
+## titan-engine serving
+
+Settings read by the titan GGUF paths (the README's "How it works" covers the tiering, PFS and cache settings).
+
+| Variable | Purpose |
+|---|---|
+| `TITAN_MODEL_ALIAS` | Comma-separated extra names for the default model, e.g. the model id an agent stack's catalog already uses. |
+| `TITAN_SAMPLING` | Server-side sampling defaults for fields a request leaves unset: `temp=0.7,top_p=0.8,top_k=20,min_p=0,presence=1.5` (any subset). The GGUF pipeline has no model-card defaults, so without it such requests decode greedily. |
+| `TITAN_ENABLE_THINKING` | `0` or `1`: the default when a request leaves `enable_thinking` unset. |
+| `TITAN_REASONING_EFFORT` | `low`/`medium`/`high`/`xhigh`: the default reasoning effort for templates whose own default runs long. |
+| `TITAN_PFS_DIRECT` | `0` makes prefill expert streaming page-fault mmap'd host experts instead of reading the GGUF with `O_DIRECT` (default on). |
+
 ## Internal
 
 Not intended for direct use.

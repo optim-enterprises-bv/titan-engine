@@ -57,6 +57,10 @@ VRAM stays flat at 15.3 GiB from 0 to 248k tokens; the KV takes 32 KiB per token
 |---|---:|---:|---|
 | Qwen3-Next-80B-A3B Q4_K_M (48.5 GB) | 41.5 | 15.2 | experts streamed from NVMe; prompt speed is NVMe/page-cache bound on 30 GB RAM and varies run to run |
 | gpt-oss-120b MXFP4 (63.4 GB) | 4.4 | 2.8 | older build, 8-prompt set |
+| Qwen3.6-35B-A3B UD-Q3_K_M (16 GB; IQ3_XXS / IQ4_XS / Q3_K experts) | 77.1 | 55.2 | 2026-11-22; prompt 1598 / 3130 tok/s vs 2118 / 2992 at 1.6k / 6.4k tokens |
+| Inkling 2 Mini UD-Q3_K_XL (`inkling2_loop`, 13 GB, all on GPU) | 72 | 55-69 | 2026-11-22; prompt 525 / 435 tok/s at 1.8k / 7.1k tokens, llama.cpp 557-928 |
+| Qwen3.6-35B-A3B NanoQuant 1-bit (5.2 GB) | ~100 | - | 2026-11-22; perplexity 14.081 vs 14.075 for the PyTorch reference; no llama.cpp support |
+| Qwen3.8-Flash-Next 125B (`qwen4exp`) IQ2_XXS / IQ4_NL (78.5 GB) | 10.9 | 2.3-2.5 | 2026-11-22; prompt ~135 tok/s vs ~28; llama.cpp figures are on the 84 GB Q2_K / IQ4_NL file; 30 GB RAM, so experts stream from NVMe |
 
 What the numbers do not say:
 - They are one laptop GPU, one user and one request at a time. The MoE paths do not batch concurrent users (the dense
@@ -94,6 +98,18 @@ For a prompt chunk big enough to need most experts, `TITAN_PFS=1` streams the no
 device staging buffers on a copy stream. The grouped expert matmul then runs on the GPU over resident and staged
 experts, using a port of llama.cpp's MMQ kernels (MMQ-MoE). Before this, prefill on the tiered path was bound by the
 CPU experts.
+
+Host experts read through the GGUF mmap (models larger than RAM) are staged with page-aligned `O_DIRECT` reads of
+the file into pinned bounce buffers, split across the copy threads, instead of page-faulting the map
+(`TITAN_PFS_DIRECT=0` keeps the faults). On the 125B model with 30 GB of RAM this took the copies from 0.4 to 3 GB/s
+and prefill from ~25 to ~135 tok/s, together with 2048-token prefill chunks (each chunk streams every non-resident
+expert once).
+
+Grouped MMQ also takes a K that is not a whole number of tile iterations (Qwen3.8-Flash-Next's 640-wide IQ4_NL down
+rows), as llama.cpp does: the last tile reads up to `GROUPED_TAIL_BYTES` past each weight buffer's last expert into
+zero activations, so the resident slot buffer carries a zeroed tail and the copy worker zeroes one after every staged
+tensor. A layer only takes MMQ when gate, up and down all qualify. MMQ against the slot-map GEMV is about 2e-4
+relative error per projection, the same for full and partial K.
 
 ### Batched MoE decode
 Decode and MTP-verify batches (up to 8 rows) use kernels shaped like llama.cpp's `mul_mat_vec_q` MoE grid, ported to
@@ -149,6 +165,19 @@ for bit (`oxide-kernels/mmvq-rows/src/gate.rs` checks this against nvcc). They a
 `TITAN_VERIFY_MMQ` (on by default) sends verification to the MMQ tile instead; set it to 0 for the row-exact kernels. The Q4_K / Q5_K two-row kernels are capped at 48 registers (`#[launch_bounds]`): at 56
 the lost occupancy made one two-row launch slower than two one-row launches.
 
+### Agent clients
+Agent stacks name the model by their own catalog id and often send no sampling or thinking fields.
+`TITAN_MODEL_ALIAS=a[,b]` registers extra names for the default model. `TITAN_SAMPLING=temp=0.7,top_p=0.8,top_k=20,min_p=0,presence=1.5`
+fills the sampling fields a request leaves unset; the GGUF pipeline has no model-card defaults, so without it such
+requests decode greedily. `TITAN_ENABLE_THINKING=0|1` sets the default when `enable_thinking` is unset.
+
+Inkling turns are a list of blocks closed by `<|end_message|>`: `<|content_thinking|>` (reasoning),
+`<|content_text|>` (content) and `NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}` (a tool call). A reasoning
+parser for that format is enabled from the chat template (detected as llama.cpp does), and an Inkling tool-call parser
+turns call blocks into OpenAI tool calls. llama.cpp constrains the call JSON with a grammar; titan does not, so a body
+with raw control characters in its strings or a missing closing brace is repaired before parsing, and a body that still
+fails is logged.
+
 ### nvcc-free build with cuda-oxide
 The kernels in the service path live in `oxide-kernels/`. They are Rust `#[kernel]` functions compiled to PTX by
 cuda-oxide's rustc backend: GGUF dequantisation, the Q8_0 and K-quant matvecs, the expert GEMVs, MMQ prefill tiles,
@@ -172,7 +201,7 @@ Headline numbers on this box (RTX 5080 Laptop, cc 12.0):
 | `fmt_mmq` (default) | 1,753 launches, 910,060,092 bytes compared, 0 failing - iq4_nl, iq4_xs, MXFP4 and NVFP4 through both the block-scaled MMA and the int8 path |
 | `mistralrs-quant-c` | 20,120 calls, 9,436,413,576 bytes |
 | `mistralrs-paged-attn-a` | 2,538 calls, 5,436,402,887 bytes |
-| `titan-kernels-oxide` | 20,184,168 outputs / 32,774,352 CPU-twin rows |
+| `titan-kernels-oxide` | 20,184,168 outputs / 32,774,352 CPU-twin rows; since 2026-11-22 the llama.cpp-format sections (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, IQ4_NL, Q2_K, Q3_K, MXFP4, NVFP4, Q1_0) add 8,183,556 outputs bit-identical to llama.cpp's mmvq and 16,367,112 CPU-twin rows bit-identical to the GPU |
 | `candle-mmq` | 10 of 10 quant types |
 
 MXFP4 and NVFP4 block-scaled MMQ were long recorded as "requires sm_120a hardware" on this card. They are not:
@@ -190,8 +219,16 @@ Measured in this release:
 - Qwen3.8-27B (`qwen35`, dense, with the MTP head): Q4_K_M (with `output` and `ffn_down` at Q5_K) and Q3_K_M,
   host-RAM KV up to 256k.
 
-Tiered expert formats (GPU kernel and CPU twin): Q4_K, Q5_K, Q6_K, IQ4_NL, MXFP4, NVFP4, Q1_0. Other
-architectures work as they do in upstream mistral.rs v0.9.4, without the titan paths.
+Ported 2026-11-21/22 (preliminary numbers above):
+- Qwen3.6-35B-A3B UD-Q3_K_M (`qwen35moe`, IQ3_XXS / IQ4_XS / Q3_K experts);
+- Inkling 2 Mini (`inkling2`, `inkling2_loop`): UD-Q3_K_XL and AD-IQ3_S, with its reasoning and tool-call format;
+- Qwen3.6-35B-A3B NanoQuant 1-bit (factored binary weights, `scripts/nq2gguf.py`);
+- Qwen3.8-Flash-Next 125B (`qwen4exp`: hyper-connection streams, sparse indexer attention, n-gram embeddings),
+  converted with `scripts/convert_q4x.py`; perplexity matches llama.cpp within its error bars.
+
+Tiered expert formats (GPU kernel and CPU twin): Q4_K, Q5_K, Q6_K, IQ4_NL, MXFP4, NVFP4, Q1_0, IQ4_XS, IQ3_XXS,
+Q3_K, Q2_K, IQ2_XS, IQ2_XXS. Other architectures work as they do in upstream mistral.rs v0.9.4, without the titan
+paths.
 
 ## Build and run
 
@@ -236,6 +273,14 @@ cp deploy/titan-dense.service ~/.config/systemd/user/ && systemctl --user enable
 It exposes an OpenAI-compatible API on port 1234. The per-model configurations used in the benchmark are in
 `release/bench/campaign.json`, and the exact command lines are in `release/bench/results.md`.
 
+Converting models (`scripts/`):
+- `convert_q4x.py <hf dir> <out.gguf>`: Qwen3.8-Flash-Next bf16 to GGUF in one pass, through llama.cpp's converter with
+  its quantize step redirected to libggml. `GATEUP`, `DOWN`, `NGRAM`, `EMBD` pick the formats, `IMATRIX` takes a
+  llama-imatrix GGUF (normalised per expert as llama-quantize does). Rows that are not a whole number of 256-value
+  blocks are zero-padded (`PAD_ROWS=1`), which llama.cpp then refuses to load.
+- `nq2gguf.py`: a NanoQuant checkpoint to a titan GGUF.
+- `trace2profile.py`: a `TITAN_TIERED_TRACE` log to a `TITAN_TIERED_PROFILE` hotness profile.
+
 To reproduce the benchmark, see `release/bench/campaign.sh`. It needs the models, llama.cpp at `acecd56`, and the GPU
 to itself for about several hours.
 
@@ -251,6 +296,8 @@ to itself for about several hours.
   cache, so their speed depends on the NVMe and on what else is using memory.
 - **Model coverage.** The titan paths cover the architectures listed above. Anything else runs on upstream
   mistral.rs code.
+- **Inkling tool calls are not grammar-constrained.** llama.cpp constrains the call JSON once a call starts; titan
+  parses what the model writes and repairs the two malformations seen so far.
 - **Bit-identity is a gate, not a guarantee.** The release gates check byte-identical greedy output against frozen
   references for the 35B model, with and without MTP. Other models were checked against llama.cpp at the first-token
   and top-k level, not byte for byte.
@@ -263,8 +310,8 @@ to itself for about several hours.
   `oxide-kernels` ports (MMQ, mmvq, MoE grids, the flash-decode structure). It is also the baseline we measure
   against.
 - [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Apache-2.0, NVIDIA): the Rust-to-PTX compiler for our kernels.
-- [Qwen](https://github.com/QwenLM) (Qwen3.6, Qwen3-Next), [OpenAI](https://github.com/openai/gpt-oss) (gpt-oss) and
-  PrismML (Bonsai): the models. Their weights are not part of this repository.
+- [Qwen](https://github.com/QwenLM) (Qwen3.6, Qwen3.8, Qwen3-Next), [OpenAI](https://github.com/openai/gpt-oss) (gpt-oss),
+  PrismML (Bonsai), Thinking Machines (Inkling 2 Mini) and NanoQuant: the models. Their weights are not part of this repository.
 - [Strata](https://github.com/Niko1221/Strata): the mapped-memory doorbell, the single CPU pass per expert miss and
   the prefill staging ring were first described there. These are ideas, not code: Strata publishes no licence, and
   none of its code, text or identifiers were used. The implementations here were written independently.

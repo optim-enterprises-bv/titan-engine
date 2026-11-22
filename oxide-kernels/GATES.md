@@ -8,7 +8,7 @@ gate is staging them (see "Artifacts" below).
 
 | crate | evidence |
 |---|---|
-| `titan-kernels-oxide` (repo root) | 20,184,168 outputs / 32,774,352 CPU-twin rows bit-identical |
+| `titan-kernels-oxide` (repo root) | 20,184,168 outputs / 32,774,352 CPU-twin rows bit-identical. 2026-11-22 full run, llama.cpp-format sections: 8,183,556 outputs bit-identical to llama.cpp `mul_mat_vec_q` and 16,367,112 CPU-twin rows (scalar + AVX2) bit-identical to the GPU, over IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, IQ4_NL, Q2_K, Q3_K, MXFP4, NVFP4, Q1_0. Reference: mmvq cubin mined from llama.cpp `mmvq.cu.o` (sm_120), 80-byte fusion args; Q2_K / Q3_K compare at 2 rows per block |
 | `mistralrs-paged-attn-a` | 2,538 calls, 5,436,402,887 bytes, 0 failing |
 | `mistralrs-quant-a` | 7,004 calls, 572,862,725 bytes, 0 failing |
 | `mistralrs-quant-b` | 4,670 calls, 38,465,320 bytes, 0 failing |
