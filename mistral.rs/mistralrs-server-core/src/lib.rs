@@ -262,6 +262,7 @@ pub mod skills;
 pub mod speech_generation;
 pub mod streaming;
 pub mod titan_monitor;
+mod titan_sampling;
 mod titan_sys;
 pub mod types;
 pub mod util;

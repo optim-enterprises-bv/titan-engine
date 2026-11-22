@@ -973,6 +973,7 @@ impl MistralRsForServerBuilder {
         }
 
         let mistralrs = builder.build().await;
+        register_titan_aliases(&mistralrs)?;
 
         Ok(mistralrs)
     }
@@ -1398,6 +1399,7 @@ impl MistralRsForServerBuilder {
         }
 
         let mistralrs = builder.build().await;
+        register_titan_aliases(&mistralrs)?;
 
         if let Some(alias) = first_model.alias.as_ref() {
             if alias != &first_pipeline_name {
@@ -1910,4 +1912,18 @@ pub fn get_search_embedding_model(
     } else {
         None
     }
+}
+
+/// `TITAN_MODEL_ALIAS=a[,b..]`: extra names for the default model, e.g. the id a client's model catalog already uses.
+fn register_titan_aliases(mistralrs: &SharedMistralRsState) -> Result<()> {
+    let Ok(names) = mistralrs_core::titan_cfg::var("TITAN_MODEL_ALIAS") else {
+        return Ok(());
+    };
+    let Some(default_id) = mistralrs.get_default_model_id().map_err(|e| anyhow::anyhow!(e))? else {
+        return Ok(());
+    };
+    for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        mistralrs.register_model_alias(name, &default_id).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
 }
