@@ -64,6 +64,8 @@ struct Inner {
     failed: usize,
     replays: u64,
     copies: u64,
+    /// `kernel_workspace_generation` the segments were captured under
+    workspace_gen: u64,
 }
 
 #[derive(Default)]
@@ -163,6 +165,16 @@ impl SegmentGraphs {
         }
         let stream = dev.cuda_stream();
         let mut inner = self.inner.lock().expect("titan graphs poisoned");
+        // captured kernels address the kernels' cached workspaces; once those were freed (a prompt step's trim, an
+        // OOM retry), replaying them reads and writes memory the pool has handed out again
+        let gen = mistralrs_quant::kernel_workspace_generation();
+        if inner.workspace_gen != gen {
+            if !inner.segs.is_empty() {
+                tracing::debug!("titan graphs: kernel workspaces were released; dropping {} captured segments", inner.segs.len());
+            }
+            let fresh = Inner { workspace_gen: gen, ..Default::default() };
+            drop(std::mem::replace(&mut *inner, fresh));
+        }
         match inner.segs.remove(&key) {
             None => {
                 // warm-up: eager, recording the step-invariant HtoD uploads

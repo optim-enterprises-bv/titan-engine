@@ -49,6 +49,7 @@ pub(crate) fn free_leaked<K, T>(m: &std::sync::OnceLock<std::sync::Mutex<std::co
 /// kernel workspaces) and reset the per-model statics, so the next model starts as in a fresh process.
 #[cfg(feature = "cuda")]
 pub fn release_titan_state() {
+    KERNEL_WORKSPACE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     titan_tiered::release_statics();
     titan_pfs::release_all();
     fast_mmvq::release_workspaces();
@@ -61,10 +62,19 @@ pub fn release_titan_state() {
 #[cfg(not(feature = "cuda"))]
 pub fn release_titan_state() {}
 
+static KERNEL_WORKSPACE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever the kernels' cached workspaces are freed: a captured CUDA graph holds their device addresses, so
+/// graphs captured under an older generation must not replay.
+pub fn kernel_workspace_generation() -> u64 {
+    KERNEL_WORKSPACE_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Free the kernels' grow-only workspaces (they regrow to the next call's size), e.g. before a prompt step on a
 /// device too full for the prompt's buffers next to them.
 #[cfg(feature = "cuda")]
 pub fn release_kernel_workspaces() {
+    KERNEL_WORKSPACE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     fast_mmvq::release_workspaces();
     fast_mmq::release_workspaces();
     ptq1_0::release_workspaces();
