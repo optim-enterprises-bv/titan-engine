@@ -319,3 +319,168 @@ impl Ple {
         (x + gated)? + conv
     }
 }
+
+/// Raw indexer keys of one sequence slot, valid for positions `0..len`.
+struct QsaKeys {
+    len: usize,
+    keys: Tensor,
+}
+
+/// QSA: each query attends to the `budget / ratio` best blocks of `ratio` consecutive keys (scored by the indexer)
+/// plus the incomplete tail block. With at most `budget + ratio - 1` visible keys every block is kept, i.e. dense.
+pub(crate) struct Qsa {
+    q_proj: Arc<dyn QuantMethod>,
+    k_proj: Arc<dyn QuantMethod>,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    budget: usize,
+    ratio: usize,
+    /// RoPE inverse frequencies over the first `2 * inv_freq.len()` dims (rotate-half layout)
+    inv_freq: Vec<f32>,
+    eps: f64,
+    keys: Mutex<HashMap<usize, QsaKeys>>,
+}
+
+impl Qsa {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load<R: std::io::Seek + std::io::Read>(
+        ct: &mut Content<'_, R>,
+        layer: usize,
+        rope_dims: usize,
+        rope_base: f32,
+        eps: f64,
+        device: &Device,
+    ) -> Result<Self> {
+        let md = ct.get_metadata();
+        let get = |k: &str| -> Result<usize> {
+            Ok(int_u64(md.get(&format!("{ARCH}.attention.{k}")).ok_or_else(|| candle_core::Error::msg(format!("{ARCH}: missing attention.{k}")))?)? as usize)
+        };
+        let n_heads = get("indexer.head_count")?;
+        let head_dim = get("indexer.key_length")?;
+        let budget = get("indexer.top_k")?;
+        let ratio = match md.get(&format!("{ARCH}.attention.compress_ratios")) {
+            Some(v) => v.to_vec()?.get(layer).map(int_u64).transpose()?.unwrap_or(0) as usize,
+            None => 0,
+        };
+        if ratio < 2 || budget % ratio != 0 {
+            candle_core::bail!("{ARCH}: layer {layer} has QSA ratio {ratio} for budget {budget}");
+        }
+        let p = |s: &str| format!("blk.{layer}.indexer.{s}");
+        let inv_freq = (0..rope_dims / 2).map(|j| rope_base.powf(-(2.0 * j as f32) / rope_dims as f32)).collect();
+        Ok(Self {
+            q_proj: linear(ct.tensor(&p("q_proj.weight"), device)?)?,
+            k_proj: linear(ct.tensor(&p("k_proj.weight"), device)?)?,
+            q_norm: f32_tensor(ct, &p("q_norm.weight"), device)?,
+            k_norm: f32_tensor(ct, &p("k_norm.weight"), device)?,
+            n_heads,
+            head_dim,
+            budget,
+            ratio,
+            inv_freq,
+            eps,
+            keys: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Whether the layer is in QSA (needs the indexer) given the file's compress ratio.
+    pub(crate) fn applies<R: std::io::Seek + std::io::Read>(ct: &Content<'_, R>, layer: usize) -> bool {
+        ct.get_metadata()
+            .get(&format!("{ARCH}.attention.compress_ratios"))
+            .and_then(|v| v.to_vec().ok().and_then(|a| a.get(layer).and_then(|x| int_u64(x).ok())))
+            .is_some_and(|r| r > 1)
+    }
+
+    fn rms(&self, x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let inv = (x.sqr()?.mean_keepdim(D::Minus1)? + self.eps)?.sqrt()?.recip()?;
+        x.broadcast_mul(&inv)?.broadcast_mul(w)
+    }
+
+    /// Rotate-half RoPE on the first dims of `x` `(rows, .., head_dim)` at `positions` (one per row).
+    fn rope(&self, x: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        let half = self.inv_freq.len();
+        let rows = positions.len();
+        let (mut cos, mut sin) = (Vec::with_capacity(rows * 2 * half), Vec::with_capacity(rows * 2 * half));
+        for &p in positions {
+            for _ in 0..2 {
+                for f in &self.inv_freq {
+                    let a = p as f32 * f;
+                    cos.push(a.cos());
+                    sin.push(a.sin());
+                }
+            }
+        }
+        let mut shape = vec![rows];
+        shape.extend(std::iter::repeat_n(1, x.rank() - 2));
+        shape.push(2 * half);
+        let cos = Tensor::from_vec(cos, shape.clone(), x.device())?;
+        let sin = Tensor::from_vec(sin, shape, x.device())?;
+        let r = x.narrow(D::Minus1, 0, 2 * half)?;
+        let rest = x.narrow(D::Minus1, 2 * half, self.head_dim - 2 * half)?;
+        let (r1, r2) = (r.narrow(D::Minus1, 0, half)?, r.narrow(D::Minus1, half, half)?);
+        let rot = Tensor::cat(&[&r2.neg()?, &r1], D::Minus1)?;
+        let r = (r.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?;
+        Tensor::cat(&[&r, &rest], D::Minus1)
+    }
+
+    /// Append this pass's indexer keys, and when some query sees more than `budget + ratio - 1` keys return the
+    /// additive `(t, pos + t)` mask (causal and the block selection) in `dtype`; `None` means dense causal.
+    pub(crate) fn mask(&self, h: &Tensor, slot: usize, pos: usize, dtype: DType) -> Result<Option<Tensor>> {
+        let (b, t, _) = h.dims3()?;
+        if b != 1 {
+            candle_core::bail!("{ARCH}: QSA runs one sequence at a time");
+        }
+        let raw = self.k_proj.forward(h)?.to_dtype(DType::F32)?.reshape((t, self.head_dim))?;
+        let mut cache = self.keys.lock().expect("qsa keys poisoned");
+        let prior = cache.remove(&slot).filter(|c| c.len == pos);
+        let keys = match prior {
+            Some(c) => Tensor::cat(&[&c.keys, &raw], 0)?,
+            None if pos == 0 => raw,
+            None => {
+                tracing::warn!("{ARCH}: QSA has no indexer keys for slot {slot} at position {pos}; attending densely");
+                return Ok(None);
+            }
+        };
+        let l = pos + t;
+        cache.insert(slot, QsaKeys { len: l, keys: keys.clone() });
+        drop(cache);
+        // TITAN_QSA=0: dense causal attention (debug comparison against the selection)
+        if l <= self.budget + self.ratio - 1 || !mistralrs_quant::titan_cfg::flag("TITAN_QSA", true) {
+            return Ok(None);
+        }
+        let dev = h.device();
+        let q = self.q_proj.forward(h)?.to_dtype(DType::F32)?.reshape((t, self.n_heads, self.head_dim))?;
+        let q = self.rope(&self.rms(&q, &self.q_norm)?, &(pos..l).collect::<Vec<_>>())?;
+        let nb = l / self.ratio;
+        let pooled = keys.narrow(0, 0, nb * self.ratio)?.reshape((nb, self.ratio, self.head_dim))?.mean(1)?;
+        let starts: Vec<usize> = (0..nb).map(|j| j * self.ratio).collect();
+        let pooled = self.rope(&self.rms(&pooled, &self.k_norm)?, &starts)?; // (nb, head_dim)
+        let scores = q.reshape((t * self.n_heads, self.head_dim))?.matmul(&pooled.t()?)?.relu()?;
+        let scores = (scores.reshape((t, self.n_heads, nb))?.sum(1)? / (self.head_dim as f64).sqrt())?; // (t, nb)
+        let top = self.budget / self.ratio;
+        // blocks a row cannot see (beyond its own complete blocks) score -inf
+        let nb_row: Vec<f32> = (0..t).map(|i| ((pos + i + 1) / self.ratio) as f32).collect();
+        let nb_row = Tensor::from_vec(nb_row, (t, 1), dev)?;
+        let block_ids = Tensor::arange(0f32, nb as f32, dev)?.unsqueeze(0)?;
+        let valid = block_ids.broadcast_lt(&nb_row)?;
+        let neg = Tensor::full(f32::NEG_INFINITY, (t, nb), dev)?;
+        let scores = valid.where_cond(&scores, &neg)?;
+        // k-th best score per row (rows with fewer blocks keep all of them)
+        let sorted = scores.sort_last_dim(false)?.0;
+        let k_row: Vec<u32> = (0..t).map(|i| (((pos + i + 1) / self.ratio).min(top).max(1) - 1) as u32).collect();
+        let thr = sorted.gather(&Tensor::from_vec(k_row, (t, 1), dev)?, 1)?;
+        let chosen = scores.broadcast_ge(&thr)?.mul(&valid)?; // (t, nb) u8
+        let tok = chosen.unsqueeze(2)?.repeat((1, 1, self.ratio))?.reshape((t, nb * self.ratio))?;
+        let tok = if nb * self.ratio < l { Tensor::cat(&[&tok, &Tensor::zeros((t, l - nb * self.ratio), DType::U8, dev)?], 1)? } else { tok };
+        // the tail: keys at or after the row's last complete block, up to the row itself
+        let cols = Tensor::arange(0f32, l as f32, dev)?.unsqueeze(0)?;
+        let tail_from = (nb_row * self.ratio as f64)?;
+        let row_pos = Tensor::from_vec((0..t).map(|i| (pos + i) as f32).collect::<Vec<_>>(), (t, 1), dev)?;
+        let tail = cols.broadcast_ge(&tail_from)?.mul(&cols.broadcast_le(&row_pos)?)?;
+        let allowed = (tok + tail)?.gt(0u8)?;
+        let zero = Tensor::zeros((t, l), dtype, dev)?;
+        let ninf = Tensor::full(f32::NEG_INFINITY, (t, l), dev)?.to_dtype(dtype)?;
+        Ok(Some(allowed.where_cond(&zero, &ninf)?))
+    }
+}

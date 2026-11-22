@@ -28,7 +28,7 @@ use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::{
     EitherCache, ForwardMaskCache, KvCache, ModelForwardContext, RecurrentBatchKind, RecurrentMetadata,
 };
-use super::qwen4exp_parts::{self as q4x, HcMix, Ple};
+use super::qwen4exp_parts::{self as q4x, HcMix, Ple, Qsa};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -501,6 +501,8 @@ impl QEmbedding {
 }
 
 struct FullAttention {
+    /// a custom mask carries more than causality (qwen4exp QSA): never take the mask-free flash prefill
+    exact_mask: bool,
     wq: Arc<dyn QuantMethod>,
     wk: Arc<dyn QuantMethod>,
     wv: Arc<dyn QuantMethod>,
@@ -586,6 +588,7 @@ impl FullAttention {
         }
         let rows = q.dim(2)?;
         if matches!(mask, AttentionMask::Custom(_))
+            && !self.exact_mask
             && rows > MTP_CATCHUP_MAX_ROWS
             && crate::attention::flash_prefill_wanted(rows, k.dim(2)?)
             && crate::attention::flash_prefill_supported(q, k, v, &self.sdpa_params)
@@ -1295,6 +1298,8 @@ struct DecoderLayer {
     hc: Option<(HcMix, HcMix)>,
     /// qwen4exp: the PLE n-gram block added to the streams before this layer's mixer
     ple: Option<Ple>,
+    /// qwen4exp: the QSA indexer of a full-attention layer
+    qsa: Option<Qsa>,
 }
 
 pub struct ModelWeights {
@@ -1364,6 +1369,8 @@ pub(crate) fn prefill_chunk_size() -> usize {
 /// the 1 GiB tiered reserve; 1024 was ~3% faster to prefill but failed 13k-token prompts at 16k context
 /// and 30k-token prompts at 32k context once decode steps had fragmented the pool.
 const DEFAULT_PREFILL_CHUNK: usize = 512;
+/// qwen4exp: layers whose hyper-connection streams `TITAN_LAYER_DUMP_BIN` records (they are 4x wider).
+const HC_DUMP_LAYERS: usize = 8;
 /// Granularity (tokens) of the KV room a chunked prompt reserves up front (see `kv_reserve_len`; also `titan_admit`'s).
 pub(crate) const KV_RESERVE_STEP: usize = 8192;
 /// Device memory `kv_reserve_len` leaves for the prompt's activations before it takes a whole bucket.
@@ -2170,6 +2177,7 @@ fn load_full_attention<R: std::io::Seek + std::io::Read>(
     dtype: DType,
 ) -> Result<FullAttention> {
     Ok(FullAttention {
+        exact_mask: false,
         wq: prism.load_linear(ct, &format!("{prefix}.attn_q.weight"), device)?,
         wk: prism.load_linear(ct, &format!("{prefix}.attn_k.weight"), device)?,
         wv: prism.load_linear(ct, &format!("{prefix}.attn_v.weight"), device)?,
@@ -2652,7 +2660,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     HcMix::load(&mut ct, &format!("{prefix}.hc_ffn"), hc_count, hc_rank, eps, device)?,
                 );
                 let ple = if ple_layers.contains(&layer_idx) { Some(Ple::load(&mut ct, layer_idx, hc_count, eps, device)?) } else { None };
-                layers.push(DecoderLayer { mixer, attn_norm: unit_norm(device)?, post_attention_norm: unit_norm(device)?, ffn, hc: Some(hc), ple });
+                let qsa = if is_attn[layer_idx] && Qsa::applies(&ct, layer_idx) {
+                    Some(Qsa::load(&mut ct, layer_idx, rope_dim, rope_freq_base, eps, device)?)
+                } else {
+                    None
+                };
+                let mixer = match mixer {
+                    Mixer::Attention(mut a) => {
+                        a.exact_mask = true;
+                        Mixer::Attention(a)
+                    }
+                    m => m,
+                };
+                layers.push(DecoderLayer { mixer, attn_norm: unit_norm(device)?, post_attention_norm: unit_norm(device)?, ffn, hc: Some(hc), ple, qsa });
                 continue;
             }
             layers.push(DecoderLayer {
@@ -2668,6 +2688,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 ffn,
                 hc: None,
                 ple: None,
+                qsa: None,
             });
         }
 
@@ -3124,14 +3145,31 @@ impl ModelWeights {
             let (hc_attn, hc_ffn) = layer.hc.as_ref().expect("qwen4exp layers carry hyper-connections");
             if let Some(ple) = &layer.ple {
                 x = ple.forward(&x, &ids_host, slot, pos)?;
+                if i < HC_DUMP_LAYERS {
+                    layer_dump_bin(2000 + i, pos, &x)?;
+                }
             }
             let (h, inject) = hc_attn.mix(&x)?;
             let h = h.to_dtype(out_dtype)?;
-            let h = self.run_mixer(layer, i, &h, hybrid_cache.get_mut(i), &recurrent_metadata, &mask.get(h.device()), ctx, conv_carry)?;
+            let qsa_mask = match &layer.qsa {
+                Some(qsa) => qsa.mask(&h, slot, pos, self.dtype)?.map(AttentionMask::Custom),
+                None => None,
+            };
+            let layer_mask = match &qsa_mask {
+                Some(m) => m,
+                None => &mask.get(h.device()),
+            };
+            let h = self.run_mixer(layer, i, &h, hybrid_cache.get_mut(i), &recurrent_metadata, layer_mask, ctx, conv_carry)?;
             x = q4x::hc_combine(&x, &h, &inject.expect("layer mixers inject"))?;
+            if i < HC_DUMP_LAYERS {
+                layer_dump_bin(1000 + i, pos, &x)?;
+            }
             let (h, inject) = hc_ffn.mix(&x)?;
             let h = layer.ffn.forward(&h.to_dtype(out_dtype)?)?;
             x = q4x::hc_combine(&x, &h, &inject.expect("layer mixers inject"))?;
+            if i < HC_DUMP_LAYERS {
+                layer_dump_bin(i, pos, &x)?;
+            }
         }
         drop(hybrid_cache);
         let (out, _) = head.mix(&x.to_device(&self.device)?)?;
@@ -4926,7 +4964,8 @@ impl ModelWeights {
     /// Host copies of the caches of `seq`, which just finished (alone or in a batch): its attention KV, the
     /// recurrent state at its end and the points saved during its prompt passes.
     pub(crate) fn prefix_export(&self, seq: &crate::sequence::Sequence) -> Result<Option<HybridPrefixEntry>> {
-        if !crate::prefix_cacher::hybrid_prefix_cache_on() {
+        // qwen4exp's PLE and QSA keep per-slot history outside the hybrid cache, which a resume would not restore
+        if !crate::prefix_cacher::hybrid_prefix_cache_on() || self.hc_head.is_some() {
             return Ok(None);
         }
         let toks = seq.get_toks();
