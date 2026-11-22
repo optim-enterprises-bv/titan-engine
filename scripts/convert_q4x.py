@@ -37,12 +37,21 @@ ggml.ggml_quantize_init.argtypes = [ctypes.c_int]
 ggml.ggml_quantize_requires_imatrix.restype = ctypes.c_bool
 ggml.ggml_quantize_requires_imatrix.argtypes = [ctypes.c_int]
 
+# llama-imatrix GGUF: per tensor "<name>.in_sum2" [n_experts, n_per_row] and "<name>.counts" [n_experts]; the
+# importance is in_sum2 / counts per expert (llama-quantize's normalisation), keyed by the full tensor name
 IMATRIX = {}
 if os.environ.get("IMATRIX"):
     r = gguf.GGUFReader(os.environ["IMATRIX"])
-    for t in r.tensors:
-        if t.name.endswith(".in_sum2"):
-            IMATRIX[t.name[: -len(".in_sum2")]] = np.asarray(t.data, dtype=np.float32).reshape(-1)
+    raw = {t.name: np.asarray(t.data, dtype=np.float32) for t in r.tensors}
+    for name, sums in raw.items():
+        if not name.endswith(".in_sum2"):
+            continue
+        base = name[: -len(".in_sum2")]
+        counts = raw.get(base + ".counts", np.ones(1, np.float32)).reshape(-1)
+        sums = sums.reshape(len(counts), -1)
+        IMATRIX[base] = np.where(counts[:, None] > 0, sums / np.maximum(counts[:, None], 1), 1.0).astype(np.float32)
+# 256-value block types: rows narrower than a whole number of blocks (the 640-wide expert down rows) are zero-padded
+PAD_ROWS = os.environ.get("PAD_ROWS", "1") == "1"
 CURRENT = {"name": None}
 
 orig_quantize = gguf.quants.quantize
@@ -55,15 +64,24 @@ def ggml_quantize(data, qtype):
     name = CURRENT["name"]
     if isinstance(data, gguf.LazyNumpyTensor):
         def shape_fn(shape):
-            return (*shape[:-1], ggml.ggml_row_size(int(qtype), shape[-1]))
+            return (*shape[:-1], ggml.ggml_row_size(int(qtype), padded(shape[-1], qtype)))
         lazy = gguf.LazyNumpyTensor._wrap_fn(lambda d: ggml_quantize_eager(d, qtype, name), meta_noop=(np.uint8, shape_fn))
         return lazy(data)
     return ggml_quantize_eager(data, qtype, name)
 
 
+def padded(n, qtype):
+    blk = gguf.GGML_QUANT_SIZES[qtype][0]
+    return -(-n // blk) * blk if PAD_ROWS and n % blk else n
+
+
 def ggml_quantize_eager(data: np.ndarray, qtype, name) -> np.ndarray:
     data = np.ascontiguousarray(data, dtype=np.float32)
-    n_per_row = data.shape[-1]
+    n_in = data.shape[-1]
+    n_per_row = padded(n_in, qtype)
+    if n_per_row != n_in:
+        pad = np.zeros((*data.shape[:-1], n_per_row - n_in), np.float32)
+        data = np.ascontiguousarray(np.concatenate([data, pad], axis=-1))
     nrows = data.size // n_per_row
     rb = ggml.ggml_row_size(int(qtype), n_per_row)
     out = np.empty((nrows, rb), dtype=np.uint8)
@@ -80,7 +98,10 @@ def ggml_quantize_eager(data: np.ndarray, qtype, name) -> np.ndarray:
         w = None
         if imat is not None:
             e = r0 // rows_per_expert
-            w = imat[e * n_per_row:(e + 1) * n_per_row] if imat.size >= experts * n_per_row and experts > 1 else imat[:n_per_row]
+            w = imat[e] if imat.shape[0] == experts else imat[0]
+            if w.size < n_per_row:
+                # padded columns hold zeros; a tiny weight keeps the block searches well defined
+                w = np.concatenate([w, np.full(n_per_row - w.size, max(float(w.mean()), 1e-8) * 1e-3, np.float32)])
             w = np.ascontiguousarray(w, dtype=np.float32)
         src = flat[r0:r1]
         dst = out[r0:r1]
@@ -102,9 +123,13 @@ base_force = qwen4exp.Qwen4ExpTextModel.tensor_force_quant
 
 
 def force_quant(self, name, new_name, bid, n_dims):
-    CURRENT["name"] = new_name.removesuffix(".weight")
+    CURRENT["name"] = new_name
     if "_exps" in new_name and n_dims >= 2:
-        return POLICY["down"] if "ffn_down" in new_name else POLICY["gate_up"]
+        q = POLICY["down"] if "ffn_down" in new_name else POLICY["gate_up"]
+        if ggml.ggml_quantize_requires_imatrix(int(q)) and new_name not in IMATRIX:
+            # e.g. the MTP block, which an imatrix run never reaches
+            return Q.Q2_K
+        return q
     if new_name.startswith("per_layer_token_embd"):
         return POLICY["ngram"]
     if new_name in ("token_embd.weight", "output.weight"):
