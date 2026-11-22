@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 /// iq3xxs_grid in global memory (read through a raw pointer from the kernels).
 pub static IQ3XXS_GRID: [u32; 256] = include!("iq3xxs_grid.rs");
+/// iq2xs_grid in global memory: entry i is words 2i (low 4 bytes) and 2i + 1 (high 4 bytes).
+pub static IQ2XS_GRID: [u32; 1024] = include!("iq2xs_grid.rs");
 
 #[cuda_module]
 mod kernels {
@@ -96,7 +98,11 @@ mod kernels {
     const Q2K_BYTES: usize = 84;
     const Q2K_QS: usize = 16;
     const Q2K_DM: usize = 80;
-    /// Shared by IQ3_XXS, IQ4_XS, Q3_K and Q2_K.
+    /// GGML IQ2_XS (type 17): half d, 32 u16 grid/sign codes, 8 scale bytes, 74 bytes (2-byte aligned).
+    /// qi 16, vdr 2 -> 8 threads per block, 16 blocks per iteration.
+    const FMT_IQ2_XS: u32 = 11;
+    const IQ2_XS_BYTES: usize = 74;
+    /// Shared by IQ3_XXS, IQ4_XS, Q3_K, Q2_K and IQ2_XS.
     const IQK_THREADS_PER_BLOCK: usize = 8;
     const IQK_BLOCKS_PER_ITER: usize = 16;
     /// Shared by Q4_K and Q5_K: scales start at word 1.
@@ -519,6 +525,44 @@ mod kernels {
         fma::<FTZ>(half_lo(ld16(b, Q3K_D)), sumf, tmp)
     }
 
+    #[inline(always)]
+    fn iq2xs_grid(i: u32, hi: u32) -> u32 {
+        unsafe { *(&raw const super::IQ2XS_GRID as *const u32).add((2 * (i & 511) + hi) as usize) }
+    }
+
+    /// `tmp += vec_dot_iq2_xs_q8_1(...)`: four 9-bit grid codes with 7-bit sign groups, the first two against Q8_1
+    /// words 0..4 (scale nibble lo), the last two against 4..8 (hi), `sumi = (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4`,
+    /// then `fma.ftz(mul.ftz(d, d8), (float)sumi, tmp)`.
+    /// SAFETY: `b` starts an IQ2_XS block, `xb` its 8 Q8_1 blocks; `iqs` even, < 16.
+    #[inline(always)]
+    unsafe fn acc_iq2_xs<const FTZ: bool>(tmp: f32, b: *const u8, x: &[u32], xb: usize, iqs: usize) -> f32 {
+        let bq8 = xb + (iqs / 2) * Q8_WORDS;
+        let sc = *b.add(66 + iqs / 2) as i32;
+        let (ls0, ls1) = (sc & 0x0F, sc >> 4);
+        let mut sumi0 = 0i32;
+        let mut sumi1 = 0i32;
+        let mut l0 = 0;
+        while l0 < 8 {
+            let w = ld16(b, 2 + 4 * iqs + l0);
+            let signs = unpack_ksigns(w >> 9);
+            let s0 = vcmpne4_zero(signs & 0x0804_0201);
+            let s1 = vcmpne4_zero(signs & 0x8040_2010);
+            let g0 = vsub4(iq2xs_grid(w, 0) ^ s0, s0);
+            let g1 = vsub4(iq2xs_grid(w, 1) ^ s1, s1);
+            if l0 < 4 {
+                sumi0 = dotprod::dp4a_s32(g0, *x.get_unchecked(bq8 + 1 + l0), sumi0);
+                sumi0 = dotprod::dp4a_s32(g1, *x.get_unchecked(bq8 + 2 + l0), sumi0);
+            } else {
+                sumi1 = dotprod::dp4a_s32(g0, *x.get_unchecked(bq8 + 1 + l0), sumi1);
+                sumi1 = dotprod::dp4a_s32(g1, *x.get_unchecked(bq8 + 2 + l0), sumi1);
+            }
+            l0 += 2;
+        }
+        let sumi = (sumi0.wrapping_mul(ls0).wrapping_add(sumi1.wrapping_mul(ls1)).wrapping_add((sumi0 + sumi1) / 2)) / 4;
+        let d = mul::<FTZ>(half_lo(ld16(b, 0)), half_lo(*x.get_unchecked(bq8)));
+        fma::<FTZ>(d, sumi as f32, tmp)
+    }
+
     /// `tmp += vec_dot_q2_K_q8_1(...)` (vdr 2): per shift i the 2-bit quants against Q8_1 block `bq8_offset + i`,
     /// `sumf_d = fma.ftz(d8, sumi_d * sc, ..)`, `sumf_m = fma.ftz(d8, sumi_m * m, ..)` from +0, then ptxas's contraction
     /// of `dm.x*sumf_d - dm.y*sumf_m`, added to tmp.
@@ -672,8 +716,10 @@ mod kernels {
             };
         let x_base = input_row * (k_padded as usize / 32) * Q8_WORDS;
         let mut tmp = 0f32;
-        if FMT == FMT_IQ3_XXS || FMT == FMT_IQ4_XS || FMT == FMT_Q3K || FMT == FMT_Q2K {
-            let bb = if FMT == FMT_IQ3_XXS {
+        if FMT == FMT_IQ3_XXS || FMT == FMT_IQ4_XS || FMT == FMT_Q3K || FMT == FMT_Q2K || FMT == FMT_IQ2_XS {
+            let bb = if FMT == FMT_IQ2_XS {
+                IQ2_XS_BYTES
+            } else if FMT == FMT_IQ3_XXS {
                 IQ3_XXS_BYTES
             } else if FMT == FMT_IQ4_XS {
                 IQ4_XS_BYTES
@@ -696,6 +742,8 @@ mod kernels {
                     acc_iq4_xs::<FTZ>(tmp, b, x, xb, kqs)
                 } else if FMT == FMT_Q2K {
                     acc_q2k::<FTZ>(tmp, b, x, xb, kqs)
+                } else if FMT == FMT_IQ2_XS {
+                    acc_iq2_xs::<FTZ>(tmp, b, x, xb, kqs)
                 } else {
                     acc_q3k::<FTZ>(tmp, b, x, xb, kqs)
                 };
@@ -938,6 +986,13 @@ mod kernels {
                                     n: u32, k: u32, k_padded: u32, topk: u32, input_dim1: u32) {
         moe_gemv::<true, FMT_Q2K>(w, x, ids, slot_map, out, n, k, k_padded, topk, input_dim1)
     }
+    /// IQ2_XS: llama.cpp's `mul_mat_vec_q<GGML_TYPE_IQ2_XS, 1, false>` float program (fast-math).
+    #[kernel]
+    #[launch_bounds(128)]
+    pub unsafe fn iq2_xs_q8_1_moe_gemv(w: &[u32], x: &[u32], ids: &[u32], slot_map: &[u32], out: *mut f32,
+                                       n: u32, k: u32, k_padded: u32, topk: u32, input_dim1: u32) {
+        moe_gemv::<true, FMT_IQ2_XS>(w, x, ids, slot_map, out, n, k, k_padded, topk, input_dim1)
+    }
     /// Q4_K, mistralrs-quant's (--use_fast_math) float program.
     #[kernel]
     #[launch_bounds(128)]
@@ -1012,7 +1067,7 @@ fn ref_kernel(fmt: cpu::Format) -> &'static str {
         cpu::Format::Q6K => "indexed_moe_forward_q6k_q8_1",
         // llama.cpp mul_mat_vec_q<type, 1> (different ABI: launched by llama_gate, never by the main loop)
         cpu::Format::Q1_0 | cpu::Format::IQ4NL | cpu::Format::MXFP4 | cpu::Format::NVFP4 | cpu::Format::IQ3XXS
-        | cpu::Format::IQ4XS | cpu::Format::Q3K | cpu::Format::Q2K => "mul_mat_vec_q",
+        | cpu::Format::IQ4XS | cpu::Format::Q3K | cpu::Format::Q2K | cpu::Format::IQ2XS => "mul_mat_vec_q",
     }
 }
 
@@ -1029,6 +1084,7 @@ fn ox_kernel(fmt: cpu::Format) -> &'static str {
         cpu::Format::IQ4XS => "iq4_xs_q8_1_moe_gemv",
         cpu::Format::Q3K => "q3k_q8_1_moe_gemv",
         cpu::Format::Q2K => "q2k_q8_1_moe_gemv",
+        cpu::Format::IQ2XS => "iq2_xs_q8_1_moe_gemv",
     }
 }
 
@@ -1054,7 +1110,7 @@ fn adversarial_weights(fmt: cpu::Format, blocks: usize, seed: u64) -> Vec<u8> {
     let mut b: Vec<u8> = (0..blocks * bb).map(|_| r.next() as u8).collect();
     let halves: &[usize] = match fmt {
         cpu::Format::Q6K => &[208],
-        cpu::Format::Q1_0 | cpu::Format::IQ4NL | cpu::Format::IQ3XXS | cpu::Format::IQ4XS => &[0],
+        cpu::Format::Q1_0 | cpu::Format::IQ4NL | cpu::Format::IQ3XXS | cpu::Format::IQ4XS | cpu::Format::IQ2XS => &[0],
         cpu::Format::Q3K => &[108],
         cpu::Format::Q2K => &[80, 82],
         // the e byte is drawn above
@@ -1441,7 +1497,7 @@ fn main() {
     println!(
         "{}",
         if all_ok && skipped.is_empty() {
-            "KERNEL GATE: PASS (bit-identical, Q4_K + Q5_K + Q6_K + Q1_0 + IQ4_NL + MXFP4 + NVFP4 + IQ3_XXS + IQ4_XS + Q3_K + Q2_K, permuted slots)"
+            "KERNEL GATE: PASS (bit-identical, Q4_K + Q5_K + Q6_K + Q1_0 + IQ4_NL + MXFP4 + NVFP4 + IQ3_XXS + IQ4_XS + Q3_K + Q2_K + IQ2_XS, permuted slots)"
         } else if all_ok {
             "KERNEL GATE: PASS for what ran (skipped sections listed above)"
         } else {
@@ -1562,6 +1618,8 @@ const QWEN3_EXPS: &[(&str, usize, usize)] = &[
 /// Qwen3.6-35B-A3B UD-Q3_K_M experts (k, n): gate/up [2048 -> 512], down [512 -> 2048].
 const QWEN36_GATE_UP: &[(&str, usize, usize)] = &[("blk.1.ffn_gate_exps", 2048, 512), ("blk.20.ffn_up_exps", 2048, 512)];
 const QWEN36_DOWN: &[(&str, usize, usize)] = &[("blk.1.ffn_down_exps", 512, 2048), ("blk.20.ffn_down_exps", 512, 2048)];
+/// Rows per CUDA block of the reference IQ2_XS mmvq at ncols_dst 1 (llama.cpp mmvq_two_rows_ncols1).
+const IQ2_XS_REF_ROWS: usize = 1;
 const QWEN38_Q2K: &[(&str, usize, usize)] = &[("blk.5.ffn_gate_exps", 2560, 640)];
 const QWEN36_Q3K: &[(&str, usize, usize)] = &[("blk.40.ffn_gate_exps", 2048, 512)];
 
@@ -1589,6 +1647,9 @@ fn llama_specs() -> Vec<LlamaSpec> {
         // Qwen3.8-Flash-Next gate/up experts (k 2560 = 10 blocks, a partial iteration)
         LlamaSpec { fmt: cpu::Format::Q2K, name: "q2k", ggml_type: 10, env: "Q2K_EXPERTS", files: QWEN38_Q2K,
                     adversarial: &[(4096, 64), (2560, 64), (12288, 40), (4352, 33)], ref_rows: 2 },
+        // 768 = Qwen3.8 down rows zero-padded from 640
+        LlamaSpec { fmt: cpu::Format::IQ2XS, name: "iq2_xs", ggml_type: 17, env: "IQ2_XS_EXPERTS", files: &[],
+                    adversarial: &[(4096, 64), (2560, 64), (768, 64), (12288, 40), (4352, 33)], ref_rows: IQ2_XS_REF_ROWS },
     ]
 }
 

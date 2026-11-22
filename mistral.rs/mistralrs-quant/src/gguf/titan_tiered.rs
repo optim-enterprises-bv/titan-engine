@@ -448,6 +448,7 @@ impl TieredExperts {
                 | GgmlDType::IQ4XS
                 | GgmlDType::Q3K
                 | GgmlDType::Q2K
+                | GgmlDType::IQ2XS
         )
     }
 
@@ -950,6 +951,7 @@ impl TieredExperts {
             GgmlDType::IQ4XS => Format::IQ4XS,
             GgmlDType::Q3K => Format::Q3K,
             GgmlDType::Q2K => Format::Q2K,
+            GgmlDType::IQ2XS => Format::IQ2XS,
             _ => Format::Q4K,
         }
     }
@@ -979,7 +981,8 @@ impl TieredExperts {
     /// (gate and up) share one `QInput`, and with it one host copy for the CPU misses.
     pub fn quantize_input(&self, x: &Tensor) -> Result<QInput> {
         let (batch, input_dim1, k) = x.dims3()?;
-        if k != self.k {
+        // a narrower input meets weights whose rows the converter zero-padded (k_in < k): its Q8_1 rows pad with zeros
+        if k > self.k {
             candle_core::bail!("titan tiered experts: x {:?} vs k={}", x.dims(), self.k);
         }
         if x.dtype() != DType::F32 {
@@ -992,7 +995,7 @@ impl TieredExperts {
         };
         let x_slice = x_cuda.as_cuda_slice::<f32>()?;
         let rows = batch * input_dim1;
-        let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+        let k_padded = self.k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
         let q8_row_bytes = k_padded / 32 * Q8_1_BLOCK_BYTES;
         let xq = self.dev.alloc_zeros::<u8>(rows * q8_row_bytes)?;
         let (x_ptr, g0) = slice_ptr(x_slice, x_layout.start_offset());
@@ -1009,7 +1012,7 @@ impl TieredExperts {
         }
         .w()?;
         drop((g0, g1));
-        Ok(QInput { xq, host: None, batch, input_dim1, k, q8_row_bytes })
+        Ok(QInput { xq, host: None, batch, input_dim1, k: self.k, q8_row_bytes })
     }
 
     /// Whether any of these routed experts is served by the CPU (so the input must be on the host).
@@ -1044,7 +1047,7 @@ impl TieredExperts {
 
     /// Whether mmvq_moe_oxide.ptx has this dtype's `_moe_b1` / `_moe_mmvq` kernels (else the slot-map GEMV).
     fn has_mmvq_moe(&self) -> bool {
-        !matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ4XS | GgmlDType::Q3K | GgmlDType::Q2K)
+        !matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ4XS | GgmlDType::Q3K | GgmlDType::Q2K | GgmlDType::IQ2XS)
     }
 
     /// llama.cpp `should_use_small_k` at b = 1: fewer quant blocks per row than 4 warps cover in one
@@ -1079,6 +1082,7 @@ impl TieredExperts {
             GgmlDType::IQ4XS => "iq4_xs_q8_1_moe_gemv",
             GgmlDType::Q3K => "q3k_q8_1_moe_gemv",
             GgmlDType::Q2K => "q2k_q8_1_moe_gemv",
+            GgmlDType::IQ2XS => "iq2_xs_q8_1_moe_gemv",
             _ => unreachable!("checked in from_qtensor"),
         };
         (name, warp_rows)
@@ -1364,7 +1368,7 @@ impl TieredExperts {
         let expert = self.host_expert(e);
         let row_of = |r: usize| &expert[r * row_bytes..][..row_bytes];
         let end = (r0 + rows_per_chunk()).min(n);
-        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K) {
+        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K | Format::IQ2XS) {
             let rows: Vec<&[u8]> = (r0..end).map(row_of).collect();
             let mut vals = vec![0f32; end - r0];
             unsafe { titan_cpu::rows_lanes(fmt, &rows, xq_row, self.k, &mut vals) };

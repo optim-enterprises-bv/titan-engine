@@ -40,7 +40,7 @@ impl ExpertRows for TieredExperts {
         let expert = self.host_expert(e);
         let row_of = |r: usize| &expert[r * row_bytes..][..row_bytes];
         let simd = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
-        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K) {
+        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K | Format::IQ2XS) {
             let rows: Vec<&[u8]> = (r0..r1).map(row_of).collect();
             unsafe { titan_cpu::rows_lanes(fmt, &rows, xq_row, self.k, out) };
             return;
@@ -74,7 +74,7 @@ impl TieredExperts {
     /// three (so a task misses all three or none), no fingerprint slots, the down input is the gate/up output.
     pub(crate) fn onepass_ok(gate: &TieredExperts, up: &TieredExperts, down: &TieredExperts) -> bool {
         let projs = [gate, up, down];
-        if projs.iter().any(|p| p.policy != Policy::Static || p.flex > 0) || gate.n != up.n || down.k != gate.n || gate.k != up.k {
+        if projs.iter().any(|p| p.policy != Policy::Static || p.flex > 0) || gate.n != up.n || down.k < gate.n || gate.k != up.k {
             return false;
         }
         let maps: Vec<std::sync::MutexGuard<'_, Cache>> = projs.iter().map(|p| p.cache.lock().unwrap()).collect();
