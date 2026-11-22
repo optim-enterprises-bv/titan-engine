@@ -62,6 +62,53 @@ fn collect_shape() -> (u32, u32) {
     })
 }
 
+/// `TITAN_DOORBELL_STATS=1`: per forward width, the host thread's wait for the GPU publish, its CPU pass and the
+/// misses it computed (tasks and distinct experts), logged every 4096 layer jobs.
+fn stats_on() -> bool {
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_DOORBELL_STATS", false))
+}
+/// [jobs, wait ns, run ns, miss tasks, miss experts] per batch 1..=MAX_ROWS
+static STATS: Mutex<Vec<[u64; 5]>> = Mutex::new(Vec::new());
+fn stats_misses(batch: usize, tasks: usize, experts: usize) {
+    let mut s = STATS.lock().unwrap();
+    if s.len() <= batch {
+        s.resize(batch + 1, [0; 5]);
+    }
+    s[batch][3] += tasks as u64;
+    s[batch][4] += experts as u64;
+}
+fn stats_add(batch: usize, wait: std::time::Duration, run: std::time::Duration) {
+    let mut s = STATS.lock().unwrap();
+    if s.len() <= batch {
+        s.resize(batch + 1, [0; 5]);
+    }
+    s[batch][0] += 1;
+    s[batch][1] += wait.as_nanos() as u64;
+    s[batch][2] += run.as_nanos() as u64;
+    let total: u64 = s.iter().map(|r| r[0]).sum();
+    if total % 4096 == 0 {
+        let line: Vec<String> = s
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r[0] > 0)
+            .map(|(b, r)| {
+                let n = r[0] as f64;
+                format!(
+                    "b{b}: {} jobs, wait {:.3} ms, cpu {:.3} ms, {:.2} miss tasks, {:.2} miss experts",
+                    r[0], r[1] as f64 / n / 1e6, r[2] as f64 / n / 1e6, r[3] as f64 / n, r[4] as f64 / n
+                )
+            })
+            .collect();
+        let ph: Vec<u64> = super::super::titan_onepass_core::PHASE_NS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let n = ph[3].max(1) as f64;
+        tracing::info!(
+            "titan doorbell stats (per layer job): {}; cpu passes: gate/up {:.3} ms, swiglu {:.3} ms, down {:.3} ms",
+            line.join("; "), ph[0] as f64 / n / 1e6, ph[1] as f64 / n / 1e6, ph[2] as f64 / n / 1e6
+        );
+    }
+}
+
 pub(crate) fn enabled() -> bool {
     static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
     *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_DOORBELL", false))
@@ -397,12 +444,19 @@ impl Doorbell {
             let Some(job) = self.next_job() else {
                 return;
             };
-            let Some(s) = self.wait_pub(last) else {
+            let t_w = std::time::Instant::now();
+            let pubd = self.wait_pub(last);
+            let t_wait = t_w.elapsed();
+            let Some(s) = pubd else {
                 tracing::warn!("titan doorbell: no publish within {PUB_TIMEOUT:?}; job dropped");
                 continue;
             };
             last = s;
+            let t_run = std::time::Instant::now();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run(&job, &mut last)));
+            if stats_on() {
+                stats_add(job.batch, t_wait, t_run.elapsed());
+            }
             if r.is_err() {
                 tracing::error!("titan doorbell: CPU expert pass panicked");
                 self.failed.store(true, Ordering::Release);
@@ -432,6 +486,10 @@ impl Doorbell {
         }
         let misses = {
             let mut cache = gate.cache.lock().unwrap();
+            if stats_on() {
+                let m = Misses::new(ids, |e| cache.map[e as usize] == NOT_RESIDENT);
+                stats_misses(job.batch, m.tasks.len(), m.groups.len());
+            }
             if job.batch == 1 {
                 gate.score_predictions(&cache.map, ids);
             }

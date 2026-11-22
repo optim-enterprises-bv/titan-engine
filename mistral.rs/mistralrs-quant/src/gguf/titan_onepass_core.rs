@@ -23,7 +23,20 @@ pub trait ExpertRows: Sync {
     fn k(&self) -> usize;
     /// Rows `[r0, r1)` of expert `e` against one q8_1 input row.
     fn rows_into(&self, e: usize, r0: usize, r1: usize, xq_row: &[u8], out: &mut [f32]);
+    /// `rows_into` for several input rows of the same expert (`xq_rows[i]` -> `outs[i]`), the same bits per row; a
+    /// format with a multi-row kernel decodes each weight block once for all of them.
+    fn rows_into_multi(&self, e: usize, r0: usize, r1: usize, xq_rows: &[&[u8]], outs: &mut [&mut [f32]]) {
+        for (x, o) in xq_rows.iter().zip(outs.iter_mut()) {
+            self.rows_into(e, r0, r1, x, o);
+        }
+    }
 }
+
+/// Diagnostics: nanoseconds in gate/up, the SwiGLU and down of mode-1 passes, and the pass count.
+pub static PHASE_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Input rows handed to one `rows_into_multi` call.
+const MULTI_ROWS: usize = 8;
 
 /// The missed tasks of one layer, grouped by expert: output row `i` belongs to `tasks[i]`.
 pub struct Misses {
@@ -96,9 +109,11 @@ pub fn gate_up_rows<'a, P: ExpertRows>(
         let (e, i0, cnt) = misses.groups[gi];
         let (r0, r1) = (c * chunk, ((c + 1) * chunk).min(ng));
         let (proj, dst) = if p == 0 { (gate, g) } else { (up, u) };
-        for i in i0..i0 + cnt {
-            let o = unsafe { dst.range(i * ng + r0, r1 - r0) };
-            proj.rows_into(e as usize, r0, r1, x(misses.tasks[i]), o);
+        for c0 in (i0..i0 + cnt).step_by(MULTI_ROWS) {
+            let c1 = (c0 + MULTI_ROWS).min(i0 + cnt);
+            let xs: Vec<&[u8]> = (c0..c1).map(|i| x(misses.tasks[i])).collect();
+            let mut os: Vec<&mut [f32]> = (c0..c1).map(|i| unsafe { dst.range(i * ng + r0, r1 - r0) }).collect();
+            proj.rows_into_multi(e as usize, r0, r1, &xs, &mut os);
         }
     });
 }
@@ -112,9 +127,11 @@ pub fn down_rows<'a, P: ExpertRows>(down: &P, misses: &Misses, a: &(dyn Fn(usize
         let (gi, c) = (w / chunks, w % chunks);
         let (e, i0, cnt) = misses.groups[gi];
         let (r0, r1) = (c * chunk, ((c + 1) * chunk).min(nd));
-        for i in i0..i0 + cnt {
-            let o = unsafe { out.range(i * nd + r0, r1 - r0) };
-            down.rows_into(e as usize, r0, r1, a(i), o);
+        for c0 in (i0..i0 + cnt).step_by(MULTI_ROWS) {
+            let c1 = (c0 + MULTI_ROWS).min(i0 + cnt);
+            let xs: Vec<&[u8]> = (c0..c1).map(&a).collect();
+            let mut os: Vec<&mut [f32]> = (c0..c1).map(|i| unsafe { out.range(i * nd + r0, r1 - r0) }).collect();
+            down.rows_into_multi(e as usize, r0, r1, &xs, &mut os);
         }
     });
 }
@@ -171,15 +188,23 @@ pub fn onepass<'a, P: ExpertRows>(
         });
         return;
     }
+    let t0 = std::time::Instant::now();
     let mut g = vec![0f32; m * ng];
     let mut u = vec![0f32; m * ng];
     gate_up_rows(gate, up, misses, x, Out(g.as_mut_ptr()), Out(u.as_mut_ptr()), chunk, par);
+    let t1 = std::time::Instant::now();
     let mut qa = vec![0u8; m * qa_bytes];
     let mut act = vec![0f32; ng];
     for i in 0..m {
         activate(&g[i * ng..(i + 1) * ng], &u[i * ng..(i + 1) * ng], &mut act, &mut qa[i * qa_bytes..(i + 1) * qa_bytes]);
     }
+    let t2 = std::time::Instant::now();
     down_rows(down, misses, &|i| &qa[i * qa_bytes..(i + 1) * qa_bytes], outp, chunk, par);
+    use std::sync::atomic::Ordering::Relaxed;
+    PHASE_NS[0].fetch_add((t1 - t0).as_nanos() as u64, Relaxed);
+    PHASE_NS[1].fetch_add((t2 - t1).as_nanos() as u64, Relaxed);
+    PHASE_NS[2].fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
+    PHASE_NS[3].fetch_add(1, Relaxed);
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
