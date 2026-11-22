@@ -77,11 +77,15 @@ fn cfg() -> &'static Cfg {
 
 type FnCache = Mutex<HashMap<(DeviceId, usize), CudaFunction>>;
 static FNS: OnceLock<FnCache> = OnceLock::new();
-const NAMES: [&str; 4] = [
+const NAMES: [&str; 7] = [
     "flash_decode_split_g8",
     "flash_decode_split_g16",
     "flash_decode_split_g24",
     "flash_decode_combine",
+    // F8E4M3 K/V (TITAN_KV_FP8): bit-identical to the bf16 kernels on the cache cast to bf16 (gate (0))
+    "flash_decode_split_g8_fp8",
+    "flash_decode_split_g16_fp8",
+    "flash_decode_split_g24_fp8",
 ];
 
 fn func(dev: &CudaDevice, idx: usize) -> Result<CudaFunction> {
@@ -114,9 +118,9 @@ fn supported(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> bool {
         st[3] == 1 && st[2] == HEAD_DIM && st[1] % 8 == 0 && t.layout().start_offset() % 8 == 0
     };
     q.device().is_cuda()
-        && [q.dtype(), k.dtype(), v.dtype()]
-            .iter()
-            .all(|t| *t == DType::BF16)
+        && q.dtype() == DType::BF16
+        && k.dtype() == v.dtype()
+        && matches!(k.dtype(), DType::BF16 | DType::F8E4M3)
         && b == 1
         && kb == 1
         && vb == 1
@@ -175,9 +179,19 @@ fn dptr(
     let Storage::Cuda(c) = &*st else {
         candle_core::bail!("flash-decode: tensor must live on CUDA");
     };
-    let s = c.as_cuda_slice::<half::bf16>()?;
-    let (p, _g) = s.device_ptr(stream);
-    Ok(p + (l.start_offset() * 2) as u64)
+    let p = match t.dtype() {
+        DType::F8E4M3 => {
+            let s = c.as_cuda_slice::<float8::F8E4M3>()?;
+            let (p, _g) = s.device_ptr(stream);
+            p
+        }
+        _ => {
+            let s = c.as_cuda_slice::<half::bf16>()?;
+            let (p, _g) = s.device_ptr(stream);
+            p
+        }
+    };
+    Ok(p + (l.start_offset() * t.dtype().size_in_bytes()) as u64)
 }
 
 /// Attention for query rows `q` (1, h, m, 256) where row `i` sees keys `< past + i + 1` of `k`, `v`
@@ -204,8 +218,10 @@ pub(crate) fn decode_rows(
     let stream = dev.cuda_stream();
     let (q_ptr, k_ptr, v_ptr) = (dptr(&q, &stream)?, dptr(k, &stream)?, dptr(v, &stream)?);
     let (k_hs, v_hs) = (k.stride()[1] as u64, v.stride()[1] as u64);
-    if (k_ptr | v_ptr) % 16 != 0 {
-        candle_core::bail!("flash-decode: K/V not 16-byte aligned");
+    // 16-byte K row loads (bf16), 8-byte ones (F8E4M3)
+    let fp8 = k.dtype() == DType::F8E4M3;
+    if (k_ptr | v_ptr) % if fp8 { 8 } else { 16 } != 0 {
+        candle_core::bail!("flash-decode: K/V rows misaligned");
     }
     let mut out = unsafe { dev.alloc::<half::bf16>(m * h * HEAD_DIM)? };
     let out_ptr = {
@@ -221,13 +237,13 @@ pub(crate) fn decode_rows(
         let g = n_rep * rows;
         let split = func(
             &dev,
-            if g <= 8 {
+            (if g <= 8 {
                 0
             } else if g <= 16 {
                 1
             } else {
                 2
-            },
+            }) + if fp8 { 4 } else { 0 },
         )?;
         let nq = rows * h;
         let part = unsafe { dev.alloc::<f32>(nq * nchunks * HEAD_DIM)? };

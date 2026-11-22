@@ -105,6 +105,15 @@ pub(crate) fn cuda_kv_fp8() -> bool {
     })
 }
 
+/// `TITAN_KV_PREALLOC=1`: a CUDA KV cache is allocated once at its full context (`max_seq_len`) on its first append
+/// and kept across resets. Grown caches reallocated and copied per 512-token step, and their outgrown buffers stayed in
+/// the stream-ordered pool, so a long prompt after a shorter one ran out of memory with the VRAM plan's KV reserve
+/// unused; one buffer of the planned size is exactly what the plan reserves.
+pub(crate) fn cuda_kv_prealloc() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_KV_PREALLOC", false))
+}
+
 impl KvCache {
     pub fn new_normal(dim: usize, max_seq_len: usize, capacity_seq_len: usize) -> Self {
         let k = SingleCache::new(dim, max_seq_len, capacity_seq_len);

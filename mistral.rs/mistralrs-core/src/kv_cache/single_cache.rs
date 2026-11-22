@@ -81,6 +81,13 @@ impl SingleCache {
 
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
+        // a preallocated CUDA buffer (TITAN_KV_PREALLOC) is kept: only its first `current_seq_len` rows are ever read
+        if self.capacity_seq_len == self.max_seq_len
+            && super::cuda_kv_prealloc()
+            && self.all_data.as_ref().is_some_and(|d| d.device().is_cuda())
+        {
+            return;
+        }
         self.all_data = None;
         // a reset cache starts small again: a capacity grown (or reserved) for an earlier, longer
         // sequence would otherwise be allocated in full by the next sequence's first append
@@ -128,6 +135,9 @@ impl SingleCache {
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
+            if src.device().is_cuda() && super::cuda_kv_prealloc() {
+                self.capacity_seq_len = self.max_seq_len;
+            }
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.capacity_seq_len;
             let ad = Tensor::zeros(shape, src.dtype(), src.device())?;

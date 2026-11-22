@@ -215,6 +215,7 @@ impl SegmentGraphs {
                 Ok(out)
             }
             Some(State::Warm(shapes)) => {
+                mistralrs_quant::titan_before_capture(&dev)?;
                 let free = trim_pool(&stream)?;
                 if inner.captured == 0 {
                     tracing::info!("titan graphs: first capture, {} MiB free", free >> 20);

@@ -68,6 +68,14 @@ struct Fns {
     g16: CudaFunction,
     g24: CudaFunction,
     comb: CudaFunction,
+    f8: [CudaFunction; 3],
+}
+
+/// OCP e4m3 to f32 (finite codes; 0x7f / 0xff are NaN and never generated).
+fn e4m3_f32(b: u8) -> f32 {
+    let s = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let (e, m) = (((b >> 3) & 0xf) as i32, (b & 7) as f32);
+    if e == 0 { s * (m / 8.0) * 2f32.powi(-6) } else { s * (1.0 + m / 8.0) * 2f32.powi(e - 7) }
 }
 
 /// One flash-decode call: split + combine for `rows` rows starting at query row `r0` of `dq`,
@@ -75,9 +83,22 @@ struct Fns {
 #[allow(clippy::too_many_arguments)]
 fn call(st: &CudaStream, f: &Fns, c: &Case, dq: &DeviceBuffer<u8>, dk: &DeviceBuffer<u8>, dv: &DeviceBuffer<u8>,
        r0: usize, rows: usize, l: usize, chunk: usize, reps: usize) -> (Vec<u16>, f64) {
+    call_k(st, f, c, dq, dk, dv, r0, rows, l, chunk, reps, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_k(st: &CudaStream, f: &Fns, c: &Case, dq: &DeviceBuffer<u8>, dk: &DeviceBuffer<u8>, dv: &DeviceBuffer<u8>,
+       r0: usize, rows: usize, l: usize, chunk: usize, reps: usize, fp8: bool) -> (Vec<u16>, f64) {
     let n_rep = c.n_heads / c.n_kv;
     let g = n_rep * rows;
-    let func = if g <= 8 { &f.g8 } else if g <= 16 { &f.g16 } else { &f.g24 };
+    let func = match (fp8, g <= 8, g <= 16) {
+        (false, true, _) => &f.g8,
+        (false, false, true) => &f.g16,
+        (false, false, false) => &f.g24,
+        (true, true, _) => &f.f8[0],
+        (true, false, true) => &f.f8[1],
+        (true, false, false) => &f.f8[2],
+    };
     assert!(g <= 24);
     let nchunks = l.div_ceil(chunk);
     let nq = rows * c.n_heads;
@@ -155,7 +176,7 @@ fn reference(c: &Case, dt: &Data, r: usize) -> Vec<f64> {
 }
 
 pub fn run() -> bool {
-    let root = format!("{}/titan-engine/oxide-kernels/flash-decode", std::env::var("HOME").unwrap());
+    let root = std::env::var("FD_ROOT").unwrap_or_else(|_| format!("{}/src/titan-engine/oxide-kernels/flash-decode", std::env::var("HOME").unwrap()));
     let ctx = kdiff::cuda_core::CudaContext::new(0).expect("cuda context");
     let st = ctx.default_stream();
     let m = ctx.load_module_from_file(&format!("{root}/flash_decode.ptx")).expect("load flash_decode.ptx");
@@ -164,7 +185,67 @@ pub fn run() -> bool {
         g16: m.load_function("flash_decode_split_g16").unwrap(),
         g24: m.load_function("flash_decode_split_g24").unwrap(),
         comb: m.load_function("flash_decode_combine").unwrap(),
+        f8: [
+            m.load_function("flash_decode_split_g8_fp8").unwrap(),
+            m.load_function("flash_decode_split_g16_fp8").unwrap(),
+            m.load_function("flash_decode_split_g24_fp8").unwrap(),
+        ],
     };
+    // (0) F8E4M3 cache, bit for bit: the fp8 kernels against the bf16 kernels on the same cache cast to bf16
+    {
+        let (mut n8, mut bad8) = (0usize, 0usize);
+        let mut rng = Rng(0x5EED_F8F8_0123_4567);
+        for &(n_heads, n_kv) in &[(16usize, 2usize), (8, 1)] {
+            for &l in &[1usize, 3, 128, 129, 1000, 4099, 13000] {
+                let n_rep = n_heads / n_kv;
+                for rows in 1..=(24 / n_rep).clamp(1, 3) {
+                    if rows > l {
+                        continue;
+                    }
+                    let c = Case { n_heads, n_kv, l, rows, cap: l + 37, qmul: 2.0 };
+                    let base = make(&mut rng, &c);
+                    let mut k8 = vec![0x7fu8; n_kv * c.cap * D];
+                    let mut v8 = vec![0x7fu8; n_kv * c.cap * D];
+                    let mut kb = vec![0x7fc1u16; n_kv * c.cap * D];
+                    let mut vb = vec![0x7fc1u16; n_kv * c.cap * D];
+                    for h in 0..n_kv {
+                        for t in 0..l {
+                            for d in 0..D {
+                                let i = (h * c.cap + t) * D + d;
+                                let mut pick = || loop {
+                                    let b = (rng.next() >> 56) as u8;
+                                    if b & 0x7f != 0x7f {
+                                        break b;
+                                    }
+                                };
+                                k8[i] = pick();
+                                v8[i] = pick();
+                                kb[i] = bf16_bits(e4m3_f32(k8[i]));
+                                vb[i] = bf16_bits(e4m3_f32(v8[i]));
+                            }
+                        }
+                    }
+                    let dq = DeviceBuffer::from_host(&st, &kdiff::as_bytes(&base.q)).unwrap();
+                    let (dkb, dvb) = (DeviceBuffer::from_host(&st, &kdiff::as_bytes(&kb)).unwrap(), DeviceBuffer::from_host(&st, &kdiff::as_bytes(&vb)).unwrap());
+                    let (dk8, dv8) = (DeviceBuffer::from_host(&st, &k8).unwrap(), DeviceBuffer::from_host(&st, &v8).unwrap());
+                    for &chunk in &[128usize, 256] {
+                        let (a, _) = call_k(&st, &f, &c, &dq, &dkb, &dvb, 0, rows, l, chunk, 0, false);
+                        let (b, _) = call_k(&st, &f, &c, &dq, &dk8, &dv8, 0, rows, l, chunk, 0, true);
+                        n8 += 1;
+                        if a != b {
+                            bad8 += 1;
+                            let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+                            println!("FP8 MISMATCH heads {n_heads}/{n_kv} l {l} rows {rows} chunk {chunk}: {diff} of {} values", a.len());
+                        }
+                    }
+                }
+            }
+        }
+        println!("fp8: {n8} launches bit-identical to the bf16 kernel on the cast cache: {}", if bad8 == 0 { "PASS" } else { "FAIL" });
+        if bad8 > 0 {
+            return false;
+        }
+    }
     let mut rng = Rng(0xF1A5_4DEC);
     let mut ok = true;
     let (mut n_acc, mut worst, mut n_exact, mut n_exact_fail, mut n_mut, mut n_mut_caught) = (0usize, 0f64, 0usize, 0usize, 0usize, 0usize);

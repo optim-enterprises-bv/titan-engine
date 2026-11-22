@@ -45,6 +45,14 @@ pub(crate) fn free_leaked<K, T>(m: &std::sync::OnceLock<std::sync::Mutex<std::co
     }
 }
 
+/// Retire the prefill-streaming staging ring (it waits on its copy stream) before a CUDA graph capture: inside a
+/// capture that cross-stream wait is illegal (CUDA_ERROR_STREAM_CAPTURE_ISOLATION) and the doorbell's MoE path
+/// would otherwise run it on the first decode step after a streamed prompt.
+#[cfg(feature = "cuda")]
+pub fn titan_before_capture(dev: &candle_core::cuda::CudaDevice) -> candle_core::Result<()> {
+    titan_pfs::idle(dev, 1)
+}
+
 /// Model unload: stop every titan thread, free the titan buffers (doorbell and pfs pinned memory, staging ring,
 /// kernel workspaces) and reset the per-model statics, so the next model starts as in a fresh process.
 #[cfg(feature = "cuda")]
