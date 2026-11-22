@@ -110,3 +110,10 @@ doc = "GGML type 17: half d, 32 u16 (9-bit iq2xs_grid index | 7 sign bits), 8 sc
 id = 11
 prefix = "iq2_xs"
 ftz = true
+
+[[twin.variant]]
+name = "IQ2XXS"
+doc = "GGML type 16: half d, 8 x (4 iq2xxs_grid index bytes + u32 of 4 x 7 sign bits | 4-bit scale) (66 bytes)."
+id = 12
+prefix = "iq2_xxs"
+ftz = true
