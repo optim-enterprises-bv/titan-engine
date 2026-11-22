@@ -692,14 +692,40 @@ impl Moe {
         let act = match self.gate_up_mmq(flat, &ids, gate_up, hp)? {
             Some(act) => act,
             None => {
-                let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, &ids)?.to_dtype(DType::F32)?; // (T, k, 2F)
-                if let Some(s) = per_slot(&self.experts.gate_up_scale_t)? {
-                    gu = gu.broadcast_mul(&s)?;
+                let gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, &ids)?.to_dtype(DType::F32)?; // (T, k, 2F)
+                let reference = || -> Result<Tensor> {
+                    let gu = match per_slot(&self.experts.gate_up_scale_t)? {
+                        Some(s) => gu.broadcast_mul(&s)?,
+                        None => gu.clone(),
+                    };
+                    situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()
+                };
+                #[cfg(feature = "cuda")]
+                if gu.device().is_cuda() && fused_part("SITU") {
+                    let a = crate::titan_inkling::situ(&gu, &ids, self.experts.gate_up_scale_t.as_ref(), hp.situ_beta as f32, hp.situ_lb as f32)?;
+                    check("situ", &a, reference)?;
+                    a
+                } else {
+                    reference()?
                 }
-                situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?
+                #[cfg(not(feature = "cuda"))]
+                reference()?
             }
         };
-        let mut y = down.indexed_moe_forward(&act, &ids)?.to_dtype(DType::F32)?; // (T, k, E)
+        let y = down.indexed_moe_forward(&act, &ids)?.to_dtype(DType::F32)?; // (T, k, E)
+        #[cfg(feature = "cuda")]
+        if y.device().is_cuda() && fused_part("WSUM") {
+            let out = crate::titan_inkling::wsum(&y, &topk.values, &ids, self.experts.down_scale_t.as_ref())?;
+            check("wsum", &out, || {
+                let mut w = topk.values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
+                if let Some(s) = per_slot(&self.experts.down_scale_t)? {
+                    w = w.mul(&s)?;
+                }
+                y.broadcast_mul(&w)?.sum(1)
+            })?;
+            return Ok(out);
+        }
+        let mut y = y;
         let mut w = topk.values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
         if let Some(s) = per_slot(&self.experts.down_scale_t)? {
             w = w.mul(&s)?;
@@ -1422,6 +1448,17 @@ impl Prof {
 /// Mix a cross-pass message into a looped layer input: `(1 - forget) * cur + gain * message`, both
 /// gated on `cur` and the message.
 fn control(cur: &Tensor, message: &Tensor, ctrl: &(Tensor, Tensor, Tensor)) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if cur.device().is_cuda() && fused_part("CTRL") {
+        let (down, gain, forget) = ctrl;
+        let y = crate::titan_inkling::control(cur, message, down, gain, forget, MIX_EPS as f32)?;
+        check("ctrl", &y, || control_ref(cur, message, ctrl))?;
+        return Ok(y);
+    }
+    control_ref(cur, message, ctrl)
+}
+
+fn control_ref(cur: &Tensor, message: &Tensor, ctrl: &(Tensor, Tensor, Tensor)) -> Result<Tensor> {
     let (down, gain, forget) = ctrl;
     let gate = mm_t(&Tensor::cat(&[rms_rows(cur, MIX_EPS)?, rms_rows(message, MIX_EPS)?], D::Minus1)?, down)?;
     let gain = mm_t(&gate, gain)?.tanh()?;
