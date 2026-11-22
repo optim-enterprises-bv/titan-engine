@@ -80,7 +80,7 @@ pub(super) fn titan_arch(paths: &dyn ModelPaths) -> Result<Option<String>> {
         _ => return Ok(None),
     };
     let titan = match arch.as_str() {
-        "qwen35moe" | "qwen35" | "qwen3next" | "gpt-oss" | "kimi-linear" | "inkling2" | "inkling2_loop" => true,
+        "qwen35moe" | "qwen35" | "qwen3next" | "qwen4exp" | "gpt-oss" | "kimi-linear" | "inkling2" | "inkling2_loop" => true,
         "qwen3moe" => mistralrs_quant::TieredExperts::enabled(),
         _ => false,
     };
@@ -158,7 +158,9 @@ pub(super) fn load(
         readers.push(std::fs::File::open(filename)?);
     }
     // titan tiered experts read host experts in place from the page cache (TITAN_TIERED_MMAP=1)
-    let mmaps = if mistralrs_quant::TieredExperts::mmap_enabled() {
+    // qwen4exp's PLE n-gram table (tens of GB) is read in place from the mmap
+    let needs_mmap = arch_name == "qwen4exp";
+    let mmaps = if mistralrs_quant::TieredExperts::mmap_enabled() || needs_mmap {
         readers
             .iter()
             .map(|f| {
@@ -188,7 +190,7 @@ pub(super) fn load(
     let mut num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
     if matches!(
         arch,
-        GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next
+        GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp
     ) {
         // the nextn (MTP) blocks are not trunk layers; the model loads them on the main device
         num_layers -= crate::models::quantized_qwen35_moe::nextn_predict_layers(
@@ -339,7 +341,7 @@ pub(super) fn load(
             attention,
             internal_dtype,
         )?),
-        GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next => {
+        GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp => {
             Model::Qwen35MoE(QQwen35MoE::from_gguf(
                 model,
                 device,
