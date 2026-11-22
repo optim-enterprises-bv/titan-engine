@@ -165,6 +165,20 @@ for bit (`oxide-kernels/mmvq-rows/src/gate.rs` checks this against nvcc). They a
 `TITAN_VERIFY_MMQ` (on by default) sends verification to the MMQ tile instead; set it to 0 for the row-exact kernels. The Q4_K / Q5_K two-row kernels are capped at 48 registers (`#[launch_bounds]`): at 56
 the lost occupancy made one two-row launch slower than two one-row launches.
 
+### Automatic paths
+The loader turns on every path the model supports from the GGUF itself (`titan_cfg::set_auto`), so a plain
+`serve` needs no `TITAN_*` settings; an explicit setting (environment or a swap config's `[models.titan.env]`)
+overrides any of them, and the log lists each with what overrode it:
+- MoE (`qwen35moe`, `qwen3moe`, `qwen3next`, `gpt-oss`, `qwen4exp`): tiered experts with the auto GPU fraction, PFS,
+  the doorbell and one-pass CPU misses; an `expert-profile.txt` next to the GGUF (or `<file>.expert-profile.txt`) as
+  the hotness profile; files larger than 60% of RAM keep host experts in the mmap with 2048-token prefill chunks
+  and a 3.5 GiB reserve.
+- `qwen35moe`, `qwen35`, `qwen3next`: piecewise CUDA graphs.
+- MTP when the file has the nextn head (2 drafts for MoE, 1 for dense), unless its experts are MXFP4.
+- Dense `qwen35`: host-RAM KV when the weights plus the full-context KV do not fit the card (the device map then
+  charges no KV to the GPU).
+- Hybrid models with 24 GiB of RAM or more: a 6 GiB, 4-entry prefix cache (one agent turn of 30k tokens is ~1.6 GiB).
+
 ### Agent clients
 Agent stacks name the model by their own catalog id and often send no sampling or thinking fields.
 `TITAN_MODEL_ALIAS=a[,b]` registers extra names for the default model. `TITAN_SAMPLING=temp=0.7,top_p=0.8,top_k=20,min_p=0,presence=1.5`

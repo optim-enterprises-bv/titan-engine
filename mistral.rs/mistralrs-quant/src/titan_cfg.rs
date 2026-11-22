@@ -6,6 +6,10 @@
 //! process environment, so env vars remain the defaults. An empty value in the table means "unset" (it
 //! hides an env default). [`end_model`] drops the table after an unload.
 //!
+//! Below the environment sits a third layer, [`set_auto`]: the defaults the loader derives from the model it is
+//! about to load (architecture, MTP head, size against VRAM and RAM), so every path the model supports is on without
+//! per-model settings. The overlay and the environment both override it.
+//!
 //! Values the code caches are held in [`GenCell`]s instead of `OnceLock`s: every `begin_model` /
 //! `end_model` starts a new generation, and a cell computed under an older generation is computed
 //! again on its next read. A replaced value is leaked, not dropped (readers may still hold `&'static`
@@ -16,6 +20,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 static OVERLAY: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+static AUTO: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
 static GEN: AtomicU64 = AtomicU64::new(1);
 
 /// `std::env::var` with the current model's settings on top.
@@ -25,7 +30,14 @@ pub fn var(name: &str) -> Result<String, std::env::VarError> {
             return if v.is_empty() { Err(std::env::VarError::NotPresent) } else { Ok(v.clone()) };
         }
     }
-    std::env::var(name)
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => auto(name).ok_or(std::env::VarError::NotPresent),
+        r => r,
+    }
+}
+
+fn auto(name: &str) -> Option<String> {
+    AUTO.read().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(name).cloned()
 }
 
 /// `std::env::var_os` with the current model's settings on top.
@@ -35,7 +47,7 @@ pub fn var_os(name: &str) -> Option<std::ffi::OsString> {
             return (!v.is_empty()).then(|| std::ffi::OsString::from(v));
         }
     }
-    std::env::var_os(name)
+    std::env::var_os(name).or_else(|| auto(name).map(std::ffi::OsString::from))
 }
 
 /// An on/off setting: `1`/`true`/`on`/`yes`/`enable(d)` or `0`/`false`/`off`/`no`/`disable(d)` (any case,
@@ -111,9 +123,36 @@ pub fn begin_model(settings: HashMap<String, String>) {
     GEN.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Install the automatic defaults for the model about to load (lowest priority); every [`GenCell`] recomputes on
+/// its next read. Logs each one, marking those an explicit setting overrides.
+pub fn set_auto(settings: HashMap<String, String>) {
+    let mut keys: Vec<_> = settings
+        .iter()
+        .map(|(k, v)| match var_explicit(k) {
+            Some(e) => format!("{k}={v} (overridden: {e})"),
+            None => format!("{k}={v}"),
+        })
+        .collect();
+    keys.sort();
+    tracing::info!("titan automatic settings: {}", keys.join(" "));
+    *AUTO.write().unwrap_or_else(|e| e.into_inner()) = Some(settings);
+    GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The overlay or environment value of `name`, without the automatic layer.
+fn var_explicit(name: &str) -> Option<String> {
+    if let Some(m) = OVERLAY.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(v) = m.get(name) {
+            return Some(v.clone());
+        }
+    }
+    std::env::var(name).ok()
+}
+
 /// Drop the current model's settings (after its unload): back to the process environment.
 pub fn end_model() {
     *OVERLAY.write().unwrap_or_else(|e| e.into_inner()) = None;
+    *AUTO.write().unwrap_or_else(|e| e.into_inner()) = None;
     GEN.fetch_add(1, Ordering::AcqRel);
 }
 

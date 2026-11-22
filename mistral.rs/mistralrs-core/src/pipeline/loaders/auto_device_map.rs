@@ -402,7 +402,9 @@ pub fn get_device_layers(
     } else {
         loader.kv_cache_dtype(config, dtype)?
     };
-    let kv_cache_bytes = kv_cache_elems * kv_dtype.size_in_bytes();
+    // titan host-RAM KV (TITAN_KV_HOST) holds the cache in host memory: none of it is device memory
+    let host_kv = !has_paged_attn && crate::titan_hostkv::enabled();
+    let kv_cache_bytes = if host_kv { 0 } else { kv_cache_elems * kv_dtype.size_in_bytes() };
     let kv_bytes_for_layer = |idx: usize| {
         if model_cfg.layer_has_paged_kv_cache(idx) {
             kv_cache_bytes
