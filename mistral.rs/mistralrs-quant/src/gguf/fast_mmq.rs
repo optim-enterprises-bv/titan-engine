@@ -700,16 +700,17 @@ pub fn supports_llama_mmq(dtype: GgmlDType) -> bool {
     llama_mmq(dtype).is_some()
 }
 
-/// [`plain`] for IQ4_NL / MXFP4 / NVFP4. `None` when the shape is outside what the port covers
-/// (K not a whole number of tile iterations), so the caller keeps its fallback.
+/// [`plain`] for IQ4_NL / MXFP4 / NVFP4. `None` when the shape is outside what the port covers, so the caller keeps
+/// its fallback.
 fn llama_mmq_plain(f: &LlamaMmq, w: &QTensor, xs: &Tensor, dev: &CudaDevice, nrows: usize, k: usize, b_size: usize) -> Result<Option<Tensor>> {
-    llama_mmq_plain_at(f, w, 0, xs, dev, nrows, k, b_size, false)
+    llama_mmq_plain_at(f, w, 0, xs, dev, nrows, k, b_size)
 }
 
-/// [`llama_mmq_plain`] on the `nrows x k` matrix starting `w_off` bytes into `w` (one expert of a stack).
+/// [`llama_mmq_plain`] on the `nrows x k` matrix starting `w_off` bytes into `w` (one expert of a stack). With K not a
+/// whole number of tile iterations the last tile reads up to one tile past each row end (as llama.cpp does: those
+/// weights meet the zero-padded activations), so that is taken only while the over-read of the last row stays inside
+/// `w` (llama.cpp pads its allocations instead).
 #[allow(clippy::too_many_arguments)]
-/// `partial_k` must stay false: the stream-k split counts whole tile iterations, so a partial last tile is dropped
-/// (measured: K = 2304 with 512-wide tiles lost 256/2304 of every dot product).
 fn llama_mmq_plain_at(
     f: &LlamaMmq,
     w: &QTensor,
@@ -719,13 +720,20 @@ fn llama_mmq_plain_at(
     nrows: usize,
     k: usize,
     b_size: usize,
-    partial_k: bool,
 ) -> Result<Option<Tensor>> {
     use candle_core::cuda::cudarc::driver::sys::CUfunction_attribute_enum;
     use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda::WrapErr;
-    if (!partial_k && k % f.iter_k != 0) || k % f.qk != 0 || !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+    if k % f.qk != 0 || !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
         return Ok(None);
+    }
+    if k % f.iter_k != 0 {
+        let block = w.dtype().type_size() as u64;
+        let over = ((f.iter_k - k % f.iter_k) / f.qk) as u64 * block;
+        let end = w_off + (nrows * (k / f.qk)) as u64 * block;
+        if end + over > w.storage_size_in_bytes() as u64 {
+            return Ok(None);
+        }
     }
     let input_ty = xs.dtype();
     let xs = xs.contiguous()?;
@@ -993,7 +1001,7 @@ fn llama_grouped_parts(
 }
 
 /// One expert `e` of a `(n_expert, nrows, k)` stack times `xs` through the llama.cpp MMQ port; `None` when the
-/// format is not covered or K is not a whole number of tile iterations.
+/// format or shape is not covered (see [`llama_mmq_plain_at`]).
 pub fn llama_fmt_plain_expert(w: &QTensor, e: usize, xs: &Tensor) -> Result<Option<Tensor>> {
     let Some(f) = llama_mmq(w.dtype()) else {
         return Ok(None);
@@ -1010,7 +1018,7 @@ pub fn llama_fmt_plain_expert(w: &QTensor, e: usize, xs: &Tensor) -> Result<Opti
     }
     let dtype = w.dtype();
     let off = (e * nrows * (k / dtype.block_size()) * dtype.type_size()) as u64;
-    llama_mmq_plain_at(f, w, off, xs, &dev, nrows, k, b_size, false)
+    llama_mmq_plain_at(f, w, off, xs, &dev, nrows, k, b_size)
 }
 
 /// Prefill (batch > 8) for IQ4_NL / MXFP4 / NVFP4 through the llama.cpp MMQ port; `None` when

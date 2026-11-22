@@ -769,12 +769,12 @@ impl Moe {
                 let (toks, ws) = &per_expert[&id];
                 let idx = Tensor::from_slice(toks, toks.len(), flat.device())?;
                 let xe = flat.index_select(&idx, 0)?.contiguous()?;
-                let Some(mut gu) = mistralrs_quant::mmq_plain_expert(wgu, id, &xe)? else { return Ok(None) };
+                let mut gu = expert_mm(gate_up, wgu, id, &xe)?;
                 if let Some(s) = &self.experts.gate_up_scale {
                     gu = (gu * f64::from(s[id]))?;
                 }
                 let act = situ(&gu.narrow(1, 0, ff)?, &gu.narrow(1, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
-                let Some(y) = mistralrs_quant::mmq_plain_expert(wd, id, &act)? else { return Ok(None) };
+                let y = expert_mm(down, wd, id, &act)?;
                 let ds = self.experts.down_scale.as_ref().map_or(1.0, |s| s[id]);
                 let w: Vec<f32> = ws.iter().map(|w| w * ds).collect();
                 let y = y.broadcast_mul(&Tensor::from_vec(w, (toks.len(), 1), flat.device())?)?;
@@ -828,9 +828,7 @@ impl Moe {
             for id in experts {
                 let (toks, pairs) = &per_expert[&id];
                 let xe = flat.index_select(&Tensor::from_slice(toks, toks.len(), flat.device())?, 0)?.contiguous()?;
-                let Some(mut gu) = mistralrs_quant::mmq_plain_expert(w, id, &xe)? else {
-                    return Ok(None);
-                };
+                let mut gu = expert_mm(gate_up, w, id, &xe)?;
                 if let Some(s) = &self.experts.gate_up_scale {
                     gu = (gu * f64::from(s[id]))?;
                 }
@@ -851,6 +849,17 @@ impl Moe {
         #[allow(unreachable_code)]
         Ok(None)
     }
+}
+
+/// Expert `id` of a stack times `x` `(n, k)`: the MMQ port, or the indexed GEMV where the port does not cover it.
+#[cfg(feature = "cuda")]
+fn expert_mm(m: &QMatMul, w: &candle_core::quantized::QTensor, id: usize, x: &Tensor) -> Result<Tensor> {
+    if let Some(y) = mistralrs_quant::mmq_plain_expert(w, id, x)? {
+        return Ok(y);
+    }
+    let (n, k) = x.dims2()?;
+    let ids = Tensor::from_vec(vec![id as u32; n], (n, 1), x.device())?;
+    m.indexed_moe_forward(&x.reshape((n, 1, k))?, &ids)?.to_dtype(DType::F32)?.reshape((n, ()))
 }
 
 /// `situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)` (no linear clamp when lb == 0).
