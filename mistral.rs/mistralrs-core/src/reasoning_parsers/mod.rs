@@ -5,6 +5,7 @@
 //! - **Channel tags**: `<|channel>thought\n...<channel|>` (Gemma 4)
 
 pub mod harmony;
+pub mod inkling;
 pub mod tag_based;
 
 pub use harmony::{HarmonyContext, HarmonyToolCall};
