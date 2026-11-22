@@ -208,7 +208,7 @@ pub use gguf::fast_mmq::{
     supports as supports_mmq, llama_fmt_plain_expert as mmq_plain_expert, supports_llama_mmq,
 };
 #[cfg(feature = "cuda")]
-pub use gguf::titan_tiered::{QInput, TieredExperts};
+pub use gguf::titan_tiered::{doorbell as titan_doorbell, QInput, TieredExperts};
 
 /// Non-CUDA builds: titan tiered experts need CUDA, so the planning queries report tiering off and
 /// the model loaders behave as stock mistral.rs.

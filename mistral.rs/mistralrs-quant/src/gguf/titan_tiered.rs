@@ -41,7 +41,7 @@ mod pfs;
 mod onepass;
 /// Mapped-memory doorbell for the CPU misses (`TITAN_DOORBELL`).
 #[path = "titan_doorbell.rs"]
-mod doorbell;
+pub mod doorbell;
 
 const PTX: &str = include_str!("titan_kernels_oxide.ptx");
 const MODULE: &str = "titan_kernels_oxide";
@@ -97,9 +97,15 @@ fn miss_pool() -> Option<&'static super::titan_spin::SpinPool> {
         // the calling thread works too; with the doorbell it is not the decode thread, and the memory-bound pass
         // measured faster on fewer spinning workers (m4/idle: 22 -> 14 workers, MTP=2 decode +5%)
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let default = if doorbell::enabled() { DOORBELL_WORKERS.min(threads.saturating_sub(2)) } else { threads.saturating_sub(1) };
+        let pinned = super::titan_spin::miss_cpus();
+        let default = match pinned {
+            // the doorbell thread works on the first pinned CPU, a worker on each of the others
+            Some(c) if doorbell::enabled() => c.len() - 1,
+            _ if doorbell::enabled() => DOORBELL_WORKERS.min(threads.saturating_sub(2)),
+            _ => threads.saturating_sub(1),
+        };
         let workers = env_usize("TITAN_TIERED_THREADS", default);
-        Some(super::titan_spin::SpinPool::new(workers))
+        Some(super::titan_spin::SpinPool::new(workers, if doorbell::enabled() { pinned } else { None }))
     })
     .as_ref()
 }
@@ -1121,6 +1127,18 @@ impl TieredExperts {
             add_time(3, t2);
         }
         Ok((gate.wrap(og, batch, topk), up.wrap(ou, batch, topk)))
+    }
+
+    /// Whether a batch-1 forward of these projections runs entirely on the GPU stream with the doorbell (no host sync),
+    /// so it can be captured into a CUDA graph (`titan_doorbell::record_begin`). `TITAN_GRAPH_MOE=0` turns it off.
+    pub fn doorbell_capturable(gate: &TieredExperts, up: &TieredExperts, down: &TieredExperts) -> bool {
+        crate::titan_cfg::flag("TITAN_GRAPH_MOE", true)
+            && doorbell::enabled()
+            && trace_path().is_none()
+            && !gate.all_resident()
+            && *gate.fast_ok.get_or_init(|| Self::onepass_ok(gate, up, down))
+            && gate.n % 4 == 0
+            && down.n % 4 == 0
     }
 
     /// The routed experts of one SiLU-gated MoE layer through the new miss paths: the doorbell (`TITAN_DOORBELL=1`)

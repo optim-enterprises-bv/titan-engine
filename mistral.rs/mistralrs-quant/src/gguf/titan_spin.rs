@@ -52,7 +52,8 @@ pub struct SpinPool {
 }
 
 impl SpinPool {
-    pub fn new(workers: usize) -> Self {
+    /// `cpus`: pin worker i to `cpus[(i + 1) % len]` (the caller of `run` takes `cpus[0]`, see `pin_current_thread`).
+    pub fn new(workers: usize, cpus: Option<&'static [usize]>) -> Self {
         let spin_us = crate::titan_cfg::var("TITAN_TIERED_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SPIN_US);
         let shared = Arc::new(Shared {
             gen: AtomicU64::new(0),
@@ -69,7 +70,12 @@ impl SpinPool {
             let s = shared.clone();
             std::thread::Builder::new()
                 .name(format!("titan-miss-{i}"))
-                .spawn(move || worker(&s))
+                .spawn(move || {
+                    if let Some(c) = cpus {
+                        pin_current_thread(c[(i + 1) % c.len()]);
+                    }
+                    worker(&s)
+                })
                 .expect("spawn titan miss worker");
         }
         Self { shared, busy: Mutex::new(()) }
@@ -137,4 +143,51 @@ fn worker(s: &Shared) {
         }
         s.active.fetch_sub(1, SeqCst);
     }
+}
+
+/// Pin the calling thread to one CPU (best effort).
+pub fn pin_current_thread(cpu: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::warn!("titan: could not pin a thread to CPU {cpu}");
+        }
+    }
+}
+
+/// `0-7,12,14-15` -> the CPUs listed.
+fn parse_cpus(s: &str) -> Option<Vec<usize>> {
+    let mut v = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => v.extend(a.trim().parse::<usize>().ok()?..=b.trim().parse::<usize>().ok()?),
+            None => v.push(part.trim().parse().ok()?),
+        }
+    }
+    (!v.is_empty()).then_some(v)
+}
+
+/// `TITAN_TIERED_CPUS`: the CPUs the CPU-expert threads (the doorbell thread and the miss pool) are pinned to:
+/// a list (`0-7,12`), `auto` (a hybrid Intel CPU's performance cores, `/sys/devices/cpu_core/cpus`) or `none`
+/// (default). In isolation a decode-sized pass ran 0.150 ms on 14 mixed threads and 0.110 ms on the 8 P-cores of a
+/// Core Ultra 9 285HX, but in the server the pass is bound by DRAM bandwidth (~40 GB/s of expert weights) and
+/// pinning measured the same (0.071 against 0.068 ms per decode layer), so it stays off.
+pub fn miss_cpus() -> Option<&'static [usize]> {
+    static C: crate::titan_cfg::GenCell<Option<Vec<usize>>> = crate::titan_cfg::GenCell::new();
+    C.get_or_init(|| {
+        let v = crate::titan_cfg::var("TITAN_TIERED_CPUS").unwrap_or_else(|_| "none".into());
+        let cpus = match v.trim() {
+            "none" | "0" | "" => None,
+            "auto" => std::fs::read_to_string("/sys/devices/cpu_core/cpus").ok().and_then(|s| parse_cpus(&s)),
+            list => parse_cpus(list),
+        };
+        let avail = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cpus = cpus.filter(|c| c.len() >= 2 && c.iter().all(|&x| x < avail.max(1024)));
+        if let Some(c) = &cpus {
+            tracing::info!("titan cpu experts: pinned to CPUs {c:?}");
+        }
+        cpus
+    })
+    .as_deref()
 }
