@@ -609,6 +609,67 @@ fn acc_q2k(tmp: f32, blk: &[u8], xq: &[u8], iqs: usize) -> f32 {
     tmp + sumf_d.mul_add(d, -p)
 }
 
+/// `row` for Q2_K with AVX2 integer dots: for shift i, GPU threads 0..4 of a block read qs bytes 0..32 against Q8_1
+/// block i and threads 4..8 qs bytes 32..64 against block 4 + i, each thread 8 consecutive bytes; the per-thread
+/// sums are formed exactly here and the float program (`acc_q2k`, then `reduce`) replayed.
+/// SAFETY: caller checked avx2 and fma; `k / 256 <= IQK_MAX_BLOCKS`.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_q2k(w_row: &[u8], xq: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bpr = k / 256;
+    let bb = 84;
+    // [block][thread j][shift i] -> (sumi_d, sumi_m)
+    let mut sd = [[[0i32; 4]; 8]; IQK_MAX_BLOCKS];
+    let mut sm = [[[0i32; 4]; 8]; IQK_MAX_BLOCKS];
+    let ones_b = _mm256_set1_epi8(1);
+    let ones_w = _mm256_set1_epi16(1);
+    let mask = _mm256_set1_epi8(3);
+    let pair = |v: __m256i| -> [i32; 4] {
+        let mut a = [0i32; 8];
+        _mm256_storeu_si256(a.as_mut_ptr() as *mut __m256i, v);
+        [a[0] + a[1], a[2] + a[3], a[4] + a[5], a[6] + a[7]]
+    };
+    for b in 0..bpr {
+        let blk = &w_row[b * bb..(b + 1) * bb];
+        for h in 0..2 {
+            let q = _mm256_loadu_si256(blk[16 + 32 * h..].as_ptr() as *const __m256i);
+            for i in 0..4 {
+                let q8 = &xq[(8 * b + 4 * h + i) * Q8_BYTES + 4..];
+                let y = _mm256_loadu_si256(q8.as_ptr() as *const __m256i);
+                let vals = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * i as i32)), mask);
+                let d = pair(_mm256_madd_epi16(_mm256_maddubs_epi16(vals, y), ones_w));
+                let m = pair(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_b, y), ones_w));
+                for g in 0..4 {
+                    sd[b][4 * h + g][i] = d[g];
+                    sm[b][4 * h + g][i] = m[g];
+                }
+            }
+        }
+    }
+    let mut tmp = [0f32; THREADS];
+    for (t, v) in tmp.iter_mut().enumerate() {
+        let j = t % IQK_THREADS_PER_BLOCK;
+        let mut kbx = t / IQK_THREADS_PER_BLOCK;
+        while kbx < bpr {
+            let blk = &w_row[kbx * bb..];
+            let (mut sumf_d, mut sumf_m) = (0f32, 0f32);
+            for i in 0..4 {
+                let q8 = &xq[(8 * kbx + 4 * (j / 4) + i) * Q8_BYTES..];
+                let d8 = f16_to_f32(u16::from_le_bytes([q8[0], q8[1]]));
+                let sc = blk[8 * (j / 4) + 2 * i + (j % 4) / 2] as i32;
+                sumf_d = d8.mul_add((sd[kbx][j][i] * (sc & 0xF)) as f32, sumf_d);
+                sumf_m = d8.mul_add((sm[kbx][j][i] * ((sc >> 4) & 0xF)) as f32, sumf_m);
+            }
+            let d = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
+            let p = sumf_m * dmin;
+            *v = *v + sumf_d.mul_add(d, -p);
+            kbx += IQK_BLOCKS_PER_ITER;
+        }
+    }
+    reduce(&tmp)
+}
+
 /// `chunk_sumi` with AVX2: the bits become 0/1 bytes, maddubs (unsigned 0/1 x signed q, no pair
 /// can saturate) + madd give the selected sum and the total exactly.
 #[target_feature(enable = "avx2")]
@@ -647,6 +708,9 @@ pub unsafe fn rows8(fmt: Format, w_rows: &[&[u8]; 8], xq: &[u8], k: usize) -> [f
     };
     if matches!(fmt, Format::IQ3XXS | Format::IQ4XS) && k / 256 <= IQK_MAX_BLOCKS {
         return std::array::from_fn(|r| row_iqk(fmt, w_rows[r], xq, k));
+    }
+    if fmt == Format::Q2K && k / 256 <= IQK_MAX_BLOCKS {
+        return std::array::from_fn(|r| row_q2k(w_rows[r], xq, k));
     }
     if matches!(fmt, Format::Q1_0 | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q3K | Format::Q2K) {
         // The float work is one fma per 32 weights; the AVX2 part is Q1_0's integer chunk sum.

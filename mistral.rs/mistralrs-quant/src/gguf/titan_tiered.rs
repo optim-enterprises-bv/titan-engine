@@ -1364,7 +1364,7 @@ impl TieredExperts {
         let expert = self.host_expert(e);
         let row_of = |r: usize| &expert[r * row_bytes..][..row_bytes];
         let end = (r0 + rows_per_chunk()).min(n);
-        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS) {
+        if simd && matches!(fmt, Format::Q4K | Format::Q5K | Format::Q6K | Format::IQ4NL | Format::MXFP4 | Format::NVFP4 | Format::IQ3XXS | Format::IQ4XS | Format::Q2K) {
             let rows: Vec<&[u8]> = (r0..end).map(row_of).collect();
             let mut vals = vec![0f32; end - r0];
             unsafe { titan_cpu::rows_lanes(fmt, &rows, xq_row, self.k, &mut vals) };
