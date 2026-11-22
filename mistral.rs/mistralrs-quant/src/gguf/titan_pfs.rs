@@ -47,6 +47,22 @@ const DEFAULT_COPY_THREADS: usize = 4;
 const PAGE: usize = 4096;
 /// Slack after each staging buffer: MMQ tiles may read past a buffer's last expert.
 const ENTRY_PAD: usize = 64 << 10;
+/// (map base, map length, O_DIRECT handle) of each mmap'd file holding host experts.
+static FILES: Mutex<Vec<(usize, usize, Arc<std::fs::File>)>> = Mutex::new(Vec::new());
+
+/// Mapped host experts of `path` (mapped at `base`, `len` bytes) are staged with large aligned O_DIRECT reads of the
+/// file instead of page-faulting the map (`TITAN_PFS_DIRECT=0` keeps the faults).
+pub fn register_file(base: usize, len: usize, path: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !crate::titan_cfg::flag("TITAN_PFS_DIRECT", true) {
+        return;
+    }
+    match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path) {
+        Ok(f) => FILES.lock().unwrap().push((base, len, Arc::new(f))),
+        Err(e) => tracing::warn!("titan pfs: O_DIRECT open of {} failed ({e}); mapped experts page-fault in", path.display()),
+    }
+}
+
 /// Projection order within a layer: the order the MoE forward calls them in.
 const PROJS: [&str; 3] = ["gate", "up", "down"];
 
@@ -93,6 +109,8 @@ pub struct Source {
     bytes: usize,
     /// The ranges lie in page-locked memory (registered in place): DMA straight from them.
     pinned: bool,
+    /// The mapped file behind the ranges and its map base: bounce copies read it directly.
+    file: Option<(Arc<std::fs::File>, usize)>,
     /// Registered host range to unregister on drop, and the context it was registered in.
     registered: Option<usize>,
     ctx: Arc<CudaContext>,
@@ -171,8 +189,16 @@ pub(crate) fn register<'a>(
             WARNED.get_or_init(|| tracing::warn!("titan pfs: cuMemHostRegister failed ({r:?}); host experts go through bounce buffers"));
         }
     }
+    let file = if registered.is_none() && owned.is_none() {
+        let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let hi = ranges.iter().map(|r| r.0 + r.1).max().unwrap_or(0);
+        FILES.lock().unwrap().iter().find(|f| f.0 <= lo && hi <= f.0 + f.1).map(|f| (f.2.clone(), f.0))
+    } else {
+        None
+    };
     let stage_map = dev.clone_htod(&stage_index)?;
     let src = Arc::new(Source {
+        file,
         layer,
         proj,
         ranges,
@@ -326,6 +352,35 @@ fn issue(
             unsafe { result::memcpy_htod_async(job.dst + off, src, copy.cu_stream()) }.map_err(d)?;
             off += len as u64;
         }
+    } else if let Some((file, base)) = &job.src.file {
+        // Page-aligned file spans of at most BOUNCE_BYTES read straight into a pinned bounce buffer.
+        for &(a, len) in &job.src.ranges {
+            let (f0, f1) = (a - base, a - base + len);
+            let mut p0 = f0;
+            while p0 < f1 {
+                let a0 = p0 & !(PAGE - 1);
+                let a1 = (a0 + BOUNCE_BYTES).min(f1.next_multiple_of(PAGE));
+                let p1 = f1.min(a1);
+                if bounce.len() < BOUNCE_BUFS {
+                    let ptr = unsafe { result::malloc_host(BOUNCE_BYTES, 0) }.map_err(d)? as *mut u8;
+                    bounce.push(Bounce { ptr, copied: None });
+                }
+                let nb = bounce.len();
+                let b = &mut bounce[*next % nb];
+                *next += 1;
+                if let Some(ev) = b.copied.take() {
+                    ev.synchronize().map_err(d)?;
+                }
+                if !read_direct(file, a0, a1 - a0, b.ptr, threads, p1 - a0) {
+                    return Err(sys::CUresult::CUDA_ERROR_OPERATING_SYSTEM);
+                }
+                let staged = unsafe { std::slice::from_raw_parts(b.ptr.add(p0 - a0) as *const u8, p1 - p0) };
+                unsafe { result::memcpy_htod_async(job.dst + off, staged, copy.cu_stream()) }.map_err(d)?;
+                b.copied = Some(copy.record_event(None).map_err(d)?);
+                off += (p1 - p0) as u64;
+                p0 = p1;
+            }
+        }
     } else {
         // Pieces of at most BOUNCE_BYTES, each gathered into a pinned bounce buffer by helper threads.
         let mut pieces: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
@@ -362,6 +417,8 @@ fn issue(
             off += len as u64;
         }
     }
+    // grouped MMQ with a partial last K tile reads past the last staged expert
+    unsafe { result::memset_d8_async(job.dst + off, 0, crate::gguf::fast_mmq::GROUPED_TAIL_BYTES, copy.cu_stream()) }.map_err(d)?;
     let ev = copy.record_event(None).map_err(d)?;
     if let Some(t0) = t0 {
         let t1 = copy.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(d)?;
@@ -369,6 +426,50 @@ fn issue(
     }
     let _ = ctx;
     Ok(Arc::new(ev))
+}
+
+/// Read the page-aligned file span `off..off + len` into `dst` (page aligned) split across `threads` helper threads;
+/// false if fewer than `need` bytes came back.
+fn read_direct(file: &std::fs::File, off: usize, len: usize, dst: *mut u8, threads: usize, need: usize) -> bool {
+    use std::os::unix::fs::FileExt;
+    let per = len.div_ceil(threads).next_multiple_of(PAGE).max(PAGE);
+    let dst = dst as usize;
+    let got: usize = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads)
+            .filter_map(|t| {
+                let (lo, hi) = (t * per, ((t + 1) * per).min(len));
+                (lo < hi).then(|| {
+                    s.spawn(move || {
+                        let buf = unsafe { std::slice::from_raw_parts_mut((dst + lo) as *mut u8, hi - lo) };
+                        let mut done = 0;
+                        while done < buf.len() {
+                            match file.read_at(&mut buf[done..], (off + lo + done) as u64) {
+                                Ok(0) => break,
+                                Ok(n) => done += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(e) => {
+                                    tracing::warn!("titan pfs: direct read failed ({e})");
+                                    break;
+                                }
+                            }
+                        }
+                        // a short read only counts up to the first gap
+                        if done == hi - lo { hi } else { lo + done }
+                    })
+                })
+            })
+            .collect();
+        let ends: Vec<usize> = hs.into_iter().map(|h| h.join().unwrap_or(0)).collect();
+        let mut reach = 0;
+        for (t, e) in ends.into_iter().enumerate() {
+            if t * per != reach {
+                break;
+            }
+            reach = e;
+        }
+        reach
+    });
+    got >= need
 }
 
 /// Copy `ranges` back to back into `dst`, split across `threads` helper threads (page faults of a mapped

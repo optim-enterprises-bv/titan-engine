@@ -71,6 +71,15 @@ pub fn release_kernel_workspaces() {
     cuda::release_workspaces();
 }
 
+/// Mapped GGUF file `path` at `base` (`len` bytes): streamed prefill reads its experts with direct I/O.
+#[cfg(feature = "cuda")]
+pub fn titan_register_mapped_file(base: usize, len: usize, path: &std::path::Path) {
+    titan_pfs::register_file(base, len, path);
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn titan_register_mapped_file(_base: usize, _len: usize, _path: &std::path::Path) {}
+
 /// CUDA OOM recovery: drop the staging ring and restart the doorbell (a failed step may have left a layer's
 /// publish unanswered); the model stays loaded.
 #[cfg(feature = "cuda")]

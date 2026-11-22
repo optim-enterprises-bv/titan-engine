@@ -163,8 +163,10 @@ pub(super) fn load(
     let mmaps = if mistralrs_quant::TieredExperts::mmap_enabled() || needs_mmap {
         readers
             .iter()
-            .map(|f| {
+            .zip(paths.get_weight_filenames())
+            .map(|(f, path)| {
                 let m = unsafe { memmap2::Mmap::map(f)? };
+                mistralrs_quant::titan_register_mapped_file(m.as_ptr() as usize, m.len(), path);
                 // TITAN_TIERED_MADV=hugepage|random: whole-file advice (mmap cost experiments)
                 let _ = match mistralrs_quant::titan_cfg::var("TITAN_TIERED_MADV").as_deref() {
                     Ok("hugepage") => m.advise(memmap2::Advice::HugePage),
