@@ -649,6 +649,136 @@ unsafe fn row_iqk(fmt: Format, w_row: &[u8], xq: &[u8], k: usize) -> f32 {
     reduce(&tmp)
 }
 
+/// `ksigns(i)` expanded to bytes: byte b is 0xFF where bit b is set (the value is negated).
+const KSIGN_MASKS: [u64; 128] = {
+    let mut t = [0u64; 128];
+    let mut i = 0;
+    while i < 128 {
+        let v = (i as u32) ^ (((i as u32).count_ones() & 1) << 7);
+        let mut b = 0;
+        while b < 8 {
+            if v & (1 << b) != 0 {
+                t[i] |= 0xFFu64 << (8 * b);
+            }
+            b += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Per Q8_1 block of one input row: its 32 quants, d8, and 128 * the quants' sum (the offset the unsigned IQ4 table
+/// adds to a vpdpbusd dot).
+struct Q8Prep {
+    q: Vec<std::arch::x86_64::__m256i>,
+    d8: Vec<f32>,
+    off: Vec<i32>,
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn q8_prep(xq: &[u8], nq8: usize) -> Q8Prep {
+    use std::arch::x86_64::*;
+    let mut p = Q8Prep { q: Vec::with_capacity(nq8), d8: Vec::with_capacity(nq8), off: Vec::with_capacity(nq8) };
+    for c in 0..nq8 {
+        let b = &xq[c * Q8_BYTES..(c + 1) * Q8_BYTES];
+        p.d8.push(f16_to_f32(u16::from_le_bytes([b[0], b[1]])));
+        p.off.push(128 * b[4..].iter().map(|&v| v as i8 as i32).sum::<i32>());
+        p.q.push(_mm256_loadu_si256(b[4..].as_ptr() as *const __m256i));
+    }
+    p
+}
+
+/// IQ4_XS / IQ3_XXS rows against one or more q8_1 input rows (`xqs[i]` -> `outs[i]`), bit-identical to `row_iqk` /
+/// `row`. Each sub-block's integer dot is vpdpbusd: IQ4_XS takes the table shifted to unsigned (kvalues + 128) and
+/// subtracts 128 * sum(q8); IQ3_XXS takes the unsigned grid bytes and subtracts twice the dot over its negated lanes
+/// (exact for every q8 byte, -128 included). The eight sub-block sums of a block are reduced together, and the
+/// per-thread float program (`fma(d * d8, sumi, tmp)` over blocks t / 8, t / 8 + 16, .. for thread
+/// t = 8 * (block % 16) + sub-block) runs in lanes in the same order, then `reduce`. Each weight block is decoded once
+/// for all input rows.
+/// SAFETY: caller checked avx2, fma and avxvnni; `fmt` is IQ4XS or IQ3XXS; `outs[i].len() == w_rows.len()`.
+#[target_feature(enable = "avx2,fma,avxvnni")]
+pub unsafe fn rows_iqk_vnni(fmt: Format, w_rows: &[&[u8]], xqs: &[&[u8]], k: usize, outs: &mut [&mut [f32]]) {
+    use std::arch::x86_64::*;
+    const MAXX: usize = 8;
+    let iq4 = match fmt {
+        Format::IQ4XS => true,
+        Format::IQ3XXS => false,
+        _ => panic!("rows_iqk_vnni: {fmt:?}"),
+    };
+    let bb = fmt.block_bytes();
+    let bpr = k / 256;
+    let nx = xqs.len();
+    assert!(nx <= MAXX && outs.len() == nx);
+    let preps: Vec<Q8Prep> = xqs.iter().map(|x| q8_prep(x, bpr * 8)).collect();
+    let kvu: [u8; 16] = KVALUES_IQ4NL.map(|v| (v as i32 + 128) as u8);
+    let kv = _mm256_broadcastsi128_si256(_mm_loadu_si128(kvu.as_ptr() as *const __m128i));
+    let nib = _mm256_set1_epi8(0x0F);
+    let byte_shuf = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    let bit_masks = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+    let zero = _mm256_setzero_si256();
+    // x / 2 rounded toward zero, as Rust's i32 division
+    let half = |x: __m256i| _mm256_srai_epi32::<1>(_mm256_add_epi32(x, _mm256_srli_epi32::<31>(x)));
+    let hsum8 = |dt: &[__m256i; 8]| {
+        let h0 = _mm256_hadd_epi32(_mm256_hadd_epi32(dt[0], dt[1]), _mm256_hadd_epi32(dt[2], dt[3]));
+        let h1 = _mm256_hadd_epi32(_mm256_hadd_epi32(dt[4], dt[5]), _mm256_hadd_epi32(dt[6], dt[7]));
+        _mm256_add_epi32(_mm256_permute2x128_si256::<0x20>(h0, h1), _mm256_permute2x128_si256::<0x31>(h0, h1))
+    };
+    for (r, row) in w_rows.iter().enumerate() {
+        let mut tmp = [[_mm256_setzero_ps(); 16]; MAXX];
+        for b in 0..bpr {
+            let blk = &row[b * bb..(b + 1) * bb];
+            let mut w = [zero; 8];
+            let mut neg = [zero; 8];
+            let lsv;
+            if iq4 {
+                for (j, wj) in w.iter_mut().enumerate() {
+                    let q = _mm_loadu_si128(blk[8 + 16 * j..].as_ptr() as *const __m128i);
+                    *wj = _mm256_shuffle_epi8(kv, _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16::<4>(q), q), nib));
+                }
+                let sh = u16::from_le_bytes([blk[2], blk[3]]) as u32;
+                let ls: [i32; 8] = std::array::from_fn(|j| {
+                    ((((blk[4 + j / 2] as u32 >> (4 * (j % 2))) & 0x0F) | (((sh >> (2 * j)) & 0x03) << 4)) as i32) - 32
+                });
+                lsv = _mm256_loadu_si256(ls.as_ptr() as *const __m256i);
+            } else {
+                let mut ls = [0i32; 8];
+                for j in 0..8 {
+                    let g = |l: usize| *IQ3XXS_GRID.get_unchecked(*blk.get_unchecked(2 + 8 * j + l) as usize) as i32;
+                    w[j] = _mm256_setr_epi32(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7));
+                    let aux32 = word(blk, 2 + 64 + 4 * j);
+                    let m = |p: u32| KSIGN_MASKS[((aux32 >> (7 * p)) & 0x7F) as usize] as i64;
+                    neg[j] = _mm256_setr_epi64x(m(0), m(1), m(2), m(3));
+                    ls[j] = (aux32 >> 28) as i32;
+                }
+                lsv = _mm256_loadu_si256(ls.as_ptr() as *const __m256i);
+            }
+            let d = _mm256_set1_ps(f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+            for (x, p) in preps.iter().enumerate() {
+                let c = 8 * b;
+                let sumi = if iq4 {
+                    let dt: [__m256i; 8] = std::array::from_fn(|j| _mm256_dpbusd_avx_epi32(zero, w[j], p.q[c + j]));
+                    let off = _mm256_loadu_si256(p.off[c..].as_ptr() as *const __m256i);
+                    _mm256_mullo_epi32(_mm256_sub_epi32(hsum8(&dt), off), lsv)
+                } else {
+                    let dt: [__m256i; 8] = std::array::from_fn(|j| {
+                        let all = _mm256_dpbusd_avx_epi32(zero, w[j], p.q[c + j]);
+                        let n = _mm256_dpbusd_avx_epi32(zero, w[j], _mm256_and_si256(p.q[c + j], neg[j]));
+                        _mm256_sub_epi32(all, _mm256_slli_epi32::<1>(n))
+                    });
+                    let raw = hsum8(&dt);
+                    half(_mm256_add_epi32(_mm256_mullo_epi32(lsv, raw), half(raw)))
+                };
+                let dd = _mm256_mul_ps(d, _mm256_loadu_ps(p.d8[c..].as_ptr()));
+                let t = &mut tmp[x][b % 16];
+                *t = _mm256_fmadd_ps(dd, _mm256_cvtepi32_ps(sumi), *t);
+            }
+        }
+        for x in 0..nx {
+            outs[x][r] = reduce_lanes(&tmp[x]);
+        }
+    }
+}
+
 /// `tmp += vec_dot_q2_K_q8_1` (vdr 2): per shift i the 8 quants of words iqs, iqs + 1 against Q8_1 block
 /// `bq8_offset + i`, `sumf_d = fma(d8, sumi_d * sc, ..)`, `sumf_m = fma(d8, sumi_m * m, ..)`, then
 /// `tmp + fma(sumf_d, d, -(sumf_m * dmin))`.
@@ -1005,6 +1135,9 @@ unsafe fn rows_lanes_body<const VNNI: bool>(fmt: Format, w_rows: &[&[u8]], xq: &
     use std::arch::x86_64::*;
     if matches!(fmt, Format::IQ4NL | Format::MXFP4 | Format::NVFP4) {
         return rows_lanes_nl::<VNNI>(fmt, w_rows, xq, k, out);
+    }
+    if VNNI && matches!(fmt, Format::IQ4XS | Format::IQ3XXS) {
+        return rows_iqk_vnni(fmt, w_rows, &[xq], k, &mut [out]);
     }
     if matches!(fmt, Format::IQ3XXS | Format::IQ4XS | Format::IQ2XS | Format::IQ2XXS) && k / 256 <= IQK_MAX_BLOCKS {
         w_rows.iter().zip(out.iter_mut()).for_each(|(r, o)| *o = row_iqk(fmt, r, xq, k));
@@ -1696,6 +1829,75 @@ mod tests {
     #[test]
     fn titan_cpu_avx2_bitexact_iq3xxs() {
         compare(Format::IQ3XXS, 0x6A09_E667_F3BC_C908, TARGET_ROWS_KQUANT);
+    }
+
+    /// `cargo test --release -p mistralrs-quant --lib titan_cpu_bench -- --ignored --nocapture`: single-thread
+    /// ns per row of `rows_lanes` at the Qwen3.6-35B-A3B expert shapes.
+    #[test]
+    #[ignore]
+    fn titan_cpu_bench() {
+        for (fmt, n, nb) in [(Format::IQ3XXS, 512usize, 8usize), (Format::IQ4XS, 512, 8), (Format::Q6K, 2048, 2), (Format::IQ4XS, 2048, 2)] {
+            let mut rng = Rng(0x1234_5678);
+            let bb = fmt.block_bytes();
+            let k = nb * 256;
+            let xq = q8_row(&mut rng, k, Regime::Typical);
+            let w: Vec<Vec<u8>> = (0..n)
+                .map(|_| {
+                    let mut r = vec![0u8; nb * bb];
+                    r.chunks_mut(bb).for_each(|b| block(&mut rng, fmt, Regime::Typical, b));
+                    r
+                })
+                .collect();
+            let rows: Vec<&[u8]> = w.iter().map(|r| r.as_slice()).collect();
+            let mut out = vec![0f32; n];
+            for _ in 0..20 {
+                unsafe { rows_lanes(fmt, &rows, &xq, k, &mut out) };
+            }
+            let iters = 400;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for c in rows.chunks(32).zip(out.chunks_mut(32)) {
+                    unsafe { rows_lanes(fmt, c.0, &xq, k, c.1) };
+                }
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (iters * n) as f64;
+            let gmac = k as f64 / ns;
+            eprintln!("{fmt:?} n={n} k={k}: {ns:.0} ns/row, {gmac:.2} GMAC/s, {:.1} us/matrix, vnni={}", ns * n as f64 / 1e3, vnni());
+        }
+    }
+
+    /// `rows_iqk_vnni` with several input rows gives each row's single-input bits.
+    #[test]
+    fn titan_cpu_iqk_multi_rows_bitexact() {
+        if !std::arch::is_x86_feature_detected!("avxvnni") {
+            return;
+        }
+        let mut rng = Rng(0x5151_7272_9393_A4A4);
+        for fmt in [Format::IQ4XS, Format::IQ3XXS] {
+        for &nb in &[1usize, 2, 8, 9, 17] {
+            for regime in [Regime::Wild, Regime::Typical] {
+                let k = nb * 256;
+                let w: Vec<Vec<u8>> = (0..24).map(|_| {
+                    let mut r = vec![0u8; nb * fmt.block_bytes()];
+                    r.chunks_mut(fmt.block_bytes()).for_each(|b| block(&mut rng, fmt, regime, b));
+                    r
+                }).collect();
+                let rows: Vec<&[u8]> = w.iter().map(|r| r.as_slice()).collect();
+                let xs: Vec<Vec<u8>> = (0..5).map(|_| q8_row(&mut rng, k, regime)).collect();
+                let xr: Vec<&[u8]> = xs.iter().map(|x| x.as_slice()).collect();
+                let mut multi = vec![vec![0f32; rows.len()]; xs.len()];
+                {
+                    let mut o: Vec<&mut [f32]> = multi.iter_mut().map(|v| v.as_mut_slice()).collect();
+                    unsafe { rows_iqk_vnni(fmt, &rows, &xr, k, &mut o) };
+                }
+                for (x, m) in xr.iter().zip(&multi) {
+                    for (r, &v) in rows.iter().zip(m) {
+                        assert_eq!(row(fmt, r, x, k).to_bits(), v.to_bits());
+                    }
+                }
+            }
+        }
+    }
     }
 
     #[test]
