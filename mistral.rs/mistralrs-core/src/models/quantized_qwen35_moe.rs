@@ -285,6 +285,33 @@ fn load_v_reordered<R: std::io::Seek + std::io::Read>(
     )
 }
 
+/// `name` (`<base>.weight`) as a NanoQuant factored linear when the GGUF stores `<base>.nq_*` instead.
+fn load_nq_linear<R: std::io::Seek + std::io::Read>(
+    ct: &mut Content<'_, R>,
+    name: &str,
+    rows: Option<&[usize]>,
+    cols: Option<&[usize]>,
+    device: &Device,
+) -> Result<Option<Arc<dyn QuantMethod>>> {
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    if !ct.has_tensor(&format!("{base}.nq_u")) {
+        return Ok(None);
+    }
+    let m = super::quantized_qwen3_moe::nq_mat(ct, base, rows, cols, device)?;
+    Ok(Some(mistralrs_quant::nq::NqLinear::new_from(m)))
+}
+
+/// The index map `load_v_reordered` applies to `n` rows (or columns): unit h of the span at `start` takes unit `perm[h]`.
+fn v_index(n: usize, start: usize, unit: usize, perm: &[usize]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..n).collect();
+    for (h, &g) in perm.iter().enumerate() {
+        for i in 0..unit {
+            idx[start + h * unit + i] = start + g * unit + i;
+        }
+    }
+    idx
+}
+
 fn gguf_linear(q: QTensor) -> Result<Arc<dyn QuantMethod>> {
     Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
         q_weight: Arc::new(q),
@@ -401,6 +428,9 @@ impl Prism {
     }
 
     fn load_linear<R: std::io::Seek + std::io::Read>(&self, ct: &mut Content<'_, R>, name: &str, device: &Device) -> Result<Arc<dyn QuantMethod>> {
+        if let Some(m) = load_nq_linear(ct, name, None, None, device)? {
+            return Ok(m);
+        }
         self.linear(name, ct.tensor(name, device)?)
     }
 }
@@ -2155,10 +2185,17 @@ fn load_shared_expert<R: std::io::Seek + std::io::Read>(
             .to_dtype(DType::F32)?
     };
     let hidden = gate_inp.elem_count();
+    let mut lin = |n: &str| -> Result<Arc<dyn QuantMethod>> {
+        let name = format!("{prefix}.{n}.weight");
+        match load_nq_linear(ct, &name, None, None, device)? {
+            Some(m) => Ok(m),
+            None => gguf_linear(ct.tensor(&name, device)?),
+        }
+    };
     Ok(SharedExpert {
-        gate: gguf_linear(ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?)?,
-        up: gguf_linear(ct.tensor(&format!("{prefix}.ffn_up_shexp.weight"), device)?)?,
-        down: gguf_linear(ct.tensor(&format!("{prefix}.ffn_down_shexp.weight"), device)?)?,
+        gate: lin("ffn_gate_shexp")?,
+        up: lin("ffn_up_shexp")?,
+        down: lin("ffn_down_shexp")?,
         gate_inp: gate_inp.reshape((hidden, 1))?,
     })
 }
@@ -2181,20 +2218,20 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
         rows_per_head,
     };
 
-    let in_proj_qkv = load_v_reordered(
-        ct,
-        &format!("{prefix}.attn_qkv.weight"),
-        perm,
-        rows(2 * key_dim, cfg.head_v_dim),
-        device,
-    )?;
-    let in_proj_z = load_v_reordered(
-        ct,
-        &format!("{prefix}.attn_gate.weight"),
-        perm,
-        rows(0, cfg.head_v_dim),
-        device,
-    )?;
+    let qkv_name = format!("{prefix}.attn_qkv.weight");
+    let z_name = format!("{prefix}.attn_gate.weight");
+    let nq = ct.has_tensor(&format!("{prefix}.attn_qkv.nq_u"));
+    let (in_proj_qkv, in_proj_z) = if nq {
+        let qkv_rows = v_index(conv_dim, 2 * key_dim, cfg.head_v_dim, perm);
+        let z_rows = v_index(value_dim, 0, cfg.head_v_dim, perm);
+        let qkv = load_nq_linear(ct, &qkv_name, Some(&qkv_rows), None, device)?.expect("checked");
+        let z = load_nq_linear(ct, &z_name, Some(&z_rows), None, device)?.expect("checked");
+        (qkv, z)
+    } else {
+        let qkv = load_v_reordered(ct, &qkv_name, perm, rows(2 * key_dim, cfg.head_v_dim), device)?;
+        let z = load_v_reordered(ct, &z_name, perm, rows(0, cfg.head_v_dim), device)?;
+        (prism.linear(&qkv_name, qkv)?, prism.linear(&z_name, z)?)
+    };
     if ct.has_tensor(&format!("{prefix}.ssm_in.weight")) {
         candle_core::bail!("{prefix}: legacy fused ssm_in (qkvz) GGUF; re-convert with a llama.cpp that writes attn_qkv / attn_gate");
     }
@@ -2225,23 +2262,31 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
     // 256-wide Q4_K block spans two 128-wide heads) keep the weight as stored and gather the GDN output
     // into the tiled order at run time: tiled slot perm[h] holds grouped head h.
     let ssm_out_name = format!("{prefix}.ssm_out.weight");
-    let ssm_out_block = ct.tensor_info(&ssm_out_name)?.ggml_dtype.block_size();
-    let (out_proj, out_perm) = if prism.folded.contains(&ssm_out_name) {
+    let ssm_out_block = if nq { 1 } else { ct.tensor_info(&ssm_out_name)?.ggml_dtype.block_size() };
+    let nq_out = if nq {
+        let cols = v_index(value_dim, 0, cfg.head_v_dim, perm);
+        load_nq_linear(ct, &ssm_out_name, None, Some(&cols), device)?
+    } else {
+        None
+    };
+    let (out_proj, out_perm) = if let Some(m) = nq_out {
+        (m, None)
+    } else if prism.folded.contains(&ssm_out_name) {
         // folded in the grouped V-head basis (our GDN's output order): no column move, no gather
         if !prism.gdn_v_grouped && !is_identity(perm) {
             candle_core::bail!("{prefix}: prism-folded ssm_out in the tiled V-head basis is not supported");
         }
-        (ct.tensor(&ssm_out_name, device)?, None)
+        (prism.linear(&ssm_out_name, ct.tensor(&ssm_out_name, device)?)?, None)
     } else if is_identity(perm) {
-        (ct.tensor(&ssm_out_name, device)?, None)
+        (prism.linear(&ssm_out_name, ct.tensor(&ssm_out_name, device)?)?, None)
     } else if cfg.head_v_dim % ssm_out_block == 0 {
         let w = load_v_reordered(ct, &ssm_out_name, perm, VReorder::Cols { cols_per_head: cfg.head_v_dim }, device)?;
-        (w, None)
+        (prism.linear(&ssm_out_name, w)?, None)
     } else {
         let src = v_gather_index(perm, cfg.head_v_dim);
         let n = src.len();
         let index = Tensor::from_vec(src, n, device)?;
-        (ct.tensor(&ssm_out_name, device)?, Some(index))
+        (prism.linear(&ssm_out_name, ct.tensor(&ssm_out_name, device)?)?, Some(index))
     };
 
     let conv1d = load_v_reordered(
@@ -2277,15 +2322,15 @@ fn load_gdn<R: std::io::Seek + std::io::Read>(
 
     let gdn = GatedDeltaNet::from_parts(
         cfg,
-        prism.linear(&format!("{prefix}.attn_qkv.weight"), in_proj_qkv)?,
-        prism.linear(&format!("{prefix}.attn_gate.weight"), in_proj_z)?,
+        in_proj_qkv,
+        in_proj_z,
         prism.linear(&format!("{prefix}.ssm_beta.weight"), in_proj_b)?,
         prism.linear(&format!("{prefix}.ssm_alpha.weight"), in_proj_a)?,
         conv1d,
         dt_bias,
         a_log,
         norm_weight,
-        prism.linear(&ssm_out_name, out_proj)?,
+        out_proj,
     );
     Ok(match out_perm {
         Some(index) => gdn.with_out_proj_input_perm(index),
@@ -2524,7 +2569,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 )?)
             };
 
-            let ffn = if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) {
+            let ffn = if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) || ct.has_tensor(&format!("{prefix}.ffn_gate_exps.nq_u")) {
                 let Some(top_k) = expert_used_count else {
                     candle_core::bail!("{arch}: {prefix} has experts but no expert_used_count");
                 };

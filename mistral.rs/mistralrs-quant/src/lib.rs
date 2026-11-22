@@ -21,6 +21,7 @@ use candle_core::{
 pub mod metal_kernels;
 
 mod afq;
+pub mod nq;
 mod bitsandbytes;
 mod blockwise_fp8;
 pub mod cublaslt;
