@@ -352,8 +352,7 @@ fn llama_mul_mat_vec(
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     let y = y_q8_1.device_ptr(y_q8_1.stream()).0;
-    let dst = llama_mul_mat_vec_raw(fmt, data, y, ncols, nrows, ncols_padded, b_size, dev)?;
-    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    llama_mul_mat_vec_raw(fmt, data, y, ncols, nrows, ncols_padded, b_size, dev, false)
 }
 
 /// `llama_mul_mat_vec` on Q8_1 activations at device address `y_q8_1` (e.g. the shared mmvq workspace), into a fresh
@@ -368,7 +367,8 @@ pub(super) fn llama_mul_mat_vec_raw(
     ncols_padded: usize,
     b_size: usize,
     dev: &CudaDevice,
-) -> Result<CudaSlice<f32>> {
+    bf16_out: bool,
+) -> Result<CudaStorage> {
     let blocks_per_row = ncols / fmt.qk;
     let nwarps: u32 = if b_size <= 4 { 4 } else { 2 };
     // llama.cpp should_use_small_k: the whole block covers K in one iteration.
@@ -379,8 +379,23 @@ pub(super) fn llama_mul_mat_vec_raw(
     } else {
         format!("{}_mmvq_{b_size}", fmt.prefix)
     };
-    let func = dev.get_or_load_custom_func(&name, fmt.module, fmt.ptx)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    // bf16_out (one column): `<name>_bf16o` stores the sums rounded to bf16 (cvt.rn, as cast_f32_bf16) -- the cast
+    // after the matvec folded into its store; formats without such an entry keep f32
+    let bf16o = if bf16_out && b_size == 1 { dev.get_or_load_custom_func(&format!("{name}_bf16o"), fmt.module, fmt.ptx).ok() } else { None };
+    let is_bf16o = bf16o.is_some();
+    let func = match bf16o {
+        Some(f) => f,
+        None => dev.get_or_load_custom_func(&name, fmt.module, fmt.ptx)?,
+    };
+    enum Dst {
+        F32(CudaSlice<f32>),
+        Bf16(CudaSlice<half::bf16>),
+    }
+    let dst = if is_bf16o {
+        Dst::Bf16(unsafe { dev.alloc::<half::bf16>(nrows * b_size)? })
+    } else {
+        Dst::F32(unsafe { dev.alloc::<f32>(nrows * b_size)? })
+    };
     let one = q1_0_fastdiv(1);
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (ceil_div(nrows, rpb) as u32, 1, 1),
@@ -392,7 +407,10 @@ pub(super) fn llama_mul_mat_vec_raw(
     builder.arg(&y_q8_1);
     // ids (null), fusion {x_bias, gate, gate_bias, x_scale, gate_scale, glu_op, glu_limit}
     barg!(builder, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u32, 0f32);
-    builder.arg(&dst);
+    match &dst {
+        Dst::F32(d) => builder.arg(d),
+        Dst::Bf16(d) => builder.arg(d),
+    };
     barg!(
         builder,
         /* ncols_x */ ncols as u32,
@@ -407,7 +425,10 @@ pub(super) fn llama_mul_mat_vec_raw(
         /* ids_stride */ 0u32
     );
     unsafe { builder.launch(cfg) }.w()?;
-    Ok(dst)
+    Ok(match dst {
+        Dst::F32(d) => CudaStorage::wrap_cuda_slice(d, dev.clone()),
+        Dst::Bf16(d) => CudaStorage::wrap_cuda_slice(d, dev.clone()),
+    })
 }
 
 pub(super) fn quantize_q8_1(
@@ -1276,9 +1297,10 @@ impl QCudaStorage {
         nrows: usize,
         ncols_padded: usize,
         b_size: usize,
-    ) -> Result<Option<CudaSlice<f32>>> {
+        bf16_out: bool,
+    ) -> Result<Option<CudaStorage>> {
         let Some(fmt) = llama_fmt(self.dtype) else { return Ok(None) };
-        llama_mul_mat_vec_raw(fmt, &self.data, y_q8_1, ncols, nrows, ncols_padded, b_size, &self.device).map(Some)
+        llama_mul_mat_vec_raw(fmt, &self.data, y_q8_1, ncols, nrows, ncols_padded, b_size, &self.device, bf16_out).map(Some)
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
