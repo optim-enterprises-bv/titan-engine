@@ -204,7 +204,9 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
         put("TITAN_KV_PREALLOC", "1");
         put("TITAN_TIERED", "1");
         put("TITAN_TIERED_GPU_FRACTION", "auto");
-        put("TITAN_TIERED_RESERVE_MIB", "1536");
+        // long prompts (262k window) need the pfs staging ring and prompt temporaries next to the preallocated KV:
+        // 1536 left ~900 MiB free at runtime and fell back to CPU-twin prefill; 2560 ran 25k-250k prompts cleanly
+        put("TITAN_TIERED_RESERVE_MIB", "2560");
         put("TITAN_PFS", "1");
         put("TITAN_PFS_HEADROOM_MIB", "768");
         put("TITAN_DOORBELL", "1");
