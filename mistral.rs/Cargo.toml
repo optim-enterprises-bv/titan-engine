@@ -227,3 +227,7 @@ opt-level = 3
 candle-core = { path = "../candle/candle-core" }
 candle-nn = { path = "../candle/candle-nn" }
 candle-kernels = { path = "../candle/candle-kernels" }
+
+# titan: cudarc 0.19.10 with programmatic dependent launch in result::launch_kernel (vendor/cudarc, see result::pdl)
+[patch.crates-io]
+cudarc = { path = "../vendor/cudarc" }

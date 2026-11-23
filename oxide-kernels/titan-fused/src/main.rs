@@ -12,7 +12,7 @@
 //! unfused ops on live data with TITAN_FUSED_CHECK=1 (graphs off).
 #![allow(non_snake_case, clippy::missing_safety_doc, dead_code)]
 
-use cuda_device::{float, kernel, ptx_asm, thread};
+use cuda_device::{float, kernel, ptx_asm, thread, warp, SharedArray};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -101,6 +101,85 @@ pub mod kernels {
         let e = exp_portable(-x);
         let s = float::div_rn_f32(x, float::add_rn_f32(1.0, e));
         *out.add(i as usize) = float::mul_rn_f32(s, *u.add(i as usize));
+    }
+
+    /// candle-reduce's `warp_sum`: shfl.bfly 16, 8, 4, 2, 1, add.rn.
+    #[inline(always)]
+    fn warp_sum(mut x: f32) -> f32 {
+        let mut m = 16;
+        while m > 0 {
+            x = float::add_rn_f32(x, warp::shuffle_xor_f32_sync(0xffff_ffff, x, m));
+            m >>= 1;
+        }
+        x
+    }
+
+    /// Residual add + RMSNorm of the decode trunk in one pass: s = f32(y) + r (badd_f32's add.f32), written to `sum`;
+    /// RMSNorm of s with candle-reduce `rmsnorm_f32`'s exact order (thread partials by fma.rn over a stride of
+    /// `block_size`, warp_sum, the 32 warp sums through shared memory and warp_sum again when block_size > 32,
+    /// div.rn by ncols, rsqrt.approx(mean + eps), out = (scale * s) * alpha with mul.rn) written to `out`, and its
+    /// cvt.rn bf16 narrowing to `outb` (the matvec input, `narrow_matvec`). One launch for cast_bf16_f32 (y), badd_f32,
+    /// rmsnorm_f32 and cast_f32_bf16. grid = rows, block = block_size (candle: 1024 for ncols >= 1024, else 32).
+    #[inline(always)]
+    unsafe fn add_rmsnorm<L: Fn(isize) -> f32>(
+        ly: L, r: *const f32, alpha: *const f32, sum: *mut f32, out: *mut f32, outb: *mut u16, ncols: i32, block_size: i32, eps: f32,
+    ) {
+        static mut S_SUM: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let row = thread::blockIdx_x() as i32;
+        let tid = thread::threadIdx_x() as i32;
+        let base = row.wrapping_mul(ncols);
+        let mut tmp = 0.0f32;
+        let mut col = tid;
+        while col < ncols {
+            let i = base.wrapping_add(col) as isize;
+            let x = ly(i) + *r.offset(i);
+            *sum.offset(i) = x;
+            tmp = float::fma_rn_f32(x, x, tmp);
+            col = col.wrapping_add(block_size);
+        }
+        tmp = warp_sum(tmp);
+        if block_size > 32 {
+            let s_sum = SharedArray::as_raw_mut_ptr(&raw mut S_SUM);
+            let warp_id = thread::threadIdx_x() / 32;
+            let lane_id = thread::threadIdx_x() % 32;
+            if lane_id == 0 {
+                *s_sum.add(warp_id as usize) = tmp;
+            }
+            thread::sync_threads();
+            tmp = *s_sum.add(lane_id as usize);
+            tmp = warp_sum(tmp);
+        }
+        let mean = float::div_rn_f32(tmp, ncols as f32);
+        let scale = float::rsqrt_approx_f32(float::add_rn_f32(mean, eps));
+        let mut col = tid;
+        while col < ncols {
+            let i = base.wrapping_add(col) as isize;
+            let x = ly(i) + *r.offset(i);
+            let v = float::mul_rn_f32(float::mul_rn_f32(scale, x), *alpha.offset(col as isize));
+            *out.offset(i) = v;
+            if !outb.is_null() {
+                let b: u16;
+                ptx_asm!("cvt.rn.bf16.f32 %0, %1;", out("=h") b, in("f") v, options(register_only));
+                *outb.offset(i) = b;
+            }
+            col = col.wrapping_add(block_size);
+        }
+    }
+
+    /// `add_rmsnorm` with a bf16 `y` (a narrowed projection's output, widened exactly).
+    #[kernel]
+    pub unsafe fn titan_add_rmsnorm_bf16y(
+        y: *const u16, r: *const f32, alpha: *const f32, sum: *mut f32, out: *mut f32, outb: *mut u16, ncols: i32, block_size: i32, eps: f32,
+    ) {
+        add_rmsnorm(|i| f32::from_bits((*y.offset(i) as u32) << 16), r, alpha, sum, out, outb, ncols, block_size, eps)
+    }
+
+    /// `add_rmsnorm` with an f32 `y`.
+    #[kernel]
+    pub unsafe fn titan_add_rmsnorm_f32y(
+        y: *const f32, r: *const f32, alpha: *const f32, sum: *mut f32, out: *mut f32, outb: *mut u16, ncols: i32, block_size: i32, eps: f32,
+    ) {
+        add_rmsnorm(|i| *y.offset(i), r, alpha, sum, out, outb, ncols, block_size, eps)
     }
 
     /// Dense SwiGLU of a decode step, bf16 in and out: out[i] = bf16(mulf(silu(g[i]), u[i])) with g, u widened exactly.
