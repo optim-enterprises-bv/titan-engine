@@ -12,7 +12,7 @@ const OXIDE: &str = "iq2_xs.cubin";
 
 fn mmvq_ref_name(nc: usize, small_k: bool) -> String {
     format!(
-        "_Z13mul_mat_vec_qIL9ggml_type17ELi{nc}ELb0ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+        "_Z13mul_mat_vec_qIL9ggml_type17ELi{nc}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
         small_k as u32
     )
 }
@@ -398,6 +398,10 @@ fn bench() {
             p.put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32).put(0u32);
             let mut ms = [0f32; 2];
             for (k, f) in [func(m.mmvq, &mmvq_ref_name(1, false)), func(m.oxide, "iq2_xs_mmvq_1")].into_iter().enumerate() {
+                if std::env::var("ONLY").ok().and_then(|v| v.parse::<usize>().ok()).is_some_and(|o| o != k) { continue; }
+                if let Some(c) = std::env::var("CARVE").ok().and_then(|v| v.parse::<i32>().ok()) {
+                    if k == 1 { ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, c)); }
+                }
                 let mut pb = p.0.clone();
                 let mut size = pb.len();
                 let mut extra: [*mut c_void; 5] = [1 as *mut c_void, pb.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];

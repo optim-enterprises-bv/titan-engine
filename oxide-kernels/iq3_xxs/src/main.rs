@@ -242,37 +242,43 @@ mod kernels {
     /// `yb` is the q8_1 block at `kbx * (QK_K/32) + iqs/2`.
     #[inline(always)]
     pub unsafe fn vdot_acc(vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
+        // every global load first (two u16-pair words of grid indices, the sign/scale word, the activations, both
+        // scales), then the grid lookups, then the arithmetic
         let xb = vx.offset((kbx as isize).wrapping_mul(BLOCK_BYTES as isize));
         let qs = xb.add(2); // block_iq3_xxs.qs
-        // get_int_b2(qs, iqs): the u16 pair at qs + 4*iqs.
-        let mut q3 = [0u8; 8];
-        let mut t = 0usize;
-        while t < 8 {
-            q3[t] = *qs.add(4 * iqs as usize + t);
-            t += 1;
-        }
+        let w0 = get_int_b2(qs, iqs);
+        let w1 = get_int_b2(qs, iqs + 1);
         let aux32 = get_int_b2(qs.add(64), iqs / 2);
         let q8 = yb.add(4) as *const u32;
+        let y8 = [*q8, *q8.add(1), *q8.add(2), *q8.add(3), *q8.add(4), *q8.add(5), *q8.add(6), *q8.add(7)];
+        let dx = *(xb as *const u16) as u32;
+        let dy = *(yb as *const u16) as u32;
+        let q3 = [w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF, w0 >> 24, w1 & 0xFF, (w1 >> 8) & 0xFF, (w1 >> 16) & 0xFF, w1 >> 24];
+        let mut g = [0u32; 8];
+        let mut t = 0usize;
+        while t < 8 {
+            g[t] = grid_word(q3[t]);
+            t += 1;
+        }
         let mut sumi = 0i32;
         let mut l0 = 0usize;
         while l0 < 8 {
-            let g0 = grid_word(q3[l0] as u32);
-            let g1 = grid_word(q3[l0 + 1] as u32);
-            let signs = unpack_ksigns(aux32 >> (7 * l0 as u32 / 2));
-            // grid_l = __vsub4(grid ^ signs0, signs0) with signs0 = -1 per set sign bit =
-            // wrap(byte + 1) = -byte, i.e. the sign is applied by negating that byte.
-            let s0 = vcmpne4_zero((signs as u32 * 0x0101_0101) & 0x0804_0201);
-            let gl = vsub4(g0 ^ s0, s0);
-            let s1 = vcmpne4_zero((signs as u32 * 0x0101_0101) & 0x8040_2010);
-            let gh = vsub4(g1 ^ s1, s1);
-            sumi = dp4a(gl, *q8.add(l0), sumi);
-            sumi = dp4a(gh, *q8.add(l0 + 1), sumi);
+            // the reference's __vsub4(grid ^ m, m), m = 0xFF per set sign bit, as whole-word ops: byte k of t is sign
+            // bit k (nibble * 0x204081 moves bit k to bit 8k), m = t * 0xFF; grid bytes are never 0, so ~g + 1
+            // cannot carry out of its byte and (g ^ m) + t is that bytewise negation
+            let signs = unpack_ksigns(aux32 >> (7 * l0 as u32 / 2)) as u32;
+            let t0 = ((signs & 0xF).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+            let t1 = ((signs >> 4).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+            let gl = (g[l0] ^ t0.wrapping_mul(0xFF)).wrapping_add(t0);
+            let gh = (g[l0 + 1] ^ t1.wrapping_mul(0xFF)).wrapping_add(t1);
+            sumi = dp4a(gl, y8[l0], sumi);
+            sumi = dp4a(gh, y8[l0 + 1], sumi);
             l0 += 2;
         }
         // (ls*sumi + sumi/2)/2, integer; ls = aux32 >> 28.
         let ls = (aux32 >> 28) as i32;
         let sumi = (ls.wrapping_mul(sumi).wrapping_add(sumi / 2)) / 2;
-        let d = mul(h2f(*(xb as *const u16) as u32), h2f(*(yb as *const u16) as u32));
+        let d = mul(h2f(dx), h2f(dy));
         fma(d, sumi as f32, acc)
     }
 

@@ -1358,6 +1358,46 @@ mod kernels {
         *(y.add(2) as *mut u16) = f2h(sum);
     }
 
+    /// titan (no nvcc counterpart): `quantize_q8_1` reading bf16 activations. bf16 -> f32 is exact (the bits shifted
+    /// up 16), and everything after the load is `quantize_q8_1` verbatim, so the Q8_1 bytes equal `quantize_q8_1` of
+    /// the widened f32 copy -- the copy and its cast kernel are what this saves.
+    #[kernel]
+    pub unsafe fn quantize_q8_1_bf16(x: *const u16, vy: *mut u8, kx: i32, kx_padded: i32) {
+        let ix = thread::blockDim_x().wrapping_mul(thread::blockIdx_x()).wrapping_add(thread::threadIdx_x()) as i32;
+        if ix >= kx_padded {
+            return;
+        }
+        let iy = thread::blockDim_y().wrapping_mul(thread::blockIdx_y()).wrapping_add(thread::threadIdx_y()) as i32;
+        let i_padded = iy.wrapping_mul(kx_padded).wrapping_add(ix);
+        let ib = i_padded / 32;
+        let iqs = i_padded % 32;
+        let xi = if ix < kx { f32::from_bits((*x.offset(iy.wrapping_mul(kx).wrapping_add(ix) as isize) as u32) << 16) } else { 0.0 };
+        let mut amax = f32::from_bits(xi.to_bits() & 0x7FFF_FFFF); // abs.f32
+        let mut sum = xi;
+        let mut mask = 16;
+        while mask > 0 {
+            amax = amax.max(warp::shuffle_xor_f32_sync(0xffff_ffff, amax, mask));
+            mask >>= 1;
+        }
+        sum = warp_sum(sum);
+        let d = float::div_rn_f32(amax, 127.0);
+        let q = if amax == 0.0 {
+            0i32
+        } else {
+            // roundf: add.rz(t, copysign(0.5, t)), then truncate.
+            let t = float::div_rn_f32(xi, d);
+            let half = f32::from_bits(0x3F00_0000 | (t.to_bits() & 0x8000_0000));
+            float::add_rz_f32(t, half) as i32
+        };
+        let y = vy.offset(ib as isize * 36);
+        *y.offset(4 + iqs as isize) = q as u8;
+        if iqs > 0 {
+            return;
+        }
+        *(y as *mut u16) = f2h(d);
+        *(y.add(2) as *mut u16) = f2h(sum);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Family 4: mul_mat_vec_*_q8_1_cudaN (80 entries) and indexed_moe_forward_* (6 entries),
     // both built on the MMVQ `vec_dot_*_q8_1`. FMT: 0 q4_0, 1 q4_1, 2 q5_0, 3 q5_1, 4 q8_0,

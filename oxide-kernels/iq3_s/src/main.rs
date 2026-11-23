@@ -199,34 +199,59 @@ mod kernels {
     /// `kbx * 8 + iqs/2` (the reference indexes `bq8_1[iqs/2]` from the block-aligned pointer).
     #[inline(always)]
     pub unsafe fn vdot_acc<const MUT: u32>(vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
+        // every global load first (weights, activations, scale bytes), then the dependent grid lookups, then the
+        // arithmetic: the loads of one call are in flight together instead of in dependent waves
         let xb = vx.offset((kbx as isize).wrapping_mul(BLOCK_BYTES as isize));
         let q0 = get_int_b2(xb.add(QS), iqs);
         let q1 = get_int_b2(xb.add(QS), iqs + 1);
-        let qs = [
-            q0 as u8, (q0 >> 8) as u8, (q0 >> 16) as u8, (q0 >> 24) as u8,
-            q1 as u8, (q1 >> 8) as u8, (q1 >> 16) as u8, (q1 >> 24) as u8,
-        ];
         let qh = *xb.add(QH + (iqs / 2) as usize) as u32;
         let sp = get_int_b2(xb.add(SIGNS), iqs / 2);
+        let scb = *xb.add(SCALES + (iqs / 4) as usize) as u32;
+        let dx = *(xb as *const u16) as u32;
+        let dy = *(yb as *const u16) as u32;
         let q8 = yb.add(4) as *const u32;
-        let mut sumi = 0i32;
+        let y8 = [*q8, *q8.add(1), *q8.add(2), *q8.add(3), *q8.add(4), *q8.add(5), *q8.add(6), *q8.add(7)];
+        let qs = [q0 & 0xFF, (q0 >> 8) & 0xFF, (q0 >> 16) & 0xFF, q0 >> 24, q1 & 0xFF, (q1 >> 8) & 0xFF, (q1 >> 16) & 0xFF, q1 >> 24];
+        let mut g = [0u32; 8];
         let mut l0 = 0usize;
         while l0 < 8 {
             cuda_device::thread::__unroll_config::<0>();
-            let g0 = grid(qs[l0] as u32 | ((qh << ((if MUT == 1 { 7 } else { 8 }) - l0 as u32)) & 0x100));
-            let g1 = grid(qs[l0 + 1] as u32 | ((qh << (7 - l0 as u32)) & 0x100));
+            g[l0] = grid(qs[l0] | ((qh << ((if MUT == 1 { 7 } else { 8 }) - l0 as u32)) & 0x100));
+            g[l0 + 1] = grid(qs[l0 + 1] | ((qh << (7 - l0 as u32)) & 0x100));
+            l0 += 2;
+        }
+        let mut sumi = 0i32;
+        if MUT == 0 {
+            // signs applied as whole words: byte k of t is sign bit k (nib * 0x204081 moves bit k to bit 8k), m = t * 0xFF
+            // its byte mask; the grid bytes are odd (never 0), so ~g + 1 never carries out of a byte and
+            // (g ^ m) + t is the bytewise negation the reference's __vsub4(g ^ m, m) computes
+            let mut l = 0u32;
+            while l < 4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let t0 = (((sp >> (8 * l)) & 0xF).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+                let t1 = (((sp >> (8 * l + 4)) & 0xF).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+                let gl = (g[2 * l as usize] ^ t0.wrapping_mul(0xFF)).wrapping_add(t0);
+                let gh = (g[2 * l as usize + 1] ^ t1.wrapping_mul(0xFF)).wrapping_add(t1);
+                sumi = dp4a(gl, y8[2 * l as usize], sumi);
+                sumi = dp4a(gh, y8[2 * l as usize + 1], sumi);
+                l += 1;
+            }
+        }
+        let mut l0 = 0usize;
+        while MUT != 0 && l0 < 8 {
+            cuda_device::thread::__unroll_config::<0>();
             let s8 = (sp >> (8 * (l0 as u32 / 2))) & 0xFF;
             let s0 = vcmpne4_zero(((s8 & 0x03) << 7) | ((s8 & 0x0C) << 21));
             let s1 = vcmpne4_zero(((s8 & 0x30) << 3) | ((s8 & 0xC0) << (if MUT == 2 { 16 } else { 17 })));
-            let gl = vsub4(g0 ^ s0, s0);
-            let gh = vsub4(g1 ^ s1, s1);
-            sumi = dp4a(gl, *q8.add(l0), sumi);
-            sumi = dp4a(gh, *q8.add(l0 + 1), sumi);
+            let gl = vsub4(g[l0] ^ s0, s0);
+            let gh = vsub4(g[l0 + 1] ^ s1, s1);
+            sumi = dp4a(gl, y8[l0], sumi);
+            sumi = dp4a(gh, y8[l0 + 1], sumi);
             l0 += 2;
         }
-        let sc = ((*xb.add(SCALES + (iqs / 4) as usize) as u32) >> (((iqs as u32) << 1) & (if MUT == 3 { 0x02 } else { 0x04 }))) & 0x0F;
+        let sc = (scb >> (((iqs as u32) << 1) & (if MUT == 3 { 0x02 } else { 0x04 }))) & 0x0F;
         let sumi = sumi.wrapping_mul(1 + 2 * sc as i32);
-        let d = mul(h2f(*(xb as *const u16) as u32), h2f(*(yb as *const u16) as u32));
+        let d = mul(h2f(dx), h2f(dy));
         fma(d, sumi as f32, acc)
     }
 

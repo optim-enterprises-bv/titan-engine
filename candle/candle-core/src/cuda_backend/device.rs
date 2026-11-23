@@ -360,6 +360,7 @@ impl CudaDevice {
         let ms = self.custom_modules.read().unwrap();
         if let Some(mdl) = ms.get(module_name).as_ref() {
             let func = mdl.load_function(fn_name).w()?;
+            l1_carveout(&func);
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
@@ -370,6 +371,7 @@ impl CudaDevice {
         let cuda_module = self.context.load_module(ptx.into()).w()?;
         ms.insert(module_name.to_string(), cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
+        l1_carveout(&func);
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
@@ -381,6 +383,7 @@ impl CudaDevice {
         let ms = self.modules.read().unwrap();
         if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
             let func = mdl.load_function(fn_name).w()?;
+            l1_carveout(&func);
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
@@ -391,6 +394,7 @@ impl CudaDevice {
         let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
+        l1_carveout(&func);
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
@@ -953,4 +957,37 @@ pub fn ktrace(module: &str, name: &str) {
     if SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap().insert(key.clone()) {
         eprintln!("KTRACE {key}");
     }
+}
+
+
+/// titan: the shared-memory / L1 split of a kernel with static shared memory. Left to the driver, such a kernel gets the
+/// largest shared carveout (L1 shrinks to ~28 KB on sm_120), and the matvec kernels, which re-read each weight sector
+/// through L1 several times, fall off a cliff on long rows: IQ3_S K=17408 N=5120 113 us at the default split vs 50 us
+/// with the split just big enough for 12 resident 128-thread blocks (the SM's thread limit). That smallest split is set
+/// once per function: occupancy as before for 128-thread blocks, the rest stays L1. `TITAN_L1_CARVEOUT=0` keeps the
+/// driver's choice.
+pub fn l1_carveout(func: &cudarc::driver::CudaFunction) {
+    use cudarc::driver::sys::CUfunction_attribute_enum as A;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static DONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("TITAN_L1_CARVEOUT").is_ok_and(|v| v == "0")) {
+        return;
+    }
+    let key = func.cu_function() as usize;
+    {
+        let mut g = DONE.lock().unwrap();
+        if !g.get_or_insert_with(HashSet::new).insert(key) {
+            return;
+        }
+    }
+    let Ok(smem) = func.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES) else { return };
+    if smem <= 0 {
+        return;
+    }
+    // 12 blocks x (static + the 1 KiB the driver reserves per block), as a percentage of the 100 KiB maximum
+    let need = 12 * (smem as i64 + 1024);
+    let pct = ((need * 100 + 102_399) / 102_400).clamp(1, 100) as i32;
+    let _ = func.set_attribute(A::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, pct);
 }

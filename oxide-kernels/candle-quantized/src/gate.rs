@@ -341,7 +341,7 @@ fn iq_moe(g: &mut G) {
 /// Field-by-field IQ2_XXS probe: runs the reference and port probe kernels on the SAME buffers
 /// and prints both outputs side by side so the diverging component is visible.
 pub fn run_iq_probe() -> bool {
-    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let refp = format!("{root}/reference/iq_moe/iq_moe_ref.ptx");
     let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));
     let mut g = G { h, t: Tally::default(), rng: Rng(0x1234), per_entry: Default::default(), srate: 4096, fails: Default::default() };
@@ -370,7 +370,7 @@ pub fn run_iq_probe() -> bool {
 /// Per-block isolation: diff ONE vec_dot value per (kbx, iqs) so an index bug can be localized
 /// to a specific sub-block instead of showing up as "whole output differs".
 pub fn run_iq_block() -> bool {
-    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let refp = format!("{root}/reference/iq_moe/iq_moe_ref.ptx");
     let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));
     let mut g = G { h, t: Tally::default(), rng: Rng(0x5EED), per_entry: Default::default(), srate: 1024, fails: Default::default() };
@@ -526,7 +526,7 @@ pub fn run(args: Vec<String>) -> bool {
     if args.iter().any(|a| a == "iqprobe") {
         return run_iq_probe();
     }
-    let root = format!("{}/titan-engine/oxide-kernels", std::env::var("HOME").unwrap());
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let refp = format!("{root}/reference/candle/quantized.ptx");
     let h = Harness::new(&refp, &format!("{root}/candle-quantized/candle_quantized.ptx"));
     let mut g = G { h, t: Tally::default(), rng: Rng(0x9A17), per_entry: Default::default(), srate: 16, fails: Default::default() };

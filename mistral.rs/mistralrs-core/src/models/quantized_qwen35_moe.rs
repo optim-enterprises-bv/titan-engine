@@ -4082,8 +4082,11 @@ impl ModelWeights {
                 Mixer::Linear(_) => true,
             });
             let layers_ok = mixers_ok && (self.all_moe() || (self.all_dense() && Self::dense_graphs_enabled()));
-            // host-RAM KV attends on the CPU between segments, outside any capture
-            let ok = one_device && layers_ok && lookahead_depth() == 0 && !crate::titan_hostkv::enabled();
+            // host-RAM KV attends on the CPU between segments, outside any capture: the dense graphed paths
+            // (`forward_trunk_graphed_dense`, `forward_verify_graphed_dense`) run every attention eagerly between their
+            // segments (append, then the device, split or host attend), so only the MoE paths exclude it
+            let host_ok = !crate::titan_hostkv::enabled() || self.all_dense();
+            let ok = one_device && layers_ok && lookahead_depth() == 0 && host_ok;
             if ok {
                 tracing::info!("titan graphs: piecewise CUDA graphs for batch-1 decode on");
             } else {
@@ -4104,7 +4107,7 @@ impl ModelWeights {
                 if lookahead_depth() != 0 {
                     why.push("TITAN_TIERED_LOOKAHEAD is set");
                 }
-                if crate::titan_hostkv::enabled() {
+                if !host_ok {
                     why.push("host-RAM KV (TITAN_KV_HOST; TITAN_HOST_GRAPHS covers verification only)");
                 }
                 tracing::warn!("titan graphs: TITAN_CUDA_GRAPHS=1 but batch-1 decode graphs are off: {}", why.join("; "));

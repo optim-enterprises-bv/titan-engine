@@ -625,6 +625,22 @@ impl QuantMethod for GgufMatMul {
             }
         }
 
+        // titan: the IQ / FP4 decode matvecs take bf16 directly (candle's fast_mmvq quantizes it exactly), which saves
+        // the widening cast; their output comes back in the input dtype, as the route below would return it
+        #[cfg(feature = "cuda")]
+        if let QMatMul::QTensor(q) = &self.w {
+            let rows = a.dims()[..a.dims().len().saturating_sub(1)].iter().product::<usize>();
+            if q.device().is_cuda()
+                && a.dtype() == DType::BF16
+                && (1..=8).contains(&rows)
+                && a.is_contiguous()
+                && candle_core::quantized::cuda::direct_bf16_mmvq(q.dtype())
+            {
+                let x = self.w.forward(a)?;
+                return self.add_bias(x);
+            }
+        }
+
         // Fallback: Candle QMatMul requires F32
         let original_dtype = a.dtype();
         let a_f32 = if original_dtype == DType::F32 {
