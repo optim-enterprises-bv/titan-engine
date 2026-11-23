@@ -1363,6 +1363,26 @@ impl DenseFfn {
         let xq = narrowed.as_ref().unwrap_or(xs);
         let g = self.gate.forward(xq)?;
         let u = self.up.forward(xq)?;
+        #[cfg(feature = "cuda")]
+        if narrowed.is_some() && g.dtype() == DType::BF16 && u.dtype() == DType::BF16 && xs.dtype() == DType::F32 && glu_fuse() {
+            // bf16 gate and up straight to the bf16 down input (titan_glu_silu_bf16): the widening casts, the f32
+            // SwiGLU and the narrowing below, as one kernel with the same instructions
+            let h = titan_glu_silu_bf16(&g, &u)?;
+            if mistralrs_quant::titan_cfg::flag("TITAN_GLU_CHECK", false) {
+                let want = narrow_matvec(&crate::ops::mul_and_act(
+                    &g.to_dtype(DType::F32)?,
+                    &u.to_dtype(DType::F32)?,
+                    crate::layers::Activation::Silu,
+                )?)
+                .ok_or_else(|| candle_core::Error::msg("titan glu check: no narrowing"))?;
+                let (a, b) = (h.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?, want.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?);
+                let bad = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                if bad > 0 {
+                    tracing::warn!("titan glu check: {bad} of {} differ", a.len());
+                }
+            }
+            return self.down.forward(&h)?.to_dtype(xs.dtype());
+        }
         // the gating widens to xs's dtype a block of rows at a time: a prompt chunk's whole f32 gate and up
         // (~36 MiB each at 512 rows) did not always fit the device next to the weights
         let k = g.dim(D::Minus1)?;
@@ -1952,6 +1972,49 @@ fn mtp_verify_rowwise() -> bool {
 /// GDN mixer returns f32). The residual add and the norms stay f32; only the
 /// matvec input is narrowed. `=0` restores the old path.
 /// Rows per block of the prompt FFN's gating (`DenseFfn::forward`).
+/// `TITAN_GLU_FUSE` (default on): a dense decode FFN's SwiGLU as one `titan_glu_silu_bf16` launch.
+#[cfg(feature = "cuda")]
+fn glu_fuse() -> bool {
+    mistralrs_quant::titan_cfg::flag("TITAN_GLU_FUSE", true)
+}
+
+/// `titan_glu_silu_bf16`: bf16(silu(g) * u) of two contiguous-able bf16 tensors of one shape, bit-identical to
+/// widening both, `mul_and_act(.., Silu)` in f32 and narrowing the result (see the kernel).
+#[cfg(feature = "cuda")]
+fn titan_glu_silu_bf16(g: &Tensor, u: &Tensor) -> Result<Tensor> {
+    use candle_core::cuda::cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
+    let Device::Cuda(dev) = g.device() else {
+        candle_core::bail!("titan glu: not on CUDA");
+    };
+    if g.shape() != u.shape() {
+        candle_core::bail!("titan glu: gate {:?} vs up {:?}", g.dims(), u.dims());
+    }
+    let (g, u) = (g.contiguous()?, u.contiguous()?);
+    let n = g.elem_count();
+    let out = unsafe { dev.alloc::<half::bf16>(n)? };
+    let stream = dev.cuda_stream();
+    let ptr = |t: &Tensor| -> Result<u64> {
+        let (st, l) = t.storage_and_layout();
+        let candle_core::Storage::Cuda(cs) = &*st else {
+            candle_core::bail!("titan glu: not on CUDA");
+        };
+        let (p, _g) = cs.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        Ok(p + (l.start_offset() * 2) as u64)
+    };
+    let (pg, pu) = (ptr(&g)?, ptr(&u)?);
+    let po = out.device_ptr(&stream).0;
+    let f = dev.get_or_load_custom_func("titan_glu_silu_bf16", "titan_fused_oxide", TITAN_FUSED_PTX)?;
+    let n32 = n as u32;
+    let mut b = f.builder();
+    b.arg(&pg).arg(&pu).arg(&po).arg(&n32);
+    let cfg = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    Ok(Tensor::from((
+        candle_core::Storage::Cuda(candle_core::cuda::CudaStorage::wrap_cuda_slice(out, dev.clone())),
+        g.shape().clone(),
+    )))
+}
+
 const FFN_GATE_ROWS: usize = 128;
 
 /// Most rows (a batch's verifications) `lin_rows_as` takes through MMQ, `MAX_ROWS` per launch.

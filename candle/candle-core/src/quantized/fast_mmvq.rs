@@ -256,11 +256,26 @@ pub fn try_fwd(
                 eprintln!("titan iq fast check {w_dtype:?} {input_dtype:?} k={k} b={b_size}: Q8_1 bytes differ at {diff:?}");
             }
         }
-        let Some(out) = qstorage.llama_mmvq(scratch_ptr as u64, k, nrows, k_padded, b_size)? else {
+        let Some(out) = qstorage.llama_mmvq(scratch_ptr as u64, k, nrows, k_padded, b_size, input_dtype == DType::BF16)? else {
             return Ok(None);
         };
-        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
-        let out = if input_dtype == DType::F32 {
+        if out.dtype() == DType::BF16 && std::env::var("TITAN_IQ_FAST_CHECK").is_ok_and(|v| v == "1") {
+            // the bf16-store kernel against the f32 kernel + cast_f32_bf16
+            use crate::backend::BackendStorage;
+            if let Some(f) = qstorage.llama_mmvq(scratch_ptr as u64, k, nrows, k_padded, b_size, false)? {
+                let l = crate::Layout::contiguous(out_shape.as_slice());
+                let want = f.to_dtype(&l, DType::BF16)?;
+                let (a, b) = (out.as_cuda_slice::<half::bf16>()?, want.as_cuda_slice::<half::bf16>()?);
+                let (mut va, mut vb) = (vec![half::bf16::ZERO; a.len()], vec![half::bf16::ZERO; b.len()]);
+                dev.memcpy_dtoh(a, &mut va)?;
+                dev.memcpy_dtoh(b, &mut vb)?;
+                let bad = va.iter().zip(&vb).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                if bad > 0 {
+                    eprintln!("titan iq fast check {w_dtype:?} bf16 out k={k} n={nrows}: {bad} of {} differ", va.len());
+                }
+            }
+        }
+        let out = if out.dtype() == input_dtype {
             out
         } else {
             use crate::backend::BackendStorage;
