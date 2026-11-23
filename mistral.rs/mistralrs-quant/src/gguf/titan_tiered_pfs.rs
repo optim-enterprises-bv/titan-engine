@@ -26,6 +26,15 @@ impl TieredExperts {
         titan_pfs::set_context(tokens);
     }
 
+    /// VRAM a prompt pass needs free for its expert staging ring, `rows` tokens per forward at `topk` experts each
+    /// (`titan_pfs::ring_room`); `None` when it streams nothing or `rows` is below the streaming minimum.
+    pub fn prefill_room(rows: usize, topk: usize) -> Option<usize> {
+        if rows < titan_pfs::min_rows() {
+            return None;
+        }
+        titan_pfs::ring_room(rows * topk)
+    }
+
     /// Whether a forward of `rows` tokens streams this tensor's non-resident experts (`titan_pfs`).
     pub fn streams(&self, rows: usize) -> bool {
         self.pfs_on() && rows >= titan_pfs::min_rows()

@@ -5126,10 +5126,84 @@ impl ModelWeights {
         self.mapper.as_ref().and_then(|m| m.device_for(i, false)).unwrap_or(&self.device)
     }
 
+    /// A prompt step of `rows` tokens streams its non-resident experts through a staging ring (`titan_pfs`), which
+    /// needs VRAM beyond what the plan reserved when the reserve is small or the context grew: without it the whole
+    /// prompt ran its non-resident experts on the CPU twin (Qwen3.6-35B, 6.4k prompt, 1.5 GiB reserve: 500 tok/s
+    /// against 3000 with the ring). Before such a step the coldest GPU-resident experts move to the CPU until the
+    /// ring's minimum fits.
+    #[cfg(feature = "cuda")]
+    fn ensure_prefill_room(&self, rows: usize) -> Result<()> {
+        if rows <= 1 {
+            return Ok(());
+        }
+        // rows per streamed forward: the prompt's chunk (`prefill_big_chunk` for the bulk of a long prompt)
+        let chunk = prefill_chunk_size();
+        let per_forward = if chunk == 0 { rows } else { rows.min(chunk.max(prefill_big_chunk())) };
+        let Some(top_k) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => Some(m.top_k),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let Some(room) = mistralrs_quant::TieredExperts::prefill_room(per_forward, top_k) else {
+            return Ok(());
+        };
+        crate::titan_swap::trim_pool(&self.device);
+        let free = device_free_bytes(&self.device).unwrap_or(0);
+        if free >= room {
+            return Ok(());
+        }
+        if let Some((per_layer, freed, kept)) = self.demote_experts(room - free)? {
+            tracing::info!(
+                "titan vram: prompt of {rows} tokens: {per_layer} experts per layer moved to the CPU ({} MiB) for the expert staging ring ({} MiB needed, {} MiB were free), {kept} stay on the GPU",
+                freed >> 20,
+                room >> 20,
+                free >> 20
+            );
+        }
+        Ok(())
+    }
+
+    /// Move the coldest GPU-resident experts to the CPU (the same number in every layer, placement order) until
+    /// `short` more bytes are free: `(experts per layer, bytes freed, experts per layer left)`, `None` when no layer
+    /// can give any back.
+    #[cfg(feature = "cuda")]
+    fn demote_experts(&self, short: usize) -> Result<Option<(usize, usize, usize)>> {
+        let layers: Vec<[&mistralrs_quant::TieredExperts; 3]> = self
+            .layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => match &m.experts {
+                    super::quantized_qwen3_moe::Experts::Tiered { gate, up, down } if gate.can_demote() => Some([gate, up, down]),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let slot_bytes: usize = layers.iter().map(|l| l.iter().map(|p| p.expert_bytes()).sum::<usize>()).sum::<usize>() / layers.len();
+        let per_layer = short.div_ceil(slot_bytes * layers.len()).max(1);
+        self.device.synchronize()?;
+        let mut freed = 0usize;
+        let mut kept = usize::MAX;
+        for l in &layers {
+            let n = l[0].resident_count().saturating_sub(per_layer);
+            kept = kept.min(n);
+            for p in l {
+                freed += p.demote_to(n)?;
+            }
+        }
+        mistralrs_quant::invalidate_captures();
+        crate::titan_swap::trim_pool(&self.device);
+        Ok(Some((per_layer, freed, kept)))
+    }
+
     /// `TITAN_KV_DYNAMIC`: before a step that needs `need` KV positions past the attention caches' room, grow them to
     /// the next `KV_RESERVE_STEP` bucket, first demoting the coldest GPU-resident experts (the same number in every
     /// layer, placement order) until the growth fits: the experts hold the VRAM a short context does not need.
-    pub(crate) fn ensure_kv_room(&self, need: usize, fresh: bool) -> Result<()> {
+    pub(crate) fn ensure_kv_room(&self, need: usize, fresh: bool, rows: usize) -> Result<()> {
         if !crate::kv_cache::cuda_kv_dynamic() || !self.device.is_cuda() {
             return Ok(());
         }
@@ -5141,6 +5215,8 @@ impl ModelWeights {
             }
             self.rebalance_for_fresh(need)?;
         }
+        #[cfg(feature = "cuda")]
+        self.ensure_prefill_room(rows)?;
         if self.cache.hybrid().attention_on_host() || self.cache.hybrid().attention_split() {
             return Ok(());
         }
@@ -5173,32 +5249,7 @@ impl ModelWeights {
         let free = device_free_bytes(&self.device).unwrap_or(0);
         #[cfg(feature = "cuda")]
         if free < need_bytes {
-            let layers: Vec<[&mistralrs_quant::TieredExperts; 3]> = self
-                .layers
-                .iter()
-                .filter_map(|l| match &l.ffn {
-                    Ffn::Moe(m) => match &m.experts {
-                        super::quantized_qwen3_moe::Experts::Tiered { gate, up, down } if gate.can_demote() => Some([gate, up, down]),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-            if !layers.is_empty() {
-                let slot_bytes: usize = layers.iter().map(|l| l.iter().map(|p| p.expert_bytes()).sum::<usize>()).sum::<usize>() / layers.len();
-                let per_layer = (need_bytes - free).div_ceil(slot_bytes * layers.len()).max(1);
-                self.device.synchronize()?;
-                let mut freed = 0usize;
-                let mut kept = usize::MAX;
-                for l in &layers {
-                    let n = l[0].resident_count().saturating_sub(per_layer);
-                    kept = kept.min(n);
-                    for p in l {
-                        freed += p.demote_to(n)?;
-                    }
-                }
-                mistralrs_quant::invalidate_captures();
-                crate::titan_swap::trim_pool(&self.device);
+            if let Some((per_layer, freed, kept)) = self.demote_experts(need_bytes - free)? {
                 tracing::info!(
                     "titan vram: KV room {cap} -> {target} positions: {per_layer} experts per layer moved to the CPU ({} MiB), {kept} stay on the GPU",
                     freed >> 20
