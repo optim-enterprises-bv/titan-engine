@@ -169,9 +169,18 @@ const PROMPT_TRIM_BELOW: usize = 1 << 30;
 /// Before a prompt step on a nearly full device: hand the pool's unused reservations back to the driver. Decode
 /// steps leave the pool holding fragments (~400 MiB on the dense 27B with lookup verifications) that a prompt chunk's
 /// larger buffers cannot reuse, and with ~40 MiB left on the device its new reservation failed.
+/// Every prompt step trims the pool first: its cached blocks are freed memory a different-sized allocation cannot
+/// reuse, and after a long prompt they held ~1 GiB, so the next long prompt's pfs ring found no room (CPU twin
+/// prefill) and a later chunk ran out of memory. Trimming returns only unused blocks; the workspaces (and with them
+/// the captured graphs) go only on a nearly full device.
 pub(crate) fn trim_before_prompt(device: &candle_core::Device) {
     if device_free(device) < PROMPT_TRIM_BELOW {
         release_workspaces_and_trim(device);
+    } else {
+        #[cfg(feature = "cuda")]
+        if let candle_core::Device::Cuda(dev) = device {
+            trim_cuda(dev);
+        }
     }
 }
 

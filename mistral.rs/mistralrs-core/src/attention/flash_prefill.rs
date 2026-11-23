@@ -258,6 +258,30 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
 fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice) -> Result<()> {
     let (_, kvh, cap, hd) = dst.dims4()?;
     let (st, l) = t.storage_and_layout();
+    if let Storage::Cuda(sc) = &*st {
+        // a device F8E4M3 cache (TITAN_KV_FP8): the same tiles, copied on the device
+        let hs = t.stride()[1];
+        let stream = dev.cuda_stream();
+        let (src, _gs) = sc.as_cuda_slice::<float8::F8E4M3>()?.device_ptr(&stream);
+        let (dst_st, _) = dst.storage_and_layout();
+        let Storage::Cuda(dc) = &*dst_st else {
+            candle_core::bail!("flash-prefill tiles: staging buffer must live on CUDA");
+        };
+        let (base, _g) = dc.as_cuda_slice::<float8::F8E4M3>()?.device_ptr(&stream);
+        for g in 0..kvh {
+            let off = l.start_offset() + g * hs + a * hd;
+            unsafe {
+                candle_core::cuda::cudarc::driver::result::memcpy_dtod_async(
+                    base + (g * cap * hd) as u64,
+                    src + off as u64,
+                    len * hd,
+                    stream.cu_stream(),
+                )
+            }
+            .w()?;
+        }
+        return Ok(());
+    }
     let Storage::Cpu(c) = &*st else {
         candle_core::bail!("flash-prefill host tiles: K/V must live on the CPU");
     };

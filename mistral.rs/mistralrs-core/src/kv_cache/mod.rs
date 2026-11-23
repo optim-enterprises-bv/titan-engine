@@ -172,6 +172,17 @@ impl KvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.append_impl(k, v, false)
+    }
+
+    /// `append`, handing back the cache in its stored dtype: an F8E4M3 CUDA cache (TITAN_KV_FP8) as F8E4M3, for
+    /// attention that reads it as it is (flash-decode, tiled flash-prefill). `append` converts the whole cache back to
+    /// the 16-bit dtype, a full-context copy per call.
+    pub fn append_raw(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.append_impl(k, v, true)
+    }
+
+    fn append_impl(&mut self, k: &Tensor, v: &Tensor, raw: bool) -> Result<(Tensor, Tensor)> {
         // Metal fast-path: fuse the K and V slice_set calls into one kernel.
         // Skip if inputs aren't already contiguous; the slow path will fix that.
         #[cfg(feature = "metal")]
@@ -262,7 +273,7 @@ impl KvCache {
             }
             Some(v) => v,
         };
-        if fp8 {
+        if fp8 && !raw {
             return Ok((k.to_dtype(dt)?, v.to_dtype(dt)?));
         }
         Ok((k, v))

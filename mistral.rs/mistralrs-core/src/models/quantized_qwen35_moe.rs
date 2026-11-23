@@ -567,7 +567,7 @@ impl FullAttention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(k, v)?;
+                let (k, v) = kv_cache.append_raw(k, v)?;
                 self.attend(q, &k, &v, mask, Some(ctx.flash_params()))
             }
         })
@@ -587,6 +587,25 @@ impl FullAttention {
             return crate::titan_hostkv::attend(q, k, v, &self.sdpa_params);
         }
         let rows = q.dim(2)?;
+        if k.dtype() == DType::F8E4M3 {
+            // the cache as stored (TITAN_KV_FP8, `append_raw`): never widened whole
+            if rows > MTP_CATCHUP_MAX_ROWS {
+                // a prompt chunk (its mask is the placeholder, or None after the first chunk): tiles of the cache widened
+                // one at a time, merged online, causal over the chunk's last rows
+                return crate::attention::flash_prefill_host_tiles(q, k, v, &self.sdpa_params, crate::titan_hostkv::tile());
+            }
+            let past = k.dim(2)? - rows;
+            if crate::attention::flash_decode_first_row(q, k, v, past, rows, &self.sdpa_params) == 0 {
+                // decode rows past TITAN_ATTN_FLASH_MIN keys: flash-decode reads F8E4M3 (as verify rows do)
+                let (b, h, m, d) = q.dims4()?;
+                return crate::attention::flash_decode_rows(q, k, v, past, &self.sdpa_params)?
+                    .reshape((b, m, h, d))?
+                    .transpose(1, 2);
+            }
+            // a short cache: widen it
+            let (k, v) = (k.to_dtype(q.dtype())?, v.to_dtype(q.dtype())?);
+            return self.attend(q, &k, &v, mask, flash_params);
+        }
         if matches!(mask, AttentionMask::Custom(_))
             && !self.exact_mask
             && rows > MTP_CATCHUP_MAX_ROWS
@@ -614,7 +633,7 @@ impl FullAttention {
         flash_params: Option<&crate::pipeline::text_models_inputs_processor::FlashParams>,
     ) -> Result<Tensor> {
         self.forward_with(x, mask, positions, |q, k, v| {
-            let (k, v) = kv_cache.append(k, v)?;
+            let (k, v) = kv_cache.append_raw(k, v)?;
             self.attend(q, &k, &v, mask, flash_params)
         })
     }
@@ -706,10 +725,11 @@ impl FullAttention {
             q.device().synchronize()?;
             crate::titan_hostkv::prof_mark(0, &mut t0);
         }
-        let (k, v) = kv_cache.append(k, v)?;
+        let (k, v) = kv_cache.append_raw(k, v)?;
         if prof {
             crate::titan_hostkv::prof_mark(1, &mut t0);
         }
+        let widen = |t: Tensor| -> Result<Tensor> { if t.dtype() == DType::F8E4M3 { t.to_dtype(q.dtype()) } else { Ok(t) } };
         if k.device().is_cpu() {
             // one pass over the host cache for all rows; each row still equals its decode step
             let y = Sdpa.run_attention(q, &k, &v, &AttentionMask::None, flash_params, &self.sdpa_params)?;
@@ -722,8 +742,8 @@ impl FullAttention {
         let mut ys = (0..first)
             .map(|r| {
                 let q = q.narrow(2, r, 1)?.contiguous()?;
-                let k = k.narrow(2, 0, past + r + 1)?;
-                let v = v.narrow(2, 0, past + r + 1)?;
+                let k = widen(k.narrow(2, 0, past + r + 1)?)?;
+                let v = widen(v.narrow(2, 0, past + r + 1)?)?;
                 Sdpa.run_attention(&q, &k, &v, &AttentionMask::None, flash_params, &self.sdpa_params)?
                     .reshape((b_sz, 1, ()))
             })
@@ -1161,6 +1181,99 @@ impl MoeBlock {
         expert_sum(&routed.broadcast_mul(&weights.to_dtype(routed.dtype())?.unsqueeze(D::Minus1)?)?)?.to_dtype(DType::F32)
     }
 
+    /// The shared expert before its gate, `(tokens, hidden)` F32, and the gate's logit `(tokens, 1)`.
+    fn shared_parts(&self, flat: &Tensor) -> Result<(Tensor, Tensor)> {
+        let sh = &self.shared;
+        let g = sh.gate.forward(flat)?;
+        let u = sh.up.forward(flat)?;
+        let shared = sh.down.forward(&crate::ops::mul_and_act(&g, &u, crate::layers::Activation::Silu)?)?;
+        Ok((shared.to_dtype(DType::F32)?, flat.matmul(&sh.gate_inp)?))
+    }
+
+    /// `combine(flat, routed, weights)` reshaped like `x_attn` plus `x_attn`: the layer's output. One fused kernel
+    /// (`titan_fused`, the same f32 ops in the same order as the eight candle launches it replaces) when the shapes
+    /// allow it; `TITAN_FUSED=0` keeps the ops, `TITAN_FUSED_CHECK=1` runs both and compares the bytes.
+    fn combine_residual(&self, flat: &Tensor, routed: &Tensor, weights: &Tensor, x_attn: &Tensor) -> Result<Tensor> {
+        let unfused = |s: &Self| -> Result<Tensor> {
+            let (b, sq, hidden) = x_attn.dims3()?;
+            let h = s.combine(flat, routed, weights)?.reshape((b, sq, hidden))?.to_dtype(x_attn.dtype())?;
+            h + x_attn
+        };
+        #[cfg(feature = "cuda")]
+        {
+            if titan_fused_on() && x_attn.dtype() == DType::F32 && routed.dtype() == DType::F32 && x_attn.device().is_cuda() {
+                if let Some(y) = self.combine_residual_fused(flat, routed, weights, x_attn)? {
+                    let capturing = match x_attn.device() {
+                        Device::Cuda(d) => !matches!(
+                            d.cuda_stream().capture_status(),
+                            Ok(candle_core::cuda::cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+                        ),
+                        _ => false,
+                    };
+                    if titan_fused_check() && !capturing {
+                        let want = unfused(self)?;
+                        let (a, b) = (want.flatten_all()?.to_vec1::<f32>()?, y.flatten_all()?.to_vec1::<f32>()?);
+                        let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+                        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if bad > 0 {
+                            tracing::error!("titan fused check: moe epilogue differs in {bad} of {} values (call {n})", a.len());
+                        } else if n % 512 == 0 {
+                            tracing::info!("titan fused check: moe epilogue bit-identical ({} calls)", n + 1);
+                        }
+                    }
+                    return Ok(y);
+                }
+            }
+        }
+        unfused(self)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn combine_residual_fused(&self, flat: &Tensor, routed: &Tensor, weights: &Tensor, x_attn: &Tensor) -> Result<Option<Tensor>> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let (rows, k, hidden) = match routed.dims() {
+            &[r, k, h] => (r, k, h),
+            _ => return Ok(None),
+        };
+        if k > 16 || weights.dims() != [rows, k] || x_attn.elem_count() != rows * hidden {
+            return Ok(None);
+        }
+        let (shared, logit) = self.shared_parts(flat)?;
+        let Device::Cuda(dev) = x_attn.device() else {
+            return Ok(None);
+        };
+        let c = |t: &Tensor| -> Result<Tensor> { t.to_dtype(DType::F32)?.contiguous() };
+        let (routed, weights, shared, logit, x) = (c(routed)?, c(weights)?, c(&shared)?, c(&logit)?, c(x_attn)?);
+        let out = unsafe { dev.alloc::<f32>(rows * hidden)? };
+        let stream = dev.cuda_stream();
+        let ptr = |t: &Tensor| -> Result<u64> {
+            let (st, l) = t.storage_and_layout();
+            let candle_core::Storage::Cuda(cs) = &*st else {
+                candle_core::bail!("titan fused: not on CUDA");
+            };
+            use candle_core::cuda::cudarc::driver::DevicePtr;
+            let (p, _g) = cs.as_cuda_slice::<f32>()?.device_ptr(&stream);
+            Ok(p + (l.start_offset() * 4) as u64)
+        };
+        let (pr, pw, ps, pl, px) = (ptr(&routed)?, ptr(&weights)?, ptr(&shared)?, ptr(&logit)?, ptr(&x)?);
+        let po = {
+            use candle_core::cuda::cudarc::driver::DevicePtr;
+            out.device_ptr(&stream).0
+        };
+        let f = dev.get_or_load_custom_func("titan_moe_epilogue_f32", "titan_fused_oxide", TITAN_FUSED_PTX)?;
+        let (h32, k32) = (hidden as u32, k as u32);
+        let mut b = f.builder();
+        b.arg(&pr).arg(&pw).arg(&ps).arg(&pl).arg(&px).arg(&po).arg(&h32).arg(&k32);
+        let cfg = LaunchConfig { grid_dim: (hidden.div_ceil(256) as u32, rows as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        let t = Tensor::from((
+            candle_core::Storage::Cuda(candle_core::cuda::CudaStorage::wrap_cuda_slice(out, dev.clone())),
+            candle_core::Shape::from(x_attn.dims()),
+        ));
+        Ok(Some(t))
+    }
+
     /// The gated shared expert, `(tokens, hidden)` F32.
     fn shared_out(&self, flat: &Tensor) -> Result<Tensor> {
         let sh = &self.shared;
@@ -1329,6 +1442,22 @@ pub struct ModelWeights {
     graphs: super::titan_graph::SegmentGraphs,
     /// qwen4exp: the final hyper-connection mixer (it is the output norm) and the stream count
     hc_head: Option<(HcMix, usize)>,
+}
+
+#[cfg(feature = "cuda")]
+const TITAN_FUSED_PTX: &str = include_str!("titan_fused_oxide.ptx");
+
+/// `TITAN_FUSED` (default on): fused decode kernels (`titan_fused`).
+fn titan_fused_on() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_FUSED", true))
+}
+
+/// `TITAN_FUSED_CHECK=1`: every fused call outside a graph capture (the segments' eager warm-ups) also runs the
+/// unfused ops and compares the bytes.
+fn titan_fused_check() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_FUSED_CHECK", false))
 }
 
 /// `TITAN_MTP=<n>`: draft `n` tokens per step with the GGUF's nextn (multi-token prediction) block.
@@ -2935,8 +3064,17 @@ impl ModelWeights {
             // a decode step carrying staged speculative tokens
             let mut t = std::time::Instant::now();
             #[cfg(feature = "cuda")]
+            // each verify width is its own set of captured graphs, and their outputs (the GDN state snapshots of every
+            // row, ~2 MiB x 2 per row and layer) stay allocated for good: lookup drafts reach 10 rows, and the widths
+            // they brought held ~850 MiB after one long request, so the next long prompt ran out of memory. Only the
+            // MTP widths (TITAN_GRAPH_VERIFY_MAX_ROWS, default MTP + 1) are captured; wider verifies run eager.
+            let graph_rows = mistralrs_quant::titan_cfg::var("TITAN_GRAPH_VERIFY_MAX_ROWS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(mtp_draft_len().max(1) + 1);
             let graphable = super::titan_graph::enabled()
                 && input_ids.dim(0)? == 1
+                && input_ids.dim(1)? <= graph_rows
                 && !ctx.is_paged()
                 && !mtp_verify_rowwise()
                 && self.device.is_cuda();
@@ -3325,8 +3463,10 @@ impl ModelWeights {
 
     /// The causal mask of a trunk pass, mapped to the layer devices.
     fn trunk_mask(&self, input_ids: &Tensor, ctx: &ModelForwardContext<'_>, hybrid: &HybridCache) -> Result<DeviceMappedMask> {
-        let mask = if input_ids.dim(1)? > 1 && crate::titan_hostkv::enabled() {
-            // host-RAM KV attends positionally; a (rows, keys) mask would cost 1 KiB of device memory per cached token
+        let fp8_tiles = self.device.is_cuda() && crate::kv_cache::cuda_kv_fp8();
+        let mask = if input_ids.dim(1)? > 1 && (crate::titan_hostkv::enabled() || fp8_tiles) {
+            // host-RAM KV attends positionally, and so does an F8E4M3 CUDA cache (tiled flash-prefill, causal over the
+            // chunk's last rows); a (rows, keys) mask would cost 1 KiB of device memory per cached token
             AttentionMask::Custom(Tensor::zeros((1, 1), self.dtype, &self.device)?)
         } else if ctx.is_paged() {
             let cache = ForwardMaskCache::Paged(ctx.seqlen_offsets());
@@ -3940,12 +4080,7 @@ impl ModelWeights {
             candle_core::bail!("qwen35 graphs: layer {} is not MoE", i - 1);
         };
         let (x_attn, flat, routed, weights) = (&carry[0], &carry[1], &carry[2], &carry[3]);
-        let (b, s, hidden) = x_attn.dims3()?;
-        let h = moe
-            .combine(flat, routed, weights)?
-            .reshape((b, s, hidden))?
-            .to_dtype(x_attn.dtype())?;
-        h + x_attn
+        moe.combine_residual(flat, routed, weights, x_attn)
     }
 
     /// After a mixer: the residual add, the FFN norm and the router, `[x_attn, flat, ids, weights]`.
@@ -4052,8 +4187,8 @@ impl ModelWeights {
                         Ok(vec![x, q, k, v, gate])
                     })?;
                     let (x, q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3], &pre[4]);
-                    let (k, v) = kv_cache.append(k, v)?;
-                    let y = Sdpa.run_attention(q, &k, &v, &mask, Some(flash_params), &attn.sdpa_params)?;
+                    let (k, v) = kv_cache.append_raw(k, v)?;
+                    let y = attn.attend(q, &k, &v, &mask, Some(flash_params))?;
                     let y = y.contiguous()?;
                     g.run(
                         SegKey { tag: "attn.post", layer: i, extra: vec![masked as u64] },
@@ -4211,10 +4346,8 @@ impl ModelWeights {
                         },
                     )?;
                     let (q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3]);
-                    let (k, v) = kv_cache.append(k, v)?;
-                    let y = Sdpa
-                        .run_attention(q, &k, &v, &mask, Some(flash_params), &attn.sdpa_params)?
-                        .contiguous()?;
+                    let (k, v) = kv_cache.append_raw(k, v)?;
+                    let y = attn.attend(q, &k, &v, &mask, Some(flash_params))?.contiguous()?;
                     let post = g.run(
                         SegKey { tag: "d.attn.post", layer: i, extra: vec![masked as u64] },
                         &[&y, gate, &x],
