@@ -368,7 +368,7 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.custom_modules.write().unwrap();
-        let cuda_module = self.context.load_module(ptx.into()).w()?;
+        let cuda_module = pdl_load(&self.context, ptx)?;
         ms.insert(module_name.to_string(), cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
         l1_carveout(&func);
@@ -391,7 +391,7 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
+        let cuda_module = pdl_load(&self.context, mdl.ptx())?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
         l1_carveout(&func);
@@ -972,15 +972,18 @@ pub fn l1_carveout(func: &cudarc::driver::CudaFunction) {
     use std::sync::Mutex;
     static DONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("TITAN_L1_CARVEOUT").is_ok_and(|v| v == "0")) {
-        return;
-    }
     let key = func.cu_function() as usize;
     {
         let mut g = DONE.lock().unwrap();
         if !g.get_or_insert_with(HashSet::new).insert(key) {
             return;
         }
+    }
+    if PDL_MODULES.lock().unwrap().contains(&(func_module(func) as usize)) {
+        cudarc::driver::result::pdl::register(func.cu_function());
+    }
+    if *OFF.get_or_init(|| std::env::var("TITAN_L1_CARVEOUT").is_ok_and(|v| v == "0")) {
+        return;
     }
     let Ok(smem) = func.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES) else { return };
     if smem <= 0 {
@@ -990,4 +993,67 @@ pub fn l1_carveout(func: &cudarc::driver::CudaFunction) {
     let need = 12 * (smem as i64 + 1024);
     let pct = ((need * 100 + 102_399) / 102_400).clamp(1, 100) as i32;
     let _ = func.set_attribute(A::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, pct);
+}
+
+
+/// titan: `TITAN_PDL` (default on): modules load with `griddepcontrol.wait;` as the first instruction of every
+/// entry, and their functions are launched with programmatic dependent launch (vendor cudarc `result::pdl`): each
+/// kernel is scheduled while its predecessor drains and waits for it on the device, instead of the host-visible
+/// launch gap between two dependent kernels. A module the injected PTX does not load for (a pre-sm_90 target) loads
+/// unchanged and launches as before.
+static PDL_MODULES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn pdl_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("TITAN_PDL").is_ok_and(|v| v == "0"))
+}
+
+/// The CUmodule a function belongs to (cuFuncGetModule).
+fn func_module(func: &cudarc::driver::CudaFunction) -> cudarc::driver::sys::CUmodule {
+    let mut m: cudarc::driver::sys::CUmodule = std::ptr::null_mut();
+    unsafe { cudarc::driver::sys::cuFuncGetModule(&mut m, func.cu_function()) };
+    m
+}
+
+/// `TITAN_PDL_EARLY=1`: kernels trigger their dependents right after their own wait (measured neutral on the 27B).
+fn pdl_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TITAN_PDL_EARLY").is_ok_and(|v| v == "1"))
+}
+
+/// `ptx` with `griddepcontrol.wait;` before the first instruction of each `.entry` body.
+pub fn pdl_inject(ptx: &str) -> String {
+    let mut out = String::with_capacity(ptx.len() + 4096);
+    // 0 = outside an entry, 1 = in an entry's header, 2 = in its body before the first instruction
+    let mut state = 0u8;
+    for line in ptx.lines() {
+        let t = line.trim_start();
+        if state == 0 && (t.starts_with(".visible .entry") || t.starts_with(".entry") || t.starts_with(".weak .entry")) {
+            state = 1;
+        } else if state == 1 && t.starts_with('{') {
+            state = 2;
+        } else if state == 2 && !(t.is_empty() || t.starts_with('.') || t.starts_with("//") || t.starts_with('{')) {
+            out.push_str("\tgriddepcontrol.wait;\n");
+            if pdl_early() {
+                // the next kernel may be scheduled once every block of this one has started (it fills the SMs this
+                // one's last wave frees, and waits for its completion before reading anything)
+                out.push_str("\tgriddepcontrol.launch_dependents;\n");
+            }
+            state = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn pdl_load(ctx: &std::sync::Arc<cudarc::driver::CudaContext>, ptx: &str) -> Result<std::sync::Arc<cudarc::driver::CudaModule>> {
+    if pdl_on() && ptx.contains(".entry") {
+        if let Ok(m) = ctx.load_module(pdl_inject(ptx).into()) {
+            let raw = m.cu_module() as usize;
+            PDL_MODULES.lock().unwrap().push(raw);
+            return Ok(m);
+        }
+    }
+    ctx.load_module(ptx.into()).w()
 }
