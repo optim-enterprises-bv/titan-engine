@@ -1448,6 +1448,12 @@ pub struct ModelWeights {
 #[cfg(feature = "cuda")]
 const TITAN_FUSED_PTX: &str = include_str!("titan_fused_oxide.ptx");
 
+/// `TITAN_GRAPH_RUNS` (default on): consecutive GDN layers captured as one graph segment (`forward_trunk_graphed`).
+fn graph_runs() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_GRAPH_RUNS", true))
+}
+
 /// `TITAN_FUSED` (default on): fused decode kernels (`titan_fused`).
 fn titan_fused_on() -> bool {
     static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
@@ -4136,13 +4142,72 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::msg("qwen35 graphs: missing recurrent slot"))? as u64;
 
         let mut carry = vec![x];
+        let mut skip_until = 0usize;
         for (i, layer) in self.layers.iter().enumerate() {
+            if i < skip_until {
+                continue;
+            }
             let Ffn::Moe(moe) = &layer.ffn else {
                 candle_core::bail!("qwen35 graphs: layer {i} is not MoE");
             };
             // the routed experts inside the layer's segment when they run on the stream alone (doorbell): one graph per
             // layer instead of a graph, the eager expert launches and another graph
             let in_graph = moe.experts.graph_capturable();
+            // TITAN_GRAPH_RUNS (default on): consecutive GDN layers with captured experts are one segment, so the
+            // layers between two attention layers launch as one graph without the per-segment output and input copies
+            if in_graph && graph_runs() && matches!(layer.mixer, Mixer::Linear(_)) {
+                let mut j = i + 1;
+                while j < self.layers.len()
+                    && matches!(self.layers[j].mixer, Mixer::Linear(_))
+                    && matches!(&self.layers[j].ffn, Ffn::Moe(m) if m.experts.graph_capturable())
+                {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    let mut extra = vec![slot, j as u64];
+                    let mut pools = Vec::with_capacity(j - i);
+                    for c in hybrid_cache.caches[i..j].iter_mut() {
+                        let HybridLayerCache::Recurrent(p) = c else {
+                            candle_core::bail!("qwen35 graphs: GDN layer without a recurrent cache");
+                        };
+                        extra.push(dptr(&p.conv_state)?);
+                        extra.push(dptr(&p.recurrent_state)?);
+                        pools.push(p);
+                    }
+                    let mut inputs: Vec<&Tensor> = carry.iter().collect();
+                    inputs.push(&indices);
+                    let batch_kind = recurrent_metadata.batch_kind();
+                    let host = recurrent_metadata.state_indices_host();
+                    let out = g.run(SegKey { tag: "gdn.run", layer: i, extra }, &inputs, |ins| {
+                        let (carry_in, idx) = ins.split_at(ins.len() - 1);
+                        let mut c: Vec<Tensor> = carry_in.to_vec();
+                        for (k, pool) in (i..j).zip(pools.iter_mut()) {
+                            let lk = &self.layers[k];
+                            let (Mixer::Linear(gdn), Ffn::Moe(mk)) = (&lk.mixer, &lk.ffn) else {
+                                candle_core::bail!("qwen35 graphs: layer {k} is not a GDN MoE layer");
+                            };
+                            let x = self.graph_layer_input(k, &c)?;
+                            let h = lk.attn_norm.forward(&x)?;
+                            let mut gdn_cache = GdnLayerCache {
+                                conv_state: pool.gather_conv_state(&idx[0])?,
+                                recurrent_state: pool.gather_recurrent_state(&idx[0])?,
+                            };
+                            let o = gdn.forward_with_conv_carry(&h.to_dtype(self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
+                            pool.scatter_conv_state_with_host_indices(&idx[0], host, &gdn_cache.conv_state)?;
+                            pool.scatter_recurrent_state_with_host_indices(&idx[0], host, &gdn_cache.recurrent_state)?;
+                            let r = self.graph_route(k, o.to_dtype(DType::F32)?, &x)?;
+                            let (flat, ids) = (&r[1], &r[2]);
+                            let (rows, hidden) = flat.dims2()?;
+                            let routed = mk.experts.forward_lookahead(&flat.reshape((rows, 1, hidden))?, ids, &[])?;
+                            c = vec![r[0].clone(), flat.clone(), routed, r[3].clone()];
+                        }
+                        Ok(c)
+                    })?;
+                    carry = out;
+                    skip_until = j;
+                    continue;
+                }
+            }
             let experts_in = |r: Vec<Tensor>| -> Result<Vec<Tensor>> {
                 if !in_graph {
                     return Ok(r);
