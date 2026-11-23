@@ -269,6 +269,8 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
                 // the KV starts on the GPU (F8E4M3, flash kernels) and only a sequence that outgrows the VRAM moves to
                 // host RAM (Huihui 27B Q3_K_XL: host KV decoded 16.6 tok/s at 25k context)
                 put("TITAN_KV_SPILL", "1");
+                // a dense prompt chunk's working set next to a grown KV (512 MiB ran a 60k prompt out of memory)
+                put("TITAN_KV_MARGIN_MIB", "1536");
                 put("TITAN_KV_FP8", "1");
                 put("TITAN_KV_PREALLOC", "1");
                 put("TITAN_KV_DYNAMIC", "1");

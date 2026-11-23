@@ -309,3 +309,62 @@ pub(crate) fn decode_rows(
         Shape::from((1, m, h * HEAD_DIM)),
     )))
 }
+
+/// Split attention (TITAN_KV_SPILL): every row of `q` (1, h, m, 256) over ALL keys of the device part `k`, `v`
+/// (1, kvh, n, 256) — the rows' own keys live in the host part — as `(o, lse)`: `o` (1, h, m, 256) F32 normalised and
+/// `lse` (1, h, m, 1) its log-sum-exp, for merging with the host part's. The split kernel runs once per row as a
+/// one-row call over `n` keys; its chunk partials are combined here.
+pub(crate) fn decode_partial(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Result<(Tensor, Tensor)> {
+    let Device::Cuda(dev) = q.device() else {
+        candle_core::bail!("flash-decode partial: CUDA only");
+    };
+    if !supported(q, k, v, p) {
+        candle_core::bail!("flash-decode partial: unsupported q {:?} k {:?} {:?}", q.shape(), k.shape(), k.dtype());
+    }
+    let (_, h, m, _) = q.dims4()?;
+    let (_, kvh, n, _) = k.dims4()?;
+    let n_rep = h / kvh;
+    let chunk = cfg().chunk;
+    let nchunks = n.div_ceil(chunk);
+    let q = q.contiguous()?;
+    let stream = dev.cuda_stream();
+    let (q_ptr, k_ptr, v_ptr) = (dptr(&q, &stream)?, dptr(k, &stream)?, dptr(v, &stream)?);
+    let (k_hs, v_hs) = (k.stride()[1] as u64, v.stride()[1] as u64);
+    let fp8 = k.dtype() == DType::F8E4M3;
+    let split = func(&dev, (if n_rep <= 8 { 0 } else if n_rep <= 16 { 1 } else { 2 }) + if fp8 { 4 } else { 0 })?;
+    let mut os = Vec::with_capacity(m);
+    let mut ls = Vec::with_capacity(m);
+    for r in 0..m {
+        let part = unsafe { dev.alloc::<f32>(h * nchunks * HEAD_DIM)? };
+        let meta = unsafe { dev.alloc::<f32>(h * nchunks * 2)? };
+        let (part_ptr, meta_ptr) = {
+            let (a, _ga) = part.device_ptr(&stream);
+            let (b, _gb) = meta.device_ptr(&stream);
+            (a, b)
+        };
+        let qp = q_ptr + (r * HEAD_DIM * 2) as u64;
+        let (n_rep_i, h_i, l_i, rows_i, chunk_i, nch_i) = (n_rep as i32, h as i32, n as i32, 1i32, chunk as i32, nchunks as i32);
+        let (q_hs, q_rs) = ((m * HEAD_DIM) as i32, HEAD_DIM as i32);
+        let scale = p.softmax_scale;
+        let mut b = stream.launch_builder(&split);
+        b.arg(&qp).arg(&k_ptr).arg(&v_ptr).arg(&part_ptr).arg(&meta_ptr).arg(&scale);
+        b.arg(&n_rep_i).arg(&h_i).arg(&l_i).arg(&rows_i).arg(&chunk_i).arg(&nch_i);
+        b.arg(&q_hs).arg(&q_rs).arg(&k_hs).arg(&v_hs);
+        let cfg_s = LaunchConfig { grid_dim: (nchunks as u32, kvh as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg_s) }.w()?;
+        let part = Tensor::from((Storage::Cuda(CudaStorage::wrap_cuda_slice(part, dev.clone())), Shape::from((h, nchunks, HEAD_DIM))));
+        let meta = Tensor::from((Storage::Cuda(CudaStorage::wrap_cuda_slice(meta, dev.clone())), Shape::from((h, nchunks, 2))));
+        let mc = meta.narrow(2, 0, 1)?; // (h, nchunks, 1)
+        let sc = meta.narrow(2, 1, 1)?;
+        let mx = mc.max_keepdim(1)?; // (h, 1, 1)
+        let w = mc.broadcast_sub(&mx)?.exp()?;
+        let sum = (&w * &sc)?.sum_keepdim(1)?; // (h, 1, 1)
+        let o = part.broadcast_mul(&w)?.sum_keepdim(1)?.broadcast_div(&sum)?; // (h, 1, 256)
+        let lse = (mx + sum.log()?)?; // (h, 1, 1)
+        os.push(o);
+        ls.push(lse);
+    }
+    let o = Tensor::cat(&os, 1)?.unsqueeze(0)?; // (1, h, m, 256)
+    let lse = Tensor::cat(&ls, 1)?.unsqueeze(0)?; // (1, h, m, 1)
+    Ok((o, lse))
+}

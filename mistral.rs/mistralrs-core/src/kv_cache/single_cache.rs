@@ -20,11 +20,41 @@ pub struct SingleCache {
     pub current_seq_len: usize,
     pub capacity_seq_len: usize,
     pub max_seq_len: usize,
+    /// TITAN_KV_SPILL split attention: positions from `at` on live in a host buffer, the first `at` stay in `all_data`.
+    pub host_split: Option<HostSplit>,
+}
+
+/// The host part of a split cache: positions `at..` in `data` (CPU, room for `cap` positions).
+#[derive(Debug, Clone)]
+pub struct HostSplit {
+    pub at: usize,
+    pub data: Option<Tensor>,
+    pub cap: usize,
 }
 
 impl SingleCache {
+    /// From here on, positions `at..` go to host memory (`at` >= the current length is rounded down to it).
+    pub fn split_at(&mut self, at: usize) {
+        if self.host_split.is_none() {
+            let at = at.max(self.current_seq_len).min(self.capacity_seq_len);
+            self.host_split = Some(HostSplit { at, data: None, cap: 0 });
+        }
+    }
+
+    /// The host part's current positions (`None` when unsplit or empty).
+    pub fn host_data(&self) -> Result<Option<Tensor>> {
+        match &self.host_split {
+            Some(h) if self.current_seq_len > h.at => match &h.data {
+                Some(d) => Ok(Some(d.narrow(self.dim, 0, self.current_seq_len - h.at)?)),
+                None => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     pub fn new(dim: usize, max_seq_len: usize, capacity_seq_len: usize) -> Self {
         Self {
+            host_split: None,
             all_data: None,
             dim,
             current_seq_len: 0,
@@ -50,9 +80,14 @@ impl SingleCache {
     }
 
     pub fn current_data(&self) -> Result<Option<Tensor>> {
+        // a split cache: the device part only (`host_data` has the rest)
+        let len = match &self.host_split {
+            Some(h) => self.current_seq_len.min(h.at),
+            None => self.current_seq_len,
+        };
         let data = match self.all_data.as_ref() {
             None => None,
-            Some(d) => Some(d.narrow(self.dim, 0, self.current_seq_len)?),
+            Some(d) => Some(d.narrow(self.dim, 0, len)?),
         };
         Ok(data)
     }
@@ -89,6 +124,7 @@ impl SingleCache {
 
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
+        self.host_split = None;
         // a preallocated or dynamic CUDA buffer (TITAN_KV_PREALLOC / TITAN_KV_DYNAMIC) is kept: only its first
         // `current_seq_len` rows are ever read, and reallocating it fragments the pool
         if (self.capacity_seq_len == self.max_seq_len || super::cuda_kv_dynamic())
@@ -104,11 +140,15 @@ impl SingleCache {
     }
 
     pub fn try_set_len(&self, len: usize) -> candle_core::Result<()> {
-        if len > self.capacity_seq_len {
+        let room = match &self.host_split {
+            Some(h) => h.at + h.cap,
+            None => self.capacity_seq_len,
+        };
+        if len > room {
             candle_core::bail!(
                 "kv-cache: requested length ({}) exceeds current capacity ({})",
                 len,
-                self.capacity_seq_len
+                room
             );
         }
         Ok(())
@@ -124,6 +164,9 @@ impl SingleCache {
     /// reallocation per `CACHE_GROW_SIZE` step as appends arrive (a chunked prompt knows its length up
     /// front; the outgrown buffers fragment the device pool).
     pub fn reserve(&mut self, len: usize) -> Result<()> {
+        if self.host_split.is_some() {
+            return Ok(());
+        }
         let len = len.min(self.max_seq_len);
         if len <= self.capacity_seq_len {
             return Ok(());
@@ -140,6 +183,52 @@ impl SingleCache {
     }
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
+        if let Some(at) = self.host_split.as_ref().map(|h| h.at) {
+            return self.append_split(src, at);
+        }
+        self.append_unsplit(src)
+    }
+
+    /// A split cache's append: rows below `at` into the device buffer, the rest into the host buffer (grown by a
+    /// quarter at a time).
+    fn append_split(&mut self, src: &Tensor, at: usize) -> Result<()> {
+        let n = src.dim(self.dim)?;
+        let dev_rows = at.saturating_sub(self.current_seq_len).min(n);
+        if dev_rows > 0 {
+            if self.all_data.is_none() {
+                // split before its first append (a fresh long prompt): the device part's buffer, `at` positions
+                let mut shape = src.dims().to_vec();
+                shape[self.dim] = at;
+                self.all_data = Some(kv_zeros(shape, src.dtype(), src.device())?);
+                self.capacity_seq_len = at;
+            }
+            let ad = self.all_data.as_mut().expect("split cache has its device buffer");
+            ad.slice_set(&src.narrow(self.dim, 0, dev_rows)?.contiguous()?, self.dim, self.current_seq_len)?;
+        }
+        let host_rows = n - dev_rows;
+        if host_rows > 0 {
+            let start = self.current_seq_len + dev_rows - at;
+            let rows = src.narrow(self.dim, dev_rows, host_rows)?.to_device(&candle_core::Device::Cpu)?;
+            let h = self.host_split.as_mut().expect("split");
+            let need = start + host_rows;
+            if need > h.cap || h.data.is_none() {
+                let cap = need.max(h.cap + h.cap / HOST_GROW_DIV).next_multiple_of(NormalCache::CACHE_GROW_SIZE);
+                let mut shape = rows.dims().to_vec();
+                shape[self.dim] = cap;
+                let grown = Tensor::zeros(shape, rows.dtype(), &candle_core::Device::Cpu)?;
+                if let Some(old) = &h.data {
+                    grown.slice_set(&old.narrow(self.dim, 0, start)?.contiguous()?, self.dim, 0)?;
+                }
+                h.data = Some(grown);
+                h.cap = cap;
+            }
+            h.data.as_ref().expect("grown").slice_set(&rows.contiguous()?, self.dim, start)?;
+        }
+        self.current_seq_len += n;
+        Ok(())
+    }
+
+    fn append_unsplit(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.

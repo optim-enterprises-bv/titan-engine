@@ -464,6 +464,38 @@ pub(crate) fn flash_prefill_supported(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_p
     }
 }
 
+/// `flash_decode::decode_partial` (split attention's device part).
+pub(crate) fn flash_decode_partial(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        flash_decode::decode_partial(q, k, v, sdpa_params)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, sdpa_params);
+        candle_core::bail!("flash-decode needs CUDA")
+    }
+}
+
+/// `flash_prefill::attend_split_tiles` (split attention's prompt chunks).
+pub(crate) fn flash_prefill_split_tiles(
+    q: &Tensor,
+    dev_part: (&Tensor, &Tensor),
+    host_part: (&Tensor, &Tensor),
+    sdpa_params: &SdpaParams,
+    tile: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        flash_prefill::attend_split_tiles(q, dev_part, host_part, sdpa_params, tile)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, dev_part, host_part, sdpa_params, tile);
+        candle_core::bail!("flash-prefill needs CUDA")
+    }
+}
+
 /// `flash_prefill::attend_host_tiles`: a CUDA prompt chunk over a host F8E4M3 KV cache, streamed in `tile`-key tiles.
 pub(crate) fn flash_prefill_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, sdpa_params: &SdpaParams, tile: usize) -> Result<Tensor> {
     #[cfg(feature = "cuda")]

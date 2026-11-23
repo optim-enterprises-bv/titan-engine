@@ -189,6 +189,37 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Resu
     Ok(y)
 }
 
+/// Split attention (TITAN_KV_SPILL): `attend`'s host part for decode-shaped rows (`s <= CPU_MAX_ROWS`), as `(o, lse)` on
+/// `q`'s device: `o` (1, h, s, 256) F32 normalised, `lse` (1, h, s, 1) its log-sum-exp (row `r` sees the host keys
+/// `< kv_len - s + r + 1`, its own and the ones before them).
+pub(crate) fn attend_partial(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams) -> Result<(Tensor, Tensor)> {
+    let (b, h, s, d) = q.dims4()?;
+    let (kb, kvh, kv_len, kd) = k.dims4()?;
+    if b != 1 || kb != 1 || !hd_supported(d) || kd != d || h % kvh != 0 || kv_len < s || s > CPU_MAX_ROWS || v.dims4()? != k.dims4()? {
+        candle_core::bail!("titan host kv partial: unsupported q {:?} k {:?}", q.shape(), k.shape());
+    }
+    prewarm(kv_len);
+    let qh = q.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.contiguous()?;
+    let (qg, ql) = qh.storage_and_layout();
+    let Storage::Cpu(qc) = &*qg else {
+        candle_core::bail!("titan host kv: q not on the CPU");
+    };
+    let qd = &qc.as_slice::<f32>()?[ql.start_offset()..];
+    let cache = HostCache::new(k, v)?;
+    let pool = pool_for(kv_len);
+    pool.prewarming.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (out, lse) = pool.pool.install(|| {
+        let job = cache.job(qd, h, s, p.softmax_scale)?;
+        let parts: Vec<Partial> = (0..job.units()).into_par_iter().map(|i| job.unit(i)).collect();
+        Ok::<_, candle_core::Error>(merge_lse(&job, &parts))
+    })?;
+    drop(cache);
+    drop(qg);
+    let o = Tensor::from_vec(out, (1, h, s, d), &Device::Cpu)?.to_device(q.device())?;
+    let l = Tensor::from_vec(lse, (1, h, s, 1), &Device::Cpu)?.to_device(q.device())?;
+    Ok((o, l))
+}
+
 /// `attend` for a batch whose sequences keep their own host caches: row `i` of `q` (b, h, s, 256) on CUDA over
 /// `kvs[i]` (1, kvh, len_i, 256), with one device round trip for the batch. Each row equals its `attend` call.
 pub(crate) fn attend_many(q: &Tensor, kvs: &[(Tensor, Tensor)], p: &SdpaParams) -> Result<Tensor> {
@@ -361,6 +392,41 @@ fn run_jobs(jobs: &[Job]) -> Vec<Vec<f32>> {
             out
         })
         .collect()
+}
+
+/// `merge` that also returns each query's log-sum-exp (`m + ln l`), in the output's (head, row) order.
+fn merge_lse(job: &Job, parts: &[Partial]) -> (Vec<f32>, Vec<f32>) {
+    let (sh, chunks, per, ns) = (&job.sh, job.chunks, job.per, job.spans.len());
+    let spans = &job.spans;
+    let (hd, stride) = (sh.hd, sh.stride());
+    let nq = sh.h / sh.kvh * sh.s;
+    let mut out = vec![0f32; sh.h * sh.s * hd];
+    let mut lse = vec![0f32; sh.h * sh.s];
+    out.par_chunks_mut(nq * hd).zip(lse.par_chunks_mut(nq)).enumerate().for_each(|(g, (out, lse))| {
+        for qi in 0..nq {
+            let s = qi / per;
+            let at = (qi - spans[s].0) * stride;
+            let ps = || (0..chunks).map(|c| &parts[(g * chunks + c) * ns + s].0);
+            let m = ps().map(|p| p[at + hd]).fold(f32::NEG_INFINITY, f32::max);
+            let o = &mut out[qi * hd..][..hd];
+            let mut l = 0f32;
+            for p in ps() {
+                let pm = p[at + hd];
+                if pm == f32::NEG_INFINITY {
+                    continue;
+                }
+                let w = (pm - m).exp();
+                l += w * p[at + hd + 1];
+                for (o, a) in o.iter_mut().zip(&p[at..at + hd]) {
+                    *o += w * a;
+                }
+            }
+            let inv = 1.0 / l;
+            o.iter_mut().for_each(|x| *x *= inv);
+            lse[qi] = m + l.ln();
+        }
+    });
+    (out, lse)
 }
 
 fn merge(job: &Job, parts: &[Partial]) -> Vec<f32> {

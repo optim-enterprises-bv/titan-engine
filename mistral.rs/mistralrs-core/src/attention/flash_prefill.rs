@@ -255,7 +255,7 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
 
 /// Keys `a .. a + len` of a host F8E4M3 cache `t` (1, kvh, >= a + len, 256) into the device F8E4M3 buffer `dst`
 /// (1, kvh, cap, 256), head `g` at row 0 of its `cap` rows.
-fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice) -> Result<()> {
+fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dst_off: usize, dev: &CudaDevice) -> Result<()> {
     let (_, kvh, cap, hd) = dst.dims4()?;
     let (st, l) = t.storage_and_layout();
     if let Storage::Cuda(sc) = &*st {
@@ -272,7 +272,7 @@ fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice)
             let off = l.start_offset() + g * hs + a * hd;
             unsafe {
                 candle_core::cuda::cudarc::driver::result::memcpy_dtod_async(
-                    base + (g * cap * hd) as u64,
+                    base + ((g * cap + dst_off) * hd) as u64,
                     src + off as u64,
                     len * hd,
                     stream.cu_stream(),
@@ -298,7 +298,7 @@ fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice)
         // pageable source: the driver stages it before returning, ordered on the stream
         unsafe {
             candle_core::cuda::cudarc::driver::result::memcpy_htod_async(
-                base + (g * cap * hd) as u64,
+                base + ((g * cap + dst_off) * hd) as u64,
                 &src[off..off + len * hd],
                 stream.cu_stream(),
             )
@@ -312,12 +312,35 @@ fn upload_keys(t: &Tensor, a: usize, len: usize, dst: &Tensor, dev: &CudaDevice)
 /// (1, kvh, kv_len, 256): the cached keys stream to the device `tile` at a time and each tile's split partials
 /// merge into running f32 (o, max, sum) as they come, so device memory stays one tile plus the chunk.
 pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, tile: usize) -> Result<Tensor> {
+    attend_tiles(q, k, v, None, p, tile)
+}
+
+/// `attend_host_tiles` over a split cache (TITAN_KV_SPILL): positions `0..n` in `dev_part` (device F8E4M3), the rest in
+/// `host_part` (host F8E4M3); each tile is copied from whichever part holds its positions.
+pub(crate) fn attend_split_tiles(
+    q: &Tensor,
+    dev_part: (&Tensor, &Tensor),
+    host_part: (&Tensor, &Tensor),
+    p: &SdpaParams,
+    tile: usize,
+) -> Result<Tensor> {
+    attend_tiles(q, dev_part.0, dev_part.1, Some(host_part), p, tile)
+}
+
+fn attend_tiles(q: &Tensor, k: &Tensor, v: &Tensor, host: Option<(&Tensor, &Tensor)>, p: &SdpaParams, tile: usize) -> Result<Tensor> {
     let Device::Cuda(dev) = q.device() else {
         candle_core::bail!("flash-prefill host tiles: q must live on CUDA");
     };
     let q = q.contiguous()?;
     let (_, h0, s, d) = q.dims4()?;
-    let (_, kvh, kv_len, kd) = k.dims4()?;
+    let at = k.dim(2)?;
+    let (_, kvh, kv_len, kd) = match host {
+        Some((kh, _)) => {
+            let (b, g, n, dd) = kh.dims4()?;
+            (b, g, at + n, dd)
+        }
+        None => k.dims4()?,
+    };
     if (d != HEAD_DIM && d != 128) || kd != d || h0 % kvh != 0 || h0 / kvh > N_REP || kv_len < s || k.dtype() != DType::F8E4M3 {
         candle_core::bail!("flash-prefill host tiles: unsupported q {:?} k {:?} {:?}", q.shape(), k.shape(), k.dtype());
     }
@@ -370,8 +393,25 @@ pub(crate) fn attend_host_tiles(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaPara
     let n = ranges.len();
     for (i, (a, b)) in ranges.into_iter().enumerate() {
         let len = b - a;
-        upload_keys(k, a, len, &kf8, dev)?;
-        upload_keys(v, a, len, &vf8, dev)?;
+        match host {
+            None => {
+                upload_keys(k, a, len, &kf8, 0, dev)?;
+                upload_keys(v, a, len, &vf8, 0, dev)?;
+            }
+            Some((kh, vh)) => {
+                // the tile's positions below `at` from the device part, the rest from the host part
+                let n1 = at.saturating_sub(a).min(len);
+                if n1 > 0 {
+                    upload_keys(k, a, n1, &kf8, 0, dev)?;
+                    upload_keys(v, a, n1, &vf8, 0, dev)?;
+                }
+                if len > n1 {
+                    let h0 = (a + n1) - at;
+                    upload_keys(kh, h0, len - n1, &kf8, n1, dev)?;
+                    upload_keys(vh, h0, len - n1, &vf8, n1, dev)?;
+                }
+            }
+        }
         let (kt, vt) = (kf8.to_dtype(DType::BF16)?, vf8.to_dtype(DType::BF16)?);
         let (k_ptr, v_ptr) = (dptr(&kt, &stream)?, dptr(&vt, &stream)?);
         let (past_i, kv_i, ns_i) = ((past - a) as i32, len as i32, ns as i32);
