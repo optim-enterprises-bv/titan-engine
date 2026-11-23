@@ -354,9 +354,26 @@ fn llama_mul_mat_vec(
     } else {
         format!("{}_mmvq_{b_size}", fmt.prefix)
     };
+    let one = q1_0_fastdiv(1);
+    if let Some(f) = nvcc_mmvq::func(dev, fmt.prefix, b_size, small_k) {
+        // llama.cpp's own nvcc build of the kernel the oxide port reproduces bit for bit (same ABI)
+        let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+        let st = dev.cuda_stream();
+        let mut p = nvcc_mmvq::Params::default();
+        p.put(data.inner.device_ptr(&st).0).put(y_q8_1.device_ptr(&st).0).put(0u64);
+        for _ in 0..5 {
+            p.put(0u64);
+        }
+        p.put(0u32).put(0f32).put(dst.device_ptr(&st).0);
+        p.put(ncols as u32).put(0u32).put(0u32).put(0u32);
+        p.put(blocks_per_row as u32).put((ncols_padded / 32) as u32).put(nrows as u32);
+        p.put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32);
+        p.put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32).put(0u32);
+        nvcc_mmvq::launch(dev, f, (ceil_div(nrows, rpb) as u32, 1, 1), (WARP_SIZE as u32, nwarps, 1), &p)?;
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let func = dev.get_or_load_custom_func(&name, fmt.module, fmt.ptx)?;
     let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
-    let one = q1_0_fastdiv(1);
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (ceil_div(nrows, rpb) as u32, 1, 1),
         block_dim: (WARP_SIZE as u32, nwarps, 1),
@@ -1793,6 +1810,115 @@ mod test {
         )?;
         let vs = cuda_storage.as_cuda_slice::<f32>()?;
         let _vs = dev.clone_dtoh(&vs.as_view())?;
+        Ok(())
+    }
+}
+
+
+/// titan: llama.cpp acecd56's `mul_mat_vec_q` as built by nvcc for sm_120a (ggml-cuda/mmvq.cu, the reference every
+/// oxide `<fmt>_mmvq_*` port is gated bit-identical against). On an RTX 5080 Laptop the oxide build of the same
+/// program measured 1.3-3x slower (IQ3_S K=17408 N=5120: 144.5 vs 48.7 us), so the decode matvecs launch this one
+/// when it loads (sm_120 only; `TITAN_MMVQ_NVCC=0` keeps the oxide kernels). Same parameter ABI, passed as one packed
+/// buffer because the fusion arguments are a struct.
+mod nvcc_mmvq {
+    use cudarc::driver::sys;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static CUBIN: &[u8] = include_bytes!("llama_mmvq_acecd56_sm120a.cubin");
+
+    struct Loaded {
+        module: Option<usize>,
+        funcs: HashMap<String, usize>,
+    }
+    static MODS: Mutex<Option<HashMap<usize, Loaded>>> = Mutex::new(None);
+
+    fn type_id(prefix: &str) -> Option<u32> {
+        Some(match prefix {
+            "iq2_xxs" => 16,
+            "iq2_xs" => 17,
+            "iq3_xxs" => 18,
+            "iq4_nl" => 20,
+            "iq3_s" => 21,
+            "iq2_s" => 22,
+            "iq4_xs" => 23,
+            "mxfp4" => 39,
+            "nvfp4" => 40,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn func(dev: &super::CudaDevice, prefix: &str, b_size: usize, small_k: bool) -> Option<sys::CUfunction> {
+        if std::env::var("TITAN_MMVQ_NVCC").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let t = type_id(prefix)?;
+        let name = format!(
+            "_Z13mul_mat_vec_qIL9ggml_type{t}ELi{b_size}ELb0ELb{}ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj",
+            small_k as u32
+        );
+        let stream = dev.cuda_stream();
+        let ctx = stream.context();
+        let key = ctx.cu_ctx() as usize;
+        let mut g = MODS.lock().unwrap();
+        let map = g.get_or_insert_with(HashMap::new);
+        let l = map.entry(key).or_insert_with(|| {
+            let _ = ctx.bind_to_thread();
+            let mut m: sys::CUmodule = std::ptr::null_mut();
+            let r = unsafe { sys::cuModuleLoadData(&mut m, CUBIN.as_ptr() as *const std::ffi::c_void) };
+            if r == sys::CUresult::CUDA_SUCCESS {
+                eprintln!("titan: llama.cpp nvcc mmvq kernels loaded (sm_120a cubin)");
+                Loaded { module: Some(m as usize), funcs: HashMap::new() }
+            } else {
+                eprintln!("titan: llama.cpp nvcc mmvq cubin not loadable here ({r:?}); oxide kernels");
+                Loaded { module: None, funcs: HashMap::new() }
+            }
+        });
+        let m = l.module? as sys::CUmodule;
+        if let Some(&f) = l.funcs.get(&name) {
+            return Some(f as sys::CUfunction);
+        }
+        let cname = std::ffi::CString::new(name.clone()).ok()?;
+        let mut f: sys::CUfunction = std::ptr::null_mut();
+        let r = unsafe { sys::cuModuleGetFunction(&mut f, m, cname.as_ptr()) };
+        if r != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        l.funcs.insert(name, f as usize);
+        Some(f)
+    }
+
+    #[derive(Default)]
+    pub(super) struct Params(Vec<u8>);
+    impl Params {
+        pub(super) fn put<T: Copy>(&mut self, v: T) -> &mut Self {
+            let a = std::mem::align_of::<T>();
+            while self.0.len() % a != 0 {
+                self.0.push(0);
+            }
+            let b = unsafe { std::slice::from_raw_parts(&v as *const T as *const u8, std::mem::size_of::<T>()) };
+            self.0.extend_from_slice(b);
+            self
+        }
+    }
+
+    pub(super) fn launch(dev: &super::CudaDevice, f: sys::CUfunction, grid: (u32, u32, u32), block: (u32, u32, u32), p: &Params) -> crate::Result<()> {
+        let stream = dev.cuda_stream();
+        let mut buf = p.0.clone();
+        let mut size = buf.len();
+        let mut extra: [*mut std::ffi::c_void; 5] = [
+            1 as *mut std::ffi::c_void, // CU_LAUNCH_PARAM_BUFFER_POINTER
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            2 as *mut std::ffi::c_void, // CU_LAUNCH_PARAM_BUFFER_SIZE
+            &mut size as *mut usize as *mut std::ffi::c_void,
+            std::ptr::null_mut(), // CU_LAUNCH_PARAM_END
+        ];
+        let r = unsafe {
+            sys::cuLaunchKernel(f, grid.0, grid.1, grid.2, block.0, block.1, block.2, 0, stream.cu_stream(), std::ptr::null_mut(), extra.as_mut_ptr())
+        };
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::bail!("titan nvcc mmvq launch: {r:?}");
+        }
         Ok(())
     }
 }
