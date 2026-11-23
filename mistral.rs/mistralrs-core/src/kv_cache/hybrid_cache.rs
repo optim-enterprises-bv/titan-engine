@@ -3943,6 +3943,30 @@ impl HybridCache {
         }
     }
 
+    /// Whether any attention layer's KV lives in host memory.
+    pub fn attention_on_host(&self) -> bool {
+        self.caches.iter().any(|c| matches!(c, HybridLayerCache::Attention(kv) if kv.on_host()))
+    }
+
+    /// Move every attention layer's KV to host memory (TITAN_KV_SPILL).
+    pub fn attention_to_host(&mut self) -> Result<()> {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.to_host()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the empty host-resident attention buffers (a new sequence starts on the GPU).
+    pub fn drop_empty_host_attention(&mut self) {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.drop_empty_host();
+            }
+        }
+    }
+
     /// The smallest room (positions) of the attention layers' KV caches.
     pub fn attention_capacity(&self) -> usize {
         self.caches

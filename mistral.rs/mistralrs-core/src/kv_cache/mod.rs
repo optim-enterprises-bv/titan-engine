@@ -114,6 +114,14 @@ pub(crate) fn cuda_kv_prealloc() -> bool {
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_KV_PREALLOC", false))
 }
 
+/// `TITAN_KV_SPILL=1` (with TITAN_KV_HOST): KV caches live on the GPU (F8E4M3, attended by the flash kernels) until a
+/// sequence outgrows the VRAM, then move to host RAM for the rest of it (`HybridCache::attention_to_host`); a new
+/// sequence starts on the GPU again.
+pub(crate) fn kv_spill() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_KV_SPILL", false))
+}
+
 /// `TITAN_KV_DYNAMIC=1`: the CUDA KV cache starts at `TITAN_KV_BASE` positions and grows in `KV_RESERVE_STEP`
 /// buckets as sequences need them, the tiered experts giving up the VRAM it takes (`ensure_kv_room`); with
 /// TITAN_KV_PREALLOC alone it is the full context from the first append.
@@ -236,7 +244,8 @@ impl KvCache {
         // Host-RAM KV attends positionally over the whole cache (no mask, window, softcap or sinks), so a
         // sliding-window (rotating) cache stays on the GPU: moved to the host, its layer attended over every
         // retained key. Attention refuses host KV for any windowed, softcapped or sink layer (Sdpa::run_attention).
-        let host = to_f8 && crate::titan_hostkv::enabled() && matches!(self, Self::Normal { .. });
+        // TITAN_KV_SPILL: a cache starts on the GPU and appends on the host only once it was moved there (`to_host`)
+        let host = to_f8 && crate::titan_hostkv::enabled() && matches!(self, Self::Normal { .. }) && (!kv_spill() || self.on_host());
         let fp8 = to_f8 && !host && cuda_kv_fp8();
         let (k, v) = if host {
             let cpu = candle_core::Device::Cpu;
@@ -431,6 +440,33 @@ impl KvCache {
                 v.reset();
             }
             Self::Shared { .. } => {}
+        }
+    }
+
+    /// Whether a normal cache's buffer lives in host memory.
+    pub fn on_host(&self) -> bool {
+        matches!(self, Self::Normal { k, .. } if k.all_data.as_ref().is_some_and(|d| d.device().is_cpu()))
+    }
+
+    /// Move a normal cache's buffers to host memory (same dtype: the F8E4M3 host-KV format); later appends stay there.
+    pub fn to_host(&mut self) -> candle_core::Result<()> {
+        if let Self::Normal { k, v } = self {
+            for c in [k, v] {
+                if let Some(d) = c.all_data.take() {
+                    c.all_data = Some(d.to_device(&candle_core::Device::Cpu)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop an empty host-resident buffer (the next append allocates on the appended rows' device).
+    pub fn drop_empty_host(&mut self) {
+        if let Self::Normal { k, v } = self {
+            if k.current_seq_len == 0 && k.all_data.as_ref().is_some_and(|d| d.device().is_cpu()) {
+                k.all_data = None;
+                v.all_data = None;
+            }
         }
     }
 
