@@ -2132,6 +2132,17 @@ fn remember_narrowed(x: &Tensor, b: Tensor) {
     q.push_back((x.id(), b));
 }
 
+/// `x.to_dtype(dt)`, taking the stored bf16 narrowing of `x` when one exists (`remember_narrowed`: written by the
+/// kernel that produced `x`, with the same cvt.rn the cast uses).
+fn to_dtype_narrowed(x: &Tensor, dt: DType) -> Result<Tensor> {
+    if dt == DType::BF16 && x.dtype() == DType::F32 {
+        if let Some((_, b)) = NARROWED.lock().unwrap().iter().find(|(id, _)| *id == x.id()) {
+            return Ok(b.clone());
+        }
+    }
+    x.to_dtype(dt)
+}
+
 fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
     if !mistralrs_quant::titan_cfg::flag("TITAN_DENSE_BF16_MATVEC", true) {
         return None;
@@ -3678,7 +3689,7 @@ impl ModelWeights {
                         recurrent_state: pool.recurrent_state_row(slot)?,
                     };
                     let out = gdn.forward_with_conv_carry(
-                        &h.to_dtype(self.gdn_dtype)?,
+                        &to_dtype_narrowed(&h, self.gdn_dtype)?,
                         &mut gdn_cache,
                         recurrent_metadata.batch_kind(),
                         conv_carry,
@@ -3691,7 +3702,7 @@ impl ModelWeights {
                         recurrent_state: pool.gather_recurrent_state(indices)?,
                     };
                     let out = gdn.forward_with_conv_carry(
-                        &h.to_dtype(self.gdn_dtype)?,
+                        &to_dtype_narrowed(&h, self.gdn_dtype)?,
                         &mut gdn_cache,
                         recurrent_metadata.batch_kind(),
                         conv_carry,
@@ -3843,7 +3854,7 @@ impl ModelWeights {
                         if replay {
                             let mut rows = Vec::new();
                             let out = gdn.forward_decode_rows(
-                                &h.to_dtype(self.gdn_dtype)?,
+                                &to_dtype_narrowed(&h, self.gdn_dtype)?,
                                 &mut gdn_cache,
                                 &VERIFY_MATMULS,
                                 &mut |r, c, inputs| keep_row_zero(pool, indices, host, r, n, c, inputs, &mut rows),
@@ -3855,7 +3866,7 @@ impl ModelWeights {
                             // replays rows instead (forward_ragged), where the copies do not fit next to a prefill
                             let mut snaps = Vec::with_capacity(n - 1);
                             let out = gdn.forward_decode_rows(
-                                &h.to_dtype(self.gdn_dtype)?,
+                                &to_dtype_narrowed(&h, self.gdn_dtype)?,
                                 &mut gdn_cache,
                                 &VERIFY_MATMULS,
                                 &mut |r, c, _| {
@@ -3916,7 +3927,7 @@ impl ModelWeights {
                         let residual = x.narrow(1, r, 1)?;
                         let h = layer.attn_norm.forward(&residual)?;
                         let out = gdn.forward(
-                            &h.to_dtype(self.gdn_dtype)?,
+                            &to_dtype_narrowed(&h, self.gdn_dtype)?,
                             &mut gdn_cache,
                             RecurrentBatchKind::Decode,
                         )?;
@@ -4035,7 +4046,7 @@ impl ModelWeights {
                     let host = recurrent_metadata.state_indices_host();
                     let mut rows = Vec::with_capacity(n - 1);
                     let out = gdn.forward_decode_rows(
-                        &h.to_dtype(self.gdn_dtype)?,
+                        &to_dtype_narrowed(&h, self.gdn_dtype)?,
                         &mut gdn_cache,
                         mm,
                         &mut |r, c, inputs| keep_row_zero(pool, indices, host, r, n, c, inputs, &mut rows),
@@ -4440,7 +4451,7 @@ impl ModelWeights {
                                 conv_state: pool.gather_conv_state(&idx[0])?,
                                 recurrent_state: pool.gather_recurrent_state(&idx[0])?,
                             };
-                            let o = gdn.forward_with_conv_carry(&h.to_dtype(self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
+                            let o = gdn.forward_with_conv_carry(&to_dtype_narrowed(&h, self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
                             pool.scatter_conv_state_with_host_indices(&idx[0], host, &gdn_cache.conv_state)?;
                             pool.scatter_recurrent_state_with_host_indices(&idx[0], host, &gdn_cache.recurrent_state)?;
                             let r = self.graph_route(k, o.to_dtype(DType::F32)?, &x)?;
@@ -4484,7 +4495,7 @@ impl ModelWeights {
                             conv_state: pool.gather_conv_state(&idx[0])?,
                             recurrent_state: pool.gather_recurrent_state(&idx[0])?,
                         };
-                        let out = gdn.forward_with_conv_carry(&h.to_dtype(self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
+                        let out = gdn.forward_with_conv_carry(&to_dtype_narrowed(&h, self.gdn_dtype)?, &mut gdn_cache, batch_kind, false)?;
                         pool.scatter_conv_state_with_host_indices(&idx[0], host, &gdn_cache.conv_state)?;
                         pool.scatter_recurrent_state_with_host_indices(&idx[0], host, &gdn_cache.recurrent_state)?;
                         experts_in(self.graph_route(i, out.to_dtype(DType::F32)?, &x)?)
@@ -4641,7 +4652,7 @@ impl ModelWeights {
                             recurrent_state: pool.gather_recurrent_state(&idx[0])?,
                         };
                         let mixer = gdn.forward_with_conv_carry(
-                            &h.to_dtype(self.gdn_dtype)?,
+                            &to_dtype_narrowed(&h, self.gdn_dtype)?,
                             &mut gdn_cache,
                             batch_kind,
                             false,
@@ -4787,7 +4798,7 @@ impl ModelWeights {
                         };
                         let mut snaps = Vec::with_capacity(2 * (n - 1));
                         let out = gdn.forward_decode_rows(
-                            &h.to_dtype(self.gdn_dtype)?,
+                            &to_dtype_narrowed(&h, self.gdn_dtype)?,
                             &mut gdn_cache,
                             &VERIFY_MATMULS,
                             &mut |r, c, _| {
@@ -4933,7 +4944,7 @@ impl ModelWeights {
                         };
                         let mut snaps = Vec::with_capacity(2 * (n - 1));
                         let out = gdn.forward_decode_rows(
-                            &h.to_dtype(self.gdn_dtype)?,
+                            &to_dtype_narrowed(&h, self.gdn_dtype)?,
                             &mut gdn_cache,
                             &VERIFY_MATMULS,
                             &mut |r, c, _| {
@@ -5115,7 +5126,7 @@ impl ModelWeights {
                     };
                     let mut rows = Vec::with_capacity(n - 1);
                     let out = gdn.forward_decode_rows(
-                        &h.to_dtype(self.gdn_dtype)?,
+                        &to_dtype_narrowed(&h, self.gdn_dtype)?,
                         &mut gdn_cache,
                         &VERIFY_MATMULS,
                         &mut |r, c, inputs| keep_row_zero(pool, idx, host, r, n, c, inputs, &mut rows),
