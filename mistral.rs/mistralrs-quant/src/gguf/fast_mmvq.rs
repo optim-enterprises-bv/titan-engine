@@ -274,6 +274,10 @@ fn q1_0_plain(w: &QTensor, xs: &Tensor, dev: &CudaDevice, nrows: usize, k: usize
 
 struct WorkspaceSlot {
     slice: CudaSlice<u8>,
+    /// The input whose Q8_1 quantization the slot holds (`plain`): the next projection of the same tensor
+    /// (gate/up, Q/K/V, ...) reuses it instead of quantizing again (tensor ids are never reused and activations are
+    /// not mutated in place, as for `Q1Tag`). Any other use of the slot clears it.
+    tag: Option<Q1Tag>,
 }
 
 struct WorkspaceGuard<'a> {
@@ -329,7 +333,7 @@ fn workspace_ensure<'a>(
             None => {
                 let slice = unsafe { dev.alloc::<u8>(capacity)? };
                 // CUDA graph replay requires process-stable workspace addresses.
-                let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot { slice })));
+                let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot { slice, tag: None })));
                 guard.insert(key, leaked);
                 leaked
             }
@@ -538,6 +542,11 @@ fn fused_qkv_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedQkvLaunc
 /// by `w.shape().dims2()?.0` (nrows of the weight).
 ///
 /// The output dtype matches the input dtype (BF16 → BF16, F16 → F16, F32 → F32).
+/// `TITAN_SHARE_Q8` (default on): consecutive matvecs of one input share its Q8_1 quantization.
+pub(crate) fn share_q8_1() -> bool {
+    crate::titan_cfg::flag("TITAN_SHARE_Q8", true)
+}
+
 pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         candle_core::cuda::ktrace("mq", concat!(module_path!(), "::plain"));
@@ -606,6 +615,10 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
     let scratch_bytes = b_size * dst_row_bytes;
 
     let mut workspace = workspace_ensure(&dev, scratch_bytes, &stream)?;
+    // the quantization of this very input may already be in the slot (the previous projection of it)
+    let tag: Q1Tag = (xs.id(), xs.dtype(), xs_offset, xs.dims().to_vec());
+    let quantize = !share_q8_1() || workspace.slot.tag.as_ref() != Some(&tag);
+    workspace.slot.tag = Some(tag);
     let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let stride_col_y = (k_padded / Q8_1_BLOCK_SIZE) as i32;
@@ -623,14 +636,16 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
+                    if quantize {
                     ffi::launch_mmvq_gguf_quantize_q8_1_bf16(
-                        xs_ptr as *const std::ffi::c_void,
-                        scratch_ptr,
-                        k as i32,
-                        k_padded as i32,
-                        b_size as i32,
-                        stream_ptr,
-                    );
+                            xs_ptr as *const std::ffi::c_void,
+                            scratch_ptr,
+                            k as i32,
+                            k_padded as i32,
+                            b_size as i32,
+                            stream_ptr,
+                        );
+                    }
                     let launcher = plain_launcher_bf16(dtype).expect("supports() checked");
                     launcher(
                         weight_ptr,
@@ -661,14 +676,16 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
+                    if quantize {
                     ffi::launch_mmvq_gguf_quantize_q8_1_f16(
-                        xs_ptr as *const std::ffi::c_void,
-                        scratch_ptr,
-                        k as i32,
-                        k_padded as i32,
-                        b_size as i32,
-                        stream_ptr,
-                    );
+                            xs_ptr as *const std::ffi::c_void,
+                            scratch_ptr,
+                            k as i32,
+                            k_padded as i32,
+                            b_size as i32,
+                            stream_ptr,
+                        );
+                    }
                     let launcher = plain_launcher_f16(dtype).expect("supports() checked");
                     launcher(
                         weight_ptr,
@@ -699,14 +716,16 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
+                    if quantize {
                     ffi::launch_mmvq_gguf_quantize_q8_1_f32(
-                        xs_ptr as *const std::ffi::c_void,
-                        scratch_ptr,
-                        k as i32,
-                        k_padded as i32,
-                        b_size as i32,
-                        stream_ptr,
-                    );
+                            xs_ptr as *const std::ffi::c_void,
+                            scratch_ptr,
+                            k as i32,
+                            k_padded as i32,
+                            b_size as i32,
+                            stream_ptr,
+                        );
+                    }
                     let launcher = plain_launcher_f32(dtype).expect("supports() checked");
                     launcher(
                         weight_ptr,
@@ -809,6 +828,7 @@ pub fn fused_glu(
     let scratch_bytes = b_size * dst_row_bytes;
 
     let mut workspace = workspace_ensure(&dev, scratch_bytes, &stream)?;
+    workspace.slot.tag = None;
     let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let stride_col_y = (k_padded / Q8_1_BLOCK_SIZE) as i32;
@@ -1026,6 +1046,7 @@ pub fn fused_qkv(
     let scratch_bytes = b_size * dst_row_bytes;
 
     let mut workspace = workspace_ensure(&dev, scratch_bytes, &stream)?;
+    workspace.slot.tag = None;
     let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let stride_col_y = (k_padded / Q8_1_BLOCK_SIZE) as i32;

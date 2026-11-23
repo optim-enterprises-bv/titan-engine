@@ -162,6 +162,23 @@ fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
 /// - unsupported quant dtype
 /// - batch too large
 /// - non-BF16/F32 input
+/// titan: the input of the next llama-port matvec on this thread, as a caller that knows it says (tensor id,
+/// dtype, offset, shape, rendered): `fast_mmvq` keeps the tag of the Q8_1 quantization its workspace holds and skips
+/// quantizing an input it already holds under the same quantizer (consecutive projections of one activation).
+/// Tensor ids are never reused and activations are not mutated in place, so a match is the same data.
+thread_local! {
+    static Q8_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+static HELD: std::sync::Mutex<Option<(String, &'static str, u64, usize)>> = std::sync::Mutex::new(None);
+
+/// Run `f` (one matmul) with its input tagged `tag` (see `Q8_TAG`).
+pub fn with_q8_tag<R>(tag: String, f: impl FnOnce() -> R) -> R {
+    Q8_TAG.with(|t| *t.borrow_mut() = Some(tag));
+    let r = f();
+    Q8_TAG.with(|t| *t.borrow_mut() = None);
+    r
+}
+
 pub fn try_fwd(
     qstorage: &QCudaStorage,
     self_shape: &Shape,
@@ -209,6 +226,9 @@ pub fn try_fwd(
     let scratch_bytes = b_size * dst_row_bytes;
 
     let (scratch_ptr, _workspace_guard) = workspace_ensure(dev, scratch_bytes)?;
+    // titan: what the workspace holds after this call (see `with_q8_tag`); every path but the tagged llama one below
+    // leaves it holding nothing known
+    let held_before = HELD.lock().unwrap().take();
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let stride_col_y = (k_padded / Q8_1_BLOCK_SIZE) as i32;
     let stride_col_dst = nrows as i32;
@@ -235,7 +255,11 @@ pub fn try_fwd(
             DType::BF16 => rhs.as_cuda_slice::<half::bf16>()?.slice(o1..o2).device_ptr(&stream).0,
             _ => rhs.as_cuda_slice::<f32>()?.slice(o1..o2).device_ptr(&stream).0,
         };
-        super::cuda::quantize_q8_1_raw(kernel, rhs_ptr, scratch_ptr as u64, k, b_size, dev)?;
+        let cur = Q8_TAG.with(|t| t.borrow().clone()).map(|t| (t, kernel, scratch_ptr as u64, scratch_bytes));
+        if cur.is_none() || cur != held_before {
+            super::cuda::quantize_q8_1_raw(kernel, rhs_ptr, scratch_ptr as u64, k, b_size, dev)?;
+        }
+        *HELD.lock().unwrap() = cur;
         if std::env::var("TITAN_IQ_FAST_CHECK").is_ok_and(|v| v == "1") {
             // the old route's Q8_1 bytes (f32 copy, candle quantize_q8_1 into a zeroed buffer) against the workspace's
             use crate::backend::BackendStorage;

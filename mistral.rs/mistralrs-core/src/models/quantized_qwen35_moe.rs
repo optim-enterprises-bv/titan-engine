@@ -3556,7 +3556,15 @@ impl ModelWeights {
         // decode: each residual add and the RMSNorm after it as one kernel (titan_add_rmsnorm), the next layer's input
         // norm carried over in `pending`
         #[cfg(feature = "cuda")]
-        let fuse = self.mapper.is_none() && x.dim(1)? == 1 && x.device().is_cuda() && add_norm_on();
+        let fuse = x.dim(1)? == 1
+            && x.device().is_cuda()
+            && add_norm_on()
+            && (0..self.layers.len()).all(|i| self.layer_device(i).same_device(&self.device));
+        #[cfg(feature = "cuda")]
+        if fuse {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("titan decode trunk: fused residual add + RMSNorm (titan_add_rmsnorm) on"));
+        }
         #[cfg(not(feature = "cuda"))]
         let fuse = false;
         let mut pending: Option<Tensor> = None;

@@ -636,7 +636,13 @@ impl QuantMethod for GgufMatMul {
                 && a.is_contiguous()
                 && candle_core::quantized::cuda::direct_bf16_mmvq(q.dtype())
             {
-                let x = self.w.forward(a)?;
+                // tagged with its input: the next projection of the same activation reuses the quantization
+                let x = if fast_mmvq::share_q8_1() {
+                    let tag = format!("{:?}/{:?}/{}/{:?}", a.id(), a.dtype(), a.layout().start_offset(), a.dims());
+                    candle_core::quantized::fast_mmvq::with_q8_tag(tag, || self.w.forward(a))?
+                } else {
+                    self.w.forward(a)?
+                };
                 return self.add_bias(x);
             }
         }
