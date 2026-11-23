@@ -849,7 +849,7 @@ impl Pipeline for TitanGGUFPipeline {
                 // TITAN_KV_DYNAMIC: KV room for this step (experts give up VRAM as the context grows)
                 let need = seqlen_offsets.iter().max().copied().unwrap_or(0) + input_ids.dim(1)? + 1;
                 let fresh = input_ids.dim(1)? > 1 && seqlen_offsets.iter().all(|&o| o == 0);
-                model.ensure_kv_room(need, fresh)?;
+                model.ensure_kv_room(need, fresh, input_ids.dim(1)?)?;
                 let recurrent_metadata = {
                     let hybrid = model.cache.hybrid();
                     hybrid.state_indices().cloned().map(|indices| {

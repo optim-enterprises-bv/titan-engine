@@ -558,6 +558,30 @@ fn free_bytes(ctx: &Arc<CudaContext>) -> usize {
     free + get(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT).saturating_sub(get(CU_MEMPOOL_ATTR_USED_MEM_CURRENT))
 }
 
+/// `TITAN_PFS_MIN_RING`: staging buffers a prompt pass should get before it falls back to the CPU twin (default 4).
+fn min_ring() -> usize {
+    env_usize("TITAN_PFS_MIN_RING", 4).clamp(1, MAX_ENTRIES)
+}
+
+/// VRAM a prompt pass of `tasks` (rows x top-k per streamed forward) needs free for its staging ring: the headroom
+/// `allocate` keeps plus `TITAN_PFS_MIN_RING` buffers. `None` when streaming is off, nothing is registered, or a ring
+/// is already allocated. The caller (the model's `ensure_kv_room`) moves experts to the CPU when this does not fit,
+/// so a long prompt streams instead of running every non-resident expert on the CPU twin (6x slower: 500 vs 3000
+/// tok/s on Qwen3.6-35B with a 1.5 GiB reserve).
+pub(crate) fn ring_room(tasks: usize) -> Option<usize> {
+    if !enabled() || RING.lock().unwrap().is_some() {
+        return None;
+    }
+    let entry_bytes = REGISTRY.lock().unwrap().iter().filter_map(|w| w.upgrade()).map(|s| s.bytes).max()?;
+    if entry_bytes == 0 {
+        return None;
+    }
+    let headroom = (env_usize("TITAN_PFS_HEADROOM_MIB", DEFAULT_HEADROOM_MIB) << 20) + tasks * (env_usize("TITAN_PFS_TASK_KIB", DEFAULT_TASK_KIB) << 10)
+        + CONTEXT.load(std::sync::atomic::Ordering::Relaxed) * (env_usize("TITAN_PFS_CTX_KIB", ctx_kib_default()) << 10);
+    let want = ((env_usize("TITAN_PFS_RING_MIB", DEFAULT_RING_MIB) << 20) / entry_bytes).clamp(1, min_ring());
+    Some(headroom + want * (entry_bytes + ENTRY_PAD))
+}
+
 fn allocate(dev: &CudaDevice, tasks: usize) -> Result<Option<Ring>> {
     let mut order: Vec<Arc<Source>> =
         REGISTRY.lock().unwrap().iter().filter_map(|w| w.upgrade()).filter(|s| s.bytes > 0).collect();
