@@ -1351,6 +1351,16 @@ impl DenseFfn {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_impl(xs, false)
+    }
+
+    /// `forward` without the widening of the down projection's output to `xs`'s dtype (the decode trunk's fused
+    /// residual add takes it as it comes).
+    fn forward_native(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_impl(xs, true)
+    }
+
+    fn forward_impl(&self, xs: &Tensor, native: bool) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if xs.device().is_cuda() && self.ptq1_0_pair() {
             if let (Some(g), Some(u)) = (self.gate.get_qtensor(), self.up.get_qtensor()) {
@@ -1381,7 +1391,8 @@ impl DenseFfn {
                     tracing::warn!("titan glu check: {bad} of {} differ", a.len());
                 }
             }
-            return self.down.forward(&h)?.to_dtype(xs.dtype());
+            let d = self.down.forward(&h)?;
+            return if native { Ok(d) } else { d.to_dtype(xs.dtype()) };
         }
         // the gating widens to xs's dtype a block of rows at a time: a prompt chunk's whole f32 gate and up
         // (~36 MiB each at 512 rows) did not always fit the device next to the weights
@@ -1429,6 +1440,14 @@ impl Ffn {
         match self {
             Self::Moe(moe) => moe.forward(xs),
             Self::Dense(ffn) => ffn.forward(xs),
+        }
+    }
+
+    /// `forward`, a dense FFN's output left in the down projection's dtype (see `DenseFfn::forward_native`).
+    fn forward_native(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Moe(moe) => moe.forward(xs),
+            Self::Dense(ffn) => ffn.forward_native(xs),
         }
     }
 }
@@ -1972,6 +1991,78 @@ fn mtp_verify_rowwise() -> bool {
 /// GDN mixer returns f32). The residual add and the norms stay f32; only the
 /// matvec input is narrowed. `=0` restores the old path.
 /// Rows per block of the prompt FFN's gating (`DenseFfn::forward`).
+/// `TITAN_ADD_NORM` (default on): the decode trunk's residual adds and the RMSNorms after them as `titan_add_rmsnorm`.
+#[cfg(feature = "cuda")]
+fn add_norm_on() -> bool {
+    mistralrs_quant::titan_cfg::flag("TITAN_ADD_NORM", true)
+}
+
+/// `(y + r, rmsnorm(y + r))` as one `titan_add_rmsnorm_{bf16,f32}y` launch, bit-identical to
+/// `(y.to_dtype(F32) + r, norm.forward(..))`; the norm's bf16 narrowing, written by the same kernel, is registered
+/// for `narrow_matvec`. `TITAN_ADD_NORM_CHECK=1` compares against the separate ops.
+#[cfg(feature = "cuda")]
+fn add_rmsnorm(y: &Tensor, r: &Tensor, norm: &QRmsNorm) -> Result<(Tensor, Tensor)> {
+    use candle_core::cuda::cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
+    let Device::Cuda(dev) = r.device() else {
+        candle_core::bail!("titan add-norm: not on CUDA");
+    };
+    if r.dtype() != DType::F32 || y.shape() != r.shape() || !matches!(y.dtype(), DType::BF16 | DType::F32) {
+        let s = (y.to_dtype(r.dtype())? + r)?;
+        let n = norm.forward(&s)?;
+        return Ok((s, n));
+    }
+    let (y, r) = (y.contiguous()?, r.contiguous()?);
+    let w = norm.weight().to_dtype(DType::F32)?.contiguous()?;
+    let ncols = r.dim(D::Minus1)?;
+    let rows = r.elem_count() / ncols;
+    let n = r.elem_count();
+    let sum = unsafe { dev.alloc::<f32>(n)? };
+    let out = unsafe { dev.alloc::<f32>(n)? };
+    let outb = unsafe { dev.alloc::<half::bf16>(n)? };
+    let stream = dev.cuda_stream();
+    let ptr = |t: &Tensor| -> Result<u64> {
+        let (st, l) = t.storage_and_layout();
+        let candle_core::Storage::Cuda(cs) = &*st else {
+            candle_core::bail!("titan add-norm: not on CUDA");
+        };
+        let es = t.dtype().size_in_bytes() as u64;
+        let p = match t.dtype() {
+            DType::BF16 => cs.as_cuda_slice::<half::bf16>()?.device_ptr(&stream).0,
+            _ => cs.as_cuda_slice::<f32>()?.device_ptr(&stream).0,
+        };
+        Ok(p + l.start_offset() as u64 * es)
+    };
+    let (py, pr, pw) = (ptr(&y)?, ptr(&r)?, ptr(&w)?);
+    let (ps, po, pb) = (sum.device_ptr(&stream).0, out.device_ptr(&stream).0, outb.device_ptr(&stream).0);
+    let name = if y.dtype() == DType::BF16 { "titan_add_rmsnorm_bf16y" } else { "titan_add_rmsnorm_f32y" };
+    let f = dev.get_or_load_custom_func(name, "titan_fused_oxide", TITAN_FUSED_PTX)?;
+    let block = if ncols < 1024 { 32i32 } else { 1024 };
+    let (nc, eps) = (ncols as i32, norm.eps() as f32);
+    let mut b = f.builder();
+    b.arg(&py).arg(&pr).arg(&pw).arg(&ps).arg(&po).arg(&pb).arg(&nc).arg(&block).arg(&eps);
+    let cfg = LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 };
+    unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    let wrap = |s: candle_core::cuda::CudaStorage| Tensor::from((candle_core::Storage::Cuda(s), r.shape().clone()));
+    let sum = wrap(candle_core::cuda::CudaStorage::wrap_cuda_slice(sum, dev.clone()));
+    let out = wrap(candle_core::cuda::CudaStorage::wrap_cuda_slice(out, dev.clone()));
+    let outb = wrap(candle_core::cuda::CudaStorage::wrap_cuda_slice(outb, dev.clone()));
+    if mistralrs_quant::titan_cfg::flag("TITAN_ADD_NORM_CHECK", false) {
+        let s2 = (y.to_dtype(DType::F32)? + &r)?;
+        let n2 = norm.forward(&s2)?;
+        let b2 = n2.to_dtype(DType::BF16)?;
+        let bits = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect())
+        };
+        let d = |a: &Tensor, b: &Tensor| -> Result<usize> { Ok(bits(a)?.iter().zip(bits(b)?).filter(|(x, y)| **x != *y).count()) };
+        let (ds, dn, db) = (d(&sum, &s2)?, d(&out, &n2)?, d(&outb, &b2)?);
+        if ds + dn + db > 0 {
+            tracing::warn!("titan add-norm check: sum {ds}, norm {dn}, bf16 {db} of {n} differ");
+        }
+    }
+    remember_narrowed(&out, outb);
+    Ok((sum, out))
+}
+
 /// `TITAN_GLU_FUSE` (default on): a dense decode FFN's SwiGLU as one `titan_glu_silu_bf16` launch.
 #[cfg(feature = "cuda")]
 fn glu_fuse() -> bool {
@@ -2027,9 +2118,28 @@ fn verify_mmq() -> bool {
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_VERIFY_MMQ", true))
 }
 
+/// bf16 narrowings of f32 tensors computed alongside them (`add_rmsnorm` writes the norm and its narrowing in one
+/// kernel), by tensor id: `narrow_matvec` of such a tensor returns the stored copy instead of casting again. Ids are
+/// unique per tensor, so a hit is always the narrowing of that very tensor.
+static NARROWED: std::sync::Mutex<std::collections::VecDeque<(candle_core::TensorId, Tensor)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn remember_narrowed(x: &Tensor, b: Tensor) {
+    let mut q = NARROWED.lock().unwrap();
+    if q.len() >= 4 {
+        q.pop_front();
+    }
+    q.push_back((x.id(), b));
+}
+
 fn narrow_matvec(x: &Tensor) -> Option<Tensor> {
     if !mistralrs_quant::titan_cfg::flag("TITAN_DENSE_BF16_MATVEC", true) {
         return None;
+    }
+    if x.dtype() == DType::F32 {
+        if let Some((_, b)) = NARROWED.lock().unwrap().iter().find(|(id, _)| *id == x.id()) {
+            return Some(b.clone());
+        }
     }
     if x.dtype() == DType::F32 && x.device().is_cuda() {
         x.to_dtype(DType::BF16).ok()
@@ -3443,16 +3553,43 @@ impl ModelWeights {
         let mask = self.trunk_mask(input_ids, ctx, &hybrid_cache)?;
 
         let look = lookahead_depth();
+        // decode: each residual add and the RMSNorm after it as one kernel (titan_add_rmsnorm), the next layer's input
+        // norm carried over in `pending`
+        #[cfg(feature = "cuda")]
+        let fuse = self.mapper.is_none() && x.dim(1)? == 1 && x.device().is_cuda() && add_norm_on();
+        #[cfg(not(feature = "cuda"))]
+        let fuse = false;
+        let mut pending: Option<Tensor> = None;
+        let nl = self.layers.len();
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(mapper) = &self.mapper {
                 x = mapper.map(x, i)?;
             }
             let mut t = std::time::Instant::now();
             let residual = &x;
-            let h = layer.attn_norm.forward(&x)?;
+            let h = match pending.take() {
+                Some(h) => h,
+                None => layer.attn_norm.forward(&x)?,
+            };
             let h = self.run_mixer(layer, i, &h, hybrid_cache.get_mut(i), &recurrent_metadata, &mask.get(h.device()), ctx, conv_carry)?;
             if h.dim(1)? == 1 {
                 prof(if matches!(layer.mixer, Mixer::Attention(_)) { "d.attn" } else { "d.gdn" }, &self.device, &mut t);
+            }
+            let decode_row = h.dim(1)? == 1;
+            let lookahead = matches!(layer.ffn, Ffn::Moe(_)) && look > 0 && decode_row;
+            #[cfg(feature = "cuda")]
+            if fuse && !lookahead {
+                let (x_attn, h) = add_rmsnorm(&h, residual, &layer.post_attention_norm)?;
+                let d = layer.ffn.forward_native(&h)?;
+                if i + 1 < nl {
+                    let (xn, hn) = add_rmsnorm(&d, &x_attn, &self.layers[i + 1].attn_norm)?;
+                    x = xn;
+                    pending = Some(hn);
+                } else {
+                    x = (d.to_dtype(x_attn.dtype())? + x_attn)?;
+                }
+                prof("d.moe", &self.device, &mut t);
+                continue;
             }
             let x_attn = (h + residual)?;
             if x_attn.dim(1)? > 1 {
@@ -3460,9 +3597,8 @@ impl ModelWeights {
                 layer_dump_bin(1000 + i, ctx.seqlen_offsets().first().copied().unwrap_or(0), &x_attn)?;
             }
             let h = layer.post_attention_norm.forward(&x_attn)?;
-            let decode_row = x_attn.dim(1)? == 1;
             let h = match &layer.ffn {
-                Ffn::Moe(moe) if look > 0 && decode_row => {
+                Ffn::Moe(moe) if lookahead => {
                     let preds = self.lookahead_preds(i, &x_attn, look)?;
                     prof("d.look", &self.device, &mut t);
                     moe.forward_lookahead(&h, &preds)?
