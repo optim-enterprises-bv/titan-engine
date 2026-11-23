@@ -379,6 +379,12 @@ pub fn get_device_layers(
             key_sz + val_sz
         }
         None => {
+            // TITAN_KV_DYNAMIC: the cache starts at the base context and grows into expert VRAM (`ensure_kv_room`)
+            let max_seq_len = if crate::kv_cache::cuda_kv_dynamic() && devices.iter().any(|d| d.is_cuda()) {
+                max_seq_len.min(crate::kv_cache::cuda_kv_base())
+            } else {
+                max_seq_len
+            };
             let key_shape = [
                 max_batch_size,
                 model_cfg.num_kv_heads(),

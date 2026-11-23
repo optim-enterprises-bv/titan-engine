@@ -5012,6 +5012,80 @@ impl ModelWeights {
         self.mapper.as_ref().and_then(|m| m.device_for(i, false)).unwrap_or(&self.device)
     }
 
+    /// `TITAN_KV_DYNAMIC`: before a step that needs `need` KV positions past the attention caches' room, grow them to
+    /// the next `KV_RESERVE_STEP` bucket, first demoting the coldest GPU-resident experts (the same number in every
+    /// layer, placement order) until the growth fits: the experts hold the VRAM a short context does not need.
+    pub(crate) fn ensure_kv_room(&self, need: usize) -> Result<()> {
+        if !crate::kv_cache::cuda_kv_dynamic() || !self.device.is_cuda() {
+            return Ok(());
+        }
+        let need = need.min(self.max_seq_len);
+        let cap = self.cache.hybrid().attention_capacity();
+        if need <= cap {
+            return Ok(());
+        }
+        let target = need.max(cap.max(crate::kv_cache::cuda_kv_base())).next_multiple_of(KV_RESERVE_STEP).min(self.max_seq_len);
+        let attn: Vec<&FullAttention> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match &l.mixer {
+                Mixer::Attention(a) if self.layer_device(i).same_device(&self.device) => Some(a),
+                _ => None,
+            })
+            .collect();
+        let kv_dtype = if crate::kv_cache::cuda_kv_fp8() { DType::F8E4M3 } else { self.dtype };
+        let per_layer_pos = attn.first().map_or(0, |a| 2 * a.n_kv_head * a.head_dim * kv_dtype.size_in_bytes());
+        let grow = (target - cap) * per_layer_pos * attn.len();
+        // the largest layer buffer is allocated before its old copy goes back, and afterwards the step still needs the
+        // working room the plan reserved (TITAN_TIERED_RESERVE_MIB: the pfs ring and prompt temporaries)
+        let reserve = mistralrs_quant::titan_cfg::var("TITAN_TIERED_RESERVE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(KV_BUCKET_MARGIN, |m| m << 20);
+        let need_bytes = grow + target * per_layer_pos + reserve;
+        crate::titan_swap::trim_pool(&self.device);
+        let free = device_free_bytes(&self.device).unwrap_or(0);
+        #[cfg(feature = "cuda")]
+        if free < need_bytes {
+            let layers: Vec<[&mistralrs_quant::TieredExperts; 3]> = self
+                .layers
+                .iter()
+                .filter_map(|l| match &l.ffn {
+                    Ffn::Moe(m) => match &m.experts {
+                        super::quantized_qwen3_moe::Experts::Tiered { gate, up, down } if gate.can_demote() => Some([gate, up, down]),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if !layers.is_empty() {
+                let slot_bytes: usize = layers.iter().map(|l| l.iter().map(|p| p.expert_bytes()).sum::<usize>()).sum::<usize>() / layers.len();
+                let per_layer = (need_bytes - free).div_ceil(slot_bytes * layers.len()).max(1);
+                self.device.synchronize()?;
+                let mut freed = 0usize;
+                let mut kept = usize::MAX;
+                for l in &layers {
+                    let n = l[0].resident_count().saturating_sub(per_layer);
+                    kept = kept.min(n);
+                    for p in l {
+                        freed += p.demote_to(n)?;
+                    }
+                }
+                mistralrs_quant::invalidate_captures();
+                crate::titan_swap::trim_pool(&self.device);
+                tracing::info!(
+                    "titan vram: KV room {cap} -> {target} positions: {per_layer} experts per layer moved to the CPU ({} MiB), {kept} stay on the GPU",
+                    freed >> 20
+                );
+            }
+        }
+        let dev = self.device.clone();
+        self.cache.hybrid().reserve_attention_each(target, &mut || crate::titan_swap::trim_pool(&dev))?;
+        let _ = free;
+        Ok(())
+    }
+
     /// KV positions to reserve for a prompt needing `need`: the `KV_RESERVE_STEP` bucket (buffers freed by one
     /// sequence are reused whole by the next instead of fragmenting the device pool) while the bucket's extra
     /// positions fit in the main device's free memory with `KV_BUCKET_MARGIN` to spare; otherwise `need` rounded

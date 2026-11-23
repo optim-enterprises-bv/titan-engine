@@ -45,6 +45,12 @@ pub(crate) fn free_leaked<K, T>(m: &std::sync::OnceLock<std::sync::Mutex<std::co
     }
 }
 
+/// Captured CUDA graphs hold kernel arguments that just changed (a tiered expert slot buffer moved): bump the
+/// generation `SegmentGraphs` checks, so every segment is captured again.
+pub fn invalidate_captures() {
+    KERNEL_WORKSPACE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// Retire the prefill-streaming staging ring (it waits on its copy stream) before a CUDA graph capture: inside a
 /// capture that cross-stream wait is illegal (CUDA_ERROR_STREAM_CAPTURE_ISOLATION) and the doorbell's MoE path
 /// would otherwise run it on the first decode step after a streamed prompt.

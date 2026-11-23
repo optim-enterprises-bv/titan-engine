@@ -399,6 +399,10 @@ pub struct TieredExperts {
     flex: usize,
     /// `onepass_ok` of this layer when this is its gate projection, decided at the first forward.
     fast_ok: std::sync::OnceLock<bool>,
+    /// Host copies of experts demoted from the GPU after load (`demote_to`), for those `host` has no copy of:
+    /// expert -> its bytes (null when none). The boxes live in `demoted_store` until the model drops.
+    demoted: Vec<std::sync::atomic::AtomicPtr<u8>>,
+    demoted_store: std::sync::Mutex<Vec<Box<[u8]>>>,
 }
 
 static TRACE: crate::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = crate::titan_cfg::GenCell::new();
@@ -778,6 +782,8 @@ impl TieredExperts {
             order,
             flex,
             fast_ok: std::sync::OnceLock::new(),
+            demoted: (0..num_experts).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect(),
+            demoted_store: std::sync::Mutex::new(Vec::new()),
         };
         if titan_pfs::enabled() && policy == Policy::Static && me.flex == 0 {
             let cold = &me.order[num_resident..];
@@ -792,8 +798,14 @@ impl TieredExperts {
     }
 
     fn host_expert(&self, e: usize) -> &[u8] {
-        let i = self.host_index[e] as usize;
         let eb = self.expert_bytes;
+        if self.host_index[e] == NOT_RESIDENT {
+            let p = self.demoted[e].load(std::sync::atomic::Ordering::Acquire);
+            assert!(!p.is_null(), "titan tiered: expert {e} of layer {} {} has no host copy", self.layer, self.proj);
+            // SAFETY: the box behind `p` (eb bytes) lives in `demoted_store` until `self` drops
+            return unsafe { std::slice::from_raw_parts(p, eb) };
+        }
+        let i = self.host_index[e] as usize;
         match &self.host {
             HostStore::Owned(v) => &v[i * eb..(i + 1) * eb],
             HostStore::Mapped { map, offset } => &map[offset + i * eb..offset + (i + 1) * eb],
@@ -1127,6 +1139,74 @@ impl TieredExperts {
             add_time(3, t2);
         }
         Ok((gate.wrap(og, batch, topk), up.wrap(ou, batch, topk)))
+    }
+
+    /// GPU-resident experts of this projection.
+    pub fn resident_count(&self) -> usize {
+        self.cache.lock().unwrap().owner.len()
+    }
+
+    /// Bytes of one expert on the GPU.
+    pub fn expert_bytes(&self) -> usize {
+        self.expert_bytes
+    }
+
+    /// Whether `demote_to` can change this projection's residency (a static placement without fingerprint slots).
+    pub fn can_demote(&self) -> bool {
+        self.policy == Policy::Static && self.flex == 0
+    }
+
+    /// Keep only the hottest `n` resident experts (placement order) and free the rest of the slot buffer: the demoted
+    /// experts' bytes go to the host first (a mapped store already has them), so the CPU computes them from then on.
+    /// The slots move to a new, smaller buffer; captured graphs hold the old address, so the caller must invalidate
+    /// them (`invalidate_captures`) and must not have work in flight on these experts. Returns the device bytes freed.
+    /// All three projections of a layer must keep the same `n` (the one-pass paths need equal maps).
+    pub fn demote_to(&self, n: usize) -> Result<usize> {
+        if !self.can_demote() {
+            return Ok(0);
+        }
+        let stream = self.dev.cuda_stream();
+        let mut cache = self.cache.lock().unwrap();
+        let old_n = cache.owner.len();
+        if n >= old_n {
+            return Ok(0);
+        }
+        let eb = self.expert_bytes;
+        // residents in placement order: the first n stay
+        let residents: Vec<usize> = self.order.iter().copied().filter(|&e| cache.map[e] != NOT_RESIDENT).collect();
+        let (keep, drop) = residents.split_at(n);
+        {
+            let mut store = self.demoted_store.lock().unwrap();
+            for &e in drop {
+                if self.host_index[e] != NOT_RESIDENT || !self.demoted[e].load(std::sync::atomic::Ordering::Acquire).is_null() {
+                    continue;
+                }
+                let off = cache.map[e] as usize * eb;
+                let bytes = stream.clone_dtoh(&cache.slots.slice(off..off + eb)).w()?;
+                let mut b = bytes.into_boxed_slice();
+                self.demoted[e].store(b.as_mut_ptr(), std::sync::atomic::Ordering::Release);
+                store.push(b);
+            }
+        }
+        let mut slots = self.dev.alloc_zeros::<u8>(n.max(1) * eb + crate::gguf::fast_mmq::GROUPED_TAIL_BYTES)?;
+        let mut map = vec![NOT_RESIDENT; self.num_experts];
+        let mut owner = vec![NOT_RESIDENT; n];
+        for (slot, &e) in keep.iter().enumerate() {
+            let off = cache.map[e] as usize * eb;
+            stream.memcpy_dtod(&cache.slots.slice(off..off + eb), &mut slots.slice_mut(slot * eb..(slot + 1) * eb)).w()?;
+            map[e] = slot as u32;
+            owner[slot] = e as u32;
+        }
+        let slot_map = stream.clone_htod(&map).w()?;
+        stream.synchronize().w()?;
+        let freed = (old_n - n) * eb;
+        cache.slots_ptr = slice_ptr(&slots, 0).0;
+        cache.slots = slots;
+        cache.slot_map = slot_map;
+        cache.map = map;
+        cache.owner = owner;
+        cache.last_use = vec![0; n];
+        Ok(freed)
     }
 
     /// Whether a batch-1 forward of these projections runs entirely on the GPU stream with the doorbell (no host sync),

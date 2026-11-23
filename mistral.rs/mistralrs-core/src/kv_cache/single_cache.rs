@@ -81,8 +81,9 @@ impl SingleCache {
 
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
-        // a preallocated CUDA buffer (TITAN_KV_PREALLOC) is kept: only its first `current_seq_len` rows are ever read
-        if self.capacity_seq_len == self.max_seq_len
+        // a preallocated or dynamic CUDA buffer (TITAN_KV_PREALLOC / TITAN_KV_DYNAMIC) is kept: only its first
+        // `current_seq_len` rows are ever read, and reallocating it fragments the pool
+        if (self.capacity_seq_len == self.max_seq_len || super::cuda_kv_dynamic())
             && super::cuda_kv_prealloc()
             && self.all_data.as_ref().is_some_and(|d| d.device().is_cuda())
         {
@@ -136,7 +137,11 @@ impl SingleCache {
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
             if src.device().is_cuda() && super::cuda_kv_prealloc() {
-                self.capacity_seq_len = self.max_seq_len;
+                self.capacity_seq_len = if super::cuda_kv_dynamic() {
+                    self.capacity_seq_len.max(super::cuda_kv_base()).min(self.max_seq_len)
+                } else {
+                    self.max_seq_len
+                };
             }
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.capacity_seq_len;
@@ -161,6 +166,9 @@ impl SingleCache {
                 (self.capacity_seq_len / HOST_GROW_DIV)
                     .next_multiple_of(NormalCache::CACHE_GROW_SIZE)
                     .max(NormalCache::CACHE_GROW_SIZE)
+            } else if super::cuda_kv_dynamic() {
+                // a dynamic CUDA cache normally grew ahead of this (`ensure_kv_room`): if not, a whole bucket at once
+                crate::models::quantized_qwen35_moe::KV_RESERVE_STEP
             } else {
                 NormalCache::CACHE_GROW_SIZE
             };
