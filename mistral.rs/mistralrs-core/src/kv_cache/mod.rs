@@ -114,6 +114,20 @@ pub(crate) fn cuda_kv_prealloc() -> bool {
     *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_KV_PREALLOC", false))
 }
 
+/// `TITAN_KV_DYNAMIC=1`: the CUDA KV cache starts at `TITAN_KV_BASE` positions and grows in `KV_RESERVE_STEP`
+/// buckets as sequences need them, the tiered experts giving up the VRAM it takes (`ensure_kv_room`); with
+/// TITAN_KV_PREALLOC alone it is the full context from the first append.
+pub(crate) fn cuda_kv_dynamic() -> bool {
+    static ON: mistralrs_quant::titan_cfg::GenCell<bool> = mistralrs_quant::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| mistralrs_quant::titan_cfg::flag("TITAN_KV_DYNAMIC", false))
+}
+
+/// `TITAN_KV_BASE` (default 32768): the positions a dynamic KV cache, and the VRAM plan, start from.
+pub(crate) fn cuda_kv_base() -> usize {
+    static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
+    *N.get_or_init(|| mistralrs_quant::titan_cfg::var("TITAN_KV_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(32768))
+}
+
 impl KvCache {
     pub fn new_normal(dim: usize, max_seq_len: usize, capacity_seq_len: usize) -> Self {
         let k = SingleCache::new(dim, max_seq_len, capacity_seq_len);
@@ -417,6 +431,14 @@ impl KvCache {
                 v.reset();
             }
             Self::Shared { .. } => {}
+        }
+    }
+
+    /// Positions the cache holds room for (a normal cache's K capacity; 0 for other kinds).
+    pub fn capacity(&self) -> usize {
+        match self {
+            Self::Normal { k, .. } => k.capacity_seq_len,
+            Self::Rotating { .. } | Self::Shared { .. } => 0,
         }
     }
 

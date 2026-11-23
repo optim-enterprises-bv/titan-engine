@@ -3934,6 +3934,30 @@ impl HybridCache {
         Ok(())
     }
 
+    /// The smallest room (positions) of the attention layers' KV caches.
+    pub fn attention_capacity(&self) -> usize {
+        self.caches
+            .iter()
+            .filter_map(|c| match c {
+                HybridLayerCache::Attention(kv) => Some(kv.capacity()),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// `reserve_attention` one layer at a time, `between()` after each (a sync and a pool trim: each layer's old
+    /// buffer goes back before the next grows, so the transient is one layer's, not the whole cache's).
+    pub fn reserve_attention_each(&mut self, len: usize, between: &mut dyn FnMut()) -> Result<()> {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.reserve(len)?;
+                between();
+            }
+        }
+        Ok(())
+    }
+
     /// Truncate all attention layer KV caches to the given sequence length.
     /// Recurrent layers are unchanged, use snapshot/restore for recurrent rollback.
     pub fn truncate_attention_to(&mut self, len: usize) -> Result<()> {

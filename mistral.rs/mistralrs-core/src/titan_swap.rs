@@ -228,6 +228,16 @@ pub(crate) fn release_after_oom(p: &dyn crate::pipeline::Pipeline) -> (usize, us
 }
 
 #[cfg(feature = "cuda")]
+/// Sync and hand the stream-ordered pool's unused memory back (no-op off CUDA).
+pub(crate) fn trim_pool(device: &candle_core::Device) {
+    #[cfg(feature = "cuda")]
+    if let candle_core::Device::Cuda(dev) = device {
+        trim_cuda(dev);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+}
+
 fn trim_cuda(dev: &candle_core::cuda::CudaDevice) {
     use candle_core::cuda::cudarc::driver::sys;
     let stream = dev.cuda_stream();

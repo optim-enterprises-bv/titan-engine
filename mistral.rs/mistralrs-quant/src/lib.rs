@@ -238,7 +238,7 @@ impl TieredExperts {
     pub fn set_auto_extra_reserve(_bytes: usize) {}
 }
 pub use gguf::GgufMatMul;
-pub use gguf::{kernel_workspace_generation, release_titan_state, titan_before_capture, titan_recover_oom, titan_register_mapped_file};
+pub use gguf::{invalidate_captures, kernel_workspace_generation, release_titan_state, titan_before_capture, titan_recover_oom, titan_register_mapped_file};
 #[cfg(feature = "cuda")]
 pub use gguf::release_kernel_workspaces;
 pub use gguf::{

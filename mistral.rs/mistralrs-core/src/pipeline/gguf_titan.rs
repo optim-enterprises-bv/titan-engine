@@ -202,6 +202,8 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
         // F8E4M3 KV (half the VRAM of BF16 at the same decode speed) allocated once at the full context
         put("TITAN_KV_FP8", "1");
         put("TITAN_KV_PREALLOC", "1");
+        // TITAN_KV_DYNAMIC (KV grows into expert VRAM) stays opt-in: short-context decode 103 vs 89 tok/s, but its
+        // slot and KV reallocations fragment the stream-ordered pool and long prompts ran out of memory
         put("TITAN_TIERED", "1");
         put("TITAN_TIERED_GPU_FRACTION", "auto");
         // long prompts (262k window) need the pfs staging ring and prompt temporaries next to the preallocated KV:
@@ -407,9 +409,15 @@ pub(super) fn load(
             let frac = model.kv_cache_layer_fraction("this is a dummy config!")?;
             // the KV's own dtype (F8E4M3 with TITAN_KV_FP8), not the model's
             let kv_dtype = if device.is_cuda() && crate::kv_cache::cuda_kv_fp8() { DType::F8E4M3 } else { dtype };
+            // TITAN_KV_DYNAMIC: the plan holds the base context's KV; longer contexts take expert VRAM as they come
+            let plan_ctx = if crate::kv_cache::cuda_kv_dynamic() {
+                params.max_seq_len().min(crate::kv_cache::cuda_kv_base())
+            } else {
+                params.max_seq_len()
+            };
             let per_layer = params.max_batch_size()
                 * cfg.num_kv_heads()
-                * params.max_seq_len()
+                * plan_ctx
                 * (cfg.k_head_dim() + cfg.v_head_dim())
                 * kv_dtype.size_in_bytes();
             let kv = (per_layer as f64 * cfg.num_layers() as f64 * frac).ceil() as usize;
@@ -823,6 +831,9 @@ impl Pipeline for TitanGGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen35MoE(ref model) => {
+                // TITAN_KV_DYNAMIC: KV room for this step (experts give up VRAM as the context grows)
+                let need = seqlen_offsets.iter().max().copied().unwrap_or(0) + input_ids.dim(1)? + 1;
+                model.ensure_kv_room(need)?;
                 let recurrent_metadata = {
                     let hybrid = model.cache.hybrid();
                     hybrid.state_indices().cloned().map(|indices| {
