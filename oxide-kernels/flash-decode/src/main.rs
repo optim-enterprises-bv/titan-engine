@@ -143,6 +143,37 @@ pub mod kernels {
         f32::from_bits((r as u32) << 16)
     }
     #[inline(always)]
+    pub unsafe fn ldg_v2(p: *const u8) -> (u32, u32) {
+        let (a, b): (u32, u32);
+        ptx_asm!("ld.global.nc.v2.u32 {%0, %1}, [%2];", out("=r") a, out("=r") b, in("l") p as u64);
+        (a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn ldg_u8(p: *const u8) -> u16 {
+        let r: u16;
+        ptx_asm!("ld.global.nc.u8 %0, [%1];", out("=h") r, in("l") p as u64);
+        r
+    }
+    /// Two e4m3 bytes (low byte first) to f32, exactly (every e4m3 value is an f16 and an f32).
+    #[inline(always)]
+    pub fn e4m3x2(h: u16) -> (f32, f32) {
+        let r: u32;
+        unsafe { ptx_asm!("cvt.rn.f16x2.e4m3x2 %0, %1;", out("=r") r, in("h") h, options(register_only)); }
+        let (lo, hi): (f32, f32);
+        unsafe {
+            ptx_asm!("cvt.f32.f16 %0, %1;", out("=f") lo, in("h") (r & 0xffff) as u16, options(register_only));
+            ptx_asm!("cvt.f32.f16 %0, %1;", out("=f") hi, in("h") (r >> 16) as u16, options(register_only));
+        }
+        (lo, hi)
+    }
+    /// Four e4m3 bytes of a word, in byte order.
+    #[inline(always)]
+    pub fn e4m3x4(wd: u32) -> [f32; 4] {
+        let (a, b) = e4m3x2((wd & 0xffff) as u16);
+        let (c, d) = e4m3x2((wd >> 16) as u16);
+        [a, b, c, d]
+    }
+    #[inline(always)]
     pub unsafe fn lds(addr: u32) -> f32 {
         let r: f32;
         ptx_asm!("ld.shared.f32 %0, [%1];", out("=f") r, in("r") addr);
@@ -176,8 +207,8 @@ pub mod kernels {
     /// query index `r * n_heads + hd`.
     #[device]
     #[inline(always)]
-    pub unsafe fn split<const G: usize>(
-        q: *const u16, k: *const u16, v: *const u16, part: *mut f32, meta: *mut f32, scale: f32,
+    pub unsafe fn split<const G: usize, const FP8: bool>(
+        q: *const u16, k: *const u8, v: *const u8, part: *mut f32, meta: *mut f32, scale: f32,
         n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
         q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
     ) {
@@ -226,13 +257,20 @@ pub mod kernels {
             let key = t0 + (tid >> 1);
             let mut s = [0f32; G];
             if key < c1 {
-                let kp = k.add((kvh as u64 * k_hs + key as u64 * 256) as usize);
+                let ke = (kvh as u64 * k_hs + key as u64 * 256) as usize;
                 let mut i = 0;
                 #[unroll]
                 while i < 16 {
                     let cc = (2 * i + half) as u32;
-                    let (a0, a1, a2, a3) = ldg_v4(kp.add((cc * 8) as usize));
-                    let kf = [bf_lo(a0), bf_hi(a0), bf_lo(a1), bf_hi(a1), bf_lo(a2), bf_hi(a2), bf_lo(a3), bf_hi(a3)];
+                    let kf = if FP8 {
+                        let (a0, a1) = ldg_v2(k.add(ke + (cc * 8) as usize));
+                        let lo = e4m3x4(a0);
+                        let hi = e4m3x4(a1);
+                        [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+                    } else {
+                        let (a0, a1, a2, a3) = ldg_v4((k as *const u16).add(ke + (cc * 8) as usize));
+                        [bf_lo(a0), bf_hi(a0), bf_lo(a1), bf_hi(a1), bf_lo(a2), bf_hi(a2), bf_lo(a3), bf_hi(a3)]
+                    };
                     let qa = sb + w(OFF_Q + cc * 8);
                     let mut j = 0;
                     #[unroll]
@@ -347,13 +385,20 @@ pub mod kernels {
             if nfull > nk {
                 nfull = nk;
             }
-            let vp = v.add((kvh as u64 * v_hs + t0 as u64 * 256 + tid as u64) as usize);
+            let ve = (kvh as u64 * v_hs + t0 as u64 * 256 + tid as u64) as usize;
+            let ldv = |kk: i32| -> f32 {
+                if FP8 {
+                    e4m3x2(ldg_u8(v.add(ve + (kk * 256) as usize))).0
+                } else {
+                    ldg_bf((v as *const u16).add(ve + (kk * 256) as usize))
+                }
+            };
             let mut kk = 0;
             while kk + 4 <= nfull {
-                let v0 = ldg_bf(vp.add((kk * 256) as usize));
-                let v1 = ldg_bf(vp.add(((kk + 1) * 256) as usize));
-                let v2 = ldg_bf(vp.add(((kk + 2) * 256) as usize));
-                let v3 = ldg_bf(vp.add(((kk + 3) * 256) as usize));
+                let v0 = ldv(kk);
+                let v1 = ldv(kk + 1);
+                let v2 = ldv(kk + 2);
+                let v3 = ldv(kk + 3);
                 let vs = [v0, v1, v2, v3];
                 let mut u = 0;
                 #[unroll]
@@ -374,7 +419,7 @@ pub mod kernels {
                 kk += 4;
             }
             while kk < nfull {
-                let vv = ldg_bf(vp.add((kk * 256) as usize));
+                let vv = ldv(kk);
                 let pa = sb + w(OFF_P + (kk as u32) * (G as u32));
                 let mut j = 0;
                 #[unroll]
@@ -391,7 +436,7 @@ pub mod kernels {
             // the last n_rows - 1 keys of the sequence: only some rows see them
             while kk < nk {
                 let key = t0 + kk;
-                let vv = ldg_bf(vp.add((kk * 256) as usize));
+                let vv = ldv(kk);
                 let pa = sb + w(OFF_P + (kk as u32) * (G as u32));
                 let mut j = 0;
                 #[unroll]
@@ -438,7 +483,17 @@ pub mod kernels {
         n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
         q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
     ) {
-        split::<8>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+        split::<8, false>(q, k as *const u8, v as *const u8, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+    }
+    /// `flash_decode_split_g8` over an F8E4M3 KV cache (strides in elements): each key and value is converted to
+    /// f32 exactly where the bf16 kernel widens its bf16, so it equals that kernel on the cache cast to bf16.
+    #[kernel]
+    pub unsafe fn flash_decode_split_g8_fp8(
+        q: *const u16, k: *const u8, v: *const u8, part: *mut f32, meta: *mut f32, scale: f32,
+        n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
+        q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
+    ) {
+        split::<8, true>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
     }
     #[kernel]
     pub unsafe fn flash_decode_split_g16(
@@ -446,7 +501,17 @@ pub mod kernels {
         n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
         q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
     ) {
-        split::<16>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+        split::<16, false>(q, k as *const u8, v as *const u8, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+    }
+    /// `flash_decode_split_g16` over an F8E4M3 KV cache (strides in elements): each key and value is converted to
+    /// f32 exactly where the bf16 kernel widens its bf16, so it equals that kernel on the cache cast to bf16.
+    #[kernel]
+    pub unsafe fn flash_decode_split_g16_fp8(
+        q: *const u16, k: *const u8, v: *const u8, part: *mut f32, meta: *mut f32, scale: f32,
+        n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
+        q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
+    ) {
+        split::<16, true>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
     }
     #[kernel]
     pub unsafe fn flash_decode_split_g24(
@@ -454,7 +519,17 @@ pub mod kernels {
         n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
         q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
     ) {
-        split::<24>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+        split::<24, false>(q, k as *const u8, v as *const u8, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
+    }
+    /// `flash_decode_split_g24` over an F8E4M3 KV cache (strides in elements): each key and value is converted to
+    /// f32 exactly where the bf16 kernel widens its bf16, so it equals that kernel on the cache cast to bf16.
+    #[kernel]
+    pub unsafe fn flash_decode_split_g24_fp8(
+        q: *const u16, k: *const u8, v: *const u8, part: *mut f32, meta: *mut f32, scale: f32,
+        n_rep: i32, n_heads: i32, kv_total: i32, n_rows: i32, chunk: i32, nchunks: i32,
+        q_hs: i32, q_rs: i32, k_hs: u64, v_hs: u64,
+    ) {
+        split::<24, true>(q, k, v, part, meta, scale, n_rep, n_heads, kv_total, n_rows, chunk, nchunks, q_hs, q_rs, k_hs, v_hs)
     }
 
     /// Merge row r's chunks `0..ceil(len_r / chunk)` in chunk order (flash_attn_combine_results) and

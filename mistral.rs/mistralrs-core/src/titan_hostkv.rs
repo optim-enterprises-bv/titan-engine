@@ -47,7 +47,7 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
-fn tile() -> usize {
+pub(crate) fn tile() -> usize {
     static N: mistralrs_quant::titan_cfg::GenCell<usize> = mistralrs_quant::titan_cfg::GenCell::new();
     *N.get_or_init(|| {
         mistralrs_quant::titan_cfg::var("TITAN_KV_HOST_TILE").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TILE)

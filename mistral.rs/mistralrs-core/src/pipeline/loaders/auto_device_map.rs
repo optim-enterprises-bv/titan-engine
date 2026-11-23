@@ -399,6 +399,9 @@ pub fn get_device_layers(
     // cache is held in the loader's KV dtype (paged blocks are sized in `dtype` above).
     let kv_dtype = if has_paged_attn {
         dtype
+    } else if crate::kv_cache::cuda_kv_fp8() && devices.iter().any(|d| d.is_cuda()) {
+        // TITAN_KV_FP8: the non-paged CUDA cache is F8E4M3 whatever the model dtype
+        DType::F8E4M3
     } else {
         loader.kv_cache_dtype(config, dtype)?
     };

@@ -32,6 +32,11 @@ const DEFAULT_TASK_KIB: usize = 32;
 /// Headroom per token of the prompt's KV room on top (`TITAN_PFS_CTX_KIB`): long-context attention
 /// temporaries (a 28k prompt ran with 1 staging buffer where 4 ran out of memory).
 const DEFAULT_CTX_KIB: usize = 10;
+/// An F8E4M3 KV cache (TITAN_KV_FP8) is attended in fixed-size tiles (`flash_prefill::attend_host_tiles`): its long-context
+/// temporaries do not grow with the context, so the per-token headroom is 0.
+fn ctx_kib_default() -> usize {
+    if crate::titan_cfg::flag("TITAN_KV_FP8", false) { 0 } else { DEFAULT_CTX_KIB }
+}
 static CONTEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The KV room (tokens) of the prompt pass about to run, for the ring's headroom.
@@ -565,7 +570,7 @@ fn allocate(dev: &CudaDevice, tasks: usize) -> Result<Option<Ring>> {
     ctx.bind_to_thread().w()?;
     let want = (env_usize("TITAN_PFS_RING_MIB", DEFAULT_RING_MIB) << 20) / entry_bytes;
     let headroom = (env_usize("TITAN_PFS_HEADROOM_MIB", DEFAULT_HEADROOM_MIB) << 20) + tasks * (env_usize("TITAN_PFS_TASK_KIB", DEFAULT_TASK_KIB) << 10)
-        + CONTEXT.load(std::sync::atomic::Ordering::Relaxed) * (env_usize("TITAN_PFS_CTX_KIB", DEFAULT_CTX_KIB) << 10);
+        + CONTEXT.load(std::sync::atomic::Ordering::Relaxed) * (env_usize("TITAN_PFS_CTX_KIB", ctx_kib_default()) << 10);
     let free = free_bytes(&ctx);
     let fit = free.saturating_sub(headroom) / (entry_bytes + ENTRY_PAD);
     let n = want.min(fit).clamp(0, MAX_ENTRIES);

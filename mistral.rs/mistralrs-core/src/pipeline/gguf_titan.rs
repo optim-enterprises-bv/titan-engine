@@ -185,11 +185,28 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
     let get = |k: &str| md.get(&format!("{arch}.{k}")).and_then(|v| v.to_u32().ok()).map(|v| v as u64);
     let (ram, vram) = (total_ram_bytes(), total_vram_bytes(device));
 
+    // One context length for the VRAM plan and the request limit: the GGUF's own, capped by an explicit
+    // `--max-seq-len` (the CLI's default is not a choice) and TITAN_MAX_SEQ_LEN. The plan used the CLI value (4096 by
+    // default) while requests were held to the GGUF's 262144, so long prompts ran out of the memory never planned.
+    let native = get("context_length").map(|c| c as usize);
+    let requested = max_seq_len.filter(|&c| c != crate::AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN);
+    let configured = mistralrs_quant::titan_cfg::var("TITAN_MAX_SEQ_LEN").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&c| c > 0);
+    let ctx = [native, requested, configured].into_iter().flatten().min();
+    if let Some(c) = ctx {
+        put("TITAN_MAX_SEQ_LEN", &c.to_string());
+    }
+    let max_seq_len = ctx.or(max_seq_len);
+
     let moe = matches!(arch, "qwen35moe" | "qwen3moe" | "qwen3next" | "gpt-oss" | "qwen4exp");
     if moe {
+        // F8E4M3 KV (half the VRAM of BF16 at the same decode speed) allocated once at the full context
+        put("TITAN_KV_FP8", "1");
+        put("TITAN_KV_PREALLOC", "1");
         put("TITAN_TIERED", "1");
         put("TITAN_TIERED_GPU_FRACTION", "auto");
-        put("TITAN_TIERED_RESERVE_MIB", "1536");
+        // long prompts (262k window) need the pfs staging ring and prompt temporaries next to the preallocated KV:
+        // 1536 left ~900 MiB free at runtime and fell back to CPU-twin prefill; 2560 ran 25k-250k prompts cleanly
+        put("TITAN_TIERED_RESERVE_MIB", "2560");
         put("TITAN_PFS", "1");
         put("TITAN_PFS_HEADROOM_MIB", "768");
         put("TITAN_DOORBELL", "1");
@@ -276,6 +293,20 @@ pub(super) fn load(
         _ => None,
     };
     mistralrs_quant::titan_cfg::set_auto(auto_settings(arch_name, paths, device, auto_ctx)?);
+    // the plan sizes the KV for the context requests are held to
+    let planned_ctx = mistralrs_quant::titan_cfg::var("TITAN_MAX_SEQ_LEN").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    if let (
+        Some(ctx),
+        DeviceMapSetting::Auto(
+            crate::AutoDeviceMapParams::Text { max_seq_len, .. } | crate::AutoDeviceMapParams::Multimodal { max_seq_len, .. },
+        ),
+    ) = (planned_ctx, &mut mapper)
+    {
+        if *max_seq_len != ctx {
+            tracing::info!("titan context: planning VRAM for {ctx} tokens (CLI --max-seq-len {max_seq_len})");
+            *max_seq_len = ctx;
+        }
+    }
 
     let mut readers = Vec::new();
     for filename in paths.get_weight_filenames() {
@@ -374,11 +405,13 @@ pub(super) fn load(
         if mistralrs_quant::TieredExperts::wants_auto_plan() {
             let cfg = model.model_config("this is a dummy config!")?;
             let frac = model.kv_cache_layer_fraction("this is a dummy config!")?;
+            // the KV's own dtype (F8E4M3 with TITAN_KV_FP8), not the model's
+            let kv_dtype = if device.is_cuda() && crate::kv_cache::cuda_kv_fp8() { DType::F8E4M3 } else { dtype };
             let per_layer = params.max_batch_size()
                 * cfg.num_kv_heads()
                 * params.max_seq_len()
                 * (cfg.k_head_dim() + cfg.v_head_dim())
-                * dtype.size_in_bytes();
+                * kv_dtype.size_in_bytes();
             let kv = (per_layer as f64 * cfg.num_layers() as f64 * frac).ceil() as usize;
             // TITAN_CUDA_GRAPHS=1: graph memory (captured decode segments) comes from its own pool
             let graphs = if mistralrs_quant::titan_cfg::flag("TITAN_CUDA_GRAPHS", false) {
