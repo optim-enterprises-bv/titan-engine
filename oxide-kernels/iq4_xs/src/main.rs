@@ -212,30 +212,36 @@ mod kernels {
     /// Gate mutants (MUT != 0, never launched by candle): 1 = q8_1 words j / j+4 paired with the
     /// wrong nibble half, 2 = scales_h bits taken one bit too high, 3 = group bias 31 instead of 32.
     pub unsafe fn vdot_acc<const MUT: u32>(vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
+        // every global load first (weights, activations, scales), then the arithmetic: one call's loads are in flight
+        // together instead of in dependent waves
         let xb = vx.offset((kbx as isize).wrapping_mul(BLOCK_BYTES as isize));
         let qs = xb.add(8 + (iqs as usize) * 4) as *const u32;
         let q8 = yb.add(4) as *const u32;
+        let w = [*qs, *qs.add(1), *qs.add(2), *qs.add(3)];
+        let y8 = [*q8, *q8.add(1), *q8.add(2), *q8.add(3), *q8.add(4), *q8.add(5), *q8.add(6), *q8.add(7)];
+        let g = (iqs as usize) / 4;
+        let sc_lo = *xb.add(4 + g / 2) as u32;
+        let sc_hi = *(xb.add(2) as *const u16) as u32;
+        let dx = *(xb as *const u16) as u32;
+        let dy = *(yb as *const u16) as u32;
         let mut sumi = 0i32;
         let mut l = 0usize;
         while l < 4 {
-            let (vx0, vy0) = if MUT == 1 { let (a, b) = table16(*qs.add(l)); (b, a) } else { table16(*qs.add(l)) };
-            sumi = dp4a(vx0, *q8.add(l), sumi);
-            sumi = dp4a(vy0, *q8.add(l + 4), sumi);
+            let (vx0, vy0) = if MUT == 1 { let (a, b) = table16(w[l]); (b, a) } else { table16(w[l]) };
+            sumi = dp4a(vx0, y8[l], sumi);
+            sumi = dp4a(vy0, y8[l + 4], sumi);
             l += 1;
         }
         // Reference order: the group bias is an integer multiply of the dp4a sum, and only
         // `d_x * d_y` is folded into a float -- associating it the other way drifts 1-2 ulp.
         // Reference: `sumi *= ls - 32` stays an integer multiply; only `d_x * d_y` is float.
-        let g = (iqs as usize) / 4;
         let ls = if MUT == 2 {
-            let lo = *xb.add(4 + g / 2) as u32;
-            let hi = *(xb.add(2) as *const u16) as u32;
-            (((lo >> (4 * (g as u32 % 2))) & 0xF) | (((hi >> (2 * g as u32 + 1)) & 3) << 4)) as i32 - 32
+            (((sc_lo >> (4 * (g as u32 % 2))) & 0xF) | (((sc_hi >> (2 * g as u32 + 1)) & 3) << 4)) as i32 - 32
         } else {
-            group_scale6(xb, g) as i32 - if MUT == 3 { 31 } else { 32 }
+            (((sc_lo >> (4 * (g as u32 % 2))) & 0xF) | (((sc_hi >> (2 * g as u32)) & 3) << 4)) as i32 - if MUT == 3 { 31 } else { 32 }
         };
         let sumi = sumi.wrapping_mul(ls);
-        let d = mul(h2f(*(xb as *const u16) as u32), h2f(*(yb as *const u16) as u32));
+        let d = mul(h2f(dx), h2f(dy));
         fma(d, sumi as f32, acc)
     }
 

@@ -27,7 +27,10 @@ use cuda_device::{SharedArray, convert, device, dotprod, kernel, ptx_asm, thread
 use cuda_host::cuda_module;
 
 /// `iq2s_grid[1024]` (ggml-common.h, u64) as little-endian (low, high) `u32` word pairs.
-pub static IQ2S_GRID: [u32; 2048] = include!("iq2s_grid.rs");
+/// 8-byte aligned so one grid entry is one 64-bit load (`grid64`), as the reference's `iq2s_grid` (uint64_t).
+#[repr(C, align(8))]
+pub struct Grid64(pub [u32; 2048]);
+pub static IQ2S_GRID: Grid64 = Grid64(include!("iq2s_grid.rs"));
 
 #[cuda_module]
 mod kernels {
@@ -196,33 +199,47 @@ mod kernels {
             s8[t] = (sp >> (8 * t)) as u8;
             t += 1;
         }
+        // every global load first (indices, signs, high bits, scales, activations, both deltas), then the grid lookups,
+        // then the arithmetic
         let qh = *xb.add(66 + i2 as usize) as u32;
-        let ls0 = (*xb.add(74 + i2 as usize) & 0x0F) as i32;
-        let ls1 = (*xb.add(74 + i2 as usize) >> 4) as i32;
+        let lsb = *xb.add(74 + i2 as usize);
+        let ls0 = (lsb & 0x0F) as i32;
+        let ls1 = (lsb >> 4) as i32;
         let q8 = yb.add(4) as *const u32;
+        let y8 = [*q8, *q8.add(1), *q8.add(2), *q8.add(3), *q8.add(4), *q8.add(5), *q8.add(6), *q8.add(7)];
+        let dx = *(xb as *const u16) as u32;
+        let dy = *(yb as *const u16) as u32;
+        let mut glo = [0u32; 4];
+        let mut ghi = [0u32; 4];
+        let mut t = 0usize;
+        while t < 4 {
+            let gidx = q8b[t] as u32 | ((qh << (8 - 2 * t as u32)) & 0x300);
+            (glo[t], ghi[t]) = grid64(gidx);
+            t += 1;
+        }
         let mut sumi0 = 0i32;
         let mut sumi1 = 0i32;
         let mut l0 = 0usize;
         while l0 < 8 {
-            let gidx = q8b[l0 / 2] as u32 | ((qh << (8 - l0 as u32)) & 0x300);
-            let gl = grid_lo(gidx);
-            let gh = grid_hi(gidx);
+            // the reference's __vsub4(grid ^ m, m), m = 0xFF per set sign bit, as whole-word ops: byte k of t is sign
+            // bit k (nibble * 0x204081 moves bit k to bit 8k), m = t * 0xFF; grid bytes are never 0, so ~g + 1
+            // cannot carry out of its byte and (g ^ m) + t is that bytewise negation
             let sb = s8[l0 / 2] as u32;
-            let s0 = vcmpne4_zero(((sb & 0x03) << 7) | ((sb & 0x0C) << 21));
-            let s1 = vcmpne4_zero(((sb & 0x30) << 3) | ((sb & 0xC0) << 17));
-            let g_l = vsub4(gl ^ s0, s0);
-            let g_h = vsub4(gh ^ s1, s1);
+            let t0 = ((sb & 0xF).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+            let t1 = ((sb >> 4).wrapping_mul(0x0020_4081)) & 0x0101_0101;
+            let g_l = (glo[l0 / 2] ^ t0.wrapping_mul(0xFF)).wrapping_add(t0);
+            let g_h = (ghi[l0 / 2] ^ t1.wrapping_mul(0xFF)).wrapping_add(t1);
             if l0 < 4 {
-                sumi0 = dp4a(g_l, *q8.add(l0), sumi0);
-                sumi0 = dp4a(g_h, *q8.add(l0 + 1), sumi0);
+                sumi0 = dp4a(g_l, y8[l0], sumi0);
+                sumi0 = dp4a(g_h, y8[l0 + 1], sumi0);
             } else {
-                sumi1 = dp4a(g_l, *q8.add(l0), sumi1);
-                sumi1 = dp4a(g_h, *q8.add(l0 + 1), sumi1);
+                sumi1 = dp4a(g_l, y8[l0], sumi1);
+                sumi1 = dp4a(g_h, y8[l0 + 1], sumi1);
             }
             l0 += 2;
         }
         let sumi = (sumi0.wrapping_mul(ls0).wrapping_add(sumi1.wrapping_mul(ls1)).wrapping_add((sumi0 + sumi1) / 2)) / 4;
-        let d = mul(h2f(*(xb as *const u16) as u32), h2f(*(yb as *const u16) as u32));
+        let d = mul(h2f(dx), h2f(dy));
         fma(d, sumi as f32, acc)
     }
 
@@ -360,12 +377,18 @@ mod kernels {
     /// replaced made the dense decode ~18x slower than IQ3_S.
     #[inline(always)]
     pub fn grid_lo(i: u32) -> u32 {
-        unsafe { *(&raw const IQ2S_GRID as *const u32).add(2 * (i & 1023) as usize) }
+        unsafe { *(&raw const IQ2S_GRID.0 as *const u32).add(2 * (i & 1023) as usize) }
     }
     /// `iq2s_grid[i]` high word (see grid_lo).
     #[inline(always)]
     pub fn grid_hi(i: u32) -> u32 {
-        unsafe { *(&raw const IQ2S_GRID as *const u32).add(2 * (i & 1023) as usize + 1) }
+        unsafe { *(&raw const IQ2S_GRID.0 as *const u32).add(2 * (i & 1023) as usize + 1) }
+    }
+    /// `iq2s_grid[i]` as one 64-bit load: (low word, high word).
+    #[inline(always)]
+    pub fn grid64(i: u32) -> (u32, u32) {
+        let v = unsafe { *(&raw const IQ2S_GRID.0 as *const u64).add((i & 1023) as usize) };
+        (v as u32, (v >> 32) as u32)
     }
     /// `kmask_iq2xs[8]` (indexed only by an unrolled constant, so a plain array stays in registers).
     pub const KMASK: [u8; 8] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80];

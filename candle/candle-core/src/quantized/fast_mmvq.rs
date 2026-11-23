@@ -172,7 +172,8 @@ pub fn try_fwd(
 
     // Gate checks.
     let w_dtype = qstorage.dtype();
-    if !supports(w_dtype) {
+    let llama = super::cuda::direct_bf16_mmvq(w_dtype);
+    if !supports(w_dtype) && !llama {
         return Ok(None);
     }
     let input_dtype = rhs.dtype();
@@ -218,6 +219,55 @@ pub fn try_fwd(
     out_shape.push(nrows);
 
     let stream = dev.cuda_stream();
+
+    if llama {
+        // titan: the IQ / FP4 llama-port matvecs, fed like the K-quants but with candle's exact quantizer (div.rn; the
+        // mmvq_gguf_quantize kernels are ports of a fast-math build and round some ties the other way): f32 activations
+        // through `quantize_q8_1`, bf16 straight through its exact twin `quantize_q8_1_bf16` (bf16 -> f32 is exact,
+        // so the bytes equal those of the old route: cast to f32, zero-filled buffer, quantize), into the workspace;
+        // the matvec writes f32, cast to the input dtype at the end. The input cast and two memsets fewer per matvec.
+        let kernel = match input_dtype {
+            DType::BF16 => "quantize_q8_1_bf16",
+            DType::F32 => "quantize_q8_1",
+            _ => return Ok(None),
+        };
+        let rhs_ptr = match input_dtype {
+            DType::BF16 => rhs.as_cuda_slice::<half::bf16>()?.slice(o1..o2).device_ptr(&stream).0,
+            _ => rhs.as_cuda_slice::<f32>()?.slice(o1..o2).device_ptr(&stream).0,
+        };
+        super::cuda::quantize_q8_1_raw(kernel, rhs_ptr, scratch_ptr as u64, k, b_size, dev)?;
+        if std::env::var("TITAN_IQ_FAST_CHECK").is_ok_and(|v| v == "1") {
+            // the old route's Q8_1 bytes (f32 copy, candle quantize_q8_1 into a zeroed buffer) against the workspace's
+            use crate::backend::BackendStorage;
+            let f = rhs.to_dtype(rhs_l, DType::F32)?;
+            let src = f.as_cuda_slice::<f32>()?;
+            let src = src.slice(0..b_size * k);
+            let mut y2 = dev.alloc_zeros::<u8>(scratch_bytes)?;
+            super::cuda::quantize_q8_1(&src, &mut y2, k, b_size, dev)?;
+            let mut a = vec![0u8; scratch_bytes];
+            let mut b = vec![0u8; scratch_bytes];
+            dev.memcpy_dtoh(&y2, &mut b)?;
+            unsafe {
+                cudarc::driver::sys::cuStreamSynchronize(stream.cu_stream());
+                cudarc::driver::sys::cuMemcpyDtoH_v2(a.as_mut_ptr() as *mut std::ffi::c_void, scratch_ptr as u64, scratch_bytes);
+            }
+            let diff: Vec<usize> = (0..scratch_bytes).filter(|&i| a[i] != b[i]).take(8).collect();
+            if !diff.is_empty() {
+                eprintln!("titan iq fast check {w_dtype:?} {input_dtype:?} k={k} b={b_size}: Q8_1 bytes differ at {diff:?}");
+            }
+        }
+        let Some(out) = qstorage.llama_mmvq(scratch_ptr as u64, k, nrows, k_padded, b_size)? else {
+            return Ok(None);
+        };
+        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        let out = if input_dtype == DType::F32 {
+            out
+        } else {
+            use crate::backend::BackendStorage;
+            out.to_dtype(&crate::Layout::contiguous(out_shape.as_slice()), input_dtype)?
+        };
+        return Ok(Some((out, out_shape.into())));
+    }
 
     match input_dtype {
         DType::BF16 => {

@@ -419,7 +419,7 @@ fn bench() {
     let m = Mods { mmvq: load(&format!("{dir}/{REF_MMVQ}")), convert: load(&format!("{dir}/{REF_CONVERT}")), oxide: load(&format!("{dir}/{OXIDE}")) };
     let _ = m.convert;
     let mut r = Rng(7);
-    for &(bpr, nrows) in &[(20u32, 17408u32), (68, 5120), (20, 6144), (20, 248320)] {
+    for &(bpr, nrows) in &[(20u32, 17408u32), (68, 5120), (20, 5120), (20, 10240), (20, 248320)] {
         let x = x_blocks(&mut r, (bpr * (nrows + 1)) as usize, 512);
         let y = q8_1_blocks(&mut r, (8 * bpr + 8) as usize, 512);
         unsafe {
@@ -427,6 +427,17 @@ fn bench() {
             let mut dy: cu::CUdeviceptr = 0;
             let mut dd: cu::CUdeviceptr = 0;
             ck!(cu::cuMemAlloc_v2(&mut dx, x.len()));
+            // ROT=1: launches cycle through copies of the weights totalling >= 512 MiB, so each one streams its matrix
+            // from DRAM as a decode step does (one matrix repeated stays in the 64 MiB L2)
+            let rot = std::env::var("ROT").is_ok_and(|v| v == "1");
+            let ncopy = if rot { (512usize << 20).div_ceil(x.len()).max(2) } else { 1 };
+            let mut copies = vec![dx];
+            for _ in 1..ncopy {
+                let mut d: cu::CUdeviceptr = 0;
+                ck!(cu::cuMemAlloc_v2(&mut d, x.len()));
+                ck!(cu::cuMemcpyHtoD_v2(d, x.as_ptr() as *const c_void, x.len()));
+                copies.push(d);
+            }
             ck!(cu::cuMemAlloc_v2(&mut dy, y.len()));
             ck!(cu::cuMemAlloc_v2(&mut dd, nrows as usize * 4));
             ck!(cu::cuMemcpyHtoD_v2(dx, x.as_ptr() as *const c_void, x.len()));
@@ -440,15 +451,31 @@ fn bench() {
             p.put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32).put(0u32);
             let mut ms = [0f32; 2];
             for (k, f) in [func(m.mmvq, &mmvq_ref_name(1, false)), func(m.oxide, "iq3_s_mmvq_1")].into_iter().enumerate() {
+                if std::env::var("ONLY").ok().and_then(|v| v.parse::<usize>().ok()).is_some_and(|o| o != k) { continue; }
                 let mut pb = p.0.clone();
                 let mut size = pb.len();
+                if let Some(c) = std::env::var("CARVE").ok().and_then(|v| v.parse::<i32>().ok()) {
+                    ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, c));
+                }
+                if k == 1 {
+                    let mut n = 0i32;
+                    let shm: usize = std::env::var("OX_SHM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    ck!(cu::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut n, f, 128, shm));
+                    eprint!("[ox blocks/SM {n}] ");
+                } else {
+                    let mut n = 0i32;
+                    ck!(cu::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut n, f, 128, 0));
+                    eprint!("[ref blocks/SM {n}] ");
+                }
                 let mut extra: [*mut c_void; 5] = [1 as *mut c_void, pb.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];
                 let (mut e0, mut e1): (cu::CUevent, cu::CUevent) = (std::ptr::null_mut(), std::ptr::null_mut());
                 ck!(cu::cuEventCreate(&mut e0, 0));
                 ck!(cu::cuEventCreate(&mut e1, 0));
                 for it in 0..220 {
                     if it == 20 { ck!(cu::cuEventRecord(e0, std::ptr::null_mut())); }
-                    ck!(cu::cuLaunchKernel(f, nrows, 1, 1, 32, 4, 1, 0, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr()));
+                    pb[0..8].copy_from_slice(&copies[it % copies.len()].to_le_bytes());
+                    let shm: u32 = if k == 1 { std::env::var("OX_SHM").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+                    ck!(cu::cuLaunchKernel(f, nrows, 1, 1, 32, 4, 1, shm, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr()));
                 }
                 ck!(cu::cuEventRecord(e1, std::ptr::null_mut()));
                 ck!(cu::cuEventSynchronize(e1));
@@ -457,7 +484,8 @@ fn bench() {
             let gb = (x.len() as f64 * nrows as f64 / (nrows + 1) as f64) / 1e9;
             println!("mmvq nc=1 K={} N={nrows}: ref {:.2} us ({:.0} GB/s), oxide {:.2} us ({:.0} GB/s)", bpr * QK,
                 ms[0] * 5.0, gb / (ms[0] as f64 / 200e3), ms[1] * 5.0, gb / (ms[1] as f64 / 200e3));
-            cu::cuMemFree_v2(dx); cu::cuMemFree_v2(dy); cu::cuMemFree_v2(dd);
+            for d in copies { cu::cuMemFree_v2(d); }
+            cu::cuMemFree_v2(dy); cu::cuMemFree_v2(dd);
         }
     }
 }
