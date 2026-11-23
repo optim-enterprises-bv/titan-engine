@@ -167,6 +167,9 @@ pub(super) struct LlamaFmt {
     /// block; for the 256-value i-quant blocks one block per CUDA block, the same launch),
     /// true = NVFP4's `<<<k / 64, 32>>>(vx, y, k)`
     deq_per_block: bool,
+    /// decode matvecs use titan's warp-row kernels `<prefix>_mmvq_w<n>` (one warp per reference CUDA block, lookup
+    /// table in shared memory, bit-identical; oxide-kernels/gen_warp_row.py). Only where they measured faster.
+    warp_row: bool,
 }
 
 /// IQ3_S (type 21, titan-engine/oxide-kernels/iq3_s): `dequantize_block_iq3_s` + `mul_mat_vec_q
@@ -179,6 +182,8 @@ const IQ3_S_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 0,
     deq_per_block: false,
+    // 8-16% faster at decode shapes: the 512-word grid's scattered lookups were bound by L1 wavefronts
+    warp_row: true,
 };
 
 /// IQ4_XS (type 23, titan-engine/oxide-kernels/iq4_xs): `dequantize_block_iq4_xs` + `mul_mat_vec_q
@@ -193,6 +198,7 @@ const IQ4_XS_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 4,
     deq_per_block: false,
+    warp_row: false,
 };
 
 /// IQ3_XXS (type 18, titan-engine/oxide-kernels/iq3_xxs): `dequantize_block_iq3_xxs` + `mul_mat_vec_q
@@ -205,6 +211,7 @@ const IQ3_XXS_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 0,
     deq_per_block: false,
+    warp_row: false,
 };
 
 /// IQ2_S (type 22, titan-engine/oxide-kernels/iq2_s): `dequantize_block_iq2_s` + `mul_mat_vec_q
@@ -217,6 +224,7 @@ const IQ2_S_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 4,
     deq_per_block: false,
+    warp_row: false,
 };
 
 /// IQ2_XXS (type 16, titan-engine/oxide-kernels/iq2_xxs) and IQ2_XS (type 17, oxide-kernels/iq2_xs):
@@ -229,6 +237,7 @@ const IQ2_XXS_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 4,
     deq_per_block: false,
+    warp_row: false,
 };
 
 const IQ2_XS_FMT: LlamaFmt = LlamaFmt {
@@ -238,6 +247,7 @@ const IQ2_XS_FMT: LlamaFmt = LlamaFmt {
     qk: 256,
     blocks_per_iter_1warp: 4,
     deq_per_block: false,
+    warp_row: false,
 };
 
 const IQ4_NL_FMT: LlamaFmt = LlamaFmt {
@@ -247,6 +257,7 @@ const IQ4_NL_FMT: LlamaFmt = LlamaFmt {
     qk: 32,
     blocks_per_iter_1warp: 16,
     deq_per_block: false,
+    warp_row: false,
 };
 
 const MXFP4_FMT: LlamaFmt = LlamaFmt {
@@ -256,6 +267,7 @@ const MXFP4_FMT: LlamaFmt = LlamaFmt {
     qk: 32,
     blocks_per_iter_1warp: 16,
     deq_per_block: false,
+    warp_row: false,
 };
 
 const NVFP4_FMT: LlamaFmt = LlamaFmt {
@@ -265,6 +277,7 @@ const NVFP4_FMT: LlamaFmt = LlamaFmt {
     qk: 64,
     blocks_per_iter_1warp: 16,
     deq_per_block: true,
+    warp_row: false,
 };
 
 /// titan: whether a matmul of this format takes bf16 / f32 activations of a decode batch (<= 8 rows, contiguous)
@@ -358,6 +371,12 @@ fn llama_mul_mat_vec(
 /// `llama_mul_mat_vec` on Q8_1 activations at device address `y_q8_1` (e.g. the shared mmvq workspace), into a fresh
 /// f32 buffer: the kernel writes every one of its `nrows * b_size` outputs, so the buffer is not zero-filled first.
 #[allow(clippy::too_many_arguments)]
+/// `TITAN_WARP_ROW=0` keeps every format on the reference-shaped mmvq kernels.
+fn warp_row_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TITAN_WARP_ROW").map_or(true, |v| v != "0"))
+}
+
 pub(super) fn llama_mul_mat_vec_raw(
     fmt: &LlamaFmt,
     data: &PaddedCudaSlice,
@@ -374,10 +393,15 @@ pub(super) fn llama_mul_mat_vec_raw(
     // llama.cpp should_use_small_k: the whole block covers K in one iteration.
     let small_k = b_size == 1 && blocks_per_row < (nwarps as usize) * fmt.blocks_per_iter_1warp;
     let rpb = if b_size == 1 { if small_k { nwarps as usize } else { 1 } } else { 2 };
+    // warp-row: one warp per reference CUDA block (`rpb` rows), 4 warps per block, row-group count in the ABI's
+    // ids_stride slot
+    let wr = fmt.warp_row && warp_row_on();
+    let w = if wr { "w" } else { "" };
+    let nvb = ceil_div(nrows, rpb);
     let name = if small_k {
-        format!("{}_mmvq_1_small_k", fmt.prefix)
+        format!("{}_mmvq_{w}1_small_k", fmt.prefix)
     } else {
-        format!("{}_mmvq_{b_size}", fmt.prefix)
+        format!("{}_mmvq_{w}{b_size}", fmt.prefix)
     };
     // bf16_out (one column): `<name>_bf16o` stores the sums rounded to bf16 (cvt.rn, as cast_f32_bf16) -- the cast
     // after the matvec folded into its store; formats without such an entry keep f32
@@ -398,8 +422,8 @@ pub(super) fn llama_mul_mat_vec_raw(
     };
     let one = q1_0_fastdiv(1);
     let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (ceil_div(nrows, rpb) as u32, 1, 1),
-        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        grid_dim: (if wr { ceil_div(nvb, 4) } else { nvb } as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, if wr { 4 } else { nwarps }, 1),
         shared_mem_bytes: 0,
     };
     let mut builder = func.builder();
@@ -422,7 +446,7 @@ pub(super) fn llama_mul_mat_vec_raw(
         /* stride_channel_{x,y,dst} */ 0u32, 0u32, 0u32,
         /* sample_ratio */ one[0], one[1], one[2],
         /* stride_sample_{x,y,dst} */ 0u32, 0u32, 0u32,
-        /* ids_stride */ 0u32
+        /* ids_stride (warp-row: row groups) */ if wr { nvb as u32 } else { 0u32 }
     );
     unsafe { builder.launch(cfg) }.w()?;
     Ok(match dst {

@@ -28,7 +28,7 @@ gate is staging them (see "Artifacts" below).
 | `iq2_xxs` `iq2_xs` `iq2_s` `iq3_xxs` `iq4_nl` | 1,074 launches, 2,909,304 bytes each, 0 failing |
 | `nvfp4` | 1,074 launches, 3,413,112 bytes, 0 failing |
 | `mxfp4` | 1,074 launches, 2,909,304 bytes, 0 failing |
-| `iq3_s` | 1,085 launches, 15,608,544 bytes, 0 failing |
+| `iq3_s` | 2,374 launches, 23,001,396 bytes, 0 failing (2026-11-24, with the warp-row `iq3_s_mmvq_w*` kernels and their bf16 stores checked against the reference too) |
 | `iq4_xs` | 1,157 launches, 15,612,608 bytes, 0 failing |
 | `q1_0` | 1,098 launches: dequantize x3, mmvq x27, quantize x6, mmq x16 + fixup x16 |
 | `ptq1_0` | quantize pt x2, fwht x6 + fused x4, mmvq pt x12, quantize mmq x2, mmq x16 + fixup x16 |

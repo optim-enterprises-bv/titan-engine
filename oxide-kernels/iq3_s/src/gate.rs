@@ -253,7 +253,46 @@ fn mmvq_case_named(m: &Mods, t: &mut Tally, r: &mut Rng, c: &MmvqCase, rate: u64
         "mmvq nc={} small_k={} bpr={} nrows={} pads={}/{} ch={}/{} samp={}/{} ids={}",
         c.nc, c.small_k, c.bpr, c.nrows, c.pad_row, c.pad_dst, c.nch_dst, c.nch_x, c.nsamp_dst, nsamp_x, c.ids
     );
-    compare(t, &format!("{ox_name}: {label}"), &a, &b)
+    let bad = compare(t, &format!("{ox_name}: {label}"), &a, &b);
+    // WARP-ROW GATE BEGIN (gen_warp_row.py)
+    if !ox_name.contains("mut") {
+        // titan's warp-row kernels (one warp per reference CUDA block, 4 per block): same bits as the reference
+        let nvb = c.nrows.div_ceil(rpb);
+        let mut pw = Params(p.0.clone());
+        let n = pw.0.len();
+        pw.0[n - 4..].copy_from_slice(&nvb.to_le_bytes());
+        let wgrid = (nvb.div_ceil(4), c.nch_dst, c.nsamp_dst);
+        let wname = ox_name.replacen("iq3_s_mmvq_", "iq3_s_mmvq_w", 1);
+        let w = launch(func(m.oxide, &wname), wgrid, (32, 4, 1), &pw, &slots, &bufs, &[2]);
+        let _ = compare(t, &format!("{wname}: {label}"), &a, &w);
+        if c.nc == 1 {
+            // bf16 out: the reference's f32 sums rounded to nearest even (NaN stays NaN), the rest untouched
+            let mut fb = bufs.clone();
+            fb[2] = vec![0xFF; bufs[2].len()];
+            let rf = launch(func(m.mmvq, &mmvq_ref_name(c.nc, c.small_k)), grid, block, &p, &slots, &fb, &[2]);
+            let ob = launch(func(m.oxide, &format!("{wname}_bf16o")), wgrid, (32, 4, 1), &pw, &slots, &fb, &[2]);
+            let (rf, ob) = (&rf[0], &ob[0]);
+            let mut errs = 0usize;
+            for k in 0..rf.len() / 4 {
+                let f = u32::from_le_bytes(rf[4 * k..4 * k + 4].try_into().unwrap());
+                let h = u16::from_le_bytes(ob[2 * k..2 * k + 2].try_into().unwrap());
+                let ok = if f == 0xFFFF_FFFF {
+                    h == 0xFFFF
+                } else if f32::from_bits(f).is_nan() {
+                    (h & 0x7F80) == 0x7F80 && (h & 0x7F) != 0
+                } else {
+                    h as u32 == (f.wrapping_add(0x7FFF + ((f >> 16) & 1))) >> 16
+                };
+                if !ok { errs += 1; }
+            }
+            for k in rf.len() / 4..ob.len() / 2 {
+                if u16::from_le_bytes(ob[2 * k..2 * k + 2].try_into().unwrap()) != 0xFFFF { errs += 1; }
+            }
+            t.record(&format!("{wname}_bf16o: {label}"), &kdiff::Diff { bytes: ob.len(), differing: errs, first: if errs > 0 { Some((0, 0, 0, 0)) } else { None } });
+        }
+    }
+    // WARP-ROW GATE END
+    bad
 }
 
 /// `dequantize_row_iq3_s_cuda`: grid k / 256, block 32, params (vx, y). Both sides get the same
@@ -412,80 +451,92 @@ pub fn run_gate() -> bool {
     t.finish("iq3_s (dequantize x3, mmvq x9) vs llama.cpp acecd56 cubins")
 }
 
-/// `--bench`: reference vs oxide mmvq (nc = 1) on Qwen3-14B decode shapes, 200 launches each.
+/// `--bench`: reference vs oxide vs warp-row mmvq (nc = 1) on Qwen decode shapes. ROT=1 cycles through weight
+/// copies totalling >= 512 MiB (each launch streams from DRAM, as in decode); ITERS (default 200) launches each;
+/// `--bench`: reference vs oxide vs warp-row mmvq (nc = 1) on Qwen decode shapes. ROT=1 cycles through weight
+/// copies totalling >= 512 MiB (each launch streams from DRAM, as in decode); ITERS (default 200) launches each;
+/// CARVE sets the preferred shared-memory carveout; ONLY=k times one of them.
 fn bench() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let _ctx = kdiff::cuda_core::CudaContext::new(0).expect("cuda context");
     let m = Mods { mmvq: load(&format!("{dir}/{REF_MMVQ}")), convert: load(&format!("{dir}/{REF_CONVERT}")), oxide: load(&format!("{dir}/{OXIDE}")) };
     let _ = m.convert;
     let mut r = Rng(7);
-    for &(bpr, nrows) in &[(20u32, 17408u32), (68, 5120), (20, 5120), (20, 10240), (20, 248320)] {
+    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let rot = std::env::var("ROT").is_ok_and(|v| v == "1");
+    for &(bpr, nrows) in &[(20u32, 17408u32), (68, 5120), (20, 5120), (20, 10240), (24, 5120)] {
         let x = x_blocks(&mut r, (bpr * (nrows + 1)) as usize, 512);
         let y = q8_1_blocks(&mut r, (8 * bpr + 8) as usize, 512);
         unsafe {
-            let mut dx: cu::CUdeviceptr = 0;
-            let mut dy: cu::CUdeviceptr = 0;
-            let mut dd: cu::CUdeviceptr = 0;
-            ck!(cu::cuMemAlloc_v2(&mut dx, x.len()));
-            // ROT=1: launches cycle through copies of the weights totalling >= 512 MiB, so each one streams its matrix
-            // from DRAM as a decode step does (one matrix repeated stays in the 64 MiB L2)
-            let rot = std::env::var("ROT").is_ok_and(|v| v == "1");
             let ncopy = if rot { (512usize << 20).div_ceil(x.len()).max(2) } else { 1 };
-            let mut copies = vec![dx];
-            for _ in 1..ncopy {
+            let mut copies = vec![];
+            for _ in 0..ncopy {
                 let mut d: cu::CUdeviceptr = 0;
                 ck!(cu::cuMemAlloc_v2(&mut d, x.len()));
                 ck!(cu::cuMemcpyHtoD_v2(d, x.as_ptr() as *const c_void, x.len()));
                 copies.push(d);
             }
+            let (mut dy, mut dd): (cu::CUdeviceptr, cu::CUdeviceptr) = (0, 0);
             ck!(cu::cuMemAlloc_v2(&mut dy, y.len()));
             ck!(cu::cuMemAlloc_v2(&mut dd, nrows as usize * 4));
-            ck!(cu::cuMemcpyHtoD_v2(dx, x.as_ptr() as *const c_void, x.len()));
             ck!(cu::cuMemcpyHtoD_v2(dy, y.as_ptr() as *const c_void, y.len()));
             let one = fastdiv_values(1);
             let mut p = Params::default();
-            p.put(dx).put(dy).put(0u64);
+            p.put(copies[0]).put(dy).put(0u64);
             for _ in 0..5 { p.put(0u64); }
             p.put(0u32).put(0f32).put(dd).put(bpr * QK).put(0u32).put(0u32).put(0u32);
             p.put(bpr).put(8 * bpr).put(nrows).put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32);
             p.put(one[0]).put(one[1]).put(one[2]).put(0u32).put(0u32).put(0u32).put(0u32);
-            let mut ms = [0f32; 2];
-            for (k, f) in [func(m.mmvq, &mmvq_ref_name(1, false)), func(m.oxide, "iq3_s_mmvq_1")].into_iter().enumerate() {
-                if std::env::var("ONLY").ok().and_then(|v| v.parse::<usize>().ok()).is_some_and(|o| o != k) { continue; }
-                let mut pb = p.0.clone();
-                let mut size = pb.len();
+            // the kernels are timed interleaved, in rounds of 100 launches each, so drift in clocks (the decode power
+            // cap settles over ~100 ms) hits all of them alike; timing one after another favoured whichever ran first
+            let mut ms = [0f32; 3];
+            let fs = [func(m.mmvq, &mmvq_ref_name(1, false)), func(m.oxide, "iq3_s_mmvq_1"), func(m.oxide, "iq3_s_mmvq_w1")];
+            let shm: u32 = std::env::var("SHM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let only = std::env::var("ONLY").ok().and_then(|v| v.parse::<usize>().ok());
+            let mut pbs = vec![];
+            for (k, &f) in fs.iter().enumerate() {
                 if let Some(c) = std::env::var("CARVE").ok().and_then(|v| v.parse::<i32>().ok()) {
                     ck!(cu::cuFuncSetAttribute(f, cu::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, c));
                 }
-                if k == 1 {
-                    let mut n = 0i32;
-                    let shm: usize = std::env::var("OX_SHM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    ck!(cu::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut n, f, 128, shm));
-                    eprint!("[ox blocks/SM {n}] ");
-                } else {
-                    let mut n = 0i32;
-                    ck!(cu::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut n, f, 128, 0));
-                    eprint!("[ref blocks/SM {n}] ");
+                let mut pb = p.0.clone();
+                if k == 2 {
+                    let n = pb.len();
+                    pb[n - 4..].copy_from_slice(&nrows.to_le_bytes());
                 }
-                let mut extra: [*mut c_void; 5] = [1 as *mut c_void, pb.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];
-                let (mut e0, mut e1): (cu::CUevent, cu::CUevent) = (std::ptr::null_mut(), std::ptr::null_mut());
-                ck!(cu::cuEventCreate(&mut e0, 0));
-                ck!(cu::cuEventCreate(&mut e1, 0));
-                for it in 0..220 {
-                    if it == 20 { ck!(cu::cuEventRecord(e0, std::ptr::null_mut())); }
-                    pb[0..8].copy_from_slice(&copies[it % copies.len()].to_le_bytes());
-                    let shm: u32 = if k == 1 { std::env::var("OX_SHM").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
-                    ck!(cu::cuLaunchKernel(f, nrows, 1, 1, 32, 4, 1, shm, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr()));
-                }
-                ck!(cu::cuEventRecord(e1, std::ptr::null_mut()));
-                ck!(cu::cuEventSynchronize(e1));
-                ck!(cu::cuEventElapsedTime_v2(&mut ms[k], e0, e1));
+                pbs.push(pb);
             }
+            let (mut e0, mut e1): (cu::CUevent, cu::CUevent) = (std::ptr::null_mut(), std::ptr::null_mut());
+            ck!(cu::cuEventCreate(&mut e0, 0));
+            ck!(cu::cuEventCreate(&mut e1, 0));
+            let mut it = 0usize;
+            for round in 0..(iters / 100).max(1) + 1 {
+                for (k, &f) in fs.iter().enumerate() {
+                    if only.is_some_and(|o| o != k) { continue; }
+                    let pb = &mut pbs[k];
+                    let mut size = pb.len();
+                    let mut extra: [*mut c_void; 5] = [1 as *mut c_void, pb.as_mut_ptr() as *mut c_void, 2 as *mut c_void, &mut size as *mut usize as *mut c_void, std::ptr::null_mut()];
+                    let gx = if k == 2 { nrows.div_ceil(4) } else { nrows };
+                    ck!(cu::cuEventRecord(e0, std::ptr::null_mut()));
+                    for _ in 0..100 {
+                        (*pb)[0..8].copy_from_slice(&copies[it % copies.len()].to_le_bytes());
+                        it += 1;
+                        ck!(cu::cuLaunchKernel(f, gx, 1, 1, 32, 4, 1, if k > 0 { shm } else { 0 }, std::ptr::null_mut(), std::ptr::null_mut(), extra.as_mut_ptr()));
+                    }
+                    ck!(cu::cuEventRecord(e1, std::ptr::null_mut()));
+                    ck!(cu::cuEventSynchronize(e1));
+                    let mut t = 0f32;
+                    ck!(cu::cuEventElapsedTime_v2(&mut t, e0, e1));
+                    if round > 0 { ms[k] += t; } // round 0 warms up
+                }
+            }
+            for v in ms.iter_mut() { *v *= 1e3 / (100 * (iters / 100).max(1)) as f32; }
             let gb = (x.len() as f64 * nrows as f64 / (nrows + 1) as f64) / 1e9;
-            println!("mmvq nc=1 K={} N={nrows}: ref {:.2} us ({:.0} GB/s), oxide {:.2} us ({:.0} GB/s)", bpr * QK,
-                ms[0] * 5.0, gb / (ms[0] as f64 / 200e3), ms[1] * 5.0, gb / (ms[1] as f64 / 200e3));
+            let gbs = |us: f32| gb / (us as f64 / 1e6);
+            println!("mmvq nc=1 K={} N={nrows}: ref {:.2} us ({:.0} GB/s), oxide {:.2} ({:.0}), warp-row {:.2} ({:.0})", bpr * QK,
+                ms[0], gbs(ms[0]), ms[1], gbs(ms[1]), ms[2], gbs(ms[2]));
             for d in copies { cu::cuMemFree_v2(d); }
-            cu::cuMemFree_v2(dy); cu::cuMemFree_v2(dd);
+            cu::cuMemFree_v2(dy);
+            cu::cuMemFree_v2(dd);
         }
     }
 }
