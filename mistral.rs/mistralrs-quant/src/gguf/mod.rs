@@ -729,6 +729,14 @@ impl QuantMethod for GgufMatMul {
             if matches!(&self.w, QMatMul::QTensor(q) if q.dtype() == GgmlDType::PTQ1_0 && q.device().is_cuda()) {
                 return None;
             }
+            // titan: dense IQ / FP4 matrices take bf16 activations as they come (`forward_raw`: decode rows straight to
+            // candle's exact bf16 quantizer, larger batches widened there as before); the autocast to f32 here was the
+            // cast_bf16_f32 in front of every one of their decode matvecs. Expert stacks (rank 3) keep the f32 route.
+            if matches!(&self.w, QMatMul::QTensor(q)
+                if q.device().is_cuda() && q.shape().rank() == 2 && candle_core::quantized::cuda::direct_bf16_mmvq(q.dtype()))
+            {
+                return None;
+            }
         }
         #[cfg(all(feature = "cuda", has_marlin_kernels))]
         if matches!(
