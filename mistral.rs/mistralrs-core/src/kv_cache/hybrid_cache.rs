@@ -3948,6 +3948,31 @@ impl HybridCache {
         self.caches.iter().any(|c| matches!(c, HybridLayerCache::Attention(kv) if kv.on_host()))
     }
 
+    /// Split every attention layer's KV at `at` (TITAN_KV_SPILL): later positions go to host memory.
+    pub fn split_attention_at(&mut self, at: usize) {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.split_at(at);
+            }
+        }
+    }
+
+    /// Whether the attention KV is split between device and host.
+    pub fn attention_split(&self) -> bool {
+        self.caches.iter().any(|c| matches!(c, HybridLayerCache::Attention(kv) if kv.is_split()))
+    }
+
+    /// The attention layers' current length (positions).
+    pub fn attention_len(&self) -> usize {
+        self.caches
+            .iter()
+            .find_map(|c| match c {
+                HybridLayerCache::Attention(kv) => Some(kv.current_seq_len()),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// Move every attention layer's KV to host memory (TITAN_KV_SPILL).
     pub fn attention_to_host(&mut self) -> Result<()> {
         for cache in &mut self.caches {

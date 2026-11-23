@@ -443,6 +443,26 @@ impl KvCache {
         }
     }
 
+    /// TITAN_KV_SPILL split attention: positions from `at` on (at least the current length) go to host memory.
+    pub fn split_at(&mut self, at: usize) {
+        if let Self::Normal { k, v } = self {
+            k.split_at(at);
+            v.split_at(at);
+        }
+    }
+
+    /// The host part of a split cache, `(k, v)` (`None` when unsplit or empty).
+    pub fn host_parts(&self) -> candle_core::Result<Option<(Tensor, Tensor)>> {
+        match self {
+            Self::Normal { k, v } => Ok(k.host_data()?.zip(v.host_data()?)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn is_split(&self) -> bool {
+        matches!(self, Self::Normal { k, .. } if k.host_split.is_some())
+    }
+
     /// Whether a normal cache's buffer lives in host memory.
     pub fn on_host(&self) -> bool {
         matches!(self, Self::Normal { k, .. } if k.all_data.as_ref().is_some_and(|d| d.device().is_cpu()))
@@ -708,6 +728,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
                     caches.push(KvCache::Normal {
                         k: SingleCache {
+                            host_split: None,
                             all_data: k_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
@@ -715,6 +736,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len: template_cache_capsl,
                         },
                         v: SingleCache {
+                            host_split: None,
                             all_data: v_cache.map(|x| x.contiguous()).transpose()?,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
@@ -811,6 +833,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     } => {
                         *seq_cache = Some(KvCache::Normal {
                             k: SingleCache {
+                                host_split: None,
                                 all_data: Some(k),
                                 dim: cache_k.dim,
                                 current_seq_len: cache_k.current_seq_len,
@@ -818,6 +841,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 capacity_seq_len: cache_k.capacity_seq_len,
                             },
                             v: SingleCache {
+                                host_split: None,
                                 all_data: Some(v),
                                 dim: cache_v.dim,
                                 current_seq_len: cache_v.current_seq_len,
@@ -966,6 +990,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
                     let cache = KvCache::Normal {
                         k: SingleCache {
+                            host_split: None,
                             all_data: Some(k_cache),
                             dim: template_cache_dim,
                             current_seq_len: 0,
@@ -973,6 +998,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len,
                         },
                         v: SingleCache {
+                            host_split: None,
                             all_data: Some(v_cache),
                             dim: template_cache_dim,
                             current_seq_len: 0,

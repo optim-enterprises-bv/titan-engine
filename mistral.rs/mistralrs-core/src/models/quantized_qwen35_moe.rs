@@ -568,9 +568,29 @@ impl FullAttention {
             },
             None => {
                 let (k, v) = kv_cache.append_raw(k, v)?;
-                self.attend(q, &k, &v, mask, Some(ctx.flash_params()))
+                match kv_cache.host_parts()? {
+                    Some((hk, hv)) => self.attend_split(q, &k, &v, &hk, &hv),
+                    None => self.attend(q, &k, &v, mask, Some(ctx.flash_params())),
+                }
             }
         })
+    }
+
+    /// Split KV (TITAN_KV_SPILL): attention over the device part `k`, `v` (every row sees all of it) and the host part
+    /// `hk`, `hv` (the newest positions, the rows' own among them): prompt chunks through the tiles that read both
+    /// parts, decode-shaped rows as two partials (flash-decode on the device part, the CPU on the host part) merged by
+    /// their log-sum-exp. (1, h, s, 256) in `q`'s dtype.
+    fn attend_split(&self, q: &Tensor, k: &Tensor, v: &Tensor, hk: &Tensor, hv: &Tensor) -> Result<Tensor> {
+        if q.dim(2)? > MTP_CATCHUP_MAX_ROWS {
+            return crate::attention::flash_prefill_split_tiles(q, (k, v), (hk, hv), &self.sdpa_params, crate::titan_hostkv::tile());
+        }
+        let (og, lg) = crate::attention::flash_decode_partial(q, k, v, &self.sdpa_params)?;
+        let (oh, lh) = crate::titan_hostkv::attend_partial(q, hk, hv, &self.sdpa_params)?;
+        let m = lg.maximum(&lh)?;
+        let wg = (lg - &m)?.exp()?;
+        let wh = (lh - &m)?.exp()?;
+        let o = (og.broadcast_mul(&wg)? + oh.broadcast_mul(&wh)?)?.broadcast_div(&(wg + wh)?)?;
+        o.to_dtype(q.dtype())
     }
 
     /// Attention over the whole cache `k`, `v` after the append: a masked prompt chunk long enough for the
@@ -635,7 +655,10 @@ impl FullAttention {
     ) -> Result<Tensor> {
         self.forward_with(x, mask, positions, |q, k, v| {
             let (k, v) = kv_cache.append_raw(k, v)?;
-            self.attend(q, &k, &v, mask, flash_params)
+            match kv_cache.host_parts()? {
+                Some((hk, hv)) => self.attend_split(q, &k, &v, &hk, &hv),
+                None => self.attend(q, &k, &v, mask, flash_params),
+            }
         })
     }
 
@@ -729,6 +752,10 @@ impl FullAttention {
         let (k, v) = kv_cache.append_raw(k, v)?;
         if prof {
             crate::titan_hostkv::prof_mark(1, &mut t0);
+        }
+        if let Some((hk, hv)) = kv_cache.host_parts()? {
+            // split KV (TITAN_KV_SPILL): every row against both parts
+            return self.attend_split(q, &k, &v, &hk, &hv)?.transpose(1, 2)?.reshape((b_sz, n, ()));
         }
         let widen = |t: Tensor| -> Result<Tensor> { if t.dtype() == DType::F8E4M3 { t.to_dtype(q.dtype()) } else { Ok(t) } };
         if k.device().is_cpu() {
@@ -1673,8 +1700,16 @@ fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
     if len == 0 || k.current_seq_len() < len || v.current_seq_len() < len {
         return Ok(None);
     }
-    let host = |t: &Tensor| t.narrow(2, 0, len)?.contiguous()?.to_device(&Device::Cpu);
-    Ok(Some((host(kd)?, host(vd)?)))
+    // a split cache (TITAN_KV_SPILL): positions from `at` on come from its host part
+    let at = k.host_split.as_ref().map_or(len, |h| h.at.min(len));
+    let host = |t: &Tensor, extra: Option<Tensor>| -> Result<Tensor> {
+        let d = t.narrow(2, 0, at)?.contiguous()?.to_device(&Device::Cpu)?;
+        match extra {
+            Some(e) if len > at => Tensor::cat(&[d, e.narrow(2, 0, len - at)?.contiguous()?], 2),
+            _ => Ok(d),
+        }
+    };
+    Ok(Some((host(kd, k.host_data()?)?, host(vd, v.host_data()?)?)))
 }
 
 /// A KV cache on `dev` holding the first `len` positions of a host copy, with room for `cap`.
@@ -1688,6 +1723,7 @@ fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usi
         let buf = Tensor::zeros(shape, t.dtype(), dev)?;
         buf.slice_set(&t.narrow(2, 0, len)?.contiguous()?.to_device(dev)?, 2, 0)?;
         Ok(SingleCache {
+            host_split: None,
             all_data: Some(buf),
             dim: 2,
             current_seq_len: len,
@@ -4256,7 +4292,10 @@ impl ModelWeights {
                     })?;
                     let (x, q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3], &pre[4]);
                     let (k, v) = kv_cache.append_raw(k, v)?;
-                    let y = attn.attend(q, &k, &v, &mask, Some(flash_params))?;
+                    let y = match kv_cache.host_parts()? {
+                        Some((hk, hv)) => attn.attend_split(q, &k, &v, &hk, &hv)?,
+                        None => attn.attend(q, &k, &v, &mask, Some(flash_params))?,
+                    };
                     let y = y.contiguous()?;
                     g.run(
                         SegKey { tag: "attn.post", layer: i, extra: vec![masked as u64] },
@@ -4415,7 +4454,11 @@ impl ModelWeights {
                     )?;
                     let (q, k, v, gate) = (&pre[0], &pre[1], &pre[2], &pre[3]);
                     let (k, v) = kv_cache.append_raw(k, v)?;
-                    let y = attn.attend(q, &k, &v, &mask, Some(flash_params))?.contiguous()?;
+                    let y = match kv_cache.host_parts()? {
+                        Some((hk, hv)) => attn.attend_split(q, &k, &v, &hk, &hv)?,
+                        None => attn.attend(q, &k, &v, &mask, Some(flash_params))?,
+                    }
+                    .contiguous()?;
                     let post = g.run(
                         SegKey { tag: "d.attn.post", layer: i, extra: vec![masked as u64] },
                         &[&y, gate, &x],
@@ -5095,7 +5138,7 @@ impl ModelWeights {
             }
             self.rebalance_for_fresh(need)?;
         }
-        if self.cache.hybrid().attention_on_host() {
+        if self.cache.hybrid().attention_on_host() || self.cache.hybrid().attention_split() {
             return Ok(());
         }
         let cap = self.cache.hybrid().attention_capacity();
@@ -5117,9 +5160,10 @@ impl ModelWeights {
         let grow = (target - cap) * per_layer_pos * attn.len();
         // the largest layer buffer is allocated before its old copy goes back, and afterwards the step still needs the
         // working room the plan reserved (TITAN_TIERED_RESERVE_MIB: the pfs ring and prompt temporaries)
-        let reserve = mistralrs_quant::titan_cfg::var("TITAN_TIERED_RESERVE_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        // TITAN_KV_MARGIN_MIB (dense spill models) or the expert reserve
+        let reserve = ["TITAN_KV_MARGIN_MIB", "TITAN_TIERED_RESERVE_MIB"]
+            .iter()
+            .find_map(|k| mistralrs_quant::titan_cfg::var(k).ok().and_then(|v| v.parse::<usize>().ok()))
             .map_or(KV_BUCKET_MARGIN, |m| m << 20);
         let need_bytes = grow + target * per_layer_pos + reserve;
         crate::titan_swap::trim_pool(&self.device);
@@ -5162,13 +5206,16 @@ impl ModelWeights {
         if crate::kv_cache::kv_spill() && crate::titan_hostkv::enabled() {
             let free_now = device_free_bytes(&self.device).unwrap_or(0);
             if free_now < need_bytes {
-                self.device.synchronize()?;
-                self.cache.hybrid().attention_to_host()?;
-                crate::titan_swap::trim_pool(&self.device);
-                if let Device::Cuda(d) = &self.device {
-                    mistralrs_quant::titan_static_pool::trim(d);
-                }
-                tracing::info!("titan kv: {need} positions do not fit the GPU ({} MiB free): this sequence's KV moves to host RAM", free_now >> 20);
+                // split: the positions the GPU holds stay there (a prompt chunk fills its room first; decode-shaped rows
+                // go to the host whole, since the device partial lets every row see every device key)
+                let cur = self.cache.hybrid().attention_len();
+                let rows = need.saturating_sub(cur + 1);
+                let at = if rows > MTP_CATCHUP_MAX_ROWS { cap } else { cur };
+                self.cache.hybrid().split_attention_at(at);
+                tracing::info!(
+                    "titan kv: {need} positions do not fit the GPU ({} MiB free): positions from {at} on live in host RAM (split attention)",
+                    free_now >> 20
+                );
                 return Ok(());
             }
         }
