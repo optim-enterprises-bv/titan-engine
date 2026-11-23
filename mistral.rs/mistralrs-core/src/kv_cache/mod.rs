@@ -434,6 +434,14 @@ impl KvCache {
         }
     }
 
+    /// See `SingleCache::shrink_empty_to` (normal caches).
+    pub fn shrink_empty_to(&mut self, len: usize) {
+        if let Self::Normal { k, v } = self {
+            k.shrink_empty_to(len);
+            v.shrink_empty_to(len);
+        }
+    }
+
     /// Positions the cache holds room for (a normal cache's K capacity; 0 for other kinds).
     pub fn capacity(&self) -> usize {
         match self {

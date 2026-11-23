@@ -28,7 +28,7 @@ impl TieredExperts {
 
     /// Whether a forward of `rows` tokens streams this tensor's non-resident experts (`titan_pfs`).
     pub fn streams(&self, rows: usize) -> bool {
-        self.pfs.is_some() && rows >= titan_pfs::min_rows()
+        self.pfs_on() && rows >= titan_pfs::min_rows()
     }
 
     /// `forward_q` for a prefill chunk (`streams`): the slot-map GEMV over the resident slots, then the
@@ -36,7 +36,7 @@ impl TieredExperts {
     /// the stream (`TITAN_PFS_SHARE` < 1) go to the CPU twin. Bit-identical to `forward_q`; `None` when
     /// no staging buffer could be had.
     pub fn forward_streamed(&self, q: &QInput, ids: &Tensor, ids_host: &[u32]) -> Result<Option<Tensor>> {
-        let Some(src) = &self.pfs else {
+        let Some(src) = self.pfs() else {
             return Ok(None);
         };
         let (batch, input_dim1, k) = (q.batch, q.input_dim1, q.k);
@@ -44,7 +44,7 @@ impl TieredExperts {
         if k != self.k || id_batch != batch || ids_host.len() != batch * topk {
             candle_core::bail!("titan tiered experts: input [{batch}, {input_dim1}, {k}] / ids {:?} vs k={}", ids.dims(), self.k);
         }
-        let Some(st) = titan_pfs::acquire(&self.dev, src, batch * topk)? else {
+        let Some(st) = titan_pfs::acquire(&self.dev, &src, batch * topk)? else {
             return Ok(None);
         };
         let ids = ids.contiguous()?;
@@ -119,7 +119,7 @@ impl TieredExperts {
         piece_tasks: usize,
         mut each: impl FnMut(usize, Tensor) -> Result<()>,
     ) -> Result<bool> {
-        let Some(src) = &self.pfs else {
+        let Some(src) = self.pfs() else {
             return Ok(false);
         };
         let tasks = ids_host.len();
@@ -133,7 +133,7 @@ impl TieredExperts {
             );
         }
         let st = if src.staged > 0 {
-            let Some(st) = titan_pfs::acquire(&self.dev, src, tasks)? else {
+            let Some(st) = titan_pfs::acquire(&self.dev, &src, tasks)? else {
                 return Ok(false);
             };
             Some(st)

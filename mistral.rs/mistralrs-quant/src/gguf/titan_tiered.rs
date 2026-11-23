@@ -379,7 +379,7 @@ enum HostStore {
 /// Stacked `[experts, n, k]` quantized weights: all in host RAM, a subset in GPU slots.
 pub struct TieredExperts {
     /// Prefill streaming of the non-resident experts (`titan_pfs`); first, so it drops before `host`.
-    pfs: Option<Arc<titan_pfs::Source>>,
+    pfs: std::sync::RwLock<Option<Arc<titan_pfs::Source>>>,
     cache: std::sync::Mutex<Cache>,
     policy: Policy,
     host: HostStore,
@@ -403,6 +403,8 @@ pub struct TieredExperts {
     /// expert -> its bytes (null when none). The boxes live in `demoted_store` until the model drops.
     demoted: Vec<std::sync::atomic::AtomicPtr<u8>>,
     demoted_store: std::sync::Mutex<Vec<Box<[u8]>>>,
+    /// Residents of the load-time placement: `promote_to` never goes past it.
+    planned: usize,
 }
 
 static TRACE: crate::titan_cfg::GenCell<Option<std::sync::Mutex<std::fs::File>>> = crate::titan_cfg::GenCell::new();
@@ -664,7 +666,8 @@ impl TieredExperts {
             slotted[slot * expert_bytes..(slot + 1) * expert_bytes]
                 .copy_from_slice(&data[e * expert_bytes..(e + 1) * expert_bytes]);
         }
-        let slots = dev.clone_htod(&slotted)?;
+        let mut slots = super::titan_static_pool::alloc_zeros::<u8>(dev, slotted.len())?;
+        dev.cuda_stream().memcpy_htod(&slotted, &mut slots).w()?;
         let gpu_mib = slotted.len() >> 20;
         drop(slotted);
         let slot_map = dev.clone_htod(&map)?;
@@ -766,7 +769,7 @@ impl TieredExperts {
             slots_ptr,
         };
         let mut me = Self {
-            pfs: None,
+            pfs: std::sync::RwLock::new(None),
             cache: std::sync::Mutex::new(cache),
             policy,
             host,
@@ -784,6 +787,7 @@ impl TieredExperts {
             fast_ok: std::sync::OnceLock::new(),
             demoted: (0..num_experts).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect(),
             demoted_store: std::sync::Mutex::new(Vec::new()),
+            planned: num_resident,
         };
         if titan_pfs::enabled() && policy == Policy::Static && me.flex == 0 {
             let cold = &me.order[num_resident..];
@@ -792,7 +796,8 @@ impl TieredExperts {
                 HostStore::Owned(v) => Some(&v[..]),
                 HostStore::Mapped { .. } => None,
             };
-            me.pfs = titan_pfs::register(dev, layer, proj, num_experts, staged, |e| me.host_expert(e), owned)?;
+            let src = titan_pfs::register(dev, layer, proj, num_experts, staged, |e| me.host_expert(e), owned)?;
+            *me.pfs.get_mut().unwrap() = src;
         }
         Ok(me)
     }
@@ -1141,6 +1146,90 @@ impl TieredExperts {
         Ok((gate.wrap(og, batch, topk), up.wrap(ou, batch, topk)))
     }
 
+    /// The prefill-streaming source (`titan_pfs`), if any.
+    pub(crate) fn pfs(&self) -> Option<Arc<titan_pfs::Source>> {
+        self.pfs.read().unwrap().clone()
+    }
+
+    pub(crate) fn pfs_on(&self) -> bool {
+        self.pfs.read().unwrap().is_some()
+    }
+
+    /// Re-register prefill streaming for the current residency (after `demote_to`): every non-resident expert is
+    /// staged as at load (the `titan_pfs::share` coldest-first prefix of the placement order's tail), the demoted
+    /// ones included, so a long prompt streams them instead of computing them on the CPU.
+    fn restage(&self) -> Result<()> {
+        if self.pfs.read().unwrap().is_none() {
+            return Ok(());
+        }
+        // the old source unregisters its pinned host range when it drops, before the new one registers it: the staging
+        // ring holds sources too, so it goes first
+        titan_pfs::idle(&self.dev, 1)?;
+        drop(self.pfs.write().unwrap().take());
+        let cold: Vec<usize> = {
+            let cache = self.cache.lock().unwrap();
+            self.order.iter().copied().filter(|&e| cache.map[e] == NOT_RESIDENT).collect()
+        };
+        let staged = &cold[..(cold.len() as f64 * titan_pfs::share()).ceil() as usize];
+        let owned = match &self.host {
+            HostStore::Owned(v) => Some(&v[..]),
+            HostStore::Mapped { .. } => None,
+        };
+        let src = titan_pfs::register(&self.dev, self.layer, self.proj, self.num_experts, staged, |e| self.host_expert(e), owned)?;
+        *self.pfs.write().unwrap() = src;
+        Ok(())
+    }
+
+    /// Residents of the load-time placement.
+    pub fn planned_count(&self) -> usize {
+        self.planned
+    }
+
+    /// The reverse of `demote_to`: make the hottest `n` experts (placement order, at most the load-time count)
+    /// resident again, uploading the ones that came back from their host copies. Same contract as `demote_to`
+    /// (no work in flight, captures invalidated by the caller). Returns the device bytes added.
+    pub fn promote_to(&self, n: usize) -> Result<usize> {
+        let n = n.min(self.planned);
+        if !self.can_demote() {
+            return Ok(0);
+        }
+        let stream = self.dev.cuda_stream();
+        let mut cache = self.cache.lock().unwrap();
+        let old_n = cache.owner.len();
+        if n <= old_n {
+            return Ok(0);
+        }
+        let eb = self.expert_bytes;
+        let mut slots = super::titan_static_pool::alloc_zeros::<u8>(&self.dev, n * eb + crate::gguf::fast_mmq::GROUPED_TAIL_BYTES)?;
+        let mut map = vec![NOT_RESIDENT; self.num_experts];
+        let mut owner = vec![NOT_RESIDENT; n];
+        // the residents are the placement order's first old_n; the next ones come back from the host
+        for (slot, &e) in self.order.iter().take(n).enumerate() {
+            let dst = &mut slots.slice_mut(slot * eb..(slot + 1) * eb);
+            match cache.map[e] {
+                NOT_RESIDENT => stream.memcpy_htod(self.host_expert(e), dst).w()?,
+                s0 => {
+                    let off = s0 as usize * eb;
+                    stream.memcpy_dtod(&cache.slots.slice(off..off + eb), dst).w()?
+                }
+            }
+            map[e] = slot as u32;
+            owner[slot] = e as u32;
+        }
+        let slot_map = stream.clone_htod(&map).w()?;
+        stream.synchronize().w()?;
+        cache.slots_ptr = slice_ptr(&slots, 0).0;
+        cache.slots = slots;
+        cache.slot_map = slot_map;
+        cache.map = map;
+        cache.owner = owner;
+        cache.last_use = vec![0; n];
+        drop(cache);
+        super::titan_static_pool::trim(&self.dev);
+        self.restage()?;
+        Ok((n - old_n) * eb)
+    }
+
     /// GPU-resident experts of this projection.
     pub fn resident_count(&self) -> usize {
         self.cache.lock().unwrap().owner.len()
@@ -1174,10 +1263,10 @@ impl TieredExperts {
         let eb = self.expert_bytes;
         // residents in placement order: the first n stay
         let residents: Vec<usize> = self.order.iter().copied().filter(|&e| cache.map[e] != NOT_RESIDENT).collect();
-        let (keep, drop) = residents.split_at(n);
+        let (keep, victims) = residents.split_at(n);
         {
             let mut store = self.demoted_store.lock().unwrap();
-            for &e in drop {
+            for &e in victims {
                 if self.host_index[e] != NOT_RESIDENT || !self.demoted[e].load(std::sync::atomic::Ordering::Acquire).is_null() {
                     continue;
                 }
@@ -1188,7 +1277,7 @@ impl TieredExperts {
                 store.push(b);
             }
         }
-        let mut slots = self.dev.alloc_zeros::<u8>(n.max(1) * eb + crate::gguf::fast_mmq::GROUPED_TAIL_BYTES)?;
+        let mut slots = super::titan_static_pool::alloc_zeros::<u8>(&self.dev, n.max(1) * eb + crate::gguf::fast_mmq::GROUPED_TAIL_BYTES)?;
         let mut map = vec![NOT_RESIDENT; self.num_experts];
         let mut owner = vec![NOT_RESIDENT; n];
         for (slot, &e) in keep.iter().enumerate() {
@@ -1206,6 +1295,9 @@ impl TieredExperts {
         cache.map = map;
         cache.owner = owner;
         cache.last_use = vec![0; n];
+        drop(cache);
+        super::titan_static_pool::trim(&self.dev);
+        self.restage()?;
         Ok(freed)
     }
 
@@ -1271,7 +1363,7 @@ impl TieredExperts {
             candle_core::bail!("titan tiered experts: ids not on CUDA");
         };
         let ids_slice = ids_cuda.as_cuda_slice::<u32>()?;
-        if self.pfs.is_some() {
+        if self.pfs_on() {
             titan_pfs::idle(&self.dev, batch)?;
         }
         let mut cache = self.cache.lock().unwrap();

@@ -147,7 +147,7 @@ impl TieredExperts {
         act: &dyn Fn(&Tensor, &Tensor) -> Result<Tensor>,
     ) -> Result<Tensor> {
         let (batch, topk) = indices.dims2()?;
-        if gate.pfs.is_some() {
+        if gate.pfs_on() {
             titan_pfs::idle(&gate.dev, batch)?;
         }
         let qx = gate.quantize_input(xs)?;

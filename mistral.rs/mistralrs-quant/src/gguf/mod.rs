@@ -27,6 +27,8 @@ mod titan_onepass_core;
 #[cfg(feature = "cuda")]
 mod titan_pfs;
 #[cfg(feature = "cuda")]
+pub mod titan_static_pool;
+#[cfg(feature = "cuda")]
 mod titan_spin;
 #[cfg(feature = "cuda")]
 pub mod titan_tiered;

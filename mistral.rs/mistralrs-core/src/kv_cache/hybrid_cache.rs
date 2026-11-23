@@ -3934,6 +3934,15 @@ impl HybridCache {
         Ok(())
     }
 
+    /// Every attention layer's empty KV cache back to `len` positions (`KvCache::shrink_empty_to`).
+    pub fn shrink_empty_attention_to(&mut self, len: usize) {
+        for cache in &mut self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                kv.shrink_empty_to(len);
+            }
+        }
+    }
+
     /// The smallest room (positions) of the attention layers' KV caches.
     pub fn attention_capacity(&self) -> usize {
         self.caches

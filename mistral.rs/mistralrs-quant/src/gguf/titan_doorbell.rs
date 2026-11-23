@@ -632,7 +632,7 @@ impl TieredExperts {
         }
         let two_phase = onepass::mode() == 0;
         let dev = &gate.dev;
-        if gate.pfs.is_some() {
+        if gate.pfs_on() {
             titan_pfs::idle(dev, batch)?;
         }
         let qx = gate.quantize_input(xs)?;
