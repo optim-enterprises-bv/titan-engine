@@ -103,6 +103,27 @@ pub mod kernels {
         *out.add(i as usize) = float::mul_rn_f32(s, *u.add(i as usize));
     }
 
+    /// Dense SwiGLU of a decode step, bf16 in and out: out[i] = bf16(mulf(silu(g[i]), u[i])) with g, u widened exactly.
+    /// One launch for what was cast_bf16_f32 (g), cast_bf16_f32 (u), fused_glu4_f32k / fused_glu_f32k (silu, act 0)
+    /// and cast_f32_bf16 (the narrowing before the down projection), with the same instructions: silu(x) =
+    /// x * rcp.approx.ftz(ex2.approx.ftz(x * -log2e) + 1) (mul/add .rn.ftz), the product mul.rn.ftz, cvt.rn.bf16.f32.
+    /// grid ceil(n / 256), block 256.
+    #[kernel]
+    pub unsafe fn titan_glu_silu_bf16(g: *const u16, u: *const u16, out: *mut u16, n: u32) {
+        let i = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if i >= n {
+            return;
+        }
+        let gf = f32::from_bits((*g.add(i as usize) as u32) << 16);
+        let uf = f32::from_bits((*u.add(i as usize) as u32) << 16);
+        let e = float::ex2_approx_ftz_f32(float::mul_rn_ftz_f32(gf, f32::from_bits(0xbfb8aa3b)));
+        let s = float::mul_rn_ftz_f32(gf, float::rcp_approx_ftz_f32(float::add_rn_ftz_f32(e, 1.0)));
+        let h = float::mul_rn_ftz_f32(s, uf);
+        let r: u16;
+        ptx_asm!("cvt.rn.bf16.f32 %0, %1;", out("=h") r, in("f") h, options(register_only));
+        *out.add(i as usize) = r;
+    }
+
     /// out[r][h] = (sum_k routed[r][k][h] * w[r][k] + shared[r][h] * sigmoid(glogit[r])) + x[r][h]
     /// grid (ceil(hidden / 256), rows), block 256; k <= 16.
     #[kernel]
