@@ -199,6 +199,21 @@ mod kernels {
     /// `kbx * 8 + iqs/2` (the reference indexes `bq8_1[iqs/2]` from the block-aligned pointer).
     #[inline(always)]
     pub unsafe fn vdot_acc<const MUT: u32>(vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
+        vdot_g::<MUT>(&raw const IQ3S_GRID as *const u32, vx, yb, kbx, iqs, acc)
+    }
+    /// Warp-row hooks (gen_warp_row.py): the 512-word grid is read from its shared-memory copy.
+    pub const GRID_W: u32 = 512;
+    #[inline(always)]
+    pub fn grid_w(e: u32) -> u32 {
+        grid(e)
+    }
+    #[inline(always)]
+    pub unsafe fn vdot_w<const MUT: u32>(gt: *const u32, vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
+        vdot_g::<MUT>(gt, vx, yb, kbx, iqs, acc)
+    }
+    /// `vdot_acc` with the grid read from `gt` (the global table, or its shared-memory copy).
+    #[inline(always)]
+    pub unsafe fn vdot_g<const MUT: u32>(gt: *const u32, vx: *const u8, yb: *const u8, kbx: i32, iqs: i32, acc: f32) -> f32 {
         // every global load first (weights, activations, scale bytes), then the dependent grid lookups, then the
         // arithmetic: the loads of one call are in flight together instead of in dependent waves
         let xb = vx.offset((kbx as isize).wrapping_mul(BLOCK_BYTES as isize));
@@ -216,8 +231,8 @@ mod kernels {
         let mut l0 = 0usize;
         while l0 < 8 {
             cuda_device::thread::__unroll_config::<0>();
-            g[l0] = grid(qs[l0] | ((qh << ((if MUT == 1 { 7 } else { 8 }) - l0 as u32)) & 0x100));
-            g[l0 + 1] = grid(qs[l0 + 1] | ((qh << (7 - l0 as u32)) & 0x100));
+            g[l0] = *gt.add(((qs[l0] | ((qh << ((if MUT == 1 { 7 } else { 8 }) - l0 as u32)) & 0x100)) & 511) as usize);
+            g[l0 + 1] = *gt.add(((qs[l0 + 1] | ((qh << (7 - l0 as u32)) & 0x100)) & 511) as usize);
             l0 += 2;
         }
         let mut sumi = 0i32;
@@ -391,6 +406,162 @@ mod kernels {
     }
 
 
+    // WARP-ROW BEGIN (gen_warp_row.py)
+
+    /// Warps per CUDA block of the warp-row kernels.
+    pub const WPB: usize = 4;
+
+    /// Titan's warp-row matvec: one warp computes what one CUDA block of `mmvq` computes (`RPB` rows of one column
+    /// group), `WPB` warps per CUDA block, so the block-wide costs (lookup-table copy, barrier) are shared by `WPB`
+    /// row groups and the cross-warp reduction happens in registers instead of through shared memory.
+    ///
+    /// Bit-identical to `mmvq`: lane `l` keeps one accumulator per reference warp `v` and walks exactly the blocks
+    /// reference thread `(v, l)` walks, in the same order (`kbx = 4v + l/8 + 4*NW*t`, `kqs = 2*(l%8)`), then
+    /// sums them `((a0 + a1) + a2) + a3` as the reference adds its shared-memory partials, then the same
+    /// xor-shuffle tree. A `GRID_W`-word lookup table is read from a shared-memory copy: a warp's 32 scattered
+    /// lookups cost a few bank-conflict replays there, against an L1 wavefront per distinct 128-byte line from
+    /// global.
+    ///
+    /// `nvb` (the reference ABI's otherwise unused `ids_stride` slot) = number of row groups, `ceil(nrows/RPB)`;
+    /// launch `(ceil(nvb / WPB), channels, samples)` blocks of `(32, WPB)`.
+    #[device]
+    pub unsafe fn mmvq_w<const NC: usize, const SMALL_K: bool, const MUT: u32, const OB: bool>(
+        vx: *const u8, vy: *const u8, ids: *const i32, dst: *mut f32, ncols_x: u32,
+        nchannels_y_mp: u32, nchannels_y_l: u32, nchannels_y_d: u32,
+        stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32,
+        channel_ratio_mp: u32, channel_ratio_l: u32,
+        stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32,
+        sample_ratio_mp: u32, sample_ratio_l: u32,
+        stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32,
+    ) {
+        static mut GRID_SHARED: SharedArray<u32, { if GRID_W == 0 { 4 } else { GRID_W as usize } }, 16> = SharedArray::UNINIT;
+        const QKB: i32 = 256;
+        const TPB: i32 = 8; // qi / vdr
+        let nw = K::<NC, SMALL_K>::NW;
+        let rpb = K::<NC, SMALL_K>::RPB as u32;
+        let tx = thread::threadIdx_x() as i32;
+        let ty = thread::threadIdx_y() as i32;
+        let sh = SharedArray::as_raw_mut_ptr(&raw mut GRID_SHARED) as *mut u32;
+        if GRID_W > 0 {
+            let mut e = (32 * ty + tx) as u32;
+            while e < GRID_W {
+                *sh.add(e as usize) = grid_w(e);
+                e += 32 * WPB as u32;
+            }
+            thread::sync_threads();
+        }
+        let gt = sh as *const u32;
+        let vb = thread::blockIdx_x().wrapping_mul(WPB as u32).wrapping_add(ty as u32);
+        if vb >= nvb {
+            return;
+        }
+        let row0 = rpb.wrapping_mul(vb);
+        let blocks_per_row_x = (ncols_x / QKB as u32) as i32;
+
+        let channel_dst = thread::blockIdx_y();
+        let (channel_x, channel_y) = if NC == 1 && !ids.is_null() {
+            let cx = *ids.add(channel_dst as usize) as u32;
+            let q = fastdiv(channel_dst, nchannels_y_mp, nchannels_y_l);
+            (cx, channel_dst.wrapping_sub(q.wrapping_mul(nchannels_y_d)))
+        } else {
+            (fastdiv(channel_dst, channel_ratio_mp, channel_ratio_l), channel_dst)
+        };
+        let sample_dst = thread::blockIdx_z();
+        let sample_x = fastdiv(sample_dst, sample_ratio_mp, sample_ratio_l);
+        let sample_y = sample_dst;
+
+        // acc[j][i][v]: column j, row i of the group, reference warp v
+        let mut acc = [[[0f32; 4]; 4]; NC];
+        let y = vy
+            .add(sample_y.wrapping_mul(stride_sample_y) as usize * 36)
+            .add(channel_y.wrapping_mul(stride_channel_y) as usize * 36);
+        let kbx_offset = sample_x
+            .wrapping_mul(stride_sample_x)
+            .wrapping_add(channel_x.wrapping_mul(stride_channel_x))
+            .wrapping_add(row0.wrapping_mul(stride_row_x));
+
+        let kqs = 2 * (tx % TPB);
+        let mut kb0 = 0i32;
+        while kb0 < blocks_per_row_x {
+            let mut v = 0usize;
+            #[unroll]
+            while v < 4 {
+                let kbx = kb0 + 4 * v as i32 + tx / TPB;
+                if (v as i32) < nw && kbx < blocks_per_row_x {
+                    let kby = 8 * kbx;
+                    let mut j = 0;
+                    #[unroll]
+                    while j < NC {
+                        let yi = (j as u32).wrapping_mul(stride_col_y).wrapping_add((kby + kqs / 2) as u32);
+                        let yb = y.add(yi as usize * 36);
+                        let mut i = 0;
+                        #[unroll]
+                        while i < K::<NC, SMALL_K>::RPB {
+                            let xk = kbx_offset.wrapping_add((i as u32).wrapping_mul(stride_row_x)).wrapping_add(kbx as u32) as i32;
+                            acc[j][i][v] = vdot_w::<MUT>(gt, vx, yb, xk, kqs, acc[j][i][v]);
+                            i += 1;
+                        }
+                        j += 1;
+                    }
+                }
+                v += 1;
+            }
+            kb0 += K::<NC, SMALL_K>::BLOCKS_PER_ITER;
+        }
+
+        let dbase = sample_dst
+            .wrapping_mul(stride_sample_dst)
+            .wrapping_add(channel_dst.wrapping_mul(stride_channel_dst))
+            .wrapping_add(row0) as usize;
+        let dst16 = (dst as *mut u16).add(dbase);
+        let dst = dst.add(dbase);
+        let mut j = 0;
+        #[unroll]
+        while j < NC {
+            let mut i = 0;
+            #[unroll]
+            while i < K::<NC, SMALL_K>::RPB {
+                let mut t = acc[j][i][0];
+                let mut l = 1;
+                #[unroll]
+                while l < 4 {
+                    if (l as i32) < nw {
+                        t = add(t, acc[j][i][l]);
+                    }
+                    l += 1;
+                }
+                let mut k = 0;
+                #[unroll]
+                while k < 5 {
+                    t = add(t, warp::shuffle_xor_f32_sync(0xffff_ffff, t, 16 >> k));
+                    k += 1;
+                }
+                if tx == i as i32 && (rpb == 1 || row0.wrapping_add(i as u32) < stride_col_dst) {
+                    let o = (j as u32).wrapping_mul(stride_col_dst).wrapping_add(i as u32);
+                    if OB {
+                        // bf16 out: rounded as candle's cast_f32_bf16 rounds
+                        *dst16.add(o as usize) = f2bf(t);
+                    } else {
+                        *dst.add(o as usize) = t;
+                    }
+                }
+                i += 1;
+            }
+            j += 1;
+        }
+    }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w1(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<1, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w1_bf16o(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<1, false, 0, true>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w1_small_k(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<1, true, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w1_small_k_bf16o(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<1, true, 0, true>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w2(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<2, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w3(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<3, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w4(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<4, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w5(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<5, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w6(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<6, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w7(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<7, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    #[kernel] pub unsafe fn iq3_s_mmvq_w8(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, nvb: u32) { mmvq_w::<8, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst, nvb) }
+    // WARP-ROW END
     // One entry per reference instance; params as iq4_nl (fusion struct and uint3 passed as fields).
     // GENERATED KERNELS BEGIN (gen in-line by the crate's assembly step)
     #[kernel] pub unsafe fn iq3_s_mmvq_1(vx: *const u8, vy: *const u8, ids: *const i32, _f0: u64, _f1: u64, _f2: u64, _f3: u64, _f4: u64, _glu_op: u32, _glu_limit: f32, dst: *mut f32, ncols_x: u32, ncy_mp: u32, ncy_l: u32, ncy_d: u32, stride_row_x: u32, stride_col_y: u32, stride_col_dst: u32, cr_mp: u32, cr_l: u32, _cr_d: u32, stride_channel_x: u32, stride_channel_y: u32, stride_channel_dst: u32, sr_mp: u32, sr_l: u32, _sr_d: u32, stride_sample_x: u32, stride_sample_y: u32, stride_sample_dst: u32, _ids_stride: u32) { mmvq::<1, false, 0, false>(vx, vy, ids, dst, ncols_x, ncy_mp, ncy_l, ncy_d, stride_row_x, stride_col_y, stride_col_dst, cr_mp, cr_l, stride_channel_x, stride_channel_y, stride_channel_dst, sr_mp, sr_l, stride_sample_x, stride_sample_y, stride_sample_dst) }
