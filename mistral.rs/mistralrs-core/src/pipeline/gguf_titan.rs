@@ -230,6 +230,12 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
             put("TITAN_TIERED_RESERVE_MIB", "3584");
         }
     }
+    if arch == "qwen35moe" {
+        // MTP verification rows computed exactly as the decode steps they replace (row-exact matvecs, no bf16 narrowing):
+        // MTP's output equals plain decode's, and it measured faster (Qwen3.6-35B-A3B: 112 vs 107 tok/s)
+        put("TITAN_VERIFY_MMQ", "0");
+        put("TITAN_DENSE_BF16_MATVEC", "0");
+    }
     if matches!(arch, "qwen35moe" | "qwen35" | "qwen3next") {
         put("TITAN_CUDA_GRAPHS", "1");
         put("TITAN_CUDA_GRAPHS_RESERVE_MIB", "64");
