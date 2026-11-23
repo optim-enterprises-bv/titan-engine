@@ -1679,7 +1679,9 @@ fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
 
 /// A KV cache on `dev` holding the first `len` positions of a host copy, with room for `cap`.
 fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usize, dev: &Device) -> Result<KvCache> {
-    let dev = if dev.is_cuda() && crate::titan_hostkv::enabled() { &Device::Cpu } else { dev };
+    // TITAN_KV_SPILL: a restored prefix within the base context goes to the GPU, a longer one to the host
+    let host = crate::titan_hostkv::enabled() && (!crate::kv_cache::kv_spill() || cap > crate::kv_cache::cuda_kv_base());
+    let dev = if dev.is_cuda() && host { &Device::Cpu } else { dev };
     let single = |t: &Tensor| -> Result<SingleCache> {
         let mut shape = t.dims().to_vec();
         shape[2] = cap;
@@ -5087,7 +5089,14 @@ impl ModelWeights {
         }
         let need = need.min(self.max_seq_len);
         if fresh {
+            if crate::kv_cache::kv_spill() {
+                // a sequence that spilled to host RAM leaves empty host buffers: the next one starts on the GPU
+                self.cache.hybrid().drop_empty_host_attention();
+            }
             self.rebalance_for_fresh(need)?;
+        }
+        if self.cache.hybrid().attention_on_host() {
+            return Ok(());
         }
         let cap = self.cache.hybrid().attention_capacity();
         if need <= cap {
@@ -5147,6 +5156,20 @@ impl ModelWeights {
                     "titan vram: KV room {cap} -> {target} positions: {per_layer} experts per layer moved to the CPU ({} MiB), {kept} stay on the GPU",
                     freed >> 20
                 );
+            }
+        }
+        // TITAN_KV_SPILL (no experts to give back, or not enough): the sequence's KV moves to host RAM from here on
+        if crate::kv_cache::kv_spill() && crate::titan_hostkv::enabled() {
+            let free_now = device_free_bytes(&self.device).unwrap_or(0);
+            if free_now < need_bytes {
+                self.device.synchronize()?;
+                self.cache.hybrid().attention_to_host()?;
+                crate::titan_swap::trim_pool(&self.device);
+                if let Device::Cuda(d) = &self.device {
+                    mistralrs_quant::titan_static_pool::trim(d);
+                }
+                tracing::info!("titan kv: {need} positions do not fit the GPU ({} MiB free): this sequence's KV moves to host RAM", free_now >> 20);
+                return Ok(());
             }
         }
         let dev = self.device.clone();

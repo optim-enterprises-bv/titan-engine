@@ -266,6 +266,12 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
             let kv_bytes = (blocks / interval) * kv_heads * (k + v) * 2 * ctx as u64;
             if vram > 0 && file_bytes + kv_bytes + (AUTO_KV_HEADROOM_MIB << 20) > vram {
                 put("TITAN_KV_HOST", "1");
+                // the KV starts on the GPU (F8E4M3, flash kernels) and only a sequence that outgrows the VRAM moves to
+                // host RAM (Huihui 27B Q3_K_XL: host KV decoded 16.6 tok/s at 25k context)
+                put("TITAN_KV_SPILL", "1");
+                put("TITAN_KV_FP8", "1");
+                put("TITAN_KV_PREALLOC", "1");
+                put("TITAN_KV_DYNAMIC", "1");
             }
         }
     }
