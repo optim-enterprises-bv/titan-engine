@@ -79,6 +79,14 @@ impl SingleCache {
         self.set_len(keep_len)
     }
 
+    /// An empty cache gives its buffer back and takes room for `len` positions at the next append.
+    pub fn shrink_empty_to(&mut self, len: usize) {
+        if self.current_seq_len == 0 && len < self.capacity_seq_len {
+            self.all_data = None;
+            self.capacity_seq_len = len;
+        }
+    }
+
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
         // a preallocated or dynamic CUDA buffer (TITAN_KV_PREALLOC / TITAN_KV_DYNAMIC) is kept: only its first
@@ -123,7 +131,7 @@ impl SingleCache {
         if let Some(ad) = &self.all_data {
             let mut shape = ad.dims().to_vec();
             shape[self.dim] = len;
-            let grown = Tensor::zeros(shape, ad.dtype(), ad.device())?;
+            let grown = kv_zeros(shape, ad.dtype(), ad.device())?;
             grown.slice_set(ad, self.dim, 0)?;
             self.all_data = Some(grown);
         }
@@ -145,7 +153,7 @@ impl SingleCache {
             }
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.capacity_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            let ad = kv_zeros(shape, src.dtype(), src.device())?;
             self.all_data = Some(ad);
         };
 
@@ -185,7 +193,7 @@ impl SingleCache {
             }
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.capacity_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            let ad = kv_zeros(shape, src.dtype(), src.device())?;
             ad.slice_set(self.all_data.as_ref().unwrap(), self.dim, 0)?;
             self.all_data = Some(ad);
         }
@@ -196,4 +204,28 @@ impl SingleCache {
         self.current_seq_len += seq_len;
         Ok(())
     }
+}
+
+/// A KV buffer: from titan's long-lived CUDA pool (`titan_static_pool`) when the cache is a titan one
+/// (TITAN_KV_PREALLOC): resizing it must not leave holes among the step temporaries of the default pool.
+fn kv_zeros(shape: Vec<usize>, dtype: candle_core::DType, device: &candle_core::Device) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let (candle_core::Device::Cuda(dev), true) = (device, super::cuda_kv_prealloc()) {
+        use candle_core::cuda::CudaStorage;
+        use candle_core::DType;
+        let n: usize = shape.iter().product();
+        let pool = mistralrs_quant::titan_static_pool::alloc_zeros::<u8>;
+        let st = match dtype {
+            DType::F8E4M3 => CudaStorage::wrap_cuda_slice(mistralrs_quant::titan_static_pool::alloc_zeros::<float8::F8E4M3>(dev, n)?, dev.clone()),
+            DType::BF16 => CudaStorage::wrap_cuda_slice(mistralrs_quant::titan_static_pool::alloc_zeros::<half::bf16>(dev, n)?, dev.clone()),
+            DType::F16 => CudaStorage::wrap_cuda_slice(mistralrs_quant::titan_static_pool::alloc_zeros::<half::f16>(dev, n)?, dev.clone()),
+            DType::F32 => CudaStorage::wrap_cuda_slice(mistralrs_quant::titan_static_pool::alloc_zeros::<f32>(dev, n)?, dev.clone()),
+            _ => {
+                let _ = pool;
+                return Tensor::zeros(shape, dtype, device);
+            }
+        };
+        return Ok(Tensor::from((candle_core::Storage::Cuda(st), candle_core::Shape::from(shape))));
+    }
+    Tensor::zeros(shape, dtype, device)
 }

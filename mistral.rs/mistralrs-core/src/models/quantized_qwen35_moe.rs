@@ -589,9 +589,10 @@ impl FullAttention {
         let rows = q.dim(2)?;
         if k.dtype() == DType::F8E4M3 {
             // the cache as stored (TITAN_KV_FP8, `append_raw`): never widened whole
-            if rows > MTP_CATCHUP_MAX_ROWS {
-                // a prompt chunk (its mask is the placeholder, or None after the first chunk): tiles of the cache widened
-                // one at a time, merged online, causal over the chunk's last rows
+            let placeholder = matches!(mask, AttentionMask::Custom(t) if t.elem_count() == 1);
+            if rows > MTP_CATCHUP_MAX_ROWS || placeholder {
+                // a prompt chunk (its mask is the placeholder, or None after the first chunk), short ones included: tiles
+                // of the cache widened one at a time, merged online, causal over the chunk's last rows
                 return crate::attention::flash_prefill_host_tiles(q, k, v, &self.sdpa_params, crate::titan_hostkv::tile());
             }
             let past = k.dim(2)? - rows;
@@ -5015,11 +5016,14 @@ impl ModelWeights {
     /// `TITAN_KV_DYNAMIC`: before a step that needs `need` KV positions past the attention caches' room, grow them to
     /// the next `KV_RESERVE_STEP` bucket, first demoting the coldest GPU-resident experts (the same number in every
     /// layer, placement order) until the growth fits: the experts hold the VRAM a short context does not need.
-    pub(crate) fn ensure_kv_room(&self, need: usize) -> Result<()> {
+    pub(crate) fn ensure_kv_room(&self, need: usize, fresh: bool) -> Result<()> {
         if !crate::kv_cache::cuda_kv_dynamic() || !self.device.is_cuda() {
             return Ok(());
         }
         let need = need.min(self.max_seq_len);
+        if fresh {
+            self.rebalance_for_fresh(need)?;
+        }
         let cap = self.cache.hybrid().attention_capacity();
         if need <= cap {
             return Ok(());
@@ -5083,6 +5087,74 @@ impl ModelWeights {
         let dev = self.device.clone();
         self.cache.hybrid().reserve_attention_each(target, &mut || crate::titan_swap::trim_pool(&dev))?;
         let _ = free;
+        Ok(())
+    }
+
+    /// A new sequence (empty caches) needing `need` positions where an earlier, longer one grew the KV: give the
+    /// unneeded buckets back and bring the hottest demoted experts back to the GPU with the room (hysteresis: at least
+    /// one bucket, and never past the load-time placement).
+    fn rebalance_for_fresh(&self, need: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let base = need.max(crate::kv_cache::cuda_kv_base()).next_multiple_of(KV_RESERVE_STEP).min(self.max_seq_len);
+            let cap = self.cache.hybrid().attention_capacity();
+            let layers: Vec<[&mistralrs_quant::TieredExperts; 3]> = self
+                .layers
+                .iter()
+                .filter_map(|l| match &l.ffn {
+                    Ffn::Moe(m) => match &m.experts {
+                        super::quantized_qwen3_moe::Experts::Tiered { gate, up, down } if gate.can_demote() => Some([gate, up, down]),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            let demoted = layers.iter().any(|l| l[0].resident_count() < l[0].planned_count());
+            if cap < base + KV_RESERVE_STEP || !demoted {
+                return Ok(());
+            }
+            self.device.synchronize()?;
+            self.cache.hybrid().shrink_empty_attention_to(base);
+            crate::titan_swap::trim_pool(&self.device);
+            if let Device::Cuda(d) = &self.device {
+                mistralrs_quant::titan_static_pool::trim(d);
+            }
+            let reserve = mistralrs_quant::titan_cfg::var("TITAN_TIERED_RESERVE_MIB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(KV_BUCKET_MARGIN, |m| m << 20);
+            let attn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Attention(_))).count();
+            let kv_dtype = if crate::kv_cache::cuda_kv_fp8() { DType::F8E4M3 } else { self.dtype };
+            let per_pos = self
+                .layers
+                .iter()
+                .find_map(|l| match &l.mixer {
+                    Mixer::Attention(a) => Some(2 * a.n_kv_head * a.head_dim * kv_dtype.size_in_bytes()),
+                    _ => None,
+                })
+                .unwrap_or(0)
+                * attn;
+            let free = device_free_bytes(&self.device).unwrap_or(0);
+            // what this sequence's KV bucket and the step's working room still need
+            let spare = free.saturating_sub(base * per_pos + reserve);
+            let slot_bytes: usize = layers.iter().map(|l| l.iter().map(|p| p.expert_bytes()).sum::<usize>()).sum::<usize>() / layers.len().max(1);
+            let per_layer = spare / (slot_bytes * layers.len()).max(1);
+            if per_layer == 0 {
+                return Ok(());
+            }
+            let mut added = 0usize;
+            for l in &layers {
+                let n = l[0].resident_count() + per_layer;
+                for p in l {
+                    added += p.promote_to(n)?;
+                }
+            }
+            mistralrs_quant::invalidate_captures();
+            tracing::info!(
+                "titan vram: new sequence of {need} positions: KV room {cap} -> {base}, up to {per_layer} experts per layer back on the GPU ({} MiB)",
+                added >> 20
+            );
+        }
         Ok(())
     }
 

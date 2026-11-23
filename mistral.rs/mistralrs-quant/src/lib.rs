@@ -209,6 +209,8 @@ pub use gguf::fast_mmq::{
 };
 #[cfg(feature = "cuda")]
 pub use gguf::titan_tiered::{doorbell as titan_doorbell, QInput, TieredExperts};
+#[cfg(feature = "cuda")]
+pub use gguf::titan_static_pool;
 
 /// Non-CUDA builds: titan tiered experts need CUDA, so the planning queries report tiering off and
 /// the model loaders behave as stock mistral.rs.

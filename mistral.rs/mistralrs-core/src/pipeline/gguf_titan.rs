@@ -202,8 +202,9 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
         // F8E4M3 KV (half the VRAM of BF16 at the same decode speed) allocated once at the full context
         put("TITAN_KV_FP8", "1");
         put("TITAN_KV_PREALLOC", "1");
-        // TITAN_KV_DYNAMIC (KV grows into expert VRAM) stays opt-in: short-context decode 103 vs 89 tok/s, but its
-        // slot and KV reallocations fragment the stream-ordered pool and long prompts ran out of memory
+        // KV grows into expert VRAM as contexts need it and gives it back for shorter ones (ensure_kv_room): the
+        // full window with the short-context speed (Qwen3.6, 16 GB: 101 vs 87 tok/s at short contexts)
+        put("TITAN_KV_DYNAMIC", "1");
         put("TITAN_TIERED", "1");
         put("TITAN_TIERED_GPU_FRACTION", "auto");
         // long prompts (262k window) need the pfs staging ring and prompt temporaries next to the preallocated KV:
@@ -833,7 +834,8 @@ impl Pipeline for TitanGGUFPipeline {
             Model::Qwen35MoE(ref model) => {
                 // TITAN_KV_DYNAMIC: KV room for this step (experts give up VRAM as the context grows)
                 let need = seqlen_offsets.iter().max().copied().unwrap_or(0) + input_ids.dim(1)? + 1;
-                model.ensure_kv_room(need)?;
+                let fresh = input_ids.dim(1)? > 1 && seqlen_offsets.iter().all(|&o| o == 0);
+                model.ensure_kv_room(need, fresh)?;
                 let recurrent_metadata = {
                     let hybrid = model.cache.hybrid();
                     hybrid.state_indices().cloned().map(|indices| {
