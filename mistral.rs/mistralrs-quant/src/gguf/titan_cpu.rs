@@ -1698,8 +1698,27 @@ pub fn f32_to_f16(v: f32) -> u16 {
 /// `silu(g) * u` with candle's fused GLU program (`x / (1 + exp(-x))`); the host's `exp` is not the GPU's.
 pub fn silu_mul(g: &[f32], u: &[f32], out: &mut [f32]) {
     for ((o, &a), &b) in out.iter_mut().zip(g).zip(u) {
-        *o = a / (1.0 + (-a).exp()) * b;
+        *o = a / (1.0 + exp_portable(-a)) * b;
     }
+}
+
+/// e^x from IEEE operations only, bit-identical to titan-fused's `exp_portable` (the GPU SwiGLU of the tiered
+/// experts, `titan_swiglu_f32`): n = rint(x log2 e), r = x - n ln2 (two fma), Taylor to r^7 by Horner fma, times 2^n;
+/// x clamped to [-87, 88]. libm's expf and the GPU's ex2.approx differ in the last bit now and then, which made a
+/// CPU-computed expert's q8_1 activation differ from the GPU's in ~1.5% of rows (output depended on placement).
+pub fn exp_portable(x: f32) -> f32 {
+    let x = x.max(-87.0).min(88.0);
+    let n = (x * f32::from_bits(0x3fb8aa3b)).round_ties_even();
+    let r = (-n).mul_add(f32::from_bits(0x3f317200), x);
+    let r = (-n).mul_add(f32::from_bits(0x35bfbe8e), r);
+    let mut p = f32::from_bits(0x39500d01);
+    for c in [0x3ab60b61u32, 0x3c088889, 0x3d2aaaab, 0x3e2aaaab] {
+        p = p.mul_add(r, f32::from_bits(c));
+    }
+    p = p.mul_add(r, 0.5);
+    p = p.mul_add(r, 1.0);
+    p = p.mul_add(r, 1.0);
+    p * f32::from_bits((((n as i32) + 127) as u32) << 23)
 }
 
 /// One row quantized to q8_1 blocks in the GPU's `quantize_q8_1` layout (half d = amax / 127, half s = the warp's

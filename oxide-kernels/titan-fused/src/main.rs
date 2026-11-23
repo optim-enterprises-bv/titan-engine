@@ -47,6 +47,62 @@ pub mod kernels {
         float::rcp_rn_f32(float::fma_rn_f32(e, s, 1.0))
     }
 
+    #[inline(always)]
+    fn max_f32(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("max.f32 %0, %1, %2;", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+    #[inline(always)]
+    fn min_f32(a: f32, b: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("min.f32 %0, %1, %2;", out("=f") r, in("f") a, in("f") b, options(register_only)); }
+        r
+    }
+
+    /// `x` rounded to the nearest integer, ties to even (`cvt.rni`, as `f32::round_ties_even`).
+    #[inline(always)]
+    fn rint_f32(x: f32) -> f32 {
+        let r: f32;
+        unsafe { ptx_asm!("cvt.rni.f32.f32 %0, %1;", out("=f") r, in("f") x, options(register_only)); }
+        r
+    }
+
+    /// e^x from IEEE operations only (no MUFU approximations), so the CPU twin (`titan_cpu::exp_portable`) computes the
+    /// same bits: n = rint(x log2 e), r = x - n ln2 (two fma), Taylor to r^7 by Horner fma, times 2^n. x clamped to
+    /// [-87, 88] (2^n stays a normal number).
+    #[inline(always)]
+    pub fn exp_portable(x: f32) -> f32 {
+        let x = min_f32(max_f32(x, -87.0), 88.0);
+        let n = rint_f32(float::mul_rn_f32(x, f32::from_bits(0x3fb8aa3b)));
+        let r = float::fma_rn_f32(-n, f32::from_bits(0x3f317200), x);
+        let r = float::fma_rn_f32(-n, f32::from_bits(0x35bfbe8e), r);
+        let mut p = f32::from_bits(0x39500d01); // 1/5040
+        p = float::fma_rn_f32(p, r, f32::from_bits(0x3ab60b61)); // 1/720
+        p = float::fma_rn_f32(p, r, f32::from_bits(0x3c088889)); // 1/120
+        p = float::fma_rn_f32(p, r, f32::from_bits(0x3d2aaaab)); // 1/24
+        p = float::fma_rn_f32(p, r, f32::from_bits(0x3e2aaaab)); // 1/6
+        p = float::fma_rn_f32(p, r, 0.5);
+        p = float::fma_rn_f32(p, r, 1.0);
+        p = float::fma_rn_f32(p, r, 1.0);
+        let s = f32::from_bits((((n as i32) + 127) as u32) << 23);
+        float::mul_rn_f32(p, s)
+    }
+
+    /// SwiGLU of the tiered experts: out[i] = (g / (1 + e^-g)) * u, IEEE ops and `exp_portable`, bit-identical to the
+    /// CPU twin's `titan_cpu::silu_mul`. grid ceil(n / 256), block 256.
+    #[kernel]
+    pub unsafe fn titan_swiglu_f32(g: *const f32, u: *const f32, out: *mut f32, n: u32) {
+        let i = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if i >= n {
+            return;
+        }
+        let x = *g.add(i as usize);
+        let e = exp_portable(-x);
+        let s = float::div_rn_f32(x, float::add_rn_f32(1.0, e));
+        *out.add(i as usize) = float::mul_rn_f32(s, *u.add(i as usize));
+    }
+
     /// out[r][h] = (sum_k routed[r][k][h] * w[r][k] + shared[r][h] * sigmoid(glogit[r])) + x[r][h]
     /// grid (ceil(hidden / 256), rows), block 256; k <= 16.
     #[kernel]

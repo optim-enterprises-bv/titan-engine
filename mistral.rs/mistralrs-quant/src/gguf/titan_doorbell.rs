@@ -682,6 +682,13 @@ impl TieredExperts {
             db.collect(dev, db.layout.hdr_gu, db.layout.rows_g, &mut og, gate.n, tasks)?;
             db.scatter(dev, db.layout.hdr_gu, db.layout.rows_u, &mut ou, up.n, tasks)?;
         }
+        let check = twin_check_on() && !capturing(dev);
+        let gu_host = if check {
+            let stream = dev.cuda_stream();
+            Some((stream.clone_dtoh(&og).w()?, stream.clone_dtoh(&ou).w()?, stream.clone_dtoh(&qx.xq).w()?))
+        } else {
+            None
+        };
         let a = act(&gate.wrap(og, batch, topk), &up.wrap(ou, batch, topk))?;
         let qa = down.quantize_input(&a)?;
         if two_phase {
@@ -693,6 +700,95 @@ impl TieredExperts {
         let mut od = down.gemv_launch(&down.cache.lock().unwrap(), &qa, ids_ptr, topk)?;
         drop(g);
         db.collect(dev, db.layout.hdr_d, db.layout.rows_d, &mut od, down.n, tasks)?;
+        if let Some((g_h, u_h, xq_h)) = gu_host {
+            let stream = dev.cuda_stream();
+            let (qa_h, od_h) = (stream.clone_dtoh(&qa.xq).w()?, stream.clone_dtoh(&od).w()?);
+            let ids_h: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+            twin_check(gate, up, down, &ids_h, topk, &xq_h, qx.q8_row_bytes, &g_h, &u_h, &qa_h, qa.q8_row_bytes, &od_h)?;
+        }
         Ok(Some(down.wrap(od, batch, topk)))
     }
+}
+
+fn capturing(dev: &CudaDevice) -> bool {
+    !matches!(dev.cuda_stream().capture_status(), Ok(sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE))
+}
+
+/// `TITAN_TWIN_CHECK=1` (diagnostic, slow): every doorbell layer call outside a capture recomputes its GPU-resident
+/// tasks on the CPU from the expert slots (scalar `titan_cpu::row`, the twin's reference) and compares each stage bit
+/// for bit: gate and up rows, then SwiGLU + q8_1 of the GPU's gate/up, then down rows from the GPU's q8_1 input.
+fn twin_check_on() -> bool {
+    static ON: crate::titan_cfg::GenCell<bool> = crate::titan_cfg::GenCell::new();
+    *ON.get_or_init(|| crate::titan_cfg::flag("TITAN_TWIN_CHECK", false))
+}
+
+static TWIN: Mutex<[u64; 7]> = Mutex::new([0; 7]);
+
+#[allow(clippy::too_many_arguments)]
+fn twin_check(
+    gate: &TieredExperts, up: &TieredExperts, down: &TieredExperts, ids: &[u32], topk: usize,
+    xq: &[u8], xq_row: usize, g_h: &[f32], u_h: &[f32], qa: &[u8], qa_row: usize, od: &[f32],
+) -> Result<()> {
+    let stream = gate.dev.cuda_stream();
+    let slot_bytes = |p: &TieredExperts, e: u32| -> Result<Option<Vec<u8>>> {
+        let c = p.cache.lock().unwrap();
+        let s = c.map[e as usize];
+        if s == NOT_RESIDENT {
+            return Ok(None);
+        }
+        let off = s as usize * p.expert_bytes;
+        Ok(Some(stream.clone_dtoh(&c.slots.slice(off..off + p.expert_bytes)).w()?))
+    };
+    let (ng, nd) = (gate.n, down.n);
+    let mut st = [0u64; 7]; // tasks, gate bad, up bad, act bad, down bad, gate rows, down rows
+    let mut first: Option<String> = None;
+    for (t, &e) in ids.iter().enumerate() {
+        let (Some(gb), Some(ub), Some(db)) = (slot_bytes(gate, e)?, slot_bytes(up, e)?, slot_bytes(down, e)?) else {
+            continue;
+        };
+        st[0] += 1;
+        let x = &xq[(t / topk) * xq_row..(t / topk + 1) * xq_row];
+        let (rg, rd) = (gate.expert_bytes / ng, down.expert_bytes / nd);
+        for (p, wb, out, slot) in [(gate, &gb, g_h, 1usize), (up, &ub, u_h, 2)] {
+            for r in 0..ng {
+                let c = super::titan_cpu::row(p.format(), &wb[r * rg..(r + 1) * rg], x, p.k);
+                let gv = out[t * ng + r];
+                if c.to_bits() != gv.to_bits() {
+                    st[slot] += 1;
+                    first.get_or_insert_with(|| format!("layer {} {} task {t} expert {e} row {r}: cpu {c:e} gpu {gv:e}", p.layer, p.proj));
+                }
+            }
+        }
+        st[5] += 2 * ng as u64;
+        let mut act = vec![0f32; ng];
+        let mut qa_c = vec![0u8; qa_row];
+        super::super::titan_onepass_core::activate(&g_h[t * ng..(t + 1) * ng], &u_h[t * ng..(t + 1) * ng], &mut act, &mut qa_c);
+        let qa_g = &qa[t * qa_row..(t + 1) * qa_row];
+        if qa_c[..] != qa_g[..qa_c.len()] {
+            st[3] += 1;
+            let i = qa_c.iter().zip(qa_g).position(|(a, b)| a != b).unwrap_or(0);
+            first.get_or_insert_with(|| format!("layer {} act/q8 task {t} expert {e}: first differing byte {i} cpu {} gpu {}", gate.layer, qa_c[i], qa_g[i]));
+        }
+        for r in 0..nd {
+            let c = super::titan_cpu::row(down.format(), &db[r * rd..(r + 1) * rd], qa_g, down.k);
+            let gv = od[t * nd + r];
+            if c.to_bits() != gv.to_bits() {
+                st[4] += 1;
+                first.get_or_insert_with(|| format!("layer {} down task {t} expert {e} row {r}: cpu {c:e} gpu {gv:e}", down.layer));
+            }
+        }
+        st[6] += nd as u64;
+    }
+    let mut tot = TWIN.lock().unwrap();
+    for (a, b) in tot.iter_mut().zip(st) {
+        *a += b;
+    }
+    if let Some(f) = first {
+        tracing::warn!("titan twin check: mismatch: {f}");
+    }
+    tracing::info!(
+        "titan twin check: {} resident tasks; differing gate rows {}, up rows {}, act/q8 rows {}, down rows {} (of {} gate/up and {} down rows)",
+        tot[0], tot[1], tot[2], tot[3], tot[4], tot[5], tot[6]
+    );
+    Ok(())
 }

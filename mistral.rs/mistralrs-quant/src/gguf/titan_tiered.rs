@@ -1022,7 +1022,8 @@ impl TieredExperts {
         let rows = batch * input_dim1;
         let k_padded = self.k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
         let q8_row_bytes = k_padded / 32 * Q8_1_BLOCK_BYTES;
-        let xq = self.dev.alloc_zeros::<u8>(rows * q8_row_bytes)?;
+        // the quantize launch covers every padded value of every row (rows * k_padded threads, zeros past k)
+        let xq = unsafe { self.dev.alloc::<u8>(rows * q8_row_bytes)? };
         let (x_ptr, g0) = slice_ptr(x_slice, x_layout.start_offset());
         let (xq_ptr, g1) = slice_ptr(&xq, 0);
         // Slices cross the oxide ABI as (pointer, element count).
@@ -1433,7 +1434,10 @@ impl TieredExperts {
         let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
         let xq = &q.xq;
         let tasks = batch * topk;
-        let out = self.dev.alloc_zeros::<f32>(tasks * self.n)?;
+        // no zero fill (a memset node per projection and layer in the decode graph): the kernel writes the resident
+        // tasks' rows and every path then writes the others (the doorbell's collect, upload_rows, the pfs staged launch
+        // and cpu_misses); gate/up rows of a CPU task are never read by the GPU's down launch, which skips it
+        let out = unsafe { self.dev.alloc::<f32>(tasks * self.n)? };
         let (xq_ptr, g2) = slice_ptr(xq, 0);
         let (w_ptr, g3) = slice_ptr(&cache.slots, 0);
         let (map_ptr, g4) = slice_ptr(&cache.slot_map, 0);

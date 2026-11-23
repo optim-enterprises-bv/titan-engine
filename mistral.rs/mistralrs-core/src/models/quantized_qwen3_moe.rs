@@ -87,6 +87,11 @@ impl Experts {
         indices: &Tensor,
         preds: &[(&Experts, usize, Tensor)],
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if matches!(self, Experts::Tiered { .. }) {
+            // the CPU twin computes misses with `titan_cpu::silu_mul`: the GPU's SwiGLU must give its bits
+            return self.forward_act_lookahead(xs, indices, preds, titan_swiglu, true);
+        }
         self.forward_act_lookahead(
             xs,
             indices,
@@ -979,4 +984,42 @@ impl ModelWeights {
         let x = extract_logits(&x, context_lens)?;
         self.output.forward(&x.contiguous()?)
     }
+}
+
+#[cfg(feature = "cuda")]
+const TITAN_FUSED_PTX: &str = include_str!("titan_fused_oxide.ptx");
+
+/// SwiGLU `(g / (1 + e^-g)) * u` of the tiered experts through titan-fused's `titan_swiglu_f32` (IEEE ops and a portable
+/// exp), bit-identical to the CPU twin's `titan_cpu::silu_mul`; anything but contiguous F32 CUDA goes through
+/// `mul_and_act`.
+#[cfg(feature = "cuda")]
+fn titan_swiglu(g: &Tensor, u: &Tensor) -> Result<Tensor> {
+    use candle_core::cuda::cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
+    let (Device::Cuda(dev), true) = (g.device(), g.dtype() == DType::F32 && u.dtype() == DType::F32 && g.shape() == u.shape()) else {
+        return crate::ops::mul_and_act(g, u, crate::layers::Activation::Silu);
+    };
+    let (g, u) = (g.contiguous()?, u.contiguous()?);
+    let n = g.elem_count();
+    let stream = dev.cuda_stream();
+    let ptr = |t: &Tensor| -> Result<u64> {
+        let (st, l) = t.storage_and_layout();
+        let candle_core::Storage::Cuda(cs) = &*st else {
+            candle_core::bail!("titan swiglu: not on CUDA");
+        };
+        let (p, _g) = cs.as_cuda_slice::<f32>()?.device_ptr(&stream);
+        Ok(p + (l.start_offset() * 4) as u64)
+    };
+    let (pg, pu) = (ptr(&g)?, ptr(&u)?);
+    let out = unsafe { dev.alloc::<f32>(n)? };
+    let po = out.device_ptr(&stream).0;
+    let f = dev.get_or_load_custom_func("titan_swiglu_f32", "titan_fused_oxide", TITAN_FUSED_PTX)?;
+    let n32 = n as u32;
+    let mut b = f.builder();
+    b.arg(&pg).arg(&pu).arg(&po).arg(&n32);
+    unsafe { b.launch(LaunchConfig { grid_dim: (n.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
+        .map_err(candle_core::Error::wrap)?;
+    Ok(Tensor::from((
+        candle_core::Storage::Cuda(candle_core::cuda::CudaStorage::wrap_cuda_slice(out, dev.clone())),
+        g.shape().clone(),
+    )))
 }
