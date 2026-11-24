@@ -1620,11 +1620,22 @@ impl Engine {
                             // starts from nothing the failed step touched (Inkling at 128k on 16 GB: a few hundred MiB of
                             // pool fragmentation after a long decode decides whether the first chunks fit).
                             let fresh_prompt = scheduled.prompt.iter().all(|seq| seq.token_offset() == 0 && !seq.has_hybrid_resume());
+                            // A hybrid prefix resume is retryable too: the restore rebuilds the attention KV, rings and
+                            // recurrent state from the entry's host copies, so restoring again undoes the failed step
+                            // (Inkling at 128k: a resumed 70k-token agent turn ran out of memory once).
+                            let resumes: Vec<Option<crate::kv_cache::HybridResume>> =
+                                scheduled.prompt.iter().map(|seq| seq.hybrid_resume().cloned()).collect();
+                            let resumed_retry = resumes.iter().any(Option::is_some)
+                                && scheduled
+                                    .prompt
+                                    .iter()
+                                    .all(|seq| seq.has_hybrid_resume() || seq.token_offset() == 0);
                             let retryable_oom = (matches!(
                                 pipeline.cache(),
                                 crate::pipeline::EitherCache::Normal(_)
                             ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume()))
-                                || fresh_prompt;
+                                || fresh_prompt
+                                || resumed_retry;
                             // Token counts before the step: an OOM raised after sampling had already
                             // appended to (and maybe streamed for) a sequence must not run that
                             // sequence again, so the retry only happens if nothing advanced.
@@ -1696,21 +1707,39 @@ impl Engine {
                                                 before >> 20,
                                                 after >> 20
                                             );
-                                            let retried = pipeline
-                                                .step(
-                                                    &mut scheduled.prompt,
-                                                    true,
-                                                    return_raw_logits,
-                                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
-                                                    self.disable_eos_stop,
-                                                    rng.clone(),
-                                                    CacheBackendMetadata::DefaultInstructions {
-                                                        pre_op,
-                                                        post_op,
-                                                    },
-                                                    self.logger.as_ref(),
-                                                )
-                                                .await;
+                                            let mut restored_again = Ok(());
+                                            for (seq, resume) in scheduled.prompt.iter_mut().zip(&resumes) {
+                                                if let Some(resume) = resume {
+                                                    seq.set_hybrid_resume(Some(resume.clone()));
+                                                    restored_again = pipeline.hybrid_prefix_restore(seq);
+                                                    if restored_again.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            let retried = match restored_again {
+                                                Err(e) => {
+                                                    tracing::error!("titan: prefix restore before the retry failed: {e}");
+                                                    Err(e)
+                                                }
+                                                Ok(()) => {
+                                                    pipeline
+                                                    .step(
+                                                        &mut scheduled.prompt,
+                                                        true,
+                                                        return_raw_logits,
+                                                        &mut *get_mut_arcmutex!(self.prefix_cacher),
+                                                        self.disable_eos_stop,
+                                                        rng.clone(),
+                                                        CacheBackendMetadata::DefaultInstructions {
+                                                            pre_op,
+                                                            post_op,
+                                                        },
+                                                        self.logger.as_ref(),
+                                                    )
+                                                    .await
+                                                }
+                                            };
                                             if retried.is_ok() {
                                                 tracing::info!(
                                                     "titan: prompt step succeeded on retry after releasing memory"

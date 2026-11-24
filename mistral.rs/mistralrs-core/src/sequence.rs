@@ -1385,6 +1385,10 @@ impl Sequence {
         self.hybrid_resume.is_some()
     }
 
+    pub fn hybrid_resume(&self) -> Option<&crate::kv_cache::HybridResume> {
+        self.hybrid_resume.as_ref()
+    }
+
     pub fn take_hybrid_resume(&mut self) -> Option<crate::kv_cache::HybridResume> {
         self.hybrid_resume.take()
     }
