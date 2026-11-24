@@ -1615,10 +1615,16 @@ impl Engine {
                             // prefix-cache hit, which every request sharing a chat template is), so the failed
                             // step left the sequences' own caches untouched. Recurrent state (EitherCache::Hybrid,
                             // a hybrid prefix resume) is updated in place and is not retried.
-                            let retryable_oom = matches!(
+                            // A fresh prompt (token offset 0, nothing restored) is retryable with any cache: the pre_op
+                            // resets the cache and the model reinitializes its recurrent state at position 0, so the rerun
+                            // starts from nothing the failed step touched (Inkling at 128k on 16 GB: a few hundred MiB of
+                            // pool fragmentation after a long decode decides whether the first chunks fit).
+                            let fresh_prompt = scheduled.prompt.iter().all(|seq| seq.token_offset() == 0 && !seq.has_hybrid_resume());
+                            let retryable_oom = (matches!(
                                 pipeline.cache(),
                                 crate::pipeline::EitherCache::Normal(_)
-                            ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume());
+                            ) && scheduled.prompt.iter().all(|seq| !seq.has_hybrid_resume()))
+                                || fresh_prompt;
                             // Token counts before the step: an OOM raised after sampling had already
                             // appended to (and maybe streamed for) a sequence must not run that
                             // sequence again, so the retry only happens if nothing advanced.
