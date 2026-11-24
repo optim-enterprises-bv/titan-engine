@@ -3567,14 +3567,17 @@ impl ModelWeights {
         // decode: each residual add and the RMSNorm after it as one kernel (titan_add_rmsnorm), the next layer's input
         // norm carried over in `pending`
         #[cfg(feature = "cuda")]
-        let fuse = x.dim(1)? == 1
+        // prompt rows too (TITAN_ADD_NORM_PREFILL, default on): the kernel runs one block per row with rmsnorm_f32's
+        // per-row order, and a prompt chunk's unfused cast_bf16_f32 + badd + rmsnorm + cast_f32_bf16 took ~0.55 ms of
+        // each 2048-row layer, twice per layer
+        let fuse = (x.dim(1)? == 1 || mistralrs_quant::titan_cfg::flag("TITAN_ADD_NORM_PREFILL", true))
             && x.device().is_cuda()
             && add_norm_on()
             && (0..self.layers.len()).all(|i| self.layer_device(i).same_device(&self.device));
         #[cfg(feature = "cuda")]
         if fuse {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::info!("titan decode trunk: fused residual add + RMSNorm (titan_add_rmsnorm) on"));
+            ONCE.call_once(|| tracing::info!("titan trunk: fused residual add + RMSNorm (titan_add_rmsnorm) on"));
         }
         #[cfg(not(feature = "cuda"))]
         let fuse = false;
