@@ -186,7 +186,7 @@ fn call512(st: &Arc<CudaStream>, main: &CudaFunction, comb: &CudaFunction, ks: K
         }
         let mut p: Vec<*mut std::ffi::c_void> = a.iter_mut().map(|v| v.as_mut_ptr() as *mut std::ffi::c_void).collect();
         unsafe {
-            kdiff::cuda_core::simt::launch_kernel_on_stream(main, (s.div_ceil((16 / ks.krep) * nw) as u32, gy, gz), ((32 * nw) as u32, 1, 1), 0, st, &mut p)
+            kdiff::cuda_core::simt::launch_kernel_on_stream(main, (s.div_ceil(16 * nw / ks.krep) as u32, gy, gz), ((32 * nw) as u32, 1, 1), 0, st, &mut p)
                 .unwrap()
         };
         if nsplit > 1 {
@@ -287,7 +287,9 @@ fn suite(st: &Arc<CudaStream>, m: &Arc<CudaModule>, label: &str, d: usize, f16: 
     let (mut n_var, mut n_var_diff) = (0usize, 0usize);
     let (mut n_mut, mut n_mut_caught) = (0usize, 0usize);
     for &(s, past, kvh, win) in cases {
-        let c = Case { d, f16, s, past, cap: past + s + 40, h: 16, kvh, qmul: if (s + past) % 2 == 0 { 1.0 } else { 3.0 } };
+        let krep = vars[0].1.krep;
+        let h = if 16 % krep == 0 { 16 } else { kvh * krep };
+        let c = Case { d, f16, s, past, cap: past + s + 40, h, kvh, qmul: if (s + past) % 2 == 0 { 1.0 } else { 3.0 } };
         let gq = (c.h / c.kvh / 8).max(1);
         let dt = make(rng, &c);
         let b = upload(st, &dt);
@@ -406,6 +408,12 @@ pub fn run(ctx: &Arc<kdiff::cuda_core::CudaContext>, m: &Arc<CudaModule>) -> boo
     }
     ok &= suite(&st, m, "d128 bf16", 128, false, &[("flash_prefill_d128_w8", k(8, 8, false))], &c128, &mut rng);
     ok &= suite(&st, m, "d128 f16 o32", 128, true, &[("flash_prefill_d128_w8_f16o32", k(8, 8, true))], &c128, &mut rng);
+    // head dim 256, 6 query heads per KV head (kvh 4: the dense 27B), unpadded rows of (position, head)
+    let c256r6: Vec<(usize, usize, usize, usize)> = vec![
+        (1, 0, 4, 0), (7, 0, 4, 0), (20, 0, 4, 0), (21, 0, 4, 0), (22, 0, 4, 0), (64, 0, 4, 0), (511, 37, 4, 0),
+        (100, 3000, 4, 0), (512, 4608, 4, 0), (2048, 0, 4, 0), (2048, 6144, 4, 0), (300, 50, 4, 100),
+    ];
+    ok &= suite(&st, m, "d256 r6 bf16", 256, false, &[("flash_prefill_w8_r6", k(8, 6, false))], &c256r6, &mut rng);
 
     // the existing kernels against the base PTX (the integ2 committed one), bit for bit
     let base_path = std::env::var("FP_BASE_PTX")
