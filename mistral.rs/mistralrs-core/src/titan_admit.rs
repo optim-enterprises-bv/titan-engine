@@ -27,7 +27,7 @@ pub(crate) fn set_kv_bytes_per_token(bytes: usize) {
     KV_BYTES_PER_TOKEN.store(bytes, Ordering::Relaxed);
 }
 
-fn kv_bytes_per_token() -> usize {
+pub(crate) fn kv_bytes_per_token() -> usize {
     KV_BYTES_PER_TOKEN.load(Ordering::Relaxed)
 }
 
