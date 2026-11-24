@@ -29,11 +29,12 @@ __device__ __forceinline__ void mma(float* d, unsigned int a0, unsigned int a1, 
 #define MLD 20    // A / M row stride
 
 // grid (V / VS, BH), block 128 (4 warps). q, k: [BH, S, 128]; v, out: [BH, S, V]; g, beta: [BH, S];
-// state: [BH, 128, V] (row = key index), updated in place.
+// state: [BH, 128, V] (row = key index), updated in place. outb != null: y goes there instead, bf16 (round to nearest
+// even) token-major [B, S, H, V] with bh = b H + h.
 extern "C" __global__ void __launch_bounds__(128) titan_gdn_tc(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ g, const float* __restrict__ beta, float* __restrict__ state,
-    float* __restrict__ out, int S, int V)
+    float* __restrict__ out, int S, int V, unsigned short* __restrict__ outb, int H)
 {
     __shared__ float Ss[KD * SLD];
     __shared__ float Qs[CT * QLD];
@@ -146,7 +147,15 @@ extern "C" __global__ void __launch_bounds__(128) titan_gdn_tc(
             }
             for (int e = 0; e < 4; e++) {
                 const int t = gid + 8 * (e >> 1);
-                if (t < valid) ob[(size_t)(t0 + t) * V + v0 + n0 + 2 * tig + (e & 1)] = y[e];
+                if (t >= valid) continue;
+                const int c = v0 + n0 + 2 * tig + (e & 1);
+                if (outb) {
+                    unsigned short r;
+                    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(r) : "f"(y[e]));
+                    outb[(((size_t)(bh / H) * S + t0 + t) * H + bh % H) * V + c] = r;
+                } else {
+                    ob[(size_t)(t0 + t) * V + c] = y[e];
+                }
             }
         }
         // ---- S <- gamma_C S0 + (K * gamma_C / gamma)^T delta: warp w, state rows 32w..32w+31, all 32 columns
@@ -211,6 +220,18 @@ pub fn supported(q: &Tensor, v: &Tensor) -> bool {
 /// q, k [BH, S, 128], v [BH, S, V], g, beta [BH, S], state [BH, 128, V] (all f32, state updated); returns [BH, S, V].
 #[cfg(feature = "cuda")]
 pub fn recurrence(q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor, state: &mut Tensor) -> Result<Tensor> {
+    launch(q, k, v, g, beta, state, None)
+}
+
+/// `recurrence` with y written as bf16 in token-major [B, S, H, V] (`heads` = H): the transpose and cast the
+/// head-major f32 output went through, folded into its store.
+#[cfg(feature = "cuda")]
+pub fn recurrence_tm_bf16(q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor, state: &mut Tensor, heads: usize) -> Result<Tensor> {
+    launch(q, k, v, g, beta, state, Some(heads))
+}
+
+#[cfg(feature = "cuda")]
+fn launch(q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor, state: &mut Tensor, tm: Option<usize>) -> Result<Tensor> {
     use candle_core::cuda::cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
     use candle_core::{DType, Storage};
     let (bh, s, _) = q.dims3()?;
@@ -233,17 +254,38 @@ pub fn recurrence(q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor,
         let base = cs.as_cuda_slice::<f32>()?.device_ptr(&stream).0;
         Ok(base + 4 * l.start_offset() as u64)
     };
-    let check = mistralrs_quant::titan_cfg::flag("TITAN_GDN_TC_CHECK", false);
+    let check = mistralrs_quant::titan_cfg::flag("TITAN_GDN_TC_CHECK", false) && tm.is_none()
+        || mistralrs_quant::titan_cfg::flag("TITAN_GDN_TC_TM_CHECK", false) && tm.is_some();
     let state_before = if check { Some(state.copy()?) } else { None };
-    let out = unsafe { dev.alloc::<f32>(bh * s * vd)? };
+    let out = unsafe { dev.alloc::<f32>(if tm.is_some() { 1 } else { bh * s * vd })? };
+    let outb = if tm.is_some() { Some(unsafe { dev.alloc::<half::bf16>(bh * s * vd)? }) } else { None };
     let (pq, pk, pv, pg, pb, ps) = (ptr(&q)?, ptr(&k)?, ptr(&v)?, ptr(&g)?, ptr(&beta)?, ptr(state)?);
     let po = out.device_ptr(&stream).0;
+    let pob = outb.as_ref().map_or(0u64, |b| b.device_ptr(&stream).0);
+    let hi = tm.unwrap_or(1) as i32;
     let f = dev.get_or_load_custom_func("titan_gdn_tc", "titan_gdn_tc", ptx()?)?;
     let (si, vi) = (s as i32, vd as i32);
     let mut b = f.builder();
-    b.arg(&pq).arg(&pk).arg(&pv).arg(&pg).arg(&pb).arg(&ps).arg(&po).arg(&si).arg(&vi);
+    b.arg(&pq).arg(&pk).arg(&pv).arg(&pg).arg(&pb).arg(&ps).arg(&po).arg(&si).arg(&vi).arg(&pob).arg(&hi);
     let cfg = LaunchConfig { grid_dim: ((vd / 32) as u32, bh as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
     unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    if let (Some(ob), Some(h)) = (outb, tm) {
+        let y = Tensor::from((Storage::Cuda(candle_core::cuda::CudaStorage::wrap_cuda_slice(ob, dev.clone())), candle_core::Shape::from((bh / h, s, h, vd))));
+        if let Some(mut ref_state) = state_before {
+            // the head-major f32 path from the same starting state, transposed and cast: must match bit for bit
+            let want = launch(&q, &k, &v, &g, &beta, &mut ref_state, None)?
+                .reshape((bh / h, h, s, vd))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .to_dtype(DType::BF16)?;
+            let bits = |t: &Tensor| -> Result<Vec<u16>> { Ok(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|x| (x.to_bits() >> 16) as u16).collect()) };
+            let d = bits(&y)?.iter().zip(bits(&want)?).filter(|(a, b)| **a != *b).count();
+            if d > 0 {
+                tracing::warn!("titan_gdn_tc tm check: {d} of {} bf16 outputs differ", y.elem_count());
+            }
+        }
+        return Ok(y);
+    }
     let out = Tensor::from((Storage::Cuda(candle_core::cuda::CudaStorage::wrap_cuda_slice(out, dev.clone())), candle_core::Shape::from((bh, s, vd))));
     if let Some(mut ref_state) = state_before {
         let want = super::cuda_gdn::sequential_recurrence(&q, &k, &v, &g, &beta, &mut ref_state)?;

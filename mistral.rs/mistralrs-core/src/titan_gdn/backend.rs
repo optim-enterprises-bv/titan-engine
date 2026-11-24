@@ -231,6 +231,14 @@ fn recurrence_cuda_from_convolved(
             dims.head_k_dim,
             dims.head_v_dim,
         )?;
+        if dtype == DType::BF16 && seq_len >= super::tc::MIN_TOKENS && super::tc::supported(&q_bh, &v_bh) && mistralrs_quant::titan_cfg::flag("TITAN_GDN_TC_TM", true) {
+            // tensor-core recurrence writing bf16 token-major y: no transpose copy, no cast
+            let y = super::tc::recurrence_tm_bf16(&q_bh, &k_bh, &v_bh, &g_bh, &beta_bh, &mut state_flat, dims.num_v_heads)?;
+            cache.recurrent_state = state_flat
+                .reshape((batch_size, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim))?
+                .to_dtype(cache.recurrent_state.dtype())?;
+            return Ok(y);
+        }
         if seq_len >= RECURRENCE_CHUNK_THRESHOLD && use_warp_prefill_recurrence(dims) {
             super::cuda_gdn::warp_gated_delta_rule_recurrence_cuda(
                 &q_bh,
