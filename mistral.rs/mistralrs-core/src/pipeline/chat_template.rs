@@ -735,6 +735,15 @@ fn unknown_method_with_map_get(
     minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
 }
 
+/// Off as the template spells it: "none" for templates that key efforts by "none" and have no "off" (Inkling).
+fn effort_wire(effort: ReasoningEffort, template: &str) -> &'static str {
+    if effort.is_off() && template.contains("\"none\"") && !template.contains("\"off\"") {
+        "none"
+    } else {
+        effort.as_str()
+    }
+}
+
 pub fn apply_chat_template_to(
     mut messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
@@ -874,7 +883,7 @@ pub fn apply_chat_template_to(
     let reasoning_controls = resolve_reasoning_controls(enable_thinking, reasoning_effort)?;
     let reasoning_effort_value = reasoning_controls
         .reasoning_effort
-        .map(|effort| Value::from(effort.as_str()))
+        .map(|effort| Value::from(effort_wire(effort, &template)))
         .unwrap_or(Value::UNDEFINED);
 
     // Detect builtin tools from the tools list
