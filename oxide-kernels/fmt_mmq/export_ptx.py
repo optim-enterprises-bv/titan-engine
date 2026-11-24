@@ -33,5 +33,5 @@ for fmt in ("iq4_nl", "mxfp4", "nvfp4", "iq4_xs") + IQUANTS:
     open(path, "w").write("\n".join(out) + "\n")
     r = subprocess.run(["/usr/local/cuda/bin/ptxas", "-arch=sm_120a", "-O3", path, "-o", "/dev/null"], capture_output=True, text=True)
     print(f"{path}: {n} entries, {os.path.getsize(path)} bytes, ptxas rc={r.returncode} {r.stderr.strip()[:200]}")
-    ok &= r.returncode == 0 and n == 35
+    ok &= r.returncode == 0 and n == 36  # 35 + the j128 bf16-out instance
 sys.exit(0 if ok else 1)
