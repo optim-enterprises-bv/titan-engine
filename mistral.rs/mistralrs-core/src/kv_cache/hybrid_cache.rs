@@ -4383,6 +4383,9 @@ pub struct HybridPrefixPoint {
     pub boundary: bool,
     pub gdn: Vec<RecurrentStateSnapshot>,
     pub mtp_hidden: Option<Tensor>,
+    /// Host copies of sliding-window attention rings at `len` per layer (`None` elsewhere; empty for models
+    /// whose attention KV is all cut-able, inkling2's are rotating).
+    pub windows: Vec<Option<(super::RotatingCacheSnapshot, super::RotatingCacheSnapshot)>>,
 }
 
 /// A finished hybrid sequence kept for prefix reuse (host memory): the tokens its caches cover, the
@@ -4408,6 +4411,14 @@ impl HybridPrefixPoint {
             .map(|s| tensor_bytes(&s.conv_state) + tensor_bytes(&s.recurrent_state))
             .sum::<usize>()
             + self.mtp_hidden.as_ref().map_or(0, tensor_bytes)
+            + self
+                .windows
+                .iter()
+                .flatten()
+                .flat_map(|(k, v)| [k, v])
+                .filter_map(|w| w.retained.as_ref())
+                .map(tensor_bytes)
+                .sum::<usize>()
     }
 }
 
