@@ -142,6 +142,10 @@ const AUTO_PREFIX_CACHE_ENTRIES: &str = "4";
 const AUTO_MMAP_RAM_SHARE: f64 = 0.6;
 /// VRAM headroom (MiB) kept next to the weights and KV when deciding whether KV goes to host RAM.
 const AUTO_KV_HEADROOM_MIB: u64 = 1536;
+/// VRAM kept free (prompt chunks, kernel workspaces) when sizing the context of a model that cannot offload layers.
+const AUTO_NOOFFLOAD_HEADROOM_MIB: u64 = 2560;
+/// The automatic context never goes below this (agent prompts need >= 128k).
+const AUTO_MIN_CTX: usize = 131072;
 
 fn total_ram_bytes() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
@@ -235,6 +239,13 @@ fn auto_settings(arch: &str, paths: &dyn ModelPaths, device: &Device, max_seq_le
         // MTP's output equals plain decode's, and it measured faster (Qwen3.6-35B-A3B: 112 vs 107 tok/s)
         put("TITAN_VERIFY_MMQ", "0");
         put("TITAN_DENSE_BF16_MATVEC", "0");
+    }
+    if matches!(arch, "inkling2" | "inkling2_loop") {
+        // 8 full-attention visits x 8 KV heads x (128 + 128) = 32 KiB/token in BF16: a 128k window (4 GiB) does not fit
+        // next to the 12.4 GB weights of Inkling 2 Mini on a 16 GB card, and Inkling cannot offload layers. F8E4M3 halves
+        // it, allocated once so a long prompt does not grow the cache through reallocations.
+        put("TITAN_KV_FP8", "1");
+        put("TITAN_KV_PREALLOC", "1");
     }
     if matches!(arch, "qwen35moe" | "qwen35" | "qwen3next") {
         put("TITAN_CUDA_GRAPHS", "1");
@@ -408,6 +419,34 @@ pub(super) fn load(
             cfg.num_kv_heads(), cfg.k_head_dim(), cfg.v_head_dim(), kv_dtype, per_token
         );
         crate::titan_admit::set_kv_bytes_per_token(per_token);
+    }
+    // Inkling cannot put layers on the CPU, so a context whose KV does not fit next to the weights fails the load
+    // (its native 1M tokens = 4 GiB of BF16 KV on top of 12.4 GB of weights on a 16 GB card). Without an explicit
+    // context, halve the automatic one until weights + KV + headroom fit the card, never below 128k tokens.
+    if matches!(arch_name, "inkling2" | "inkling2_loop") && device.is_cuda() && auto_ctx == Some(crate::AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)
+        && !mistralrs_quant::titan_cfg::is_explicit("TITAN_MAX_SEQ_LEN")
+    {
+        if let DeviceMapSetting::Auto(
+            crate::AutoDeviceMapParams::Text { max_seq_len, .. } | crate::AutoDeviceMapParams::Multimodal { max_seq_len, .. },
+        ) = &mut mapper
+        {
+            let per_token = crate::titan_admit::kv_bytes_per_token() as u64;
+            let weights: u64 = paths.get_weight_filenames().iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+            let vram = total_vram_bytes(device);
+            let fits = |ctx: usize| weights + per_token * ctx as u64 + (AUTO_NOOFFLOAD_HEADROOM_MIB << 20) <= vram;
+            let mut ctx = *max_seq_len;
+            while ctx > AUTO_MIN_CTX && !fits(ctx) {
+                ctx = (ctx / 2).max(AUTO_MIN_CTX);
+            }
+            if vram > 0 && ctx != *max_seq_len {
+                tracing::info!(
+                    "titan context: {} tokens of KV ({} MiB) do not fit next to the weights on this card; using {ctx} (all layers on the GPU)",
+                    *max_seq_len, (per_token * *max_seq_len as u64) >> 20
+                );
+                *max_seq_len = ctx;
+                mistralrs_quant::titan_cfg::put_auto("TITAN_MAX_SEQ_LEN", &ctx.to_string());
+            }
+        }
     }
     if let DeviceMapSetting::Auto(params) = mapper.clone() {
         crate::titan_monitor::set_max_seq_len(params.max_seq_len());

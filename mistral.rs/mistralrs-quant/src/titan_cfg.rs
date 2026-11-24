@@ -139,6 +139,20 @@ pub fn set_auto(settings: HashMap<String, String>) {
     GEN.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Change one automatic default after [`set_auto`] (a loader decision that needs numbers known only later).
+pub fn put_auto(name: &str, value: &str) {
+    tracing::info!("titan automatic settings: {name}={value}");
+    if let Some(m) = AUTO.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.insert(name.to_string(), value.to_string());
+    }
+    GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Whether `name` is set explicitly (model overlay or environment), not only by the automatic layer.
+pub fn is_explicit(name: &str) -> bool {
+    var_explicit(name).is_some()
+}
+
 /// The overlay or environment value of `name`, without the automatic layer.
 fn var_explicit(name: &str) -> Option<String> {
     if let Some(m) = OVERLAY.read().unwrap_or_else(|e| e.into_inner()).as_ref() {

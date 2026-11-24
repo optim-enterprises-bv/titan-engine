@@ -9,6 +9,8 @@ pub(crate) const CONV_MAX_TAPS: usize = 8;
 /// Attention: aim for this many (kv head, query, split) blocks, never fewer than this many keys per split.
 const ATTN_TARGET_BLOCKS: usize = 512;
 const ATTN_MIN_KEYS: usize = 64;
+/// Chunks of at least this many queries use the tiled prefill kernel (`INKLING_FA=0`: never).
+const FA_MIN_T: usize = 16;
 
 #[cfg(feature = "cuda")]
 const SRC: &str = r#"
@@ -105,6 +107,21 @@ extern "C" __global__ void ink_mix(
 }
 
 __device__ __forceinline__ float bf16f(unsigned short b) { return __uint_as_float(((unsigned)b) << 16); }
+// F8E4M3 (bias 7, no infinities) to f32, exact: normals 2^(e-7) * (1 + m/8), subnormals m * 2^-9
+__device__ __forceinline__ float e4m3f(unsigned int b) {
+    const unsigned int s = (b & 0x80u) << 24, e = (b >> 3) & 0xFu, m = b & 7u;
+    if (e == 0) return __uint_as_float(s | __float_as_uint((float)m * 0.001953125f));
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+// 4 consecutive K/V elements starting at element `e` of a bf16 (fp8 == 0) or F8E4M3 cache
+__device__ __forceinline__ float4 kv4(const void* base, long long e, int fp8) {
+    if (fp8) {
+        const unsigned int w = *(const unsigned int*)((const unsigned char*)base + e);
+        return make_float4(e4m3f(w & 0xFF), e4m3f((w >> 8) & 0xFF), e4m3f((w >> 16) & 0xFF), e4m3f(w >> 24));
+    }
+    const unsigned short* p = (const unsigned short*)base + e;
+    return make_float4(bf16f(p[0]), bf16f(p[1]), bf16f(p[2]), bf16f(p[3]));
+}
 
 // flash-decoding style: block (4 warps) per (head, query, sequence); each warp walks every 4th key with an
 // online softmax, lanes hold 4 of the 128 dims. logit = q.k * scale + table[dist]; one extra zero-logit sink.
@@ -163,10 +180,10 @@ extern "C" __global__ void ink_attn(
 // each K/V row. Writes per (split, head) the running max, sum and unnormalized 128-wide accumulator.
 #define ATTN_G_MAX 8
 extern "C" __global__ void ink_attn_split(
-    const float* __restrict__ q, const unsigned short* __restrict__ k, const unsigned short* __restrict__ v,
+    const float* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,
     long long kh, long long kj, long long vh, long long vj,
     const float* __restrict__ table, float* __restrict__ part,
-    int T, int H, int Hkv, int L, int ext, int start, int first_key, int swa, int n_swa, float scale, int S)
+    int T, int H, int Hkv, int L, int ext, int start, int first_key, int swa, int n_swa, float scale, int S, int fp8)
 {
     const int hk = blockIdx.x, ti = blockIdx.y, sp = blockIdx.z;
     const int G = H / Hkv;
@@ -184,15 +201,13 @@ extern "C" __global__ void ink_attn_split(
         m[g] = -3.402823466e38f; s[g] = 0.f;
         a[g][0] = a[g][1] = a[g][2] = a[g][3] = 0.f;
     }
-    const unsigned short* kb = k + hk * kh;
-    const unsigned short* vb = v + hk * vh;
     for (int j = j0 + warp; j < j1; j += 4) {
         const int kp = first_key + j;
         if (kp > p || (swa && p - kp >= n_swa)) continue;
-        const unsigned short* kr = kb + j * kj + lane * 4;
-        const float k0 = bf16f(kr[0]), k1 = bf16f(kr[1]), k2 = bf16f(kr[2]), k3 = bf16f(kr[3]);
-        const unsigned short* vr = vb + j * vj + lane * 4;
-        const float v0 = bf16f(vr[0]), v1 = bf16f(vr[1]), v2 = bf16f(vr[2]), v3 = bf16f(vr[3]);
+        const float4 kf = kv4(k, hk * kh + (long long)j * kj + lane * 4, fp8);
+        const float4 vf = kv4(v, hk * vh + (long long)j * vj + lane * 4, fp8);
+        const float k0 = kf.x, k1 = kf.y, k2 = kf.z, k3 = kf.w;
+        const float v0 = vf.x, v1 = vf.y, v2 = vf.z, v3 = vf.w;
         const int dist = p - kp;
         const int idx = dist < ext ? dist : ext;
         for (int g = 0; g < G; g++) {
@@ -372,6 +387,211 @@ extern "C" __global__ void ink_ctrl_out(const float* __restrict__ cur, const flo
 }
 "#;
 
+/// Prefill attention (tensor cores): compiled for compute_80 (mma.sync tf32), separately from `SRC`.
+#[cfg(feature = "cuda")]
+const FA_SRC: &str = r#"
+__device__ __forceinline__ float bf16f(unsigned short b) { return __uint_as_float(((unsigned int)b) << 16); }
+__device__ __forceinline__ float e4m3f(unsigned int b) {
+    const unsigned int s = (b & 0x80u) << 24, e = (b >> 3) & 0xFu, m = b & 7u;
+    if (e == 0) return __uint_as_float(s | __float_as_uint((float)m * 0.001953125f));
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+__device__ __forceinline__ unsigned int tf32(float x) {
+    unsigned int r; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x)); return r;
+}
+__device__ __forceinline__ void mma_tf32(float* d, const unsigned int* a, unsigned int b0, unsigned int b1) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+#define KT 32
+#define KLD 132
+#define VLD 136
+#define PLD 36
+
+// Prefill attention with Inkling's relative-position bias and zero-logit sink. Block = 4 warps = 64 (query, head)
+// rows of one kv head (row r = query (r / G) of the block's QT = 64 / G, head g = r % G); K/V tiles of 32 keys go
+// through shared memory once per block. Warp w owns rows 16w..16w+15: S = Q K^T and O += P V on mma.m16n8k8 (tf32 in,
+// f32 accumulate), online softmax in the accumulator registers (lane holds rows lane/4 and lane/4 + 8). The sink is
+// the starting state: running max 0, running sum 1 (exp(0 - 0)).
+extern "C" __global__ void __launch_bounds__(128) ink_attn_fa(
+    const float* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,
+    long long kh, long long kj, long long vh, long long vj,
+    const float* __restrict__ table, float* __restrict__ out,
+    int T, int H, int Hkv, int L, int ext, int start, int first_key, int swa, int n_swa, float scale, int fp8)
+{
+    __shared__ float Ks[KT * KLD];
+    __shared__ float Vs[KT * VLD];
+    __shared__ float Ps[4][16 * PLD];
+    const int hk = blockIdx.x;
+    const int G = H / Hkv;
+    const int QT = 64 / G;
+    const int q0 = blockIdx.y * QT;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int gid = lane >> 2, tig = lane & 3;
+
+    // this lane's two rows
+    int rq[2], rh[2], rp[2]; bool rv[2]; const float* rt[2];
+    for (int u = 0; u < 2; u++) {
+        const int r = warp * 16 + gid + 8 * u;
+        const int qi = q0 + r / G;
+        rv[u] = (r / G) < QT && qi < T;
+        rq[u] = rv[u] ? qi : q0;
+        rh[u] = hk * G + r % G;
+        rp[u] = start + rq[u];
+        rt[u] = table + ((size_t)rq[u] * H + rh[u]) * (ext + 1);
+    }
+    // Q fragments (tf32), 16 k-steps of 8 dims
+    unsigned int qa[16][4];
+    {
+        const float* q0p = q + ((size_t)rq[0] * H + rh[0]) * 128;
+        const float* q1p = q + ((size_t)rq[1] * H + rh[1]) * 128;
+        for (int ks = 0; ks < 16; ks++) {
+            qa[ks][0] = rv[0] ? tf32(q0p[ks * 8 + tig]) : 0u;
+            qa[ks][1] = rv[1] ? tf32(q1p[ks * 8 + tig]) : 0u;
+            qa[ks][2] = rv[0] ? tf32(q0p[ks * 8 + tig + 4]) : 0u;
+            qa[ks][3] = rv[1] ? tf32(q1p[ks * 8 + tig + 4]) : 0u;
+        }
+    }
+    float o[16][4];
+    for (int n = 0; n < 16; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+    float m[2] = {0.f, 0.f}, l[2] = {0.f, 0.f};  // l: this lane's partial sums (the sink's 1 is added at the end)
+
+    const int qlast = min(q0 + QT, T) - 1;
+    const int pmin = start + q0, pmax = start + qlast;
+    const int j_end = min(L, pmax - first_key + 1);
+    const int j_beg = swa ? max(0, pmin - n_swa + 1 - first_key) : 0;
+    float* P = Ps[warp];
+
+    for (int j0 = j_beg; j0 < j_end; j0 += KT) {
+        __syncthreads();
+        {   // K/V tile -> shared (f32): thread = (key t/4, 32 dims)
+            const int kk = threadIdx.x >> 2, d0 = (threadIdx.x & 3) * 32;
+            const int j = j0 + kk;
+            if (j < j_end && fp8) {
+                const uint4* kr = (const uint4*)((const unsigned char*)k + hk * kh + (size_t)j * kj + d0);
+                const uint4* vr = (const uint4*)((const unsigned char*)v + hk * vh + (size_t)j * vj + d0);
+                for (int c = 0; c < 2; c++) {
+                    uint4 a = kr[c], b = vr[c];
+                    unsigned int aw[4] = {a.x, a.y, a.z, a.w}, bw[4] = {b.x, b.y, b.z, b.w};
+                    for (int e = 0; e < 16; e++) {
+                        Ks[kk * KLD + d0 + c * 16 + e] = e4m3f((aw[e >> 2] >> (8 * (e & 3))) & 0xFF);
+                        Vs[kk * VLD + d0 + c * 16 + e] = e4m3f((bw[e >> 2] >> (8 * (e & 3))) & 0xFF);
+                    }
+                }
+            } else if (j < j_end) {
+                const uint4* kr = (const uint4*)((const unsigned short*)k + hk * kh + (size_t)j * kj + d0);
+                const uint4* vr = (const uint4*)((const unsigned short*)v + hk * vh + (size_t)j * vj + d0);
+                for (int c = 0; c < 4; c++) {
+                    uint4 a = kr[c], b = vr[c];
+                    unsigned int aw[4] = {a.x, a.y, a.z, a.w}, bw[4] = {b.x, b.y, b.z, b.w};
+                    for (int e = 0; e < 4; e++) {
+                        Ks[kk * KLD + d0 + c * 8 + 2 * e] = __uint_as_float(aw[e] << 16);
+                        Ks[kk * KLD + d0 + c * 8 + 2 * e + 1] = __uint_as_float(aw[e] & 0xffff0000u);
+                        Vs[kk * VLD + d0 + c * 8 + 2 * e] = __uint_as_float(bw[e] << 16);
+                        Vs[kk * VLD + d0 + c * 8 + 2 * e + 1] = __uint_as_float(bw[e] & 0xffff0000u);
+                    }
+                }
+            } else {
+                for (int c = 0; c < 32; c++) { Ks[kk * KLD + d0 + c] = 0.f; Vs[kk * VLD + d0 + c] = 0.f; }
+            }
+        }
+        __syncthreads();
+        // S = Q K^T: 4 n-subtiles of 8 keys
+        float s[4][4];
+        for (int n = 0; n < 4; n++) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
+            for (int ks = 0; ks < 16; ks++) {
+                const unsigned int b0 = __float_as_uint(Ks[(n * 8 + gid) * KLD + ks * 8 + tig]);
+                const unsigned int b1 = __float_as_uint(Ks[(n * 8 + gid) * KLD + ks * 8 + tig + 4]);
+                mma_tf32(s[n], qa[ks], b0, b1);
+            }
+        }
+        // logits, mask, tile max per row
+        float tmax[2] = {-3.402823466e38f, -3.402823466e38f};
+        for (int n = 0; n < 4; n++)
+            for (int e = 0; e < 4; e++) {
+                const int u = e >> 1;
+                const int j = j0 + n * 8 + 2 * tig + (e & 1);
+                const int kp = first_key + j;
+                const int p = rp[u];
+                const bool ok = rv[u] && j < j_end && kp <= p && (!swa || p - kp < n_swa);
+                float x = -3.402823466e38f;
+                if (ok) {
+                    const int dist = p - kp;
+                    x = s[n][e] * scale + rt[u][dist < ext ? dist : ext];
+                }
+                s[n][e] = x;
+                tmax[u] = fmaxf(tmax[u], x);
+            }
+        for (int u = 0; u < 2; u++) {
+            tmax[u] = fmaxf(tmax[u], __shfl_xor_sync(0xffffffff, tmax[u], 1));
+            tmax[u] = fmaxf(tmax[u], __shfl_xor_sync(0xffffffff, tmax[u], 2));
+        }
+        float c[2];
+        for (int u = 0; u < 2; u++) {
+            const float mn = fmaxf(m[u], tmax[u]);
+            c[u] = __expf(m[u] - mn);
+            m[u] = mn;
+            l[u] *= c[u];
+        }
+        for (int n = 0; n < 16; n++) { o[n][0] *= c[0]; o[n][1] *= c[0]; o[n][2] *= c[1]; o[n][3] *= c[1]; }
+        // P = exp(logit - m) -> shared (A layout for P V)
+        __syncwarp();
+        for (int n = 0; n < 4; n++)
+            for (int e = 0; e < 4; e++) {
+                const int u = e >> 1;
+                const float pv = s[n][e] > -3.0e38f ? __expf(s[n][e] - m[u]) : 0.f;
+                l[u] += pv;
+                P[(gid + 8 * u) * PLD + n * 8 + 2 * tig + (e & 1)] = pv;
+            }
+        __syncwarp();
+        // O += P V: 4 k-steps of 8 keys x 16 n-subtiles of 8 dims
+        for (int ks = 0; ks < 4; ks++) {
+            unsigned int pa[4];
+            pa[0] = tf32(P[gid * PLD + ks * 8 + tig]);
+            pa[1] = tf32(P[(gid + 8) * PLD + ks * 8 + tig]);
+            pa[2] = tf32(P[gid * PLD + ks * 8 + tig + 4]);
+            pa[3] = tf32(P[(gid + 8) * PLD + ks * 8 + tig + 4]);
+            for (int n = 0; n < 16; n++) {
+                const unsigned int b0 = __float_as_uint(Vs[(ks * 8 + tig) * VLD + n * 8 + gid]);
+                const unsigned int b1 = __float_as_uint(Vs[(ks * 8 + tig + 4) * VLD + n * 8 + gid]);
+                mma_tf32(o[n], pa, b0, b1);
+            }
+        }
+    }
+    // row sums over the 4 lanes of the row, plus the sink
+    for (int u = 0; u < 2; u++) {
+        l[u] += __shfl_xor_sync(0xffffffff, l[u], 1);
+        l[u] += __shfl_xor_sync(0xffffffff, l[u], 2);
+        l[u] += __expf(-m[u]);
+    }
+    for (int u = 0; u < 2; u++) {
+        if (!rv[u]) continue;
+        float* op = out + ((size_t)rq[u] * H + rh[u]) * 128;
+        const float inv = 1.f / l[u];
+        for (int n = 0; n < 16; n++) {
+            op[n * 8 + 2 * tig] = o[n][2 * u] * inv;
+            op[n * 8 + 2 * tig + 1] = o[n][2 * u + 1] * inv;
+        }
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+fn fa_ptx() -> Result<&'static str> {
+    use std::sync::OnceLock;
+    static PTX: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let opts = candle_core::cuda_backend::cudarc::nvrtc::safe::CompileOptions { arch: Some("compute_80"), ..Default::default() };
+        candle_core::cuda_backend::cudarc::nvrtc::safe::compile_ptx_with_opts(FA_SRC, opts).map(|p| p.to_src()).map_err(|e| format!("{e:?}"))
+    })
+    .as_ref()
+    .map(String::as_str)
+    .map_err(|e| candle_core::Error::msg(format!("titan_inkling FA NVRTC compile failed: {e}")))
+}
+
 #[cfg(feature = "cuda")]
 fn ptx() -> Result<&'static str> {
     use std::sync::OnceLock;
@@ -529,22 +749,19 @@ mod imp {
         let (t, h, d) = q.dims3()?;
         let (hkv, l, kd) = k.dims3()?;
         let ext = table.dim(2)? - 1;
-        if d != 128 || kd != 128 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 || h % hkv != 0 || h / hkv > 8 {
-            candle_core::bail!("titan_inkling attn: want 128-wide heads and BF16 K/V");
+        let fp8 = k.dtype() == DType::F8E4M3;
+        if d != 128 || kd != 128 || !matches!(k.dtype(), DType::BF16 | DType::F8E4M3) || v.dtype() != k.dtype() || h % hkv != 0 || h / hkv > 8 {
+            candle_core::bail!("titan_inkling attn: want 128-wide heads and BF16 or F8E4M3 K/V");
         }
-        let bf = |x: &Tensor| -> Result<(u64, i64, i64)> {
-            let (storage, layout) = x.storage_and_layout();
-            let Storage::Cuda(cuda) = &*storage else { candle_core::bail!("titan_inkling attn: K/V not on CUDA") };
-            let st = layout.stride();
-            if st[2] != 1 {
-                candle_core::bail!("titan_inkling attn: K/V last dim must be contiguous");
-            }
-            let stream = dev.cuda_stream();
-            let (base, _g) = cuda.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
-            Ok((base + (layout.start_offset() * 2) as u64, st[0] as i64, st[1] as i64))
-        };
-        let (k_p, kh, kj) = bf(k)?;
-        let (v_p, vh, vj) = bf(v)?;
+        // prefill chunks: tiled tensor-core kernel (K/V read once per 64 (query, head) rows instead of once per query)
+        let g = h / hkv;
+        if t >= FA_MIN_T && g <= 64 && mistralrs_quant::titan_cfg::flag("INKLING_FA", true) {
+            mistralrs_quant::titan_cfg::note_once("ink_attn_fa", || format!("titan_inkling: tiled prefill attention (ink_attn_fa) on: t {t}, H {h}, Hkv {hkv}, L {l}"));
+            return attn_fa(&q, k, v, &table, start, first_key, swa, scale).inspect_err(|e| tracing::warn!("titan_inkling attn_fa: {e}"));
+        }
+        let (k_p, kh, kj) = kv_ptr(k, &dev, 4)?;
+        let (v_p, vh, vj) = kv_ptr(v, &dev, 4)?;
+        let fp8i = i32::from(fp8);
         let q_p = addr(&q, &dev)?;
         let t_p = addr(&table, &dev)?;
         let (out, out_p) = alloc(&dev, t * h * d)?;
@@ -557,7 +774,7 @@ mod imp {
         let f = dev.get_or_load_custom_func("ink_attn_split", "titan_inkling", ptx()?)?;
         let mut b = f.builder();
         b.arg(&q_p).arg(&k_p).arg(&v_p).arg(&kh).arg(&kj).arg(&vh).arg(&vj).arg(&t_p).arg(&part_p);
-        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale).arg(&si);
+        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale).arg(&si).arg(&fp8i);
         unsafe {
             b.launch(LaunchConfig { grid_dim: (hkv as u32, t as u32, splits as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
         }
@@ -570,6 +787,51 @@ mod imp {
         }
         .w()?;
         drop(part);
+        Ok(wrap(out, &dev, &[t, h * d]))
+    }
+
+    /// Base address (bytes) and (head, row) strides in elements of a BF16 or F8E4M3 K/V view whose last dim is
+    /// contiguous; rows and the start must be `align`-byte aligned (the kernels' vector loads).
+    fn kv_ptr(x: &Tensor, dev: &CudaDevice, align: usize) -> Result<(u64, i64, i64)> {
+        let (storage, layout) = x.storage_and_layout();
+        let Storage::Cuda(cuda) = &*storage else { candle_core::bail!("titan_inkling attn: K/V not on CUDA") };
+        let st = layout.stride();
+        let es = x.dtype().size_in_bytes();
+        if st[2] != 1 || (st[1] * es) % align != 0 || (layout.start_offset() * es) % align != 0 {
+            candle_core::bail!("titan_inkling attn: K/V rows must be contiguous and {align}-byte aligned");
+        }
+        let stream = dev.cuda_stream();
+        let base = match x.dtype() {
+            DType::F8E4M3 => cuda.as_cuda_slice::<float8::F8E4M3>()?.device_ptr(&stream).0,
+            _ => cuda.as_cuda_slice::<half::bf16>()?.device_ptr(&stream).0,
+        };
+        Ok((base + (layout.start_offset() * es) as u64, st[0] as i64, st[1] as i64))
+    }
+
+    /// `attn` for prefill chunks: `ink_attn_fa`, grid (Hkv, ceil(t / (64 / G))), 128 threads.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_fa(q: &Tensor, k: &Tensor, v: &Tensor, table: &Tensor, start: usize, first_key: usize, swa: Option<usize>, scale: f32) -> Result<Tensor> {
+        let dev = cuda_dev(q)?;
+        let (t, h, d) = q.dims3()?;
+        let (hkv, l, _) = k.dims3()?;
+        let ext = table.dim(2)? - 1;
+        let fp8i = i32::from(k.dtype() == DType::F8E4M3);
+        let (k_p, kh, kj) = kv_ptr(k, &dev, 16)?;
+        let (v_p, vh, vj) = kv_ptr(v, &dev, 16)?;
+        let q_p = addr(q, &dev)?;
+        let t_p = addr(table, &dev)?;
+        let (out, out_p) = alloc(&dev, t * h * d)?;
+        let qt = 64 / (h / hkv);
+        let (ti, hi, hkvi, li, exti) = (t as i32, h as i32, hkv as i32, l as i32, ext as i32);
+        let (st, fk, sw, nsw) = (start as i32, first_key as i32, i32::from(swa.is_some()), swa.unwrap_or(0) as i32);
+        let f = dev.get_or_load_custom_func("ink_attn_fa", "titan_inkling_fa", fa_ptx()?)?;
+        let mut b = f.builder();
+        b.arg(&q_p).arg(&k_p).arg(&v_p).arg(&kh).arg(&kj).arg(&vh).arg(&vj).arg(&t_p).arg(&out_p);
+        b.arg(&ti).arg(&hi).arg(&hkvi).arg(&li).arg(&exti).arg(&st).arg(&fk).arg(&sw).arg(&nsw).arg(&scale).arg(&fp8i);
+        unsafe {
+            b.launch(LaunchConfig { grid_dim: (hkv as u32, t.div_ceil(qt) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+        }
+        .w()?;
         Ok(wrap(out, &dev, &[t, h * d]))
     }
 

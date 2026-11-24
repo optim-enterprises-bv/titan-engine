@@ -208,7 +208,12 @@ impl Hp {
             expert_scale: m.f_or("expert_weights_scale", 1.0)?,
             softcap: f64::from(m.f_or("final_logit_softcapping", 0.0)?),
             vocab_unpadded: m.u("vocab_size_unpadded")?,
-            max_seq_len: m.u("context_length")?,
+            // the KV caches are sized (and, with TITAN_KV_PREALLOC, allocated) for the context the loader planned
+            // (TITAN_MAX_SEQ_LEN), not the GGUF's 1M: preallocating 1M tokens asked for 16 GiB
+            max_seq_len: {
+                let gguf = m.u("context_length")?;
+                mistralrs_quant::titan_cfg::var("TITAN_MAX_SEQ_LEN").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&c| c > 0).map_or(gguf, |c| c.min(gguf))
+            },
             lp,
         })
     }
@@ -1089,6 +1094,13 @@ impl ModelWeights {
             let mut chunk_ctx = ModelForwardContext::new(&offsets, &lens, &position_ids, None, ctx.flash_params())
                 .with_recurrent_batch_kind(kind)
                 .with_recurrent_metadata(recurrent_metadata.clone());
+            #[cfg(feature = "cuda")]
+            if mistralrs_quant::titan_cfg::flag("INKLING_MEMLOG", false) && start % (8 * PREFILL_CHUNK) == 0 {
+                use candle_core::cuda::cudarc::driver::result;
+                if let Ok((free, _)) = result::mem_get_info() {
+                    tracing::info!("inkling2 prefill: chunk at {start} of {total}, {} MiB free", free >> 20);
+                }
+            }
             let x = self.forward_trunk(&input_ids.narrow(1, start, len)?, &offsets, &mut chunk_ctx, start == 0 && base0 == 0)?;
             if is_last {
                 out = Some(self.head(&chunk_ctx.logits(&x)?)?);
@@ -1277,10 +1289,12 @@ impl ModelWeights {
         // distance table per (token, head): R . bias_table - sink; the last column (past the extent) is -sink
         let table = mm_t(&r, &a.rel_bias)?.broadcast_sub(&sinks.unsqueeze(3)?)?; // (n, t, H, extent+1)
 
-        let (k_all, v_all) = kv.append(
-            &k.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?,
-            &v.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?,
-        )?;
+        // the fused attention kernels read an F8E4M3 cache (TITAN_KV_FP8) as stored; `append` would hand back a BF16
+        // copy of the whole cache per visit (400 MB at 97k tokens, and the conversion traffic)
+        let k_new = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?;
+        let v_new = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::BF16)?;
+        let fused_attn = cfg!(feature = "cuda") && k_new.device().is_cuda() && t <= FUSED_ATTN_MAX_T && d == 128 && fused_part("ATTN");
+        let (k_all, v_all) = if fused_attn { kv.append_raw(&k_new, &v_new)? } else { kv.append(&k_new, &v_new)? };
         prof.mark("attend");
         let attn = self.attend(&q, &k_all, &v_all, &table, swa, pos)?; // (n, t, H*D)
 

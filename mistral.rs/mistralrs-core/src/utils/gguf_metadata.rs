@@ -26,6 +26,17 @@ pub struct ContentConfig {
     value_length: Option<usize>,
 }
 
+/// A non-negative integer metadata value of any width (`to_u64` alone accepts only the u64 type).
+fn gguf_uint(v: &gguf_file::Value) -> Option<u64> {
+    v.to_u64()
+        .ok()
+        .or_else(|| v.to_u32().ok().map(u64::from))
+        .or_else(|| v.to_i32().ok().and_then(|x| u64::try_from(x).ok()))
+        .or_else(|| v.to_i64().ok().and_then(|x| u64::try_from(x).ok()))
+        .or_else(|| v.to_u16().ok().map(u64::from))
+        .or_else(|| v.to_u8().ok().map(u64::from))
+}
+
 #[allow(clippy::cast_possible_truncation)]
 impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConfig {
     fn from(value: &Content<'a, R>) -> Self {
@@ -42,7 +53,8 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
                 // per-layer list (inkling2): the widest layer sizes the estimate
                 gguf_file::Value::Array(per_layer) => per_layer
                     .iter()
-                    .filter_map(|v| v.to_u64().ok())
+                    // per-layer arrays hold 32-bit entries: to_u64 alone rejected every one and fell back to 1
+                    .filter_map(gguf_uint)
                     .max()
                     .unwrap_or(1) as usize,
                 scalar => scalar.to_u64().unwrap() as usize,
@@ -51,7 +63,8 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
                 // per-layer list (kimi-linear): the widest layer sizes the estimate
                 gguf_file::Value::Array(per_layer) => per_layer
                     .iter()
-                    .filter_map(|v| v.to_u64().ok())
+                    // per-layer arrays hold 32-bit entries: to_u64 alone rejected every one and fell back to 1
+                    .filter_map(gguf_uint)
                     .max()
                     .unwrap_or(1) as usize,
                 scalar => scalar.to_u64().unwrap() as usize,
@@ -640,7 +653,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 Some(gguf_file::Value::Array(a)) => a.clone(),
                 _ => return Ok(1.0),
             };
-            let attn = per_layer.iter().filter(|v| v.to_u64().is_ok_and(|n| n > 0)).count();
+            let attn = per_layer.iter().filter(|v| gguf_uint(v).is_some_and(|n| n > 0)).count();
             return Ok(attn as f64 / per_layer.len().max(1) as f64);
         }
         if !matches!(self.arch, GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE | GGUFArchitecture::Qwen3Next | GGUFArchitecture::Qwen4Exp) {
