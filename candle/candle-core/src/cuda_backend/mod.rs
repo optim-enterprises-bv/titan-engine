@@ -62,7 +62,7 @@ impl SlicePtrOrNull<usize> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[l.dims(), l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_info(&[l.dims(), l.stride()].concat())?)
         };
         Ok(ds)
     }
@@ -200,7 +200,7 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.clone_htod_info(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -251,7 +251,7 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.clone_htod_info(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -343,7 +343,7 @@ impl Map1Any for FastReduce<'_> {
             block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let ds = dev.clone_htod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let ds = dev.clone_htod_info(&[dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let (name, check_empty, return_index) = match self.1 {
             ReduceOp::Sum => ("fast_sum", false, false),
@@ -442,7 +442,7 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = dev.clone_htod_info(&[ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -715,7 +715,7 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, l_out, p.stride, p.padding, p.dilation);
         builder.arg(&ds);
@@ -758,7 +758,7 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, out_w, out_h, p.stride, p.padding, p.dilation);
         builder.arg(&ds);
@@ -829,7 +829,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, l_out);
@@ -877,7 +877,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, out_w);
@@ -937,7 +937,7 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, self.w_k);
@@ -976,7 +976,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let mut builder = func.builder();
@@ -1025,7 +1025,7 @@ impl Map1 for UpsampleBilinear2D {
 
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_info(&ds)?;
 
         let mut builder = func.builder();
         barg!(builder, out_w);
@@ -1081,7 +1081,7 @@ impl Map2 for WhereCond<'_> {
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
         let ds =
-            dev.clone_htod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+            dev.clone_htod_info(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
@@ -1117,7 +1117,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_info(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1154,7 +1154,7 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_info(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
