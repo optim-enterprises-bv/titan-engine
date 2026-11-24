@@ -14,6 +14,7 @@ mod ffi;
 mod layer;
 mod norm;
 mod projection;
+mod tc;
 mod weights;
 
 pub use cache::GdnLayerCache;
