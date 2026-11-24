@@ -775,7 +775,10 @@ fn llama_mmq_plain_at(
 
     let (w_ptr, _w_guard) = w.device_ptr_with_guard(&stream)?;
     let w_ptr = w_ptr as u64 + w_off;
-    let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    // bf16 activations, whole tiles, no stream-k fixup: the J = 128 kernel stores bf16 itself (the cast's rounding)
+    let bf16o = input_ty == DType::BF16 && j == 128 && !fallback && !fixup_needed && mmq_bf16o_on();
+    let mut out = unsafe { dev.alloc::<f32>(if bf16o { 1 } else { nrows * b_size })? };
+    let mut out_bf = if bf16o { Some(unsafe { dev.alloc::<half::bf16>(nrows * b_size)? }) } else { None };
     let slot0 = 1000 + 200 * f.fi;
     {
         let (x_ptr, _x_guard) = match input_ty {
@@ -783,7 +786,10 @@ fn llama_mmq_plain_at(
             DType::F16 => slice_ptr_on_stream(xs_cuda.as_cuda_slice::<half::f16>()?, xs_offset, &stream),
             _ => slice_ptr_on_stream(xs_cuda.as_cuda_slice::<f32>()?, xs_offset, &stream),
         };
-        let (dst_ptr, _dst_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
+        let (dst_ptr, _dst_guard) = match out_bf.as_mut() {
+            Some(o) => slice_ptr_mut_on_stream(o, 0, &stream),
+            None => slice_ptr_mut_on_stream(&mut out, 0, &stream),
+        };
         let (ti, ts) = match input_ty {
             DType::BF16 => (2, "bf16"),
             DType::F16 => (1, "f16"),
@@ -837,7 +843,11 @@ fn llama_mmq_plain_at(
         let smem = q1_0_mmq_smem(j) + f.smem_extra;
         let slot = (j / 8) as usize * 2 + fb as usize;
         let name = f.name;
-        let mmq = super::fast_mmvq::q1_0_func(dev, slot0 + 10 + slot, f.module, f.ptx, || format!("{name}_mmq_j{j}_f{fb}"))?;
+        let mmq = if bf16o {
+            super::fast_mmvq::q1_0_func(dev, slot0 + MMQ_BF16O_SLOT, f.module, f.ptx, || format!("{name}_mmq_j128_f0_bf16o"))?
+        } else {
+            super::fast_mmvq::q1_0_func(dev, slot0 + 10 + slot, f.module, f.ptx, || format!("{name}_mmq_j{j}_f{fb}"))?
+        };
         mmq.set_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).w()?;
         let mut b = stream.launch_builder(&mmq);
         // x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x,
@@ -868,8 +878,19 @@ fn llama_mmq_plain_at(
     }
     drop(y_guard);
     y_ws.tag = Some(tag);
+    if let Some(o) = out_bf {
+        return Ok(Some(wrap_cuda_output(o, dev, output_shape(&xs, nrows))));
+    }
     let out = wrap_cuda_output(out, dev, output_shape(&xs, nrows));
     Ok(Some(if input_ty == DType::F32 { out } else { out.to_dtype(input_ty)? }))
+}
+
+/// Cache slot (past `slot0`) of the bf16-out J = 128 instance.
+const MMQ_BF16O_SLOT: usize = 150;
+
+/// `TITAN_MMQ_BF16O` (default on): i-quant prefill MMQ stores bf16 directly when no stream-k fixup runs.
+fn mmq_bf16o_on() -> bool {
+    crate::titan_cfg::flag("TITAN_MMQ_BF16O", true)
 }
 
 /// Whether [`grouped_parts`] covers `dtype` with `k` columns: the K-quant MoE launchers, or the llama.cpp MMQ
