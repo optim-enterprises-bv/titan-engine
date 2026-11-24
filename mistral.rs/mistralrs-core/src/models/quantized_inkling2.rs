@@ -1349,8 +1349,10 @@ impl ModelWeights {
             if dev.is_cuda() && t <= FUSED_ATTN_MAX_T && d == 128 && fused_part("ATTN") {
                 let o = crate::titan_inkling::attn(
                     &q.get(b)?,
-                    &k_all.get(b)?,
-                    &v_all.get(b)?,
+                    // views, not `get`: on the (strided) cache view `get` copied this layer's whole K and V
+                    // (~200 MB at 100k tokens, per full-attention visit); the kernels take the strides
+                    &k_all.narrow(0, b, 1)?.squeeze(0)?,
+                    &v_all.narrow(0, b, 1)?.squeeze(0)?,
                     &table.get(b)?,
                     pos.starts[b],
                     end - l,
