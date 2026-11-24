@@ -35,7 +35,11 @@ const CUDA_GRAPH_HTOD_CACHE_MAX_BYTES: usize = 4096;
 type CudaGraphHtodCacheKey = (DeviceId, TypeId, Vec<u8>);
 type CudaGraphHtodCache = HashMap<CudaGraphHtodCacheKey, Box<dyn Any>>;
 
+/// Entries of the layout-descriptor cache before it is cleared (attention layouts change every step).
+const INFO_CACHE_MAX_ENTRIES: usize = 4096;
+
 thread_local! {
+    static INFO_CACHE: RefCell<CudaGraphHtodCache> = RefCell::new(HashMap::new());
     static CUDA_GRAPH_HTOD_CACHE: RefCell<CudaGraphHtodCache> =
         RefCell::new(HashMap::new());
     static CUDA_GRAPH_HTOD_CACHE_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -181,6 +185,33 @@ impl CudaDevice {
         self.stream.clone_htod(src).w()
     }
 
+    /// `clone_htod` for a kernel's dims / strides descriptor (read-only on the device): served from a content-keyed
+    /// device copy, so an eager launch needs no host-to-device copy, which sat between dependent kernels and broke
+    /// their programmatic launch overlap (`TITAN_INFO_CACHE=0`: always upload).
+    pub fn clone_htod_info<T: cudarc::driver::DeviceRepr + 'static>(&self, src: &[T]) -> Result<cudarc::driver::CudaSlice<T>> {
+        if cuda_graph_htod_cache_enabled() || src.is_empty() || !info_cache_on() {
+            return self.clone_htod(src);
+        }
+        let byte_len = std::mem::size_of_val(src);
+        if byte_len > CUDA_GRAPH_HTOD_CACHE_MAX_BYTES {
+            return self.clone_htod(src);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), byte_len) }.to_vec();
+        let key = (self.id, TypeId::of::<T>(), bytes);
+        if let Some(c) = INFO_CACHE.with(|c| c.borrow().get(&key).and_then(|v| v.downcast_ref::<cudarc::driver::CudaSlice<T>>().cloned())) {
+            return Ok(c);
+        }
+        let up = self.stream.clone_htod(src).w()?;
+        INFO_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= INFO_CACHE_MAX_ENTRIES {
+                c.clear();
+            }
+            c.insert(key, Box::new(up.clone()));
+        });
+        Ok(up)
+    }
+
     fn memcpy_htod_capture_cached<
         T: cudarc::driver::DeviceRepr + 'static,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
@@ -260,6 +291,11 @@ impl CudaDevice {
 
 fn is_oom(e: &cudarc::driver::DriverError) -> bool {
     e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
+}
+
+fn info_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TITAN_INFO_CACHE").map_or(true, |v| v != "0"))
 }
 
 fn cuda_graph_htod_cache_enabled() -> bool {
