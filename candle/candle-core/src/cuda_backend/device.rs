@@ -187,7 +187,7 @@ impl CudaDevice {
 
     /// `clone_htod` for a kernel's dims / strides descriptor (read-only on the device): served from a content-keyed
     /// device copy, so an eager launch needs no host-to-device copy, which sat between dependent kernels and broke
-    /// their programmatic launch overlap (`TITAN_INFO_CACHE=0`: always upload).
+    /// their programmatic launch overlap (opt-in, `TITAN_INFO_CACHE=1`).
     pub fn clone_htod_info<T: cudarc::driver::DeviceRepr + 'static>(&self, src: &[T]) -> Result<cudarc::driver::CudaSlice<T>> {
         if cuda_graph_htod_cache_enabled() || src.is_empty() || !info_cache_on() {
             return self.clone_htod(src);
@@ -295,7 +295,9 @@ fn is_oom(e: &cudarc::driver::DriverError) -> bool {
 
 fn info_cache_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TITAN_INFO_CACHE").map_or(true, |v| v != "0"))
+    // opt-in: its long-lived entries pin stream-ordered pool segments (~350 MiB reserved past use over ten Inkling
+    // agent turns at 128k, which ran 30k-token turns out of memory) for +0.5% 27B decode
+    *ON.get_or_init(|| std::env::var("TITAN_INFO_CACHE").is_ok_and(|v| v == "1"))
 }
 
 fn cuda_graph_htod_cache_enabled() -> bool {
