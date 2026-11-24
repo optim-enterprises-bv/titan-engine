@@ -38,6 +38,19 @@ use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 
 const PREFILL_CHUNK: usize = 512;
+/// Smallest `INKLING_PREFILL_CHUNK` (the fused attention kernel's tile).
+const MIN_PREFILL_CHUNK: usize = 16;
+
+/// Prompt tokens per prefill chunk (`INKLING_PREFILL_CHUNK`, 16..=512, multiple of 16): smaller chunks need less scratch.
+fn prefill_chunk() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        mistralrs_quant::titan_cfg::var("INKLING_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(PREFILL_CHUNK, |c| (c / MIN_PREFILL_CHUNK * MIN_PREFILL_CHUNK).clamp(MIN_PREFILL_CHUNK, PREFILL_CHUNK))
+    })
+}
 /// Largest attention score block (bytes) one query block may build.
 const SCORES_BYTES: usize = 64 << 20;
 const RECURRENT_SLOTS: usize = 2;
@@ -1055,7 +1068,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 impl ModelWeights {
     pub fn forward(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         let prefill = matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Prefill));
-        if prefill && input_ids.dim(1)? > PREFILL_CHUNK {
+        if prefill && input_ids.dim(1)? > prefill_chunk() {
             return self.forward_chunked(input_ids, ctx);
         }
         let fresh = prefill && ctx.seqlen_offsets().first().copied().unwrap_or(0) == 0;
@@ -1080,14 +1093,15 @@ impl ModelWeights {
         let position_ids = ctx.position_ids_vec();
         let recurrent_metadata = ctx.recurrent_metadata().cloned();
         let kind = ctx.recurrent_batch_kind().expect("prefill");
-        let last_start = (total - 1) / PREFILL_CHUNK * PREFILL_CHUNK;
+        let chunk = prefill_chunk();
+        let last_start = (total - 1) / chunk * chunk;
         let last_lens = ctx.context_lens().iter().map(|(start, len)| (start - last_start, *len)).collect::<Vec<_>>();
         let end = base.iter().max().copied().unwrap_or(0) + total + 1;
         self.cache.hybrid().reserve_attention(end)?;
 
         let mut out = None;
-        for start in (0..total).step_by(PREFILL_CHUNK) {
-            let len = PREFILL_CHUNK.min(total - start);
+        for start in (0..total).step_by(chunk) {
+            let len = chunk.min(total - start);
             let is_last = start + len == total;
             let offsets = base.iter().map(|o| o + start).collect::<Vec<_>>();
             let lens = if is_last { last_lens.clone() } else { vec![(len - 1, 1); b] };
@@ -1095,7 +1109,7 @@ impl ModelWeights {
                 .with_recurrent_batch_kind(kind)
                 .with_recurrent_metadata(recurrent_metadata.clone());
             #[cfg(feature = "cuda")]
-            if mistralrs_quant::titan_cfg::flag("INKLING_MEMLOG", false) && start % (8 * PREFILL_CHUNK) == 0 {
+            if mistralrs_quant::titan_cfg::flag("INKLING_MEMLOG", false) && start % (8 * chunk) == 0 {
                 use candle_core::cuda::cudarc::driver::result;
                 if let Ok((free, _)) = result::mem_get_info() {
                     tracing::info!("inkling2 prefill: chunk at {start} of {total}, {} MiB free", free >> 20);
