@@ -625,10 +625,16 @@ impl Experts {
             && !mistralrs_quant::titan_cfg::flag("INKLING_PER_EXPERT", false)
             && [&gu_name, &down_name].iter().all(|n| ct.tensor_info(n).is_ok_and(|i| indexed_moe_supported(i.ggml_dtype)));
         let w = if indexed {
-            ExpertWeights::Indexed {
-                gate_up: QMatMul::from_qtensor(ct.tensor(&gu_name, device)?)?,
-                down: QMatMul::from_qtensor(ct.tensor(&down_name, device)?)?,
-            }
+            // zeroed row padding: the grouped prefill MMQ's last tile reads past the last expert into it
+            let mut padded = |name: &str| -> Result<QMatMul> {
+                let mut t = ct.tensor(name, device)?;
+                #[cfg(feature = "cuda")]
+                t.zero_cuda_padding()?;
+                QMatMul::from_qtensor(t)
+            };
+            let gate_up = padded(&gu_name)?;
+            let down = padded(&down_name)?;
+            ExpertWeights::Indexed { gate_up, down }
         } else {
             let gu = ct.tensor(&gu_name, &Device::Cpu)?;
             let down = ct.tensor(&down_name, &Device::Cpu)?;
@@ -720,6 +726,9 @@ impl Moe {
         let k = hp.top_k;
         let ff = hp.n_ff_exp;
         let ids = topk.indices.contiguous()?;
+        if let Some(y) = self.experts_grouped(flat, &ids, &topk.values, gate_up, down, hp)? {
+            return Ok(y);
+        }
         if let Some(y) = self.experts_mmq(flat, &ids, &topk.values, gate_up, down, hp)? {
             return Ok(y);
         }
@@ -773,6 +782,53 @@ impl Moe {
 }
 
 impl Moe {
+    /// Prefill: all routed rows of all experts in two grouped MMQs (gate/up over the tokens, down over the activated
+    /// slots) with the fused SiTU and weighted sum between; `None` for short chunks or uncovered formats.
+    fn experts_grouped(&self, flat: &Tensor, ids: &Tensor, values: &Tensor, gate_up: &QMatMul, down: &QMatMul, hp: &Hp) -> Result<Option<Tensor>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (tokens, e) = flat.dims2()?;
+            let (QMatMul::QTensor(wgu), QMatMul::QTensor(wd)) = (gate_up, down) else { return Ok(None) };
+            if tokens < EXPERT_MMQ_MIN_TOKENS
+                || !flat.device().is_cuda()
+                || !fused_part("EXPERT_GROUPED")
+                || !fused_part("SITU")
+                || !fused_part("WSUM")
+            {
+                return Ok(None);
+            }
+            let (k, ff) = (hp.top_k, hp.n_ff_exp);
+            let host = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+            let x = flat.to_dtype(DType::F32)?.contiguous()?;
+            let Some(gu) = mistralrs_quant::mmq_grouped_stack(wgu, &x, &host, false, Some(&moe_scratch(0, tokens * k, 2 * ff, flat.device())?))? else {
+                return Ok(None);
+            };
+            let act = crate::titan_inkling::situ(&gu.reshape((tokens, k, 2 * ff))?, ids, self.experts.gate_up_scale_t.as_ref(), hp.situ_beta as f32, hp.situ_lb as f32)?;
+            let act = act.to_dtype(DType::F32)?.reshape((tokens * k, ff))?.contiguous()?;
+            let Some(y) = mistralrs_quant::mmq_grouped_stack(wd, &act, &host, true, Some(&moe_scratch(1, tokens * k, e, flat.device())?))? else {
+                return Ok(None);
+            };
+            let out = crate::titan_inkling::wsum(&y.reshape((tokens, k, e))?, values, ids, self.experts.down_scale_t.as_ref())?;
+            check("experts_grouped", &out, || {
+                let per_slot = |s: &Tensor| -> Result<Tensor> { s.index_select(&ids.flatten_all()?, 0)?.reshape((tokens, k, 1)) };
+                let mut gu = gate_up.indexed_moe_forward(&flat.reshape((tokens, 1, e))?, ids)?.to_dtype(DType::F32)?;
+                if let Some(s) = &self.experts.gate_up_scale_t {
+                    gu = gu.broadcast_mul(&per_slot(s)?)?;
+                }
+                let act = situ(&gu.narrow(2, 0, ff)?, &gu.narrow(2, ff, ff)?, hp.situ_beta, hp.situ_lb)?.contiguous()?;
+                let y = down.indexed_moe_forward(&act, ids)?.to_dtype(DType::F32)?;
+                let mut w = values.to_dtype(DType::F32)?.reshape((tokens, k, 1))?;
+                if let Some(s) = &self.experts.down_scale_t {
+                    w = w.mul(&per_slot(s)?)?;
+                }
+                y.broadcast_mul(&w)?.sum(1)
+            })?;
+            return Ok(Some(out));
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
+    }
+
     /// Prefill: every used expert's gate/up and down as two MMQs over its tokens, weighted outputs added straight into
     /// `(T, E)`; `None` for short chunks or formats without an MMQ port (the indexed GEMV path then runs).
     fn experts_mmq(&self, flat: &Tensor, ids: &Tensor, values: &Tensor, gate_up: &QMatMul, down: &QMatMul, hp: &Hp) -> Result<Option<Tensor>> {
@@ -897,6 +953,23 @@ fn expert_mm(m: &QMatMul, w: &candle_core::quantized::QTensor, id: usize, x: &Te
     let (n, k) = x.dims2()?;
     let ids = Tensor::from_vec(vec![id as u32; n], (n, 1), x.device())?;
     m.indexed_moe_forward(&x.reshape((n, 1, k))?, &ids)?.to_dtype(DType::F32)?.reshape((n, ()))
+}
+
+/// Persistent f32 scratch `slot` of at least `rows x cols` on `dev` for the grouped expert MMQ outputs: one buffer
+/// reused by every layer visit (one stream) instead of a fresh ~19 MiB pool allocation per visit, which fragmented the
+/// pool by ~350 MiB at 128k context.
+fn moe_scratch(slot: usize, rows: usize, cols: usize, dev: &Device) -> Result<Tensor> {
+    static S: Mutex<[Option<Tensor>; 2]> = Mutex::new([None, None]);
+    let mut s = S.lock().expect("moe scratch poisoned");
+    let need = rows * cols;
+    if let Some(t) = &s[slot] {
+        if t.elem_count() >= need && t.device().same_device(dev) {
+            return t.narrow(0, 0, need);
+        }
+    }
+    let t = Tensor::zeros(need, DType::F32, dev)?;
+    s[slot] = Some(t.clone());
+    Ok(t)
 }
 
 /// `situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)` (no linear clamp when lb == 0).
@@ -1136,7 +1209,8 @@ impl ModelWeights {
         self.cache.hybrid().reserve_attention(end)?;
 
         let mut out = None;
-        for start in (0..total).step_by(chunk) {
+        for (i, start) in (0..total).step_by(chunk).enumerate() {
+            super::quantized_qwen35_moe::cuda_pool::between_chunks(&self.device, i, base0 + start)?;
             let len = chunk.min(total - start);
             let is_last = start + len == total;
             if is_last && start > 0 && b == 1 {

@@ -1806,13 +1806,13 @@ fn pool_indices(indices: &Tensor, pool_device: &Device) -> Result<Tensor> {
 }
 
 /// The device's stream-ordered allocation pool around prompt chunks.
-mod cuda_pool {
+pub(crate) mod cuda_pool {
     use candle_core::{Device, Result};
 
     /// `TITAN_PREFILL_MEMLOG=1`: before every prompt chunk (enqueued, not synchronised), log the
     /// pool's used / reserved / peak bytes.
     #[allow(unused_variables)]
-    pub(super) fn between_chunks(dev: &Device, chunk: usize, start: usize) -> Result<()> {
+    pub(crate) fn between_chunks(dev: &Device, chunk: usize, start: usize) -> Result<()> {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = dev {
             use candle_core::cuda_backend::cudarc::driver::sys;

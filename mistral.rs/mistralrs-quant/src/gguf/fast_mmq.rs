@@ -894,7 +894,8 @@ fn mmq_bf16o_on() -> bool {
 }
 
 /// Whether [`grouped_parts`] covers `dtype` with `k` columns: the K-quant MoE launchers, or the llama.cpp MMQ
-/// port in MoE mode (whole tile iterations only, and not NVFP4, whose activations carry a per-column scale).
+/// port in MoE mode (whole tile iterations only, and not NVFP4 here: [`grouped_stack`] takes it, its tiered callers
+/// were not validated with it).
 /// Zeroed bytes each [`grouped_parts`] weight buffer must carry past its last expert: with K not a whole number of
 /// tile iterations the last tile of the last row reads up to one tile past it (zero activations meet it, so it has to
 /// hold finite scales).
@@ -938,7 +939,9 @@ fn llama_grouped_parts(
     };
     let stream = dev.cuda_stream();
     let k_padded = pad(k, MATRIX_ROW_PADDING);
-    let y_bytes = (total * (k_padded / f.neb) + 128) * BLOCK_Q8_1_MMQ_SIZE;
+    // NVFP4: one f32 activation scale per dispatch row after the blocks
+    let y_main = (total * (k_padded / f.neb) + 128) * BLOCK_Q8_1_MMQ_SIZE;
+    let y_bytes = y_main + if f.fi == 2 { total * 4 } else { 0 };
     let mut y_ws = super::fast_mmvq::q1_0_workspace(f.ws, dev, y_bytes)?;
     // the dispatch-ordered rows are not what a plain call cached
     y_ws.tag = None;
@@ -954,6 +957,7 @@ fn llama_grouped_parts(
     let (out_ptr, _out_guard) = slice_ptr(out, 0);
     let z64 = 0u64;
     let z32 = 0i32;
+    let ys = if f.fi == 2 { y_ptr + y_main as u64 } else { 0u64 };
     {
         let quant = super::fast_mmvq::q1_0_func(dev, slot0, f.module, f.ptx, || match f.fi {
             0 | 4..=9 => "iq4_nl_quantize_mmq_d4_f32".to_string(),
@@ -963,13 +967,21 @@ fn llama_grouped_parts(
         let (ne00, s01, s02, ne0) = (k as i64, k as i64, (k * total) as i64, k_padded as i64);
         let (ne1, ne2, neu) = (total as i32, 1i32, 0i32);
         let mut b = stream.launch_builder(&quant);
-        b.arg(&x_ptr).arg(&src_ptr).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
-        b.arg(&ne1).arg(&ne2).arg(&neu);
-        if f.fi == 3 {
-            b.arg(&z64).arg(&z64).arg(&z64);
-        }
-        let block_dim = if f.fi == 1 { (32, 8, 1) } else { (128, 1, 1) };
-        let cfg = LaunchConfig { grid_dim: (total as u32, (k_padded as u32).div_ceil(512), 1), block_dim, shared_mem_bytes: 0 };
+        let (ne1_64, ne2_64) = (total as i64, 1i64);
+        let cfg = if f.fi == 2 {
+            // quantize_mmq_nvfp4: x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2 (int64), n_expert_used
+            b.arg(&x_ptr).arg(&src_ptr).arg(&y_ptr).arg(&ys).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
+            b.arg(&ne1_64).arg(&ne2_64).arg(&neu);
+            LaunchConfig { grid_dim: (total as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 }
+        } else {
+            b.arg(&x_ptr).arg(&src_ptr).arg(&y_ptr).arg(&ne00).arg(&s01).arg(&s02).arg(&s02).arg(&ne0);
+            b.arg(&ne1).arg(&ne2).arg(&neu);
+            if f.fi == 3 {
+                b.arg(&z64).arg(&z64).arg(&z64);
+            }
+            let block_dim = if f.fi == 1 { (32, 8, 1) } else { (128, 1, 1) };
+            LaunchConfig { grid_dim: (total as u32, (k_padded as u32).div_ceil(512), 1), block_dim, shared_mem_bytes: 0 }
+        };
         unsafe { b.launch(cfg) }.w()?;
     }
     let fallback = nrows % 128 != 0;
@@ -1004,7 +1016,7 @@ fn llama_grouped_parts(
         // x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst,
         // stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_{x,y,dst},
         // sample_ratio, nsamples_y, stride_sample_{x,y,dst}, ntx
-        b.arg(&w_ptr).arg(&y_ptr).arg(&dst_ids_ptr).arg(&b_ptr).arg(&out_ptr).arg(&fixup_ptr).arg(&z64);
+        b.arg(&w_ptr).arg(&y_ptr).arg(&dst_ids_ptr).arg(&b_ptr).arg(&out_ptr).arg(&fixup_ptr).arg(&ys);
         b.arg(&bpn[0]).arg(&bpn[1]).arg(&bpn[2]);
         b.arg(&nrows_x).arg(&ncols_dst).arg(&stride_row_x).arg(&ncols_dst).arg(&stride_col_dst);
         b.arg(&one[0]).arg(&one[1]).arg(&one[2]).arg(&ncy[0]).arg(&ncy[1]).arg(&ncy[2]);
@@ -1028,6 +1040,84 @@ fn llama_grouped_parts(
         }
     }
     Ok(())
+}
+
+/// Every routed row of an `(n_expert, nrows, k)` expert stack in one grouped MMQ: `ids` `[tokens][top_k]` (host),
+/// `xs` f32 `(tokens, k)` (`per_slot` false) or `(tokens * top_k, k)` (`per_slot` true, one row per routed slot).
+/// Returns `(tokens * top_k, nrows)` f32, row `t * top_k + s` for token t's slot s; `None` when the format, shape
+/// or the last tile's over-read past the stack is not covered. `out`: a contiguous f32 CUDA buffer of at least that
+/// many elements to write into (every row is written) instead of a new allocation. The caller zeroes `w`'s row padding once
+/// (`QTensor::zero_cuda_padding`): the last tile reads into it.
+pub fn grouped_stack(w: &QTensor, xs: &Tensor, ids: &[Vec<u32>], per_slot: bool, out: Option<&Tensor>) -> Result<Option<Tensor>> {
+    let Device::Cuda(dev) = w.device() else {
+        return Ok(None);
+    };
+    let Ok((n_expert, nrows, k)) = w.shape().dims3() else {
+        return Ok(None);
+    };
+    let dtype = w.dtype();
+    let (rows, xk) = xs.dims2()?;
+    let top_k = ids.first().map_or(0, Vec::len);
+    let tokens = ids.len();
+    if xk != k || top_k == 0 || xs.dtype() != DType::F32 || rows != if per_slot { tokens * top_k } else { tokens } || !(supports(dtype) || llama_mmq(dtype).is_some_and(|f| k % f.qk == 0)) {
+        return Ok(None);
+    }
+    if let Some(f) = llama_mmq(dtype).filter(|_| !supports(dtype)) {
+        if k % f.iter_k != 0 {
+            let block = dtype.type_size();
+            let over = (f.iter_k - k % f.iter_k) / f.qk * block;
+            // the zeroed row padding past the stack (`QTensor::zero_cuda_padding`) takes the last tile's over-read
+            if n_expert * nrows * (k / f.qk) * block + over > w.storage_size_in_bytes() + w.cuda_padding_bytes() {
+                return Ok(None);
+            }
+        }
+    }
+    let mut counts = vec![0u32; n_expert];
+    for row in ids {
+        for &e in row {
+            match counts.get_mut(e as usize) {
+                Some(c) => *c += 1,
+                None => candle_core::bail!("grouped_stack: expert {e} of {n_expert}"),
+            }
+        }
+    }
+    let mut bounds = vec![0u32; n_expert + 1];
+    for e in 0..n_expert {
+        bounds[e + 1] = bounds[e] + counts[e];
+    }
+    let total = tokens * top_k;
+    let mut next = bounds.clone();
+    let (mut ids_src, mut ids_dst) = (vec![0u32; total], vec![0u32; total]);
+    for (t, row) in ids.iter().enumerate() {
+        for (s, &e) in row.iter().enumerate() {
+            let j = next[e as usize] as usize;
+            next[e as usize] += 1;
+            let a = (t * top_k + s) as u32;
+            ids_src[j] = if per_slot { a } else { t as u32 };
+            ids_dst[j] = a;
+        }
+    }
+    let ncols_max = counts.iter().copied().max().unwrap_or(0) as usize;
+    let stream = dev.cuda_stream();
+    let (w_ptr, _w_guard) = w.device_ptr_with_guard(&stream)?;
+    let part = GroupedPart { weight: w_ptr as u64, first: 0, count: n_expert, ncols_max };
+    let (ids_src, ids_dst, bounds) = (dev.clone_htod(&ids_src)?, dev.clone_htod(&ids_dst)?, dev.clone_htod(&bounds)?);
+    if let Some(o) = out {
+        if o.dtype() != DType::F32 || !o.is_contiguous() || o.elem_count() < total * nrows || o.layout().start_offset() != 0 {
+            candle_core::bail!("grouped_stack: out must be contiguous f32 from offset 0 with {} elements", total * nrows);
+        }
+        {
+            let (storage, _) = o.storage_and_layout();
+            let Storage::Cuda(c) = &*storage else {
+                candle_core::bail!("grouped_stack: out must live on CUDA");
+            };
+            grouped_parts(dtype, nrows, xs, &ids_src, &ids_dst, &bounds, total, &[part], c.as_cuda_slice::<f32>()?, &dev)?;
+        }
+        return Ok(Some(o.flatten_all()?.narrow(0, 0, total * nrows)?.reshape((total, nrows))?));
+    }
+    let o = dev.alloc_zeros::<f32>(total * nrows)?;
+    grouped_parts(dtype, nrows, xs, &ids_src, &ids_dst, &bounds, total, &[part], &o, &dev)?;
+    Ok(Some(wrap_cuda_output(o, &dev, candle_core::Shape::from((total, nrows)))))
 }
 
 /// One expert `e` of a `(n_expert, nrows, k)` stack times `xs` through the llama.cpp MMQ port; `None` when the
@@ -1786,7 +1876,7 @@ pub fn grouped_parts(
     dev: &CudaDevice,
 ) -> Result<()> {
     if !supports(dtype) {
-        if let Some(f) = llama_mmq(dtype).filter(|f| f.fi != 2) {
+        if let Some(f) = llama_mmq(dtype) {
             return llama_grouped_parts(f, nrows, xs, ids_src, ids_dst, expert_bounds, total_assignments, parts, out, dev);
         }
         candle_core::bail!("fast_mmq grouped_parts: unsupported quant dtype {dtype:?}");

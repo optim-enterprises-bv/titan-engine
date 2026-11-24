@@ -1345,6 +1345,20 @@ impl QCudaStorage {
         let (ptr, guard) = self.data.inner.device_ptr(stream);
         Ok((ptr as *const u8, guard))
     }
+    /// titan: bytes allocated past the data (row padding), which grouped kernels may over-read.
+    pub fn padding_bytes(&self) -> usize {
+        self.data.inner.len() - self.data.len
+    }
+
+    /// titan: zero the allocation past the data, so an over-read meets finite (zero) blocks.
+    pub fn zero_padding(&mut self) -> Result<()> {
+        let pad = self.padding_bytes();
+        if pad > 0 {
+            let mut tail = self.data.inner.slice_mut(self.data.len..);
+            self.device.cuda_stream().memset_zeros(&mut tail).w()?;
+        }
+        Ok(())
+    }
 }
 
 impl QCudaStorage {
