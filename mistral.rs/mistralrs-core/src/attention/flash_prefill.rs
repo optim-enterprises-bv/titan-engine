@@ -41,6 +41,8 @@ const KERNELS: [(&str, &str, usize); 5] = [
     ("v1", "flash_prefill_v1", 4),
 ];
 const COMBINE: usize = KERNELS.len();
+/// Query heads per KV head of `flash_prefill_w8_r6`.
+const R6: usize = 6;
 /// Keys per tile.
 const TILE: usize = 32;
 const DEFAULT_MIN_KV: usize = 1024;
@@ -173,7 +175,9 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
     let (_, h0, s0, _) = q.dims4()?;
     let kvh0 = k.dim(1)?;
     let n_rep = h0 / kvh0;
-    if n_rep < N_REP {
+    // 6 query heads per KV head (Qwen3.8 27B): the r6 kernel packs (position, head) rows without zero heads
+    let r6 = n_rep == R6 && q.dtype() == DType::BF16 && KERNELS[cfg().kernel].0 == "w8" && mistralrs_quant::titan_cfg::flag("TITAN_FLASH_R6", true);
+    if n_rep < N_REP && !r6 {
         // fewer query heads per KV head than the kernel packs (Qwen3.8 27B: 6): zero heads fill each group
         // (heads never mix), their rows are dropped after
         let pad = Tensor::zeros((kvh0, N_REP - n_rep, s0, HEAD_DIM), q.dtype(), q.device())?;
@@ -199,7 +203,7 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
     }
     let kernel = cfg().kernel;
     let nw = KERNELS[kernel].2;
-    let npb = s.div_ceil(2 * nw);
+    let npb = if r6 { s.div_ceil(16 * nw / R6) } else { s.div_ceil(2 * nw) };
     let tiles = (if win > 0 { kv_len.min(win + 2 * nw) } else { kv_len }).div_ceil(TILE);
     let nsplit = cfg()
         .units
@@ -230,7 +234,7 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, p: &SdpaParams, win: us
     let (s_i, past_i, kv_i, h_i, ns_i) = (s as i32, past as i32, kv_len as i32, h as i32, nsplit as i32);
     let win_i = win as i32;
     let (q_hs, o_hs) = ((s * HEAD_DIM) as i32, (s * HEAD_DIM) as i32);
-    let main = func(dev, kernel)?;
+    let main = if r6 { func_named(dev, "flash_prefill_w8_r6")? } else { func(dev, kernel)? };
     let mut b = stream.launch_builder(&main);
     b.arg(&q_ptr).arg(&k_ptr).arg(&v_ptr).arg(&out_ptr).arg(&part_ptr).arg(&ml_ptr);
     b.arg(&scale_log2).arg(&s_i).arg(&past_i).arg(&kv_i).arg(&h_i).arg(&ns_i);
@@ -345,13 +349,16 @@ fn attend_tiles(q: &Tensor, k: &Tensor, v: &Tensor, host: Option<(&Tensor, &Tens
         candle_core::bail!("flash-prefill host tiles: unsupported q {:?} k {:?} {:?}", q.shape(), k.shape(), k.dtype());
     }
     let n_rep = h0 / kvh;
-    let q = if n_rep < N_REP {
+    let r6 = d == HEAD_DIM && n_rep == R6 && q.dtype() == DType::BF16 && KERNELS[cfg().kernel].0 == "w8"
+        && mistralrs_quant::titan_cfg::flag("TITAN_FLASH_R6", true);
+    let q = if n_rep < N_REP && !r6 {
         let pad = Tensor::zeros((kvh, N_REP - n_rep, s, d), q.dtype(), q.device())?;
         Tensor::cat(&[&q.reshape((kvh, n_rep, s, d))?, &pad], 1)?.reshape((1, kvh * N_REP, s, d))?
     } else {
         q
     };
-    let h = kvh * N_REP;
+    // r6: unpadded heads, so the merge's padded-to-real head map is the identity (group N_REP over h0 heads)
+    let h = if r6 { h0 } else { kvh * N_REP };
     let past = kv_len - s;
     // cached keys in whole tiles (every row sees all of them), then the chunk's own keys (causal)
     let mut ranges: Vec<(usize, usize)> = (0..past).step_by(tile.max(TILE)).map(|a| (a, (a + tile.max(TILE)).min(past))).collect();
@@ -361,10 +368,12 @@ fn attend_tiles(q: &Tensor, k: &Tensor, v: &Tensor, host: Option<(&Tensor, &Tens
     // head dim 128 drives the d128 w8 kernel (same launch signature as the 256 w8 family) and its 128-stride merge
     let (main, nw, merge) = if d == 128 {
         (func_named(dev, "flash_prefill_d128_w8")?, 8usize, func_named(dev, "flash_prefill_host_merge128")?)
+    } else if r6 {
+        (func_named(dev, "flash_prefill_w8_r6")?, 8usize, func_named(dev, "flash_prefill_host_merge")?)
     } else {
         (func(dev, cfg().kernel)?, KERNELS[cfg().kernel].2, func_named(dev, "flash_prefill_host_merge")?)
     };
-    let npb = s.div_ceil(2 * nw);
+    let npb = if r6 { s.div_ceil(16 * nw / R6) } else { s.div_ceil(2 * nw) };
     let q_ptr = dptr(&q, &stream)?;
     let scale_log2 = p.softmax_scale * std::f32::consts::LOG2_E;
     let (s_i, h_i, q_hs, o_hs, win_i) = (s as i32, h as i32, (s * d) as i32, (s * d) as i32, 0i32);
@@ -389,7 +398,7 @@ fn attend_tiles(q: &Tensor, k: &Tensor, v: &Tensor, host: Option<(&Tensor, &Tens
     let out = unsafe { dev.alloc::<half::bf16>(h0 * s * d)? };
     let ptr = |b: &candle_core::cuda::cudarc::driver::CudaSlice<f32>| b.device_ptr(&stream).0;
     let (run_o_ptr, run_ml_ptr, out_ptr) = (ptr(&run_o), ptr(&run_ml), out.device_ptr(&stream).0);
-    let n_rep_i = n_rep as i32;
+    let n_rep_i = if r6 { N_REP as i32 } else { n_rep as i32 };
     let n = ranges.len();
     for (i, (a, b)) in ranges.into_iter().enumerate() {
         let len = b - a;

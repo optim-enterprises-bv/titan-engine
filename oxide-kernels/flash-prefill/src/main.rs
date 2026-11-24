@@ -479,13 +479,16 @@ pub mod kernels {
         let pb = thread::blockIdx_x() as i32;
         let kvh = thread::blockIdx_y() as i32;
         let split = thread::blockIdx_z() as i32;
-        // REP query heads per KV head x 16 / REP positions per warp tile: row r = (head r % REP, position r / REP);
-        // a lane's rows g and g + 8 share the head and are 8 / REP positions apart (REP 8: v1's 8 heads x 2 positions)
-        let ppw = 16 / REP;
-        let p0 = pb * ppw * NW;
-        let pos_a = p0 + ppw * wid + g / REP;
-        let pos_b = pos_a + 8 / REP;
-        let hd = kvh * REP + g % REP;
+        // REP query heads per KV head: block row f = 16 wid + r is (head f % REP, position p0 + f / REP), the block
+        // taking floor(16 NW / REP) positions (rows past them idle); for REP dividing 8 this is v1's layout
+        let ppb = 16 * NW / REP;
+        let p0 = pb * ppb;
+        let fa = 16 * wid + g;
+        let fb = fa + 8;
+        let pos_a = p0 + fa / REP;
+        let pos_b = p0 + fb / REP;
+        let hd_a = kvh * REP + fa % REP;
+        let hd_b = kvh * REP + fb % REP;
         let lim_a = past + pos_a + 1;
         let lim_b = past + pos_b + 1;
         // sliding window (win > 0): row i also needs keys >= past + i + 1 - win; tiles below the first row's skipped
@@ -493,17 +496,17 @@ pub mod kernels {
         let lo_b = if win > 0 { lim_b - win } else { 0 };
         let kbeg = if win > 0 && past + p0 + 1 > win { past + p0 + 1 - win } else { 0 };
         let tfirst = kbeg / BC;
-        let kend = imin(kv_len, past + p0 + ppw * NW);
+        let kend = imin(kv_len, past + p0 + ppb);
         let ntiles = (kend + BC - 1) / BC - tfirst;
         let tps = (ntiles + nsplit - 1) / nsplit;
         let tb = tfirst + split * tps;
         let te = imin(tfirst + ntiles, tb + tps);
         let k1 = imin(kend, te * BC);
 
-        let qa = q.add((hd as i64 * q_hs as i64 + pos_a as i64 * 256) as usize);
-        let qb = q.add((hd as i64 * q_hs as i64 + pos_b as i64 * 256) as usize);
-        let va = pos_a < s;
-        let vb = pos_b < s;
+        let qa = q.add((hd_a as i64 * q_hs as i64 + pos_a as i64 * 256) as usize);
+        let qb = q.add((hd_b as i64 * q_hs as i64 + pos_b as i64 * 256) as usize);
+        let va = pos_a < s && fa < ppb * REP;
+        let vb = pos_b < s && fb < ppb * REP;
         let kbase = k.add((kvh as u64 * k_hs) as usize);
         let vbase = v.add((kvh as u64 * v_hs) as usize);
 
@@ -663,18 +666,18 @@ pub mod kernels {
         l_b = add(l_b, warp::shuffle_xor_f32_sync(0xffff_ffff, l_b, 2));
 
         if nsplit == 1 {
-            let oa = out.add((hd as i64 * o_hs as i64 + pos_a as i64 * 256) as usize);
-            let ob = out.add((hd as i64 * o_hs as i64 + pos_b as i64 * 256) as usize);
+            let oa = out.add((hd_a as i64 * o_hs as i64 + pos_a as i64 * 256) as usize);
+            let ob = out.add((hd_b as i64 * o_hs as i64 + pos_b as i64 * 256) as usize);
             let mut dn = 0;
             while dn < 32 {
                 unroll!();
                 let col = (8 * dn as i32 + 2 * t) as usize;
                 if O32 {
                     if va {
-                        stg_v2f((out as *mut f32).add((hd as i64 * o_hs as i64 + pos_a as i64 * 256) as usize + col), div_rn(o[dn][0], l_a), div_rn(o[dn][1], l_a));
+                        stg_v2f((out as *mut f32).add((hd_a as i64 * o_hs as i64 + pos_a as i64 * 256) as usize + col), div_rn(o[dn][0], l_a), div_rn(o[dn][1], l_a));
                     }
                     if vb {
-                        stg_v2f((out as *mut f32).add((hd as i64 * o_hs as i64 + pos_b as i64 * 256) as usize + col), div_rn(o[dn][2], l_b), div_rn(o[dn][3], l_b));
+                        stg_v2f((out as *mut f32).add((hd_b as i64 * o_hs as i64 + pos_b as i64 * 256) as usize + col), div_rn(o[dn][2], l_b), div_rn(o[dn][3], l_b));
                     }
                 } else {
                     if va {
@@ -687,8 +690,8 @@ pub mod kernels {
                 dn += 1;
             }
         } else {
-            let ra = ((split as i64 * n_heads as i64 + hd as i64) * s as i64 + pos_a as i64) as usize;
-            let rb = ((split as i64 * n_heads as i64 + hd as i64) * s as i64 + pos_b as i64) as usize;
+            let ra = ((split as i64 * n_heads as i64 + hd_a as i64) * s as i64 + pos_a as i64) as usize;
+            let rb = ((split as i64 * n_heads as i64 + hd_b as i64) * s as i64 + pos_b as i64) as usize;
             let mut dn = 0;
             while dn < 32 {
                 unroll!();
@@ -736,6 +739,20 @@ pub mod kernels {
         static mut SMEM: SharedArray<u16, 16384, 16> = SharedArray::UNINIT;
         let sk = cuda_device::shared::cvta_generic_to_shared_u32(SharedArray::as_raw_mut_ptr(&raw mut SMEM) as *const u8);
         body::<8, true, false, 8, false>(sk, q, k, v, out, part, ml, scale_log2, s, past, kv_len, n_heads, nsplit, q_hs, o_hs, k_hs, v_hs, win);
+    }
+
+    /// `flash_prefill_w8` for 6 query heads per KV head (no padding to 8): 21 positions per block, grid
+    /// (ceil(s / 21), kv_heads, nsplit), block 256.
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    pub unsafe fn flash_prefill_w8_r6(
+        q: *const u16, k: *const u16, v: *const u16, out: *mut u16, part: *mut f32, ml: *mut f32,
+        scale_log2: f32, s: i32, past: i32, kv_len: i32, n_heads: i32, nsplit: i32,
+        q_hs: i32, o_hs: i32, k_hs: u64, v_hs: u64, win: i32,
+    ) {
+        static mut SMEM: SharedArray<u16, 16384, 16> = SharedArray::UNINIT;
+        let sk = cuda_device::shared::cvta_generic_to_shared_u32(SharedArray::as_raw_mut_ptr(&raw mut SMEM) as *const u8);
+        body::<8, true, false, 6, false>(sk, q, k, v, out, part, ml, scale_log2, s, past, kv_len, n_heads, nsplit, q_hs, o_hs, k_hs, v_hs, win);
     }
 
     /// Q fragments from L1 each tile (fewer registers), 4 warps.
