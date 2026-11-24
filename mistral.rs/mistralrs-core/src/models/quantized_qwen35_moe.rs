@@ -1579,7 +1579,7 @@ pub(crate) const KV_RESERVE_STEP: usize = 8192;
 const KV_BUCKET_MARGIN: usize = 512 << 20;
 
 /// Free bytes on a CUDA device: unallocated device memory plus the stream-ordered pool's reserved, unused bytes.
-fn device_free_bytes(dev: &Device) -> Option<usize> {
+pub(crate) fn device_free_bytes(dev: &Device) -> Option<usize> {
     #[cfg(feature = "cuda")]
     {
         let a = crate::utils::memory_usage::MemoryUsage.query_cuda_allocator(dev).ok()??;
@@ -1715,7 +1715,7 @@ fn prefill_split_at() -> &'static [usize] {
 }
 
 /// The recurrent slot of a batch-1, unpaged prompt pass whose resume points the prefix cache keeps.
-fn prefix_slot(ctx: &ModelForwardContext<'_>) -> Option<usize> {
+pub(crate) fn prefix_slot(ctx: &ModelForwardContext<'_>) -> Option<usize> {
     if ctx.is_paged()
         || !crate::prefix_cacher::hybrid_prefix_cache_on()
         || !matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Prefill))
@@ -1729,7 +1729,7 @@ fn prefix_slot(ctx: &ModelForwardContext<'_>) -> Option<usize> {
 }
 
 /// Host copy of the first `len` positions of a KV cache (`None` if it holds fewer).
-fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
+pub(crate) fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
     let KvCache::Normal { k, v } = kv else {
         return Ok(None);
     };
@@ -1752,7 +1752,7 @@ fn kv_to_host(kv: &KvCache, len: usize) -> Result<Option<(Tensor, Tensor)>> {
 }
 
 /// A KV cache on `dev` holding the first `len` positions of a host copy, with room for `cap`.
-fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usize, dev: &Device) -> Result<KvCache> {
+pub(crate) fn kv_from_host(k: &Tensor, v: &Tensor, len: usize, cap: usize, max_seq_len: usize, dev: &Device) -> Result<KvCache> {
     // TITAN_KV_SPILL: a restored prefix within the base context goes to the GPU, a longer one to the host
     let host = crate::titan_hostkv::enabled() && (!crate::kv_cache::kv_spill() || cap > crate::kv_cache::cuda_kv_base());
     let dev = if dev.is_cuda() && host { &Device::Cpu } else { dev };
@@ -5618,7 +5618,7 @@ impl ModelWeights {
         let mut points = self.prefix_points.lock().expect("prefix points poisoned");
         let v = points.entry(slot).or_default();
         v.retain(|p| p.len != len);
-        v.push(Arc::new(HybridPrefixPoint { len, boundary, gdn, mtp_hidden }));
+        v.push(Arc::new(HybridPrefixPoint { len, boundary, gdn, mtp_hidden, windows: Vec::new() }));
         Ok(())
     }
 
@@ -5715,14 +5715,14 @@ impl ModelWeights {
                 Some((host, h_last, reach)) => {
                     points.retain(|pt| pt.len <= reach);
                     if reach == p {
-                        points.push(Arc::new(HybridPrefixPoint { len: p, boundary: false, gdn: gdn_end, mtp_hidden: Some(h_last) }));
+                        points.push(Arc::new(HybridPrefixPoint { len: p, boundary: false, gdn: gdn_end, mtp_hidden: Some(h_last), windows: Vec::new() }));
                     }
                     mtp_kv = Some(host);
                 }
                 None => points.clear(),
             }
         } else {
-            points.push(Arc::new(HybridPrefixPoint { len: p, boundary: false, gdn: gdn_end, mtp_hidden: None }));
+            points.push(Arc::new(HybridPrefixPoint { len: p, boundary: false, gdn: gdn_end, mtp_hidden: None, windows: Vec::new() }));
         }
         points.retain(|pt| pt.len <= p);
         if points.is_empty() {

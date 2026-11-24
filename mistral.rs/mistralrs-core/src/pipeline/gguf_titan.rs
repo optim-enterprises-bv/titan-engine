@@ -1006,6 +1006,7 @@ impl Pipeline for TitanGGUFPipeline {
     fn hybrid_prefix_restore(&self, seq: &mut Sequence) -> Result<(), candle_core::Error> {
         match &self.model {
             Model::Qwen35MoE(m) if self.metadata.cache_engine.is_none() => m.prefix_restore(seq),
+            Model::Inkling2(m) if self.metadata.cache_engine.is_none() => m.prefix_restore(seq),
             _ => candle_core::bail!("this GGUF model cannot resume a hybrid prefix-cache entry"),
         }
     }
@@ -1020,6 +1021,7 @@ impl Pipeline for TitanGGUFPipeline {
     ) -> Result<Option<crate::kv_cache::HybridPrefixEntry>, candle_core::Error> {
         match &self.model {
             Model::Qwen35MoE(m) if self.metadata.cache_engine.is_none() => m.prefix_export(seq),
+            Model::Inkling2(m) if self.metadata.cache_engine.is_none() => m.prefix_export(seq),
             _ => Ok(None),
         }
     }

@@ -24,12 +24,12 @@ use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Result, Tensor, D};
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
-use super::quantized_qwen35_moe::QEmbedding;
+use super::quantized_qwen35_moe::{device_free_bytes, kv_from_host, kv_to_host, prefix_slot, QEmbedding};
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::kv_cache::{
-    HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, KvCache, RecurrentLayerConfig,
-    RecurrentStatePool, RecurrentStateSpec,
+    HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, HybridPrefixEntry, HybridPrefixPoint, KvCache,
+    RecurrentLayerConfig, RecurrentStatePool, RecurrentStateSpec, RotatingCache, RotatingCacheSnapshot,
 };
 use crate::layers::QRmsNorm;
 use crate::paged_attention::AttentionImplementation;
@@ -40,6 +40,9 @@ use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 const PREFILL_CHUNK: usize = 512;
 /// Smallest `INKLING_PREFILL_CHUNK` (the fused attention kernel's tile).
 const MIN_PREFILL_CHUNK: usize = 16;
+/// Default prompt tokens per chunk: 512 runs out of VRAM next to a 128k F8E4M3 KV cache on 16 GB once agent-sized
+/// prompts (15-78k tokens) follow each other.
+const DEFAULT_PREFILL_CHUNK: usize = 256;
 
 /// Prompt tokens per prefill chunk (`INKLING_PREFILL_CHUNK`, 16..=512, multiple of 16): smaller chunks need less scratch.
 fn prefill_chunk() -> usize {
@@ -48,7 +51,7 @@ fn prefill_chunk() -> usize {
         mistralrs_quant::titan_cfg::var("INKLING_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map_or(PREFILL_CHUNK, |c| (c / MIN_PREFILL_CHUNK * MIN_PREFILL_CHUNK).clamp(MIN_PREFILL_CHUNK, PREFILL_CHUNK))
+            .map_or(DEFAULT_PREFILL_CHUNK, |c| (c / MIN_PREFILL_CHUNK * MIN_PREFILL_CHUNK).clamp(MIN_PREFILL_CHUNK, PREFILL_CHUNK))
     })
 }
 /// Largest attention score block (bytes) one query block may build.
@@ -564,6 +567,22 @@ pub struct ModelWeights {
     pub(crate) cache: EitherCache,
     pub(crate) max_seq_len: usize,
     hp: Hp,
+    /// Prefix-cache resume points saved during the prompt passes of each recurrent slot.
+    prefix_points: Mutex<HashMap<usize, Vec<Arc<HybridPrefixPoint>>>>,
+}
+
+/// A sliding-window ring's snapshot with its retained rows on the host.
+fn ring_to_host(r: &RotatingCache) -> Result<RotatingCacheSnapshot> {
+    let mut snap = r.snapshot()?;
+    snap.retained = snap.retained.map(|t| t.to_device(&Device::Cpu)).transpose()?;
+    Ok(snap)
+}
+
+/// A sliding-window ring on `dev` rebuilt from a host snapshot.
+fn ring_from_host(snap: &RotatingCacheSnapshot, dev: &Device) -> Result<RotatingCache> {
+    let mut snap = snap.clone();
+    snap.retained = snap.retained.map(|t| t.to_device(dev)).transpose()?;
+    RotatingCache::restore_from_snapshot(&snap, None, snap.current_seq_len)
 }
 
 fn split_rows(q: &QTensor, rows: usize, cols: usize, device: &Device) -> Result<Vec<QTensor>> {
@@ -1061,6 +1080,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             cache: EitherCache::Hybrid(Arc::new(Mutex::new(cache))),
             max_seq_len: hp.max_seq_len,
             hp,
+            prefix_points: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -1068,10 +1088,20 @@ impl ModelConfig::FromGGUF for ModelWeights {
 impl ModelWeights {
     pub fn forward(&self, input_ids: &Tensor, ctx: &mut ModelForwardContext<'_>) -> Result<Tensor> {
         let prefill = matches!(ctx.recurrent_batch_kind(), Some(RecurrentBatchKind::Prefill));
+        if prefill {
+            // pool memory freed by earlier requests back to the device: a prompt step at 128k context has ~800 MiB to
+            // work in, and part of its scratch does not come from the stream pool that holds it
+            crate::titan_swap::trim_pool(&self.device);
+        }
         if prefill && input_ids.dim(1)? > prefill_chunk() {
             return self.forward_chunked(input_ids, ctx);
         }
         let fresh = prefill && ctx.seqlen_offsets().first().copied().unwrap_or(0) == 0;
+        if fresh {
+            if let Some(slot) = prefix_slot(ctx) {
+                self.prefix_points.lock().expect("prefix points poisoned").remove(&slot);
+            }
+        }
         let starts = ctx.seqlen_offsets().to_vec();
         let x = self.forward_trunk(input_ids, &starts, ctx, fresh)?;
         let x = ctx.logits(&x)?;
@@ -1094,6 +1124,12 @@ impl ModelWeights {
         let recurrent_metadata = ctx.recurrent_metadata().cloned();
         let kind = ctx.recurrent_batch_kind().expect("prefill");
         let chunk = prefill_chunk();
+        let slot = prefix_slot(ctx);
+        if base0 == 0 {
+            if let Some(slot) = slot {
+                self.prefix_points.lock().expect("prefix points poisoned").remove(&slot);
+            }
+        }
         let last_start = (total - 1) / chunk * chunk;
         let last_lens = ctx.context_lens().iter().map(|(start, len)| (start - last_start, *len)).collect::<Vec<_>>();
         let end = base.iter().max().copied().unwrap_or(0) + total + 1;
@@ -1103,6 +1139,12 @@ impl ModelWeights {
         for start in (0..total).step_by(chunk) {
             let len = chunk.min(total - start);
             let is_last = start + len == total;
+            if is_last && start > 0 && b == 1 {
+                // the last chunk boundary: a later prompt sharing this prefix resumes here (prefix cache)
+                if let Some(slot) = slot {
+                    self.save_prefix_point(slot, base0 + start)?;
+                }
+            }
             let offsets = base.iter().map(|o| o + start).collect::<Vec<_>>();
             let lens = if is_last { last_lens.clone() } else { vec![(len - 1, 1); b] };
             let mut chunk_ctx = ModelForwardContext::new(&offsets, &lens, &position_ids, None, ctx.flash_params())
@@ -1503,4 +1545,190 @@ fn control_ref(cur: &Tensor, message: &Tensor, ctrl: &(Tensor, Tensor, Tensor)) 
     let gain = mm_t(&gate, gain)?.tanh()?;
     let forget = mm_t(&gate, forget)?.tanh()?;
     (cur - forget.mul(cur)?)? + gain.mul(message)?
+}
+
+/// Prefix cache (see `PrefixCacheManagerV2::search_hybrid`): the conv states and the sliding-window rings cannot
+/// rewind, so a resume point keeps both (host copies) at its length; the full-attention KV is cut to any point.
+/// Points: the last chunk boundary of each prompt pass and the finished sequence's end.
+impl ModelWeights {
+    fn is_window_slot(&self, slot: usize) -> bool {
+        self.hp.is_swa[self.hp.phys(slot)]
+    }
+
+    /// Host snapshots of the sliding-window rings among `caches` (one per layer visit), `None` unless all are at `len`.
+    fn windows_host(&self, cache_at: impl Fn(usize) -> Option<KvCache>, len: usize) -> Result<Option<Vec<Option<(RotatingCacheSnapshot, RotatingCacheSnapshot)>>>> {
+        let mut out = Vec::with_capacity(self.hp.n_slots());
+        for s in 0..self.hp.n_slots() {
+            if !self.is_window_slot(s) {
+                out.push(None);
+                continue;
+            }
+            match cache_at(s) {
+                Some(KvCache::Rotating { k, v }) if k.current_seq_len() == len && v.current_seq_len() == len => {
+                    out.push(Some((ring_to_host(&k)?, ring_to_host(&v)?)))
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Save the state of recurrent slot `slot` just after its first `len` tokens (mid prompt pass) as a resume point.
+    fn save_prefix_point(&self, slot: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let hybrid = self.cache.hybrid();
+        let windows = self.windows_host(
+            |s| match &hybrid.caches[s] {
+                HybridLayerCache::Attention(kv) => Some(kv.clone()),
+                _ => None,
+            },
+            len,
+        )?;
+        let Some(windows) = windows else {
+            return Ok(());
+        };
+        let gdn = hybrid.titan_snapshot_physical_host(slot)?;
+        drop(hybrid);
+        let mut points = self.prefix_points.lock().expect("prefix points poisoned");
+        let v = points.entry(slot).or_default();
+        v.retain(|p| p.len != len);
+        v.push(Arc::new(HybridPrefixPoint { len, boundary: true, gdn, mtp_hidden: None, windows }));
+        Ok(())
+    }
+
+    /// Host copies of the caches of `seq`, which just finished: full-attention KV, the state at its end and the
+    /// points saved during its prompt passes.
+    pub(crate) fn prefix_export(&self, seq: &crate::sequence::Sequence) -> Result<Option<HybridPrefixEntry>> {
+        if !crate::prefix_cacher::hybrid_prefix_cache_on() {
+            return Ok(None);
+        }
+        let toks = seq.get_toks();
+        let Some(slot) = seq.recurrent_state_idx() else {
+            return Ok(None);
+        };
+        let n_slots = self.hp.n_slots();
+        let seq_kv = seq.normal_cache_ref();
+        let attention = |i: usize| seq_kv.get(i).and_then(Option::as_ref);
+        let p = (0..n_slots).find(|&s| !self.is_window_slot(s)).and_then(attention).map_or(0, KvCache::current_seq_len);
+        if p == 0 || p > toks.len() {
+            return Ok(None);
+        }
+        let hybrid = self.cache.hybrid();
+        let mut kv = Vec::with_capacity(hybrid.num_layers());
+        for i in 0..hybrid.num_layers() {
+            kv.push(if i < n_slots && !self.is_window_slot(i) {
+                match attention(i).map(|layer| kv_to_host(layer, p)).transpose()?.flatten() {
+                    Some(host) => Some(host),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            });
+        }
+        let end = self.windows_host(|s| attention(s).cloned(), p)?;
+        let gdn_end = hybrid.titan_snapshot_physical_host(slot)?;
+        drop(hybrid);
+        let mut points = self.prefix_points.lock().expect("prefix points poisoned").remove(&slot).unwrap_or_default();
+        if let Some(windows) = end {
+            points.push(Arc::new(HybridPrefixPoint { len: p, boundary: false, gdn: gdn_end, mtp_hidden: None, windows }));
+        }
+        points.retain(|pt| pt.len <= p && pt.windows.len() == n_slots);
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(HybridPrefixEntry { tokens: toks[..p].to_vec(), kv, mtp_kv: None, points }))
+    }
+
+    /// Write the first `q` positions of host `k`, `v` into `kv`'s own device buffers when they hold `need` positions
+    /// and match in dtype; `false` (nothing written) otherwise.
+    fn restore_in_place(kv: &mut KvCache, k: &Tensor, v: &Tensor, q: usize, need: usize) -> Result<bool> {
+        let KvCache::Normal { k: kc, v: vc } = kv else {
+            return Ok(false);
+        };
+        let fits = |c: &crate::kv_cache::SingleCache, h: &Tensor| {
+            c.host_split.is_none()
+                && c.capacity_seq_len >= need
+                && c.all_data.as_ref().is_some_and(|d| d.device().is_cuda() && d.dtype() == h.dtype() && d.dim(c.dim).is_ok_and(|n| n >= need))
+        };
+        if !fits(kc, k) || !fits(vc, v) {
+            return Ok(false);
+        }
+        for (c, h) in [(kc, k), (vc, v)] {
+            let d = c.all_data.as_ref().expect("checked");
+            d.slice_set(&h.narrow(c.dim, 0, q)?.contiguous()?.to_device(d.device())?, c.dim, 0)?;
+            c.current_seq_len = q;
+        }
+        Ok(true)
+    }
+
+    /// Put a prefix-cache hit into place before the sequence's prompt step: the full-attention KV cut to the resume
+    /// point (with the context's room under TITAN_KV_PREALLOC), the sliding-window rings and the conv states.
+    pub(crate) fn prefix_restore(&self, seq: &mut crate::sequence::Sequence) -> Result<()> {
+        let Some(resume) = seq.take_hybrid_resume() else {
+            return Ok(());
+        };
+        let q = resume.len;
+        let entry = &resume.entry;
+        let slot = seq
+            .recurrent_state_idx()
+            .ok_or_else(|| candle_core::Error::msg("inkling2 prefix restore: sequence has no recurrent slot"))?;
+        let point = entry
+            .points
+            .iter()
+            .find(|p| p.len == q)
+            .ok_or_else(|| candle_core::Error::msg("inkling2 prefix restore: no resume point"))?;
+        let n_slots = self.hp.n_slots();
+        // the sequence holds the prompt tokens after the resume point
+        let total = q + seq.get_toks().len();
+        let cap = if crate::kv_cache::cuda_kv_prealloc() { self.max_seq_len } else { total + 1 }.max(q);
+        let free_before = device_free_bytes(&self.device).unwrap_or(0);
+        let mut in_place = 0usize;
+        let mut hybrid = self.cache.hybrid();
+        let max_seq_len = hybrid.config().max_seq_len;
+        let mut caches = Vec::with_capacity(entry.kv.len());
+        for (i, kv) in entry.kv.iter().enumerate() {
+            caches.push(if i >= n_slots {
+                None
+            } else if self.is_window_slot(i) {
+                let Some(Some((k, v))) = point.windows.get(i) else {
+                    candle_core::bail!("inkling2 prefix restore: no ring for layer visit {i}");
+                };
+                Some(KvCache::Rotating { k: ring_from_host(k, &self.device)?, v: ring_from_host(v, &self.device)? })
+            } else {
+                let Some((k, v)) = kv else {
+                    candle_core::bail!("inkling2 prefix restore: no KV for layer visit {i}");
+                };
+                // into the layer's preallocated buffer when it has the room: a second full-context buffer per layer
+                // does not fit next to the weights
+                let reused = match &mut hybrid.caches[i] {
+                    HybridLayerCache::Attention(kv @ KvCache::Normal { .. }) => {
+                        Self::restore_in_place(kv, k, v, q, total + 1)?.then(|| kv.clone())
+                    }
+                    _ => None,
+                };
+                match reused {
+                    Some(kv) => {
+                        in_place += 1;
+                        Some(kv)
+                    }
+                    None => Some(kv_from_host(k, v, q, cap, max_seq_len, &self.device)?),
+                }
+            });
+        }
+        hybrid.titan_restore_slot(slot, &point.gdn)?;
+        drop(hybrid);
+        *seq.normal_cache() = caches;
+        tracing::debug!(
+            "inkling2 prefix restore at {q}: {in_place} layers in place, {} -> {} MiB free",
+            free_before >> 20,
+            device_free_bytes(&self.device).unwrap_or(0) >> 20
+        );
+        self.prefix_points
+            .lock()
+            .expect("prefix points poisoned")
+            .insert(slot, entry.points.iter().filter(|p| p.len <= q).cloned().collect());
+        Ok(())
+    }
 }

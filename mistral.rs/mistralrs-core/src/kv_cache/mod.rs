@@ -1395,7 +1395,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                     } else {
                         seq.normal_cache()
                     };
-                    if let Some(Some(kv @ KvCache::Normal { .. })) = seq_cache.get(layer_idx) {
+                    // sliding-window rings too: rebuilt from their window they lost the write position
+                    if let Some(Some(kv @ (KvCache::Normal { .. } | KvCache::Rotating { .. }))) = seq_cache.get(layer_idx) {
                         *kv_cache = kv.clone();
                         continue;
                     }
@@ -1488,7 +1489,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             let layer_cache = hybrid_cache.caches.get(layer_idx).unwrap();
 
             if let HybridLayerCache::Attention(kv_cache) = layer_cache {
-                if let ([seq], KvCache::Normal { .. }) = (&mut *seqs, kv_cache) {
+                if let ([seq], KvCache::Normal { .. } | KvCache::Rotating { .. }) = (&mut *seqs, kv_cache) {
                     // One sequence: it keeps the layer's cache as it is (see clone_in_cache).
                     let seq_cache = if modify_draft_cache {
                         seq.normal_draft_cache()
