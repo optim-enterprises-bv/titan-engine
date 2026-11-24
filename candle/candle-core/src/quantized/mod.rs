@@ -923,6 +923,23 @@ impl QTensor {
     )> {
         self.storage.device_ptr_with_guard(stream)
     }
+    /// titan: zeroed bytes past the data of a CUDA tensor (`zero_cuda_padding`), 0 elsewhere.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_padding_bytes(&self) -> usize {
+        match &self.storage {
+            QStorage::Cuda(s) => s.padding_bytes(),
+            _ => 0,
+        }
+    }
+
+    /// titan: zero a CUDA tensor's row padding (allocated but uninitialised), for kernels that over-read it.
+    #[cfg(feature = "cuda")]
+    pub fn zero_cuda_padding(&mut self) -> Result<()> {
+        match &mut self.storage {
+            QStorage::Cuda(s) => s.zero_padding(),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
