@@ -190,7 +190,17 @@ impl GatedDeltaNet {
         let projected = self.project(x, batch_size, seq_len)?;
         let mixed_qkv = projected.conv_input();
         let carry = self.dims.conv_kernel_size.saturating_sub(1);
-        let mixed_qkv = if conv_carry && carry > 0 && matches!(batch_kind, RecurrentBatchKind::Prefill) {
+        #[cfg(feature = "cuda")]
+        let tm = if matches!(batch_kind, RecurrentBatchKind::Prefill) {
+            conv_full_tm(&mixed_qkv, &self.conv1d_weight, &self.dims, cache, conv_carry && carry > 0)?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let tm: Option<Tensor> = None;
+        let mixed_qkv = if let Some(out) = tm {
+            out
+        } else if conv_carry && carry > 0 && matches!(batch_kind, RecurrentBatchKind::Prefill) {
             let state_len = cache.conv_state.dim(2)?;
             let prev = cache
                 .conv_state
@@ -339,4 +349,82 @@ impl GatedDeltaNet {
         };
         lin(&self.out_proj, &y)
     }
+}
+
+/// GDN prefill causal conv on the token-major projection output (`titan_conv1d_full_tm`, titan-fused): the carried
+/// `kernel - 1` inputs come from `cache.conv_state` instead of a concatenated copy of the chunk, and the input is read
+/// with its strides and the output written token-major, so the transposed copies in and out of the channel-major conv
+/// go too (~1.25 ms per 2048-row layer chunk on the 27B). Same per-element instructions as that conv: same bits.
+/// `TITAN_CONV_TM=0`: the old path; `TITAN_CONV_TM_CHECK=1` runs both and compares.
+#[cfg(feature = "cuda")]
+fn conv_full_tm(x: &Tensor, conv1d_weight: &Tensor, dims: &GdnDims, cache: &mut GdnLayerCache, carry: bool) -> Result<Option<Tensor>> {
+    use candle_core::cuda::cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
+    if !x.device().is_cuda() || !matches!(x.dtype(), DType::BF16 | DType::F16) || !mistralrs_quant::titan_cfg::flag("TITAN_CONV_TM", true) {
+        return Ok(None);
+    }
+    let (nb, ns, nc) = x.dims3()?;
+    let k = dims.conv_kernel_size;
+    let state = cache.conv_state.to_dtype(x.dtype())?.contiguous()?;
+    if state.dims() != [nb, nc, k] {
+        return Ok(None);
+    }
+    let candle_core::Device::Cuda(dev) = x.device() else { return Ok(None) };
+    mistralrs_quant::titan_cfg::note_once("titan_conv_tm", || "titan GDN prefill: token-major causal conv (titan_conv1d_full_tm) on".to_string());
+    let weight = conv1d_weight.squeeze(1)?.to_dtype(x.dtype())?.contiguous()?;
+    let stream = dev.cuda_stream();
+    let ptr = |t: &Tensor| -> Result<u64> {
+        let (st, l) = t.storage_and_layout();
+        let candle_core::Storage::Cuda(cs) = &*st else { candle_core::bail!("conv_full_tm: not on CUDA") };
+        let base = match t.dtype() {
+            DType::BF16 => cs.as_cuda_slice::<half::bf16>()?.device_ptr(&stream).0,
+            _ => cs.as_cuda_slice::<half::f16>()?.device_ptr(&stream).0,
+        };
+        Ok(base + 2 * l.start_offset() as u64)
+    };
+    let sx = x.stride();
+    let (sxb, sxs, sxc) = (sx[0] as i64, sx[1] as i64, sx[2] as i64);
+    let alloc16 = |n: usize| -> Result<(candle_core::cuda::CudaStorage, u64)> {
+        Ok(if x.dtype() == DType::BF16 {
+            let b = unsafe { dev.alloc::<half::bf16>(n)? };
+            let p = b.device_ptr(&stream).0;
+            (candle_core::cuda::CudaStorage::wrap_cuda_slice(b, dev.clone()), p)
+        } else {
+            let b = unsafe { dev.alloc::<half::f16>(n)? };
+            let p = b.device_ptr(&stream).0;
+            (candle_core::cuda::CudaStorage::wrap_cuda_slice(b, dev.clone()), p)
+        })
+    };
+    let (out, po) = alloc16(nb * ns * nc)?;
+    let (state_out, pso) = alloc16(nb * nc * k)?;
+    let (px, pw, ps) = (ptr(x)?, ptr(&weight)?, ptr(&state)?);
+    let name = if x.dtype() == DType::BF16 { "titan_conv1d_full_tm_bf16" } else { "titan_conv1d_full_tm_f16" };
+    let f = dev.get_or_load_custom_func(name, "titan_fused_oxide", crate::models::quantized_qwen35_moe::TITAN_FUSED_PTX)?;
+    let (ci, nbi, nci, nsi, ki) = (i32::from(carry), nb as i32, nc as i32, ns as i32, k as i32);
+    let mut b = f.builder();
+    b.arg(&px).arg(&sxb).arg(&sxs).arg(&sxc).arg(&pw).arg(&ps).arg(&ci).arg(&po).arg(&pso).arg(&nbi).arg(&nci).arg(&nsi).arg(&ki);
+    let cfg = LaunchConfig { grid_dim: (nc.div_ceil(256) as u32, ns as u32, nb as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    let out = Tensor::from((candle_core::Storage::Cuda(out), candle_core::Shape::from(vec![nb, ns, nc])));
+    let new_state = Tensor::from((candle_core::Storage::Cuda(state_out), candle_core::Shape::from(vec![nb, nc, k])));
+    if mistralrs_quant::titan_cfg::flag("TITAN_CONV_TM_CHECK", false) {
+        // the old path on the same cache (the conv only touches conv_state), then the state restored
+        let saved = cache.conv_state.clone();
+        let want = if carry {
+            let c = k - 1;
+            let prev = cache.conv_state.narrow(2, k - c, c)?.transpose(1, 2)?.to_dtype(x.dtype())?;
+            let ext = Tensor::cat(&[prev, x.clone()], 1)?;
+            backend::causal_conv1d(&ext, conv1d_weight, dims, cache, RecurrentBatchKind::Prefill)?.narrow(1, c, ns)?
+        } else {
+            backend::causal_conv1d(x, conv1d_weight, dims, cache, RecurrentBatchKind::Prefill)?
+        };
+        let ref_state = std::mem::replace(&mut cache.conv_state, saved);
+        let bits = |t: &Tensor| -> Result<Vec<u32>> { Ok(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect()) };
+        let d = bits(&out)?.iter().zip(bits(&want)?).filter(|(a, b)| **a != *b).count();
+        let ds = bits(&new_state)?.iter().zip(bits(&ref_state.to_dtype(x.dtype())?)?).filter(|(a, b)| **a != *b).count();
+        if d + ds > 0 {
+            tracing::warn!("titan conv_tm check: output {d} of {}, state {ds} differ (carry {carry})", out.elem_count());
+        }
+    }
+    cache.conv_state = new_state.to_dtype(cache.conv_state.dtype())?;
+    Ok(Some(out))
 }

@@ -12,7 +12,7 @@
 //! unfused ops on live data with TITAN_FUSED_CHECK=1 (graphs off).
 #![allow(non_snake_case, clippy::missing_safety_doc, dead_code)]
 
-use cuda_device::{float, kernel, ptx_asm, thread, warp, SharedArray};
+use cuda_device::{convert, float, kernel, ptx_asm, thread, warp, SharedArray};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -180,6 +180,83 @@ pub mod kernels {
         y: *const f32, r: *const f32, alpha: *const f32, sum: *mut f32, out: *mut f32, outb: *mut u16, ncols: i32, block_size: i32, eps: f32,
     ) {
         add_rmsnorm(|i| *y.offset(i), r, alpha, sum, out, outb, ncols, block_size, eps)
+    }
+
+    /// GDN prefill causal conv + SiLU, token-major: `x` `[B, S, C]` (strides in elements, any layout), `weight`
+    /// `[C, K]`, `state` `[B, C, K]` (the previous chunk's last K inputs), output `[B, S, C]` contiguous and the new
+    /// state `[B, C, K]`. Window position `p < 0` reads `state[K + p]` when `carry`, else 0 (the zero-padded full
+    /// conv). Per element the same instructions as the mistralrs-core-cuda port of `causal_conv1d_full_kernel`
+    /// (`acc = fma.rn.ftz(x, w, acc)` over the window in order, `silu_rcp`, cvt to the 16-bit type), so a chunk gives
+    /// the bits of the transpose + conv + transpose (+ cat of the carried rows) it replaces.
+    /// grid (ceil(C / 256), S, B), block 256; the pos == 0 threads also write the new state.
+    #[inline(always)]
+    unsafe fn conv_full_tm<const BF: bool>(
+        x: *const u16, sxb: i64, sxs: i64, sxc: i64, weight: *const u16, state: *const u16, carry: i32,
+        out: *mut u16, state_out: *mut u16, nb: i32, nc: i32, ns: i32, k: i32,
+    ) {
+        let ch = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        let pos = thread::blockIdx_y() as i32;
+        let b = thread::blockIdx_z() as i32;
+        if ch >= nc || pos >= ns || b >= nb {
+            return;
+        }
+        let tof = |v: u16| -> f32 {
+            if BF { f32::from_bits((v as u32) << 16) } else { convert::cvt_f32_f16x2_lo(v as u32) }
+        };
+        let to16 = |v: f32| -> u16 {
+            if BF { convert::cvt_bf16x2_f32(v, 0.0) as u16 } else { convert::cvt_f16x2_f32(v, 0.0) as u16 }
+        };
+        let xb = x.offset((b as i64 * sxb + ch as i64 * sxc) as isize);
+        let st = state.offset((((b as i64) * nc as i64 + ch as i64) * k as i64) as isize);
+        let w = weight.offset((ch as i64 * k as i64) as isize);
+        let mut acc = 0f32;
+        let mut i = 0;
+        while i < k {
+            let src = pos - (k - 1) + i;
+            let xv = if src >= 0 {
+                tof(*xb.offset((src as i64 * sxs) as isize))
+            } else if carry != 0 {
+                tof(*st.offset((k + src) as isize))
+            } else {
+                0.0
+            };
+            acc = float::fma_rn_ftz_f32(xv, tof(*w.offset(i as isize)), acc);
+            i += 1;
+        }
+        const LOG2E: f32 = f32::from_bits(0x3fb8aa3b);
+        let e = float::ex2_approx_ftz_f32(float::mul_rn_ftz_f32(acc, -LOG2E));
+        let r = float::mul_rn_ftz_f32(acc, float::rcp_approx_ftz_f32(float::add_rn_ftz_f32(e, 1.0)));
+        *out.offset((((b as i64 * ns as i64) + pos as i64) * nc as i64 + ch as i64) as isize) = to16(r);
+        if pos == 0 {
+            // the last K inputs (the carried state ahead of a short chunk, else zeros), as save_conv_state keeps them
+            let so = state_out.offset((((b as i64) * nc as i64 + ch as i64) * k as i64) as isize);
+            let mut j = 0;
+            while j < k {
+                let src = ns - k + j;
+                *so.offset(j as isize) = if src >= 0 {
+                    *xb.offset((src as i64 * sxs) as isize)
+                } else if carry != 0 {
+                    *st.offset((k + src) as isize)
+                } else {
+                    0
+                };
+                j += 1;
+            }
+        }
+    }
+    #[kernel]
+    pub unsafe fn titan_conv1d_full_tm_bf16(
+        x: *const u16, sxb: i64, sxs: i64, sxc: i64, weight: *const u16, state: *const u16, carry: i32,
+        out: *mut u16, state_out: *mut u16, nb: i32, nc: i32, ns: i32, k: i32,
+    ) {
+        conv_full_tm::<true>(x, sxb, sxs, sxc, weight, state, carry, out, state_out, nb, nc, ns, k)
+    }
+    #[kernel]
+    pub unsafe fn titan_conv1d_full_tm_f16(
+        x: *const u16, sxb: i64, sxs: i64, sxc: i64, weight: *const u16, state: *const u16, carry: i32,
+        out: *mut u16, state_out: *mut u16, nb: i32, nc: i32, ns: i32, k: i32,
+    ) {
+        conv_full_tm::<false>(x, sxb, sxs, sxc, weight, state, carry, out, state_out, nb, nc, ns, k)
     }
 
     /// Dense SwiGLU of a decode step, bf16 in and out: out[i] = bf16(mulf(silu(g[i]), u[i])) with g, u widened exactly.

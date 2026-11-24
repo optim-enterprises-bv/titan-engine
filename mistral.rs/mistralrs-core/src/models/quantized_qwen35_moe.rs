@@ -1512,7 +1512,7 @@ pub struct ModelWeights {
 }
 
 #[cfg(feature = "cuda")]
-const TITAN_FUSED_PTX: &str = include_str!("titan_fused_oxide.ptx");
+pub(crate) const TITAN_FUSED_PTX: &str = include_str!("titan_fused_oxide.ptx");
 
 /// `TITAN_GRAPH_RUNS` (default on): consecutive GDN layers captured as one graph segment (`forward_trunk_graphed`).
 fn graph_runs() -> bool {
