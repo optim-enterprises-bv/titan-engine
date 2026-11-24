@@ -242,6 +242,21 @@ pub fn warp_gated_delta_rule_recurrence_cuda(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
+    if q.dim(1)? >= super::tc::MIN_TOKENS && super::tc::supported(q, v) {
+        return super::tc::recurrence(q, k, v, g, beta, state);
+    }
+    sequential_recurrence(q, k, v, g, beta, state)
+}
+
+/// The per-token warp kernel (decode's order).
+pub fn sequential_recurrence(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         candle_core::cuda::ktrace("mc", concat!(module_path!(), "::warp_gated_delta_rule_recurrence_cuda"));
     use candle::cuda_backend::cudarc::driver::DevicePtr;
