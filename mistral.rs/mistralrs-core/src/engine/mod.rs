@@ -576,6 +576,25 @@ impl Engine {
         } else {
             config
         };
+        // prealloc hybrid KV is one shared buffer: a second running sequence prefills over the first one's rows
+        let config = match config {
+            SchedulerConfig::DefaultScheduler {
+                method: DefaultSchedulerMethod::Fixed(n),
+            } if n.get() > 1 && {
+                let p = get_mut_arcmutex!(pipeline);
+                p.cache().is_hybrid() && p.device().is_cuda() && crate::kv_cache::cuda_kv_prealloc()
+            } =>
+            {
+                tracing::info!(
+                    "titan: TITAN_KV_PREALLOC hybrid cache holds one sequence: max_seqs {} -> 1 (other requests queue)",
+                    n.get()
+                );
+                SchedulerConfig::DefaultScheduler {
+                    method: DefaultSchedulerMethod::Fixed(std::num::NonZeroUsize::new(1).unwrap()),
+                }
+            }
+            config => config,
+        };
         let max_active_sequences = match &config {
             SchedulerConfig::DefaultScheduler {
                 method: DefaultSchedulerMethod::Fixed(max_num_seqs),
