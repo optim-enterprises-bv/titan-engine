@@ -1130,7 +1130,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         for slot in 0..n_slots {
             if hp.is_swa[hp.phys(slot)] {
                 if let Some(c) = cache.get_mut(slot) {
-                    *c = HybridLayerCache::Attention(KvCache::new_rotating(2, hp.n_swa, 512));
+                    *c = HybridLayerCache::Attention(KvCache::new_rotating(2, hp.n_swa, hp.n_swa + crate::kv_cache::NormalCache::CACHE_GROW_SIZE));
                 }
             }
         }
@@ -1641,7 +1641,14 @@ impl ModelWeights {
                 Some(KvCache::Rotating { k, v }) if k.current_seq_len() == len && v.current_seq_len() == len => {
                     out.push(Some((ring_to_host(&k)?, ring_to_host(&v)?)))
                 }
-                _ => return Ok(None),
+                _ => {
+                    // a resume point needs every window ring at `len`; one missing or at the wrong length
+                    // drops the whole point silently, so say why
+                    tracing::debug!(
+                        "inkling2 windows_host: slot {s} unavailable (want all window slots at len {len}); dropping resume points"
+                    );
+                    return Ok(None);
+                }
             }
         }
         Ok(Some(out))

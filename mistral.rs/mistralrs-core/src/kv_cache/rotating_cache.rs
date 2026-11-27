@@ -36,7 +36,9 @@ impl RotatingCache {
             dim,
             current_seq_len: 0,
             max_seq_len,
-            capacity_seq_len: capacity_seq_len.min(max_seq_len),
+            // up to the window plus one grow block of slack: a caller may preallocate the slack so the
+            // ring never reallocates and relocates only once per CACHE_GROW_SIZE decode tokens
+            capacity_seq_len: capacity_seq_len.min(max_seq_len + NormalCache::CACHE_GROW_SIZE),
             write_pos: 0,
             last_append_result: None,
         }
@@ -84,12 +86,18 @@ impl RotatingCache {
     }
 
     pub fn snapshot(&self) -> Result<RotatingCacheSnapshot> {
+        // The retained tensor must be an owned copy, not a view into the ring buffer:
+        // a later in-place relocation of the buffer would silently rewrite the snapshot.
+        let retained = match self.current_data()? {
+            Some(t) => Some(t.copy()?),
+            None => None,
+        };
         Ok(RotatingCacheSnapshot {
             dim: self.dim,
             current_seq_len: self.current_seq_len,
             max_seq_len: self.max_seq_len,
             capacity_seq_len: self.capacity_seq_len,
-            retained: self.current_data()?,
+            retained,
         })
     }
 
@@ -169,7 +177,9 @@ impl RotatingCache {
                     dim: snapshot.dim,
                     current_seq_len: keep_len,
                     max_seq_len: snapshot.max_seq_len,
-                    capacity_seq_len: snapshot.capacity_seq_len.min(snapshot.max_seq_len),
+                    capacity_seq_len: snapshot
+                        .capacity_seq_len
+                        .min(snapshot.max_seq_len + NormalCache::CACHE_GROW_SIZE),
                     write_pos: 0,
                     last_append_result: None,
                 });
@@ -184,7 +194,7 @@ impl RotatingCache {
         let capacity_seq_len = snapshot
             .capacity_seq_len
             .max(keep)
-            .min(snapshot.max_seq_len)
+            .min(snapshot.max_seq_len + NormalCache::CACHE_GROW_SIZE)
             .max(keep);
         let mut shape = retained.dims().to_vec();
         shape[snapshot.dim] = capacity_seq_len;
@@ -236,6 +246,21 @@ impl RotatingCache {
                 self.current_seq_len,
                 self.max_seq_len
             );
+        }
+        Ok(())
+    }
+
+    /// Room for `len` positions in the retained window before the buffer is allocated: bumps the
+    /// capacity the first `append` allocates, so the window doesn't reallocate mid-prompt. Clamps to
+    /// the window plus one grow block of slack. Once the buffer exists this is a no-op (`append`'s
+    /// grow path owns resizing; bumping the capacity past the allocated buffer would write out of bounds).
+    pub fn reserve(&mut self, len: usize) -> Result<()> {
+        if self.all_data.is_some() {
+            return Ok(());
+        }
+        let keep = len.min(self.max_capacity());
+        if self.capacity_seq_len < keep {
+            self.capacity_seq_len = keep;
         }
         Ok(())
     }
@@ -297,7 +322,21 @@ impl RotatingCache {
                 let keep_len = retained_len.min(self.max_seq_len - seq_len);
                 let keep_start = window_start + retained_len - keep_len;
                 let max_capacity = self.max_capacity();
-                if self.capacity_seq_len < max_capacity {
+                // prefill: the retained window plus the new rows fit in the current buffer, relocate in
+                // place instead of reallocating mid-prompt. Not for decode: a buffer with no slack past the
+                // window would then relocate the whole window every token; decode grows to max_capacity
+                // once and then relocates once per CACHE_GROW_SIZE tokens.
+                if seq_len > 1 && keep_len + seq_len <= self.capacity_seq_len {
+                    if keep_len > 0 {
+                        let ad = self.all_data.as_mut().unwrap();
+                        let retained = ad
+                            .narrow(self.dim, keep_start, keep_len)?
+                            .copy()?
+                            .contiguous()?;
+                        ad.slice_set(&retained, self.dim, 0)?;
+                    }
+                    self.write_pos = keep_len;
+                } else if self.capacity_seq_len < max_capacity {
                     let needed = keep_len + seq_len;
                     let n_blocks = needed
                         .div_ceil(NormalCache::CACHE_GROW_SIZE)
@@ -536,6 +575,42 @@ mod tests {
                 .flatten_all()?
                 .to_vec1::<f32>()?,
             expected_retained
+        );
+        Ok(())
+    }
+    #[test]
+    fn decode_keeps_slack_and_prefill_relocates_in_place() -> candle_core::Result<()> {
+        use super::NormalCache;
+        let w = 4;
+        // buffer sized exactly to the window: decode must grow to window + slack once, not relocate per token
+        let mut cache = RotatingCache::new(2, w, w);
+        let _ = cache.append(&make_src(&[0., 1., 2., 3.])?)?;
+        for t in 4..40 {
+            let out = cache.append(&make_src(&[t as f32])?)?;
+            let want: Vec<f32> = ((t - 3)..=t).map(|x| x as f32).collect();
+            assert_eq!(out.flatten_all()?.to_vec1::<f32>()?, want);
+        }
+        // grown in CACHE_GROW_SIZE blocks, capped at window + one block: plenty of slack past the window
+        assert!(cache.capacity_seq_len > w && cache.capacity_seq_len <= w + NormalCache::CACHE_GROW_SIZE);
+
+        // prefill chunks into a preallocated buffer: relocated in place, capacity unchanged
+        let mut cache = RotatingCache::new(2, w, w);
+        let _ = cache.append(&make_src(&[0., 1., 2., 3.])?)?;
+        let _ = cache.append(&make_src(&[4., 5.])?)?;
+        assert_eq!(cache.capacity_seq_len, w);
+        assert_eq!(cache.current_data()?.unwrap().flatten_all()?.to_vec1::<f32>()?, vec![2., 3., 4., 5.]);
+
+        // reserve after allocation is a no-op (bumping capacity past the buffer would write out of bounds)
+        let mut cache = RotatingCache::new(2, 8, 2);
+        let _ = cache.append(&make_src(&[0.])?)?;
+        cache.reserve(8)?;
+        assert_eq!(cache.capacity_seq_len, 2);
+        for t in 1..20 {
+            let _ = cache.append(&make_src(&[t as f32])?)?;
+        }
+        assert_eq!(
+            cache.current_data()?.unwrap().flatten_all()?.to_vec1::<f32>()?,
+            (12..20).map(|x| x as f32).collect::<Vec<_>>()
         );
         Ok(())
     }
