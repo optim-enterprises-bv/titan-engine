@@ -506,14 +506,19 @@ impl KvCache {
         }
     }
 
-    /// See `SingleCache::reserve`; only normal caches grow, others are left as they are.
+    /// See `SingleCache::reserve`; normal caches grow in place, rotating rings bump their capacity
+    /// (no data copy) so the window never reallocates mid-prompt.
     pub fn reserve(&mut self, len: usize) -> candle_core::Result<()> {
         match self {
             Self::Normal { k, v } => {
                 k.reserve(len)?;
                 v.reserve(len)
             }
-            Self::Rotating { .. } | Self::Shared { .. } => Ok(()),
+            Self::Rotating { k, v } => {
+                k.reserve(len)?;
+                v.reserve(len)
+            }
+            Self::Shared { .. } => Ok(()),
         }
     }
 
